@@ -124,7 +124,7 @@ class UltraHub final : public Component {
     }
     this->wake_();
   }
-  /// Boards with the input current sense, the current calibration of this pin (research/current-calibration.md):
+  /// Boards with the input current sense, the current calibration of this pin (firmware wiki: Current Sense):
   /// every board on the pin fades dark (0.3 s), then one board after the other in chain order measures each channel
   /// alone (duty_pct 0: at 25 / 50 / 75 / 100 %, ~1.1 s per board; 5..100: at that duty only, ~0.33 s), then the pin
   /// fades back (states, transitions and effects continue: the boards' engines kept running). boards: which ones to

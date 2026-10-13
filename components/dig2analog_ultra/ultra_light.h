@@ -15,6 +15,7 @@
 namespace esphome::dig2analog_ultra {
 
 class UltraLight;
+class UltraEffect;
 
 /// ESPHome's transition, run by the board: start() sends the target and length once (SET); ESPHome still
 /// interpolates its own copy for the state it reports, but nothing is written to the line meanwhile.
@@ -77,6 +78,12 @@ class UltraLight final : public light::LightOutput, public light::LightRemoteVal
   void set_cold_white_temperature(float mireds) { this->cold_white_temperature_ = mireds; }
   void set_warm_white_temperature(float mireds) { this->warm_white_temperature_ = mireds; }
   void set_power_on_scene(uint8_t mode) { this->scene_mode_ = mode; }
+  /// power_on_effect: one of the light's ultra_* effects, run by the board from its power-up on these values (a fixed
+  /// power-on scene; color_temperature > 0 sets cold / warm white as a light call would) until ESPHome takes over
+  void set_power_on_effect(UltraEffect *effect, const light::LightColorValues &values) {
+    this->power_on_effect_ = effect;
+    this->power_on_values_ = values;
+  }
   /// dim_to_warm: in the YAML (warm end in mireds, red assist 0..1); on from boot unless set_dim_to_warm(false)
   void set_dim_to_warm_config(float warm_mireds, float red_assist) {
     this->dtw_available_ = true;
@@ -179,6 +186,9 @@ class UltraLight final : public light::LightOutput, public light::LightRemoteVal
   bool scene_sent_{false};
   uint8_t scene_fade_{0};
   uint16_t scene_m_{0}, scene_a_[CHANNELS]{}, scene_b_[CHANNELS]{};
+  void send_scene_effect_();
+  UltraEffect *power_on_effect_{nullptr};
+  light::LightColorValues power_on_values_;
 
   bool sent_{false};
   bool on_{false};

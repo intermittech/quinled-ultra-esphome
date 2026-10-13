@@ -61,7 +61,7 @@ light:
 | PWM | the chip's own: ~4 kHz (WS2805), ~2 kHz (WS2915) | 2.2-100 kHz, the channels staggered, spread spectrum |
 | Transitions | ESPHome sends every step, as smooth as the frame rate | the board recomputes every 1 ms, in step on every board |
 | Effects | streamed from ESPHome, frame by frame | on the board (pulse, strobe, flicker, random, candle, breathe, colour loop, sunrise, sunset); ESPHome's own effects glide |
-| Also | | power-on scene, dim to warm, board current sense and calibration (on the board: protection, limits, automatic dimming), firmware updates over the data line |
+| Also | | power-on scene and effect, dim to warm, board current sense and calibration (on the board: protection, limits, automatic dimming), firmware updates over the data line |
 
 **Reporting back** (currents, temperature, voltages, calibration results, firmware versions to ESPHome and Home
 Assistant) is for **QuinLED Diff-Power ultra receivers only**. The QuinLED dig2analog-ultra-5ch's data line is

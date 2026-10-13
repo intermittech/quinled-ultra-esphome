@@ -1,7 +1,8 @@
 // Host test for components/dig2analog_ultra/ultra_core.h: ESPHome value mapping, PWM presets, the frame scheduler
-// (copies, ordering, replacement, refresh, start offsets) and the bit encoder. With the board firmware next to this
-// repo (../quinled-ultra-firmware or ../dig2analog-ultra-5ch/firmware, or $ULTRA_FIRMWARE), the frames also go
-// through the boards' real engine: a chain of boards with drifting clocks, lost frames and a board that reboots.
+// (copies, ordering, replacement, refresh, start offsets, the power-on effect) and the bit encoder. With the board
+// firmware next to this repo (../quinled-ultra-firmware or ../dig2analog-ultra-5ch/firmware, or $ULTRA_FIRMWARE), the
+// frames also go through the boards' real engine: a chain of boards with drifting clocks, lost frames and a board that
+// reboots.
 // Build: python tests/run_ultra_host_test.py   (uses the ziglang pip package as C/C++ compiler)
 
 #include "../components/dig2analog_ultra/ultra_core.h"
@@ -18,6 +19,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace esphome::dig2analog_ultra;
@@ -83,7 +85,7 @@ static bool frame_ok(const std::vector<uint8_t> &f, uint16_t boards) {
 }
 
 // The compatibility rules (ultra_protocol.h): the hub sends only defined values. A slot of a normal frame: a known
-// type (never POLL, never 0x0A-0xFF), LIGHT 0-4 or 15, FLAGS only on SET (and only SMOOTH / VIA_OFF), and per type no
+// type (never POLL, never 0x0B-0xFF), LIGHT 0-4 or 15, FLAGS only on SET (and only SMOOTH / VIA_OFF), and per type no
 // unknown flag bits, roles, ids, effect ids or IDENTIFY / SCENE values, and spare bytes 0. A DARK slot (all zero) is
 // fine. Returns a short reason, nullptr = defined.
 static const char *slot_undefined(const uint8_t *s) {
@@ -124,6 +126,10 @@ static const char *slot_undefined(const uint8_t *s) {
       if (p[0] >= ULTRA_FX_COUNT)
         return "effect id";
       return spare(5 + ultra_fx_param_bytes(p[0])) ? "EFFECT spare params" : nullptr;
+    case ULTRA_SCENE_EFFECT:
+      if (p[0] >= ULTRA_FX_COUNT)
+        return "power-on effect id";
+      return spare(1 + ultra_fx_param_bytes(p[0])) ? "SCENE_EFFECT spare params" : nullptr;
     case ULTRA_STEP:
       return ((p[0] & 0x0F) == 0 || (p[0] & 0x0F) > ULTRA_MAX_STEPS || (p[0] >> 4) >= (p[0] & 0x0F)) ? "STEP index"
                                                                                                     : nullptr;
@@ -252,6 +258,9 @@ static void test_defined_values() {
       case 12:
         if (rng() % 20 == 0)
           s.replay(now);
+        break;
+      case 13:
+        s.light_scene_effect(b, l, r8() % 2 ? r8() : static_cast<uint8_t>(rng() % ULTRA_FX_COUNT), par, rng() % 23);
         break;
       default:
         break;
@@ -766,6 +775,156 @@ static void test_dtw_points_path() {
   std::printf("  dim to warm set points (100 %% 4000 K, 20 %% 2700 K) on a 5000 K light: board follows the points\n");
 }
 
+// Protocol test vector slot_scene_effect (quinled-ultra-protocol test-vectors/vectors.json; run_ultra_host_test.py
+// checks this copy against it): candle (intensity 0.5, speed 100 %) as light 0's power-on effect, SEQ 0x79.
+static const char *const VEC_SLOT_SCENE_EFFECT = "0a007905800000640000000000000000000000000000000000000000000000cd";
+
+static std::vector<uint8_t> from_hex(const char *h) {
+  std::vector<uint8_t> out;
+  for (; h[0] && h[1]; h += 2)
+    out.push_back(static_cast<uint8_t>(std::strtoul(std::string(h, 2).c_str(), nullptr, 16)));
+  return out;
+}
+
+/// Power-on effect (SCENE_EFFECT, protocol 0.2.3; YAML power_on_effect): the scheduler's slot equals the protocol's test
+/// vector and goes out after the light's SCENE (copies, refresh, replay with the same SEQ); a new SEQ only when it
+/// changes; a light without one gets none (no effect, no parameter bytes). With the board engine: the board takes it,
+/// a board powered up from the stored head runs the candle on the SCENE values, and none / strobe store no effect.
+static void test_scene_effect() {
+  const uint16_t z[5] = {0, 0, 0, 0, 0}, one[5] = {65535, 65535, 65535, 65535, 65535};
+  uint8_t p[ULTRA_FX_PARAMS] = {};
+  ultra_put16(p, to16(0.5f));  // as UltraCandleEffect sends intensity 50 %, speed 100 %
+  ultra_put16(p + 2, 100);
+  ColorValues v{1.0f, 0.6f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.4f, 1.0f, MODE_CWW};
+  uint16_t m, a[5], b[5];
+  map_values(RGBWW, v, m, a, b);
+  Scheduler s;
+  s.init(1, 31, 3);
+  std::vector<uint8_t> f(s.frame_bytes());
+#ifdef WITH_ENGINE
+  ultra_t u;
+  ultra_init(&u, 9);
+#endif
+  int64_t now = 1000000;
+  uint32_t tick = 1000;
+  auto frame = [&]() {
+    s.build_frame(now, f.data());
+    CHECK(frame_undefined(f.data(), 1) == nullptr, "power-on effect frame: undefined value");
+#ifdef WITH_ENGINE
+    uint32_t hus;
+    ultra_parse_header(hdr_of(f), &hus);
+    ultra_on_header(&u, tick, hus);
+    ultra_on_slot(&u, slot_of(f, 0), tick);
+#endif
+    now += 200000;
+    tick += 4000;
+    return f[0];
+  };
+  s.light_def(0, 0, RGBWW, 2800, ULTRA_DEF_CONSTANT_BRIGHTNESS, z, one);
+  s.light_scene(0, 0, 1, 10, m, a, b);
+  s.light_scene_effect(0, 0, ULTRA_FX_CANDLE, p, 4);
+  std::vector<uint8_t> types;
+  uint8_t sent[ULTRA_SLOT_BYTES] = {};
+  while (s.pending() && types.size() < 20) {
+    types.push_back(frame());
+    if (f[0] == ULTRA_SCENE_EFFECT)
+      std::memcpy(sent, f.data(), ULTRA_SLOT_BYTES);
+  }
+  const std::vector<uint8_t> want = {ULTRA_LIGHT_DEF, ULTRA_SCENE, ULTRA_SCENE_EFFECT, ULTRA_LIGHT_DEF, ULTRA_SCENE,
+                                     ULTRA_SCENE_EFFECT, ULTRA_LIGHT_DEF, ULTRA_SCENE, ULTRA_SCENE_EFFECT};
+  CHECK(types == want, "SCENE_EFFECT goes out after the SCENE, 3 copies each");
+  const std::vector<uint8_t> vec = from_hex(VEC_SLOT_SCENE_EFFECT);
+  uint8_t t[ULTRA_SLOT_BYTES];
+  std::memcpy(t, sent, sizeof t);
+  t[2] = 0x79;  // the vector's SEQ
+  ultra_slot_seal(t);
+  CHECK(vec.size() == ULTRA_SLOT_BYTES && std::memcmp(t, vec.data(), ULTRA_SLOT_BYTES) == 0 &&
+            ultra_slot_check(sent) == 0,
+        "the slot = test vector slot_scene_effect (with its SEQ)");
+  const uint8_t seq = sent[2];
+
+  // unchanged: nothing queued; the refresh repeats it (same SEQ), so does a replay
+  s.light_scene_effect(0, 0, ULTRA_FX_CANDLE, p, 4);
+  CHECK(!s.pending(), "an unchanged power-on effect queues nothing");
+  int refreshed = 0;
+  bool same = true;
+  for (int i = 0; i < 40; i++) {
+    if (frame() == ULTRA_SCENE_EFFECT) {
+      refreshed++;
+      same &= std::memcmp(f.data(), sent, ULTRA_SLOT_BYTES) == 0;
+    }
+  }
+  CHECK(refreshed >= 2 && same, "refreshed with the same SEQ (%d times)", refreshed);
+  s.replay(now);
+  types.clear();
+  same = true;
+  while (s.pending() && types.size() < 40) {
+    types.push_back(frame());
+    if (f[0] == ULTRA_SCENE_EFFECT)
+      same &= f[2] == seq;
+  }
+  const auto pos = [&](uint8_t type) { return std::find(types.begin(), types.end(), type) - types.begin(); };
+  CHECK(pos(ULTRA_SCENE_EFFECT) < static_cast<long>(types.size()) && pos(ULTRA_SCENE) < pos(ULTRA_SCENE_EFFECT) && same,
+        "replay: again after the SCENE, same SEQ");
+
+#ifdef WITH_ENGINE
+  CHECK(u.light[0].scene_fx_have && u.light[0].scene_fx == ULTRA_FX_CANDLE && ultra_scene_fx_ok(&u.light[0]) &&
+            std::memcmp(u.light[0].scene_fxp, p, 4) == 0,
+        "the board took the candle as the light's power-on effect");
+  // the board's power-up: its stored head (main.c / hal/hw.c), no host; the candle flickers below the scene's outputs
+  scene_t stored{}, sc{};
+  ultra_scene(&u, &stored, &sc);
+  ultra_t up;
+  ultra_init(&up, 9);
+  std::memcpy(&up.light[0], &u.light[0], ULTRA_HEAD_BYTES);
+  ultra_scene_fx_start(&up, 1, 0);
+  uint16_t out[5], lo = 65535, hi = 0;
+  for (uint32_t ms = 0; ms < 3000; ms++) {
+    ultra_render(&up, ms * 20u, out);
+    lo = std::min(lo, out[4]);
+    hi = std::max(hi, out[4]);
+  }
+  CHECK(up.light[0].fx == ULTRA_FX_CANDLE && hi <= sc.v[4] + 1 && lo < sc.v[4] * 9 / 10 && hi > lo,
+        "power-up without a host: candle on WW %u..%u (scene %u)", lo, hi, sc.v[4]);
+  std::printf("  power-on effect: SCENE_EFFECT = test vector, after the SCENE, refreshed; board power-up runs the candle "
+              "(WW %u..%u of the scene's %u)\n", lo, hi, sc.v[4]);
+#endif
+
+  // changed: a new SEQ
+  ultra_put16(p + 2, 50);
+  s.light_scene_effect(0, 0, ULTRA_FX_CANDLE, p, 4);
+  CHECK(s.pending(), "a changed power-on effect is queued");
+  while (s.pending() && frame() != ULTRA_SCENE_EFFECT) {
+  }
+  CHECK(f[0] == ULTRA_SCENE_EFFECT && f[2] != seq && ultra_get16(f.data() + ULTRA_PAYLOAD + 3) == 50,
+        "changed: new SEQ, the new parameters");
+
+  // a light without power_on_effect: none, without parameter bytes (the board stores no effect for it, and drops one an
+  // earlier configuration stored); strobe isn't stored either (its steps aren't): the plain values
+  s.light_scene_effect(0, 1, ULTRA_FX_NONE, p, 4);
+  bool none = false;
+  for (int i = 0; i < 8 && s.pending(); i++) {
+    if (frame() == ULTRA_SCENE_EFFECT && (f[1] >> 4) == 1) {
+      none = f[ULTRA_PAYLOAD] == ULTRA_FX_NONE;
+      for (uint32_t k = 1; k < ULTRA_PAYLOAD_LEN; k++)
+        none &= f[ULTRA_PAYLOAD + k] == 0;
+    }
+  }
+  CHECK(none, "no power_on_effect: SCENE_EFFECT none, no parameter bytes");
+#ifdef WITH_ENGINE
+  CHECK(u.light[1].scene_fx_have && u.light[1].scene_fx == ULTRA_FX_NONE && !ultra_scene_fx_ok(&u.light[1]),
+        "the board stores no effect for it");
+  uint8_t sl[ULTRA_SLOT_BYTES];
+  const uint8_t steps[1] = {2};
+  ultra_slot_scene_effect(sl, 0, static_cast<uint8_t>(seq + 50), ULTRA_FX_STROBE, steps, 1);
+  ultra_on_slot(&u, sl, tick);
+  CHECK(u.light[0].scene_fx == ULTRA_FX_STROBE && !ultra_scene_fx_ok(&u.light[0]), "strobe: not stored (plain values)");
+  ultra_slot_scene_effect(sl, 0, static_cast<uint8_t>(seq + 51), ULTRA_FX_NONE, nullptr, 0);
+  ultra_on_slot(&u, sl, tick);
+  CHECK(u.light[0].scene_fx == ULTRA_FX_NONE && !ultra_scene_fx_ok(&u.light[0]), "none clears the light's effect");
+#endif
+}
+
 // ---------------------------------------------------------------------------------------- pin calibration sequence
 // CalSequencer on a Scheduler, frames back to back while commands are pending (as the hub sends them): when each
 // board sees DARK / CAL / RELEASE (first and last copy), and with the board engine which IDENTIFY events a board
@@ -1005,6 +1164,7 @@ int main() {
   test_switch_frames();
   test_cal_sequencer();
   test_fifty_boards();
+  test_scene_effect();
 #ifdef WITH_ENGINE
   test_config_frames();
   test_scene_path();

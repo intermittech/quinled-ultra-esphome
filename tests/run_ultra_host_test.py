@@ -6,8 +6,10 @@ header copy is checked against the firmware's master (and reported against a qui
 this repo).
 """
 
+import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -42,6 +44,16 @@ def main() -> int:
     if proto.exists():
         same = proto.read_bytes().replace(b"\r\n", b"\n") == copy
         print(f"ultra_protocol.h {'matches' if same else 'DIFFERS from'} {proto} (the checked-out tag)")
+    # the test's copy of protocol test vectors (VEC_<NAME> = "<hex>") against the protocol repository's vectors.json
+    vectors = ROOT.parent / "quinled-ultra-protocol" / "test-vectors" / "vectors.json"
+    if vectors.exists():
+        known = {v["name"]: v["hex"] for v in json.loads(vectors.read_text(encoding="utf-8"))["vectors"]}
+        src = (HERE / "ultra_host_test.cpp").read_text(encoding="utf-8")
+        for name, hexstr in re.findall(r'VEC_([A-Z0-9_]+) = "([0-9a-f]+)"', src):
+            if known.get(name.lower()) != hexstr:
+                print(f"FAIL: test vector {name.lower()} differs from {vectors}")
+                return 1
+            print(f"test vector {name.lower()} matches {vectors.name}")
     if (core / "ultra.c").exists():
         master = (core / "ultra_protocol.h").read_bytes().replace(b"\r\n", b"\n")
         if master != copy:

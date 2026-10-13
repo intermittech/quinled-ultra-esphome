@@ -87,6 +87,15 @@ ULTRA_MONO = """\
     channel: {channel}
 """
 
+MONO_CANDLE = """\
+  - platform: dig2analog_ultra
+    name: niche
+    board: 0
+    channel: 1
+    effects:
+      - ultra_candle:
+"""
+
 STRIP_PIXELS = """\
 light:
   - platform: dig2analog_ultra
@@ -355,6 +364,100 @@ CASES = [
         ULTRA + "light:\n" + ULTRA_MONO.format(name="a", board=0, channel=1) + "    power_on_scene: true\n",
         False,
         "power_on_scene shows the state the light comes back in",
+    ),
+    # power_on_effect: one of the light's ultra_* effects, run by the board from its power-up (SCENE_EFFECT)
+    ("ultra power_on_effect by name", ULTRA + "light:\n" + MONO_CANDLE + "    power_on_effect: Candle\n", True, None),
+    (
+        "ultra power_on_effect colour temperature warmer than the WW LED",
+        ULTRA + ULTRA_CCT + "    effects:\n      - ultra_candle:\n          intensity: 30%\n"
+        "    restore_mode: RESTORE_DEFAULT_OFF\n"
+        "    power_on_effect:\n      effect: candle\n      brightness: 60%\n      color_temperature: 2200 K\n",
+        False,
+        "color_temperature must be between the LEDs' 2700 K and 6500 K",
+    ),
+    (
+        "ultra power_on_effect colour temperature on cct",
+        ULTRA + ULTRA_CCT + "    effects:\n      - ultra_candle:\n"
+        "    power_on_effect:\n      effect: candle\n      brightness: 60%\n      color_temperature: 2700 K\n",
+        True,
+        None,
+    ),
+    (
+        "ultra power_on_effect colour on rgbww",
+        ULTRA + ULTRA_RGBWW + "    power_on_effect:\n      effect: Color Loop\n      brightness: 50%\n"
+        "      red: 100%\n      green: 40%\n",
+        True,
+        None,
+    ),
+    (
+        "ultra power_on_effect sunrise on rgbww",
+        ULTRA + ULTRA_RGBWW + "    power_on_effect:\n      effect: Sunrise\n      color_temperature: 3000 K\n",
+        True,
+        None,
+    ),
+    (
+        "ultra power_on_effect unknown effect",
+        ULTRA + "light:\n" + MONO_CANDLE + "    power_on_effect: Fire\n",
+        False,
+        "this light has no effect 'Fire'; use one of: Candle",
+    ),
+    (
+        "ultra power_on_effect without effects",
+        ULTRA + "light:\n" + ULTRA_MONO.format(name="a", board=0, channel=1) + "    power_on_effect: Candle\n",
+        False,
+        "add one under effects:",
+    ),
+    (
+        "ultra power_on_effect strobe",
+        ULTRA + ULTRA_RGBWW + "    power_on_effect: Strobe\n",
+        False,
+        "doesn't store the steps of 'Strobe' (ultra_strobe) and would show the plain values",
+    ),
+    (
+        "ultra power_on_effect ESPHome effect",
+        ULTRA + "light:\n" + MONO_CANDLE + "      - flicker:\n    power_on_effect: Flicker\n",
+        False,
+        "'Flicker' is an ESPHome effect (flicker)",
+    ),
+    (
+        "ultra power_on_effect with power_on_scene",
+        ULTRA + "light:\n" + MONO_CANDLE
+        + "    restore_mode: RESTORE_DEFAULT_OFF\n    power_on_scene: true\n    power_on_effect: Candle\n",
+        False,
+        "remove power_on_scene",
+    ),
+    (
+        "ultra power_on_effect brightness 0 %",
+        ULTRA + "light:\n" + MONO_CANDLE + "    power_on_effect:\n      effect: Candle\n      brightness: 0%\n",
+        False,
+        "brightness must be above 0 %",
+    ),
+    (
+        "ultra power_on_effect colour temperature on a monochromatic light",
+        ULTRA + "light:\n" + MONO_CANDLE + "    power_on_effect:\n      effect: Candle\n      color_temperature: 2700 K\n",
+        False,
+        "color_temperature needs cold_white and warm_white channels",
+    ),
+    (
+        "ultra power_on_effect red on cct",
+        ULTRA + ULTRA_CCT + "    effects:\n      - ultra_candle:\n"
+        "    power_on_effect:\n      effect: Candle\n      red: 50%\n",
+        False,
+        "red needs red, green and blue channels",
+    ),
+    (
+        "ultra power_on_effect colour temperature and cold_white",
+        ULTRA + ULTRA_CCT + "    effects:\n      - ultra_candle:\n"
+        "    power_on_effect:\n      effect: Candle\n      color_temperature: 3000 K\n      cold_white: 50%\n",
+        False,
+        "give color_temperature or cold_white / warm_white, not both",
+    ),
+    (
+        "ultra power_on_effect RGB and white with color_interlock",
+        ULTRA + ULTRA_RGBWW + "    color_interlock: true\n"
+        "    power_on_effect:\n      effect: Pulse\n      red: 100%\n      color_temperature: 3000 K\n",
+        False,
+        "with color_interlock give either the RGB colour or the white values",
     ),
     ("ultra dim_to_warm true on cct", ULTRA + ULTRA_CCT + "    dim_to_warm: true\n", True, None),
     (

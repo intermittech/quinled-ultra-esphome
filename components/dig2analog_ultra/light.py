@@ -30,6 +30,7 @@ from esphome.const import (
     CONF_COLORS,
     CONF_CONSTANT_BRIGHTNESS,
     CONF_DURATION,
+    CONF_EFFECT,
     CONF_EFFECTS,
     CONF_GREEN,
     CONF_ID,
@@ -79,6 +80,7 @@ CONF_PERIOD = "period"
 CONF_SATURATION = "saturation"
 CONF_ZERO_MEANS_ZERO = "zero_means_zero"
 CONF_POWER_ON_SCENE = "power_on_scene"
+CONF_POWER_ON_EFFECT = "power_on_effect"
 CONF_DIM_TO_WARM = "dim_to_warm"
 CONF_RED_ASSIST = "red_assist"
 CONF_WARM_COLOR_TEMPERATURE = "warm_color_temperature"
@@ -136,6 +138,138 @@ def _validate_dim_to_warm(value):
     if isinstance(value, bool) or not isinstance(value, dict):
         return DIM_TO_WARM_SCHEMA({}) if cv.boolean(value) else None
     return DIM_TO_WARM_SCHEMA(value)
+
+
+_POE_RGB = (CONF_RED, CONF_GREEN, CONF_BLUE)
+_POE_CWW = (CONF_COLOR_TEMPERATURE, CONF_COLD_WHITE, CONF_WARM_WHITE)
+
+POWER_ON_EFFECT_SCHEMA = cv.Schema(
+    {
+        # one of this light's ultra_* effects, by its name
+        cv.Required(CONF_EFFECT): cv.string_strict,
+        # the values it runs on (the board's power-on scene); colours not given are 0, all 100 % when none is given
+        cv.Optional(CONF_BRIGHTNESS, default=1.0): cv.percentage,
+        cv.Optional(CONF_COLOR_TEMPERATURE): cv.color_temperature,
+        cv.Optional(CONF_RED): cv.percentage,
+        cv.Optional(CONF_GREEN): cv.percentage,
+        cv.Optional(CONF_BLUE): cv.percentage,
+        cv.Optional(CONF_WHITE): cv.percentage,
+        cv.Optional(CONF_COLD_WHITE): cv.percentage,
+        cv.Optional(CONF_WARM_WHITE): cv.percentage,
+    }
+)
+
+
+def _validate_power_on_effect(value):
+    """the effect's name, or the effect with the values it runs on"""
+    if not isinstance(value, dict):
+        value = {CONF_EFFECT: value}
+    return POWER_ON_EFFECT_SCHEMA(value)
+
+
+def _effect_key(effect: ConfigType) -> str:
+    return next(k for k in effect if k != CONF_TYPE_ID)
+
+
+def _find_effect(config: ConfigType, name: str) -> ConfigType | None:
+    """The light's effect of that name (case-insensitive, as ESPHome's light calls)."""
+    for effect in config.get(CONF_EFFECTS, []):
+        if effect[_effect_key(effect)][CONF_NAME].lower() == name.lower():
+            return effect
+    return None
+
+
+def _check_power_on_effect(config: ConfigType, kind: str) -> None:
+    poe = config[CONF_POWER_ON_EFFECT]
+    name = poe[CONF_EFFECT]
+    usable = [
+        e[_effect_key(e)][CONF_NAME]
+        for e in config.get(CONF_EFFECTS, [])
+        if _effect_key(e).startswith("ultra_") and _effect_key(e) != "ultra_strobe"
+    ]
+    hint = f"; use one of: {', '.join(usable)}" if usable else "; add one under effects:, e.g. ultra_candle"
+    effect = _find_effect(config, name)
+    if effect is None:
+        raise cv.Invalid(f"power_on_effect: this light has no effect '{name}'{hint}", [CONF_POWER_ON_EFFECT, CONF_EFFECT])
+    key = _effect_key(effect)
+    if not key.startswith("ultra_"):
+        raise cv.Invalid(
+            f"power_on_effect: '{name}' is an ESPHome effect ({key}), which needs ESPHome; the board runs only the "
+            f"light's ultra_* effects{hint}",
+            [CONF_POWER_ON_EFFECT, CONF_EFFECT],
+        )
+    if key == "ultra_strobe":
+        raise cv.Invalid(
+            f"power_on_effect: the board doesn't store the steps of '{name}' (ultra_strobe) and would show the plain "
+            f"values{hint}",
+            [CONF_POWER_ON_EFFECT, CONF_EFFECT],
+        )
+    if config[CONF_POWER_ON_SCENE]:
+        raise cv.Invalid(
+            "power_on_effect brings its own power-on scene (the values the effect runs on); remove power_on_scene",
+            [CONF_POWER_ON_EFFECT],
+        )
+    if round(poe[CONF_BRIGHTNESS] * 65535) < 1:
+        raise cv.Invalid("power_on_effect: brightness must be above 0 %", [CONF_POWER_ON_EFFECT, CONF_BRIGHTNESS])
+    rgb = any(k in poe for k in _POE_RGB)
+    cww = any(k in poe for k in _POE_CWW)
+    for keys, ok, what in (
+        (_POE_RGB, kind in ("rgb", "rgbw", "rgbww"), "red, green and blue channels"),
+        ((CONF_WHITE,), kind == "rgbw", "an RGBW light (a white-only light takes brightness)"),
+        (_POE_CWW, kind in ("cwww", "rgbww"), "cold_white and warm_white channels"),
+    ):
+        for k in keys:
+            if k in poe and not ok:
+                raise cv.Invalid(f"power_on_effect: {k} needs {what}", [CONF_POWER_ON_EFFECT, k])
+    if CONF_COLOR_TEMPERATURE in poe:
+        path = [CONF_POWER_ON_EFFECT, CONF_COLOR_TEMPERATURE]
+        if CONF_COLD_WHITE in poe or CONF_WARM_WHITE in poe:
+            raise cv.Invalid("power_on_effect: give color_temperature or cold_white / warm_white, not both", path)
+        if CONF_COLD_WHITE_COLOR_TEMPERATURE not in config:
+            raise cv.Invalid(
+                "power_on_effect: color_temperature needs the light's cold_white_color_temperature and "
+                "warm_white_color_temperature",
+                path,
+            )
+        lo, hi = config[CONF_COLD_WHITE_COLOR_TEMPERATURE], config[CONF_WARM_WHITE_COLOR_TEMPERATURE]
+        if not lo <= poe[CONF_COLOR_TEMPERATURE] <= hi:
+            raise cv.Invalid(
+                f"power_on_effect: color_temperature must be between the LEDs' {round(1e6 / hi)} K and "
+                f"{round(1e6 / lo)} K",
+                path,
+            )
+    if config[CONF_COLOR_INTERLOCK] and rgb and (cww or CONF_WHITE in poe):
+        raise cv.Invalid(
+            "power_on_effect: with color_interlock give either the RGB colour or the white values", [CONF_POWER_ON_EFFECT]
+        )
+
+
+def _power_on_values(config: ConfigType, kind: str) -> LightColorValues:
+    """The power-on effect's values as ESPHome light values (the colour mode the values belong to)."""
+    poe = config[CONF_POWER_ON_EFFECT]
+    rgb = any(k in poe for k in _POE_RGB)
+    white = CONF_WHITE in poe
+    cww = any(k in poe for k in _POE_CWW)
+    interlock = config[CONF_COLOR_INTERLOCK]
+    mode = {
+        "monochromatic": ColorMode.BRIGHTNESS,
+        "cwww": ColorMode.COLD_WARM_WHITE,
+        "rgb": ColorMode.RGB,
+        "rgbw": (ColorMode.RGB if rgb else ColorMode.WHITE) if interlock else ColorMode.RGB_WHITE,
+        "rgbww": (ColorMode.RGB if rgb else ColorMode.COLD_WARM_WHITE) if interlock else ColorMode.RGB_COLD_WARM_WHITE,
+    }[kind]
+    unset = 0.0 if rgb or white or cww else 1.0  # no colour given: ESPHome's defaults (all on)
+    return LightColorValues(
+        mode,
+        1.0,
+        poe[CONF_BRIGHTNESS],
+        1.0,
+        *(poe.get(k, unset) for k in _POE_RGB),
+        poe.get(CONF_WHITE, unset),
+        poe.get(CONF_COLOR_TEMPERATURE, 0.0),  # cold / warm white from it at boot (the light's gamma)
+        poe.get(CONF_COLD_WHITE, unset),
+        poe.get(CONF_WARM_WHITE, unset),
+    )
 
 
 def _validate_light(config: ConfigType) -> ConfigType:
@@ -229,6 +363,8 @@ def _validate_light(config: ConfigType) -> ConfigType:
             f"ALWAYS_ON (with initial_state)",
             [CONF_POWER_ON_SCENE],
         )
+    if CONF_POWER_ON_EFFECT in config:
+        _check_power_on_effect(config, kind)
     return light.validate_color_temperature_channels(config)
 
 
@@ -258,6 +394,9 @@ CONFIG_SCHEMA = cv.All(
             # The board stores the state this light comes back in (restore_mode / initial_state) and shows it
             # ~30 ms after its own power-up, until ESPHome takes over (cross-fade over default_transition_length).
             cv.Optional(CONF_POWER_ON_SCENE, default=False): cv.boolean,
+            # One of the light's ultra_* effects, which the board stores and runs from its own power-up (on the
+            # brightness / colour given here) until ESPHome takes over: e.g. a candle that works without ESPHome.
+            cv.Optional(CONF_POWER_ON_EFFECT): _validate_power_on_effect,
             # Brightness drives the colour temperature on the board (incandescent-like): from the light's own
             # temperature at full brightness to warm_color_temperature at zero, during transitions and effects too.
             cv.Optional(CONF_DIM_TO_WARM): _validate_dim_to_warm,
@@ -318,12 +457,16 @@ async def to_code(config: ConfigType) -> None:
     glide = config[CONF_EFFECT_GLIDE]
     cg.add(var.set_effect_glide(EFFECT_GLIDE_MODES[glide]))
     for index, effect in enumerate(config.get(CONF_EFFECTS, []), start=1):
-        key = next(k for k in effect if k != CONF_TYPE_ID)
+        key = _effect_key(effect)
         if key.startswith("ultra_"):
             cg.add(var.set_effect_kind(index, EFFECT_BOARD))
         elif key in HARD_EFFECTS and glide == "auto":
             cg.add(var.set_effect_kind(index, EFFECT_HARD))
     await light.register_light(var, config)
+    if (poe := config.get(CONF_POWER_ON_EFFECT)) is not None:
+        kind = _TYPES[frozenset(k for k in ROLE_KEYS if k in config)]
+        effect = await cg.get_variable(_find_effect(config, poe[CONF_EFFECT])[CONF_TYPE_ID])
+        cg.add(var.set_power_on_effect(effect, _power_on_values(config, kind)))
 
 
 # ------------------------------------------------------------------------------------------- effects (on the board)

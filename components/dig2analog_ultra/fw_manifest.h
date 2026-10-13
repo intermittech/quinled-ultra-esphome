@@ -1,6 +1,6 @@
 #pragma once
 
-// Board firmware updates from GitHub (the firmware repo's research/firmware-update.md §4): the parts of the update
+// Board firmware updates from GitHub (the firmware wiki's Updating Over The Data Line page): the parts of the update
 // entity that need no ESPHome - channels, manifest URLs, the choice of image, the downloaded image's checks and when
 // an update is offered. Plain C++: the firmware's bootloader host tests (test_sender.cpp) run them too.
 //

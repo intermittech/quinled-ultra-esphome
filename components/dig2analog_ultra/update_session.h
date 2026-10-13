@@ -1,7 +1,7 @@
 #pragma once
 
 // Firmware update over the data line: one session on one hub's line (ultra_update.h; the QuinLED dig2analog-ultra
-// firmware repo's research/firmware-update.md). Plain C++, no ESPHome dependency: the bootloader host tests send
+// firmware wiki's Updating Over The Data Line page). Plain C++, no ESPHome dependency: the bootloader host tests send
 // these exact frames through the real bootloader logic.
 
 #include <cstdint>

@@ -44,6 +44,17 @@ class UltraEffect : public light::LightEffect {
   }
   void apply() override {}
 
+  /// As the light's power-on effect (SCENE_EFFECT): its id and parameters into p (ULTRA_FX_PARAMS), as start() sends
+  /// them. Strobe's steps aren't stored on the board, which shows the plain values: sent as none (the schema
+  /// doesn't allow it).
+  uint8_t power_on_params(uint8_t *p, size_t &n) {
+    n = 0;
+    if (this->fx_() == ULTRA_FX_STROBE)
+      return ULTRA_FX_NONE;
+    n = this->params_(p);
+    return this->fx_();
+  }
+
  protected:
   virtual uint8_t fx_() const = 0;
   virtual size_t params_(uint8_t *p) = 0;

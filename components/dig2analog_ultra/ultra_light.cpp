@@ -5,6 +5,9 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
+#include "ultra_effects.h"
+
+#include <algorithm>
 #include <cmath>
 
 namespace esphome::dig2analog_ultra {
@@ -38,6 +41,12 @@ bool UltraLight::has_rgb() const {
       return true;
   }
   return false;
+}
+
+// The take-over cross-fade of a power-on scene (x 100 ms): the light's default_transition_length
+static uint8_t scene_fade(const light::LightState *state) {
+  const uint32_t fade = (state->get_default_transition_length() + 50) / 100;
+  return static_cast<uint8_t>(fade > 255 ? 255 : fade);
 }
 
 light::LightTraits UltraLight::get_traits() {
@@ -91,10 +100,28 @@ void UltraLight::setup_state(light::LightState *state) {
   this->hub_->scheduler().light_def(this->board_, this->index_, this->roles_, g, flags, this->min_, this->max_);
   if (this->dtw_available_)
     this->send_opt_();
-  if (this->scene_mode_ == SCENE_NONE) {
+  if (this->power_on_effect_ != nullptr) {
+    // power_on_effect: a fixed power-on scene (its values) and the effect the board runs on it. Fixed, so the board
+    // writes them once, not with every change of the light.
+    light::LightColorValues v = this->power_on_values_;
+    const float ct = v.get_color_temperature(), lo = this->cold_white_temperature_, hi = this->warm_white_temperature_;
+    if (ct > 0.0f && hi > lo) {
+      // as a light call with only a colour temperature (LightCall): the linear CW / WW fractions, gamma-uncorrected
+      // (the board's exact gamma gets the fractions back)
+      const float ww = (std::min(std::max(ct, lo), hi) - lo) / (hi - lo), cw = 1.0f - ww, top = std::max(ww, cw);
+      const float g = state->get_gamma_correct(), inv = g > 0.0f ? 1.0f / g : 1.0f;
+      v.set_cold_white(std::pow(cw / top, inv));
+      v.set_warm_white(std::pow(ww / top, inv));
+    }
+    uint16_t m, a[CHANNELS], b[CHANNELS];
+    this->map(v, m, a, b);
+    this->hub_->scheduler().light_scene(this->board_, this->index_, 1, scene_fade(state), m, a, b);
+    this->send_scene_effect_();
+  } else if (this->scene_mode_ == SCENE_NONE) {
     // not in the board's power-on scene (also clears what an earlier configuration stored there)
     static const uint16_t z[CHANNELS] = {0, 0, 0, 0, 0}, one[CHANNELS] = {65535, 65535, 65535, 65535, 65535};
     this->hub_->scheduler().light_scene(this->board_, this->index_, 0, 0, 0, z, one);
+    this->send_scene_effect_();
   } else {
     state->add_remote_values_listener(this);  // before LightState::setup() restores: the first update is the boot state
   }
@@ -153,8 +180,7 @@ void UltraLight::on_light_remote_values_update() {
     v.set_brightness(1.0f);  // as LightState::setup() does on boot
   uint16_t m, a[CHANNELS], b[CHANNELS];
   this->map(v, m, a, b);
-  const uint32_t fade = (this->state_->get_default_transition_length() + 50) / 100;
-  const uint8_t f = static_cast<uint8_t>(fade > 255 ? 255 : fade);
+  const uint8_t f = scene_fade(this->state_);
   if (this->scene_sent_ && m == this->scene_m_ && f == this->scene_fade_ && memcmp(a, this->scene_a_, sizeof a) == 0 &&
       memcmp(b, this->scene_b_, sizeof b) == 0)
     return;
@@ -164,7 +190,20 @@ void UltraLight::on_light_remote_values_update() {
   memcpy(this->scene_a_, a, sizeof a);
   memcpy(this->scene_b_, b, sizeof b);
   this->hub_->scheduler().light_scene(this->board_, this->index_, 1, f, m, a, b);
+  this->send_scene_effect_();  // none, after the first SCENE (queued once)
   this->hub_->wake_();
+}
+
+// The power-on effect (SCENE_EFFECT) for every light, after its SCENE: the configured one, else none, which also
+// clears an effect an earlier configuration stored on the board (a host that never sends one leaves the board's
+// stored effects as they are). The scheduler queues it only when it changes.
+void UltraLight::send_scene_effect_() {
+  uint8_t p[ULTRA_FX_PARAMS] = {};
+  size_t n = 0;
+  uint8_t fx = ULTRA_FX_NONE;
+  if (this->power_on_effect_ != nullptr)
+    fx = this->power_on_effect_->power_on_params(p, n);
+  this->hub_->scheduler().light_scene_effect(this->board_, this->index_, fx, p, n);
 }
 
 void UltraLight::map(const light::LightColorValues &v, uint16_t &m, uint16_t *a, uint16_t *b) const {

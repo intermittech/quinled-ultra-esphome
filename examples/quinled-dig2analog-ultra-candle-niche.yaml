@@ -1,0 +1,80 @@
+# QuinLED dig2analog-ultra-5ch in Ultra mode: candle niches that flicker as soon as the power comes on, also while
+# ESPHome is off or still booting. The board stores each light's power_on_effect and runs it from its own power-up;
+# when ESPHome takes over, the light cross-fades (default_transition_length) to the state ESPHome restores.
+#   - CH1, CH2: single-colour niches, a candle each (the second one calmer and dimmer).
+#   - CH4 + CH5: a CCT strip, a candle at 2700 K.
+# The board writes a power-on effect to its flash only when it changes. Board firmware 0.6.0 or newer; older firmware
+# shows the power_on_effect's values without the effect.
+# ESP32 classic, ESP-IDF.
+
+substitutions:
+  name: d2a-ultra-candles
+  friendly_name: QuinLED dig2analog Ultra candles
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+external_components:
+  - source: github://intermittech/quinled-ultra-esphome@main
+    components: [dig2analog_ultra]
+
+logger:
+api:
+ota:
+  - platform: esphome
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap: {}
+captive_portal:
+
+dig2analog_ultra:
+  id: ultra
+  pin: GPIO16
+  num_boards: 1
+
+light:
+  - platform: dig2analog_ultra
+    name: Niche left
+    board: 0
+    channel: 1
+    restore_mode: RESTORE_DEFAULT_ON   # ESPHome restores the last state, effect included
+    effects:
+      - ultra_candle:
+    power_on_effect: Candle            # the board runs it from its power-up, at full brightness
+
+  - platform: dig2analog_ultra
+    name: Niche right
+    board: 0
+    channel: 2
+    restore_mode: RESTORE_DEFAULT_ON
+    effects:
+      - ultra_candle:
+          intensity: 30%
+          speed: 70%
+    power_on_effect:
+      effect: Candle
+      brightness: 60%
+
+  - platform: dig2analog_ultra
+    name: Niche strip
+    board: 0
+    cold_white: 4
+    warm_white: 5
+    cold_white_color_temperature: 6500 K
+    warm_white_color_temperature: 2700 K
+    constant_brightness: true
+    restore_mode: RESTORE_DEFAULT_ON
+    effects:
+      - ultra_candle:
+      - ultra_breathe:
+    power_on_effect:
+      effect: Candle
+      brightness: 70%
+      color_temperature: 2700 K

@@ -155,7 +155,7 @@ inline void pwm_for_frequency(float hz, uint16_t &preset, uint16_t &period) {
 inline uint16_t preamble_frames(uint16_t boards) { return static_cast<uint16_t>(ultra_preamble_frames(boards)); }
 /// After the boards' supply switched on, once a full preamble has reached them with power: they all stored Ultra and
 /// confirm it with the first frame, so a short preamble does (a board new since then locks in ~4 frames; 10 cover 2
-/// of them, the refresh brings the rest; research/chain-50-boards.md). 50 boards: 10 frames (0.18 s) instead of 202
+/// of them, the refresh brings the rest; wiki: Ultra Mode). 50 boards: 10 frames (0.18 s) instead of 202
 /// (3.6 s).
 static constexpr uint16_t POWER_ON_PREAMBLE_FRAMES = 10;
 inline uint16_t power_on_preamble_frames(uint16_t boards) {
@@ -329,6 +329,26 @@ class Scheduler {
     it.valid = true;
     it.start_us = NO_START;
     this->queue_(b, it, key_(light, ULTRA_SCENE, 0));
+  }
+
+  /// Power-on effect of a light (SCENE_EFFECT, protocol 0.2.3): fx (FX_NONE = none) and its parameters (as EFFECT),
+  /// run by the board on the light's SCENE values from its power-up until the host takes over. The board stores it
+  /// with the light's definition and scene (flash, written only when it changes). Like the SCENE it is sent at boot,
+  /// repeated by replay() and the refresh; a new SEQ only when it changes (an unchanged call queues nothing).
+  void light_scene_effect(uint16_t board, uint8_t light, uint8_t fx, const uint8_t *params, size_t n) {
+    if (!this->valid_(board, light))
+      return;
+    Board &b = this->boards_[board];
+    Item &it = li_(b, light).scene_fx;
+    uint8_t s[ULTRA_SLOT_BYTES];
+    ultra_slot_scene_effect(s, light, it.slot[2], fx, params, static_cast<uint32_t>(n));
+    if (it.valid && std::memcmp(s, it.slot, ULTRA_SLOT_BYTES) == 0)
+      return;
+    ultra_slot_scene_effect(it.slot, light, this->next_seq_(b, light, ULTRA_SCENE_EFFECT), fx, params,
+                            static_cast<uint32_t>(n));
+    it.valid = true;
+    it.start_us = NO_START;
+    this->queue_(b, it, key_(light, ULTRA_SCENE_EFFECT, 0));
   }
 
   /// Effect (FX_NONE stops it) at start_us; strobe steps are sent along (count in params[0]). While the light's
@@ -505,6 +525,8 @@ class Scheduler {
           this->queue_(b, li.effect, key_(l, ULTRA_EFFECT, 0));
         if (li.scene.valid)
           this->queue_(b, li.scene, key_(l, ULTRA_SCENE, 0));
+        if (li.scene_fx.valid)
+          this->queue_(b, li.scene_fx, key_(l, ULTRA_SCENE_EFFECT, 0));
         for (size_t i = 0; i < li.steps.size(); i++)
           this->queue_(b, li.steps[i], key_(l, ULTRA_STEP, static_cast<uint8_t>(i)));
       }
@@ -573,15 +595,15 @@ class Scheduler {
     uint32_t order;
   };
   struct LightItems {
-    Item def, opt, set, effect, scene;
+    Item def, opt, set, effect, scene, scene_fx;
     std::vector<Item> steps;
     bool held{false};  // a strip shows on the light: held_effect waits for release_effect()
     Item held_effect;
     std::vector<Item> held_steps;
     int64_t last_stream_us{NO_START};  // when its last streamed SET went out
   };
-  /// Per board ~340 B, + ~380 B per light in use (allocated with its first command): 50 boards with one light each
-  /// take ~36 KB of the ESP32's heap (research/chain-50-boards.md). The queue is freed whenever it empties.
+  /// Per board ~340 B, + ~435 B per light in use (allocated with its first command): 50 boards with one light each
+  /// take ~39 KB of the ESP32's heap (wiki: Ultra Mode). The queue is freed whenever it empties.
   struct Board {
     std::vector<Cmd> queue;
     Item config[CONFIG_PAGES];
@@ -703,9 +725,10 @@ class Scheduler {
     return true;
   }
 
-  /// Next item of the board's refresh list: CONFIG pages, then per light DEF, OPT, SET, EFFECT, SCENE, STEPs.
+  /// Next item of the board's refresh list: CONFIG pages, then per light DEF, OPT, SET, EFFECT, SCENE, SCENE_EFFECT,
+  /// STEPs.
   bool take_refresh_(Board &b, uint8_t *s, size_t slot, int64_t now_us) {
-    const uint16_t per_light = 5 + ULTRA_MAX_STEPS;
+    const uint16_t per_light = 6 + ULTRA_MAX_STEPS;
     const uint16_t total = CONFIG_PAGES + ULTRA_LIGHTS * per_light;
     for (uint16_t tries = 0; tries < total; tries++) {
       const uint16_t pos = b.rr;
@@ -723,7 +746,8 @@ class Scheduler {
              : k == 2 ? &li.set
              : k == 3 ? &li.effect
              : k == 4 ? &li.scene
-                      : (k - 5u < li.steps.size() ? &li.steps[k - 5] : nullptr);
+             : k == 5 ? &li.scene_fx
+                      : (k - 6u < li.steps.size() ? &li.steps[k - 6] : nullptr);
       }
       if (it == nullptr || !it->valid)
         continue;
@@ -763,7 +787,7 @@ class Scheduler {
   uint32_t order_{0};
 };
 
-/// The current calibration of one pin (research/current-calibration.md):
+/// The current calibration of one pin (firmware wiki: Current Sense):
 ///  1. every board on the pin goes dark (IDENTIFY 3: 0.3 s fade; the board's engine keeps running underneath);
 ///  2. one board after the other, in chain order, runs its test (IDENTIFY 2), so only one test channel is ever on;
 ///  3. every board is released (IDENTIFY 4: fades back; states, transitions and effects continue).

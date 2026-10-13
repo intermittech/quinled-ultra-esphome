@@ -1,7 +1,7 @@
 """Writes tests/build/ultra/ultra-example.yaml for a compile test: the Ultra example with the local components and
-a few test-only additions (boot protocol, power-on scene, dim to warm, the switch_boards_to_ultra button, calibration,
-the version display, the board firmware update with a power supply on the line), so one compile covers the hub's
-code. Also tests/build/ultra/ultra-strip.yaml: the dig2analog_ultra_strip example with a partition, effect_glide modes
+a few test-only additions (boot protocol, power-on scene and effects, dim to warm, the switch_boards_to_ultra button,
+calibration, the version display, the board firmware update with a power supply on the line), so one compile covers
+the hub's code. Also tests/build/ultra/ultra-strip.yaml: the dig2analog_ultra_strip example with a partition, effect_glide modes
 and the downlight notification pattern. The examples themselves: tests/local_examples.py.
 
 Usage: .venv/Scripts/python tests/make_ultra_compile_config.py
@@ -266,6 +266,14 @@ def main() -> None:
     src = src.replace(old, old + "    dim_to_warm:\n      points:\n        - brightness: 100%\n"
                       "          color_temperature: 4500 K\n        - brightness: 20%\n          color_temperature: 3000K\n"
                       "        - brightness: 1%\n          color_temperature: 370 mireds\n")
+    # power-on effects (SCENE_EFFECT): the CCT light with values (a colour temperature), Shelf 3 by the effect's name
+    old = "    effects:\n      - ultra_breathe:\n"
+    assert src.count(old) == 1
+    src = src.replace(old, old + "    power_on_effect:\n      effect: Breathe\n      brightness: 40%\n"
+                      "      color_temperature: 3000 K\n")
+    old = "      - ultra_candle:\n          intensity: 30%\n"
+    assert src.count(old) == 1
+    src = src.replace(old, old + "    power_on_effect: Candle\n")
     assert "set_stagger(-1, i)" in src
     # the example's own button: list gets the test buttons appended
     src = src.replace("\nbutton:\n", "\nbutton:\n" + EXTRA.split("button:\n", 1)[1], 1)

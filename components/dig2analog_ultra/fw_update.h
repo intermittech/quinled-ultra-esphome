@@ -5,7 +5,7 @@
 // image, checks it, and sends it to every board of the line in one session (the hub's update task,
 // update_session.h). The boards decide themselves: newer -> install, same -> skip, older -> reject (unless forced),
 // and blink the result; the ESP32 can't read their versions, so "installed" is what this line was last updated to.
-// Design: the firmware repo's research/firmware-update.md §4.
+// Design: the firmware wiki's Updating Over The Data Line page.
 
 #include "esphome/core/defines.h"
 

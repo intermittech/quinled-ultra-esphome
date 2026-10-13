@@ -2,7 +2,7 @@
 
 The entity reads the firmware repo's signed channel manifest from GitHub; Install downloads the image and sends it
 to every board of the line in one session. The boards decide themselves (newer: install, same: skip, older: reject
-unless forced) and blink the result. Design: the firmware repo's research/firmware-update.md §4.
+unless forced) and blink the result. Design: the firmware wiki's Updating Over The Data Line page.
 """
 
 import re

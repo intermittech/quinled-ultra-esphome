@@ -102,7 +102,7 @@ class UltraFirmwareUpdate final : public update::UpdateEntity, public PollingCom
   size_t nkeys_{0};
   bool verify_{true};
   uint8_t hw_id_{UPD_HW_ID_D2A_ULTRA_5CH};
-  uint8_t hw_rev_{UPD_REV_PB11};
+  uint8_t hw_rev_{UPD_REV_D2A_R04};
   uint8_t passes_{3};
 #ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *status_sensor_{nullptr};

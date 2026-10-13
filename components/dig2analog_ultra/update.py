@@ -87,8 +87,8 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_CHANNEL, default="stable"): cv.enum(CHANNELS, lower=True),
             cv.Optional(CONF_PUBLIC_KEYS, default="production"): cv.one_of(*PUBLIC_KEYS, lower=True),
             cv.Optional(CONF_VERIFY_SIGNATURE, default=True): cv.boolean,
-            # board revision of this line (bit of an image's hw_rev_mask): 1 = PB11 wired (3-timer build)
-            cv.Optional(CONF_BOARD_REVISION, default=1): cv.int_range(min=0, max=15),
+            # board revision of this line (bit of an image's hw_rev_mask): 3 = dig2analog-ultra-5ch rev 0.4
+            cv.Optional(CONF_BOARD_REVISION, default=3): cv.int_range(min=0, max=15),
             # every page this often per session (a board that missed one gets it in the next pass)
             cv.Optional(CONF_PASSES, default=3): cv.int_range(min=1, max=8),
             # optional: switch the channel from Home Assistant (stored on the ESP32)

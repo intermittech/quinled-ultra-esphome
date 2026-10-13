@@ -6,7 +6,7 @@
 //
 // A channel manifest (tools/release/make_manifest.py; signed as it is, fw_signature.h):
 //   {"name": ..., "channel": "beta", "version": "0.6.0-beta.1", "release_url": ..., "summary": ...,
-//    "images": [{"hw_id": 1, "hw_rev_mask": 6, "min_bootloader": 1, "size": 43288, "sha256": "...", "url": ...}]}
+//    "images": [{"hw_id": 1, "hw_rev_mask": 8, "min_bootloader": 1, "size": 43288, "sha256": "...", "url": ...}]}
 
 #include <cstdint>
 #include <cstring>

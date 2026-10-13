@@ -1,4 +1,4 @@
-/* QuinLED dig2analog Ultra firmware update over the data line (research/firmware-update.md).
+/* QuinLED dig2analog Ultra firmware update over the data line (wiki: Updating over the data line).
  * Shared by the bootloader (firmware/bootloader), the app and the ESPHome component (a copy:
  * quinled-ultra-esphome/components/dig2analog_ultra/ultra_update.h). This file is the master; keep the copy identical.
  *
@@ -86,10 +86,11 @@ enum {
 #define UPD_D_CRC            60u          /* 4 bytes, upd_crc32_words over bytes 0..59 */
 
 #define UPD_HW_ID_D2A_ULTRA_5CH  1u       /* QuinLED dig2analog-ultra-5ch */
-/* board revisions (bit numbers of the revision mask) */
-#define UPD_REV_V01_PB15     0u           /* v0.1 as first drawn: PWM_B on PB15 only (HW_PWM_3TIMERS=0 build) */
-#define UPD_REV_PB11         1u           /* PB11 wired to PWM_B (3-timer build) */
-#define UPD_REV_ISENSE       2u           /* + input current sense (PA7) */
+#define UPD_HW_ID_DP_ULTRA_RX    2u       /* QuinLED Diff-Power ultra receiver (reserved: no hardware yet) */
+/* board revisions (bit numbers of the revision mask; the bootloader carries its board's). An image installs only on
+ * the hardware id and the revisions it lists. 0-2 were numbers of dig2analog-ultra drawings that were never built:
+ * they stay unused, so no image can match them. */
+#define UPD_REV_D2A_R04      3u           /* dig2analog-ultra-5ch rev 0.4: LED on PB15, current sense, supply on PA4 */
 
 /* version word: major << 24 | minor << 16 | patch << 8 | pre; compared as an unsigned number this sorts like
  * semver: 0.6.0-alpha.3 < 0.6.0-beta.1 < 0.6.0-rc.1 < 0.6.0 */

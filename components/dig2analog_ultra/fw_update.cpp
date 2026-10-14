@@ -283,7 +283,10 @@ void UltraFirmwareUpdate::on_checked_(CheckResult *r) {
   const bool available = fw_update_available(this->installed_, this->latest_);
   const bool newly = available && this->state_ != update::UPDATE_STATE_AVAILABLE;
   this->state_ = available ? update::UPDATE_STATE_AVAILABLE : update::UPDATE_STATE_NO_UPDATE;
-  this->set_status_(available ? "update available: " + r->manifest.version : "up to date");
+  // an image for a newer bootloader says so: boards with an older one reject it (1 long blink)
+  const std::string needs =
+      r->image.min_bootloader > 1 ? " (needs bootloader " + std::to_string(r->image.min_bootloader) + ")" : "";
+  this->set_status_(available ? "update available: " + r->manifest.version + needs : "up to date");
   this->publish_state();
   if (newly)
     this->get_update_available_trigger()->trigger(this->update_info_);
@@ -321,6 +324,10 @@ void UltraFirmwareUpdate::recover(uint32_t lead_in_ms, bool power_cycle) {
   this->recover_ = true;
   this->power_cycle_ = power_cycle && this->hub_->has_power_supply();
   this->lead_in_ms_ = std::max<uint32_t>(lead_in_ms, 500);
+  // the boards come back power_cycle_ms() after the cycle starts (the supply's keep_on_time, 1.5 s off): the ANNOUNCE
+  // lead-in must still run then, with time for their boot
+  if (this->power_cycle_)
+    this->lead_in_ms_ = std::max(this->lead_in_ms_, this->hub_->power_cycle_ms() + 3000);
   this->start_install_();
 }
 
@@ -437,7 +444,9 @@ void UltraFirmwareUpdate::start_session_() {
   this->phase_ms_ = millis();
   if (this->recover_ && this->power_cycle_) {
     this->hub_->power_cycle();
-    this->set_status_("recovery: power-cycling the boards, ANNOUNCE for " + std::to_string(this->lead_in_ms_ / 1000) + " s");
+    this->set_status_("recovery: power-cycling the boards (off after the supply's keep-on time, " +
+                      std::to_string((this->hub_->power_cycle_ms() + 999) / 1000) + " s), ANNOUNCE for " +
+                      std::to_string(this->lead_in_ms_ / 1000) + " s");
   } else if (this->recover_) {
     this->set_status_("recovery: power-cycle the boards on this line now (ANNOUNCE for " +
                       std::to_string(this->lead_in_ms_ / 1000) + " s)");

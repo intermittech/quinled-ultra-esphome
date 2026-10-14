@@ -120,9 +120,9 @@ class UltraLight final : public light::LightOutput, public light::LightRemoteVal
   void setup_state(light::LightState *state) override;
   void write_state(light::LightState *state) override;
 
-  // Board effects (ultra_* effects). start_us 0: the hub's start time.
+  // Board effects (ultra_* effects). start_us NO_START: the hub's start time (0 is a start: a phase epoch at boot).
   void start_effect(uint8_t fx, const uint8_t *params, size_t n, const std::vector<Step> *steps = nullptr,
-                    int64_t start_us = 0);
+                    int64_t start_us = NO_START);
   void stop_effect();
   /// M / A / B of a color (an UNKNOWN color mode means the light's current one)
   void map(const light::LightColorValues &v, uint16_t &m, uint16_t *a, uint16_t *b) const;
@@ -158,7 +158,7 @@ class UltraLight final : public light::LightOutput, public light::LightRemoteVal
   void transition_start_(UltraTransition *t, const light::LightColorValues &end, uint32_t length, bool via_off);
   void transition_done_(UltraTransition *t);
   void send_(const light::LightColorValues &v, uint32_t length, uint8_t flags, bool stream = false);
-  void lit_(uint16_t m, uint32_t length_ms);
+  void lit_(uint16_t m, uint32_t length_ms, int64_t start_us);
   uint8_t effect_kind_(uint32_t index) const {
     return index < this->effect_kinds_.size() ? this->effect_kinds_[index] : static_cast<uint8_t>(EFFECT_HOST);
   }

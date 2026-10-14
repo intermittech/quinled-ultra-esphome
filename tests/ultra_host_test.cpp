@@ -1404,6 +1404,14 @@ static void test_diagnostics_counts() {
   w.fill(50000, true);   // the next frame's first fill, after a pause: not an underrun
   w.fill(50125, false);
   CHECK(w.count == 1, "underruns: one refill came too late (%u)", static_cast<unsigned>(w.count));
+  UnderrunWatch v;
+  v.drain_us = 250;
+  v.fill(0, true);
+  v.fill(400, false);
+  v.fill(800, false);   // two late refills in one frame: one broken frame
+  v.fill(100000, true);
+  v.fill(100400, false);
+  CHECK(v.count == 2, "underruns count broken frames, not late refills (%u)", static_cast<unsigned>(v.count));
 }
 
 #ifdef WITH_ENGINE
@@ -1478,6 +1486,85 @@ static void test_old_transition() {
       CHECK(after[4] == 40000, "joined after 300 s: the target at once (%u)", after[4]);
     }
   }
+}
+
+/// An effect without a period (a candle) left on for 25 days, a board that powers up then: the refresh's EFFECT start
+/// offset (int32 ms) stays far inside its range and the board runs the candle. (Clipped at -2^31 ms, the board took
+/// the start as one still to come and never started the effect: the plain state showed.)
+/// Turning an effect light off (a breathe held at 25 % over its 100 % state): its EFFECT none and its fade-out at one
+/// start fade from what the effect shows; an EFFECT none that starts 90 ms before its fade-out shows the light's own
+/// state, full, in between (what the hub's group budget, max_commands_, prevents: lifecycle test_group_budget).
+static void test_effect_stop_fade() {
+  const uint16_t z[5] = {0, 0, 0, 0, 0}, one[5] = {65535, 65535, 65535, 65535, 65535};
+  uint16_t peak[2] = {};
+  const int64_t gaps[2] = {0, 90000};
+  for (int i = 0; i < 2; i++) {
+    Scheduler s;
+    s.init(1, 23, 1);
+    s.light_def(0, 0, MONO1, 1000, 0, z, one);
+    s.light_set(0, 0, 0, 65535, one, one, 0, 0);
+    uint8_t breathe[7] = {};
+    ultra_put24(breathe, 4000);
+    ultra_put16(breathe + 3, 16384);   // min = max: a steady 25 %
+    ultra_put16(breathe + 5, 16384);
+    s.light_effect(0, 0, ULTRA_FX_BREATHE, breathe, 7, 0);
+    ultra_t u;
+    ultra_init(&u, 24);
+    std::vector<uint8_t> f(s.frame_bytes());
+    for (int k = 0; k < 6; k++)
+      feed(u, f, 0, s.build_frame(100000 + k * 20000, f.data()));
+    const int64_t at = 1100000;   // the change's start, 100 ms after the call
+    s.light_effect(0, 0, ULTRA_FX_NONE, nullptr, 0, at);
+    s.light_set(0, 0, ULTRA_SET_SMOOTH, 0, one, one, 1000, at + gaps[i]);
+    // a frame every 20 ms, taken by the board at its end; rendered every ms
+    int64_t start = 1000000, end = s.build_frame(start, f.data());
+    for (int64_t t = 1000000; t < 2500000; t += 1000) {
+      if (t >= end) {
+        feed(u, f, 0, end);
+        start += 20000;
+        end = s.build_frame(start, f.data());
+      }
+      uint16_t out[5];
+      ultra_render(&u, static_cast<uint32_t>(t / 50), out);
+      peak[i] = std::max(peak[i], out[4]);
+    }
+  }
+  CHECK(peak[0] <= 17000, "an effect light turned off: from 25 %% down, no flash (peak %u)", peak[0]);
+  std::printf("  effect light off: peak %u with its EFFECT none and fade-out at one start, %u with the fade 90 ms "
+              "later\n", peak[0], peak[1]);
+}
+
+static void test_old_effect() {
+  const uint16_t z[5] = {0, 0, 0, 0, 0}, one[5] = {65535, 65535, 65535, 65535, 65535};
+  Scheduler s;
+  s.init(1, 4, 1);
+  s.light_def(0, 0, MONO1, 1000, 0, z, one);
+  s.light_set(0, 0, 0, 40000, one, one, 0, 0);
+  uint8_t candle[4];
+  ultra_put16(candle, 30000);
+  ultra_put16(candle + 2, 100);
+  s.light_effect(0, 0, ULTRA_FX_CANDLE, candle, 4, 0);
+  std::vector<uint8_t> f(s.frame_bytes());
+  drain(s, f, 0);
+  ultra_t u;
+  ultra_init(&u, 6);
+  const int64_t day25 = 25LL * 86400 * 1000000;
+  int64_t end = 0, offset = 0;
+  for (int i = 0; i < 6; i++) {   // the refresh: DEF, SET, EFFECT, ...
+    end = s.build_frame(day25 + i * 1000, f.data());
+    if (f[0] == ULTRA_EFFECT)
+      offset = static_cast<int32_t>(ultra_get32(f.data() + ULTRA_PAYLOAD + 1));
+    feed(u, f, 0, end);
+  }
+  uint16_t out[5], lo = 65535, hi = 0;
+  for (uint32_t ms = 0; ms < 2000; ms++) {
+    ultra_render(&u, static_cast<uint32_t>(end / 50) + 20 * ms, out);
+    lo = std::min(lo, out[4]);
+    hi = std::max(hi, out[4]);
+  }
+  CHECK(offset > -2LL * 86400000 && u.light[0].fx == ULTRA_FX_CANDLE && hi > lo,
+        "a candle left on for 25 days: a board powered up then runs it (start offset %lld ms, effect %u, %u..%u)",
+        static_cast<long long>(offset), u.light[0].fx, lo, hi);
 }
 
 /// A light removed from the YAML (index 4 of a board that stayed powered while the ESP rebooted): the new hub clears
@@ -1583,6 +1670,8 @@ int main() {
   test_chain();
   test_refresh_under_stream();
   test_old_transition();
+  test_old_effect();
+  test_effect_stop_fade();
   test_removed_light();
   test_signal_loss_recovery();
 #else

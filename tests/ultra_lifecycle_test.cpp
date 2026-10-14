@@ -2,7 +2,8 @@
 // tests/run_ultra_lifecycle_test.py cuts their bodies unchanged from components/dig2analog_ultra into build/lifecycle/
 // *.inc, and this file compiles them with small stand-ins for ESPHome, the RMT driver and the HTTP client. Covers the
 // light's setup, a transition cut short, its power request after weeks; the update's install queue, chunked downloads
-// and the confirmation frames after a session; a frame the RMT refuses. Logic only: no ESP-IDF, no timing.
+// and the confirmation frames after a session; a frame the RMT refuses; the recovery's power cycle on ESPHome's power
+// supply (its keep-on time). Logic only: no ESP-IDF, no timing.
 // Build: python tests/run_ultra_lifecycle_test.py   (uses the ziglang pip package as C/C++ compiler)
 
 #include "../components/dig2analog_ultra/ultra_core.h"
@@ -15,10 +16,12 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
 #define USE_DIG2ANALOG_ULTRA_UPDATE
+#define ESP_LOGE(...) ((void) 0)
 #define ESP_LOGD(...) ((void) 0)
 #define ESP_LOGI(...) ((void) 0)
 #define ESP_LOGW(...) ((void) 0)
@@ -48,7 +51,8 @@ struct LightColorValues {   // what setup_state uses of it (power_on_effect)
   void set_warm_white(float) {}
 };
 struct LightState {
-  float get_gamma_correct() const { return 1.0f; }
+  float gamma{1.0f};
+  float get_gamma_correct() const { return this->gamma; }
   uint32_t get_default_transition_length() const { return 1000; }
   template<typename T> void add_remote_values_listener(T *) {}
 };
@@ -65,6 +69,7 @@ struct Hub {
   void add_light(void *) {}
   uint32_t start_delay_ms() const { return 30; }
   int64_t start_time_us() const { return now_ms * 1000LL + 30000; }
+  int64_t start_time_us(uint16_t) const { return this->start_time_us(); }
 };
 
 struct UltraTransition {
@@ -80,7 +85,10 @@ struct UltraLight {
   void setup_state(light::LightState *state);
   void send_opt_();
   void transition_done_(UltraTransition *t);
-  void lit_(uint16_t m, uint32_t length_ms);
+  void lit_(uint16_t m, uint32_t length_ms, int64_t start_us);
+  void send_pixel(uint16_t m, const uint16_t *a, const uint16_t *b, uint32_t length_ms, uint8_t flags, bool stream,
+                  int64_t start_us);
+  void start_effect(uint8_t fx, const uint8_t *params, size_t n, const std::vector<Step> *steps, int64_t start_us);
 #include "is_lit.inc"
   // stand-ins
   void map(const light::LightColorValues &, uint16_t &m, uint16_t *a, uint16_t *b) const {
@@ -135,6 +143,23 @@ static void test_light() {
   }
   CHECK(opt && fx, "setup: LIGHT_OPT without options (%d) and EFFECT none (%d)", opt, fx);
 
+  // gamma_correct as LIGHT_DEF's gamma x 1000; ESPHome's 0 is linear (its gamma table i / 255): 1000 on the wire
+  for (float g : {2.8f, 1.0f, 0.0f}) {
+    Hub h2;
+    UltraLight l2(h2);
+    light::LightState s2;
+    s2.gamma = g;
+    l2.setup_state(&s2);
+    uint32_t sent = 0xFFFFFFFFu;
+    for (int i = 0; i < 20 && h2.sched.pending(); i++) {
+      h2.sched.build_frame(i * 1000, f.data());
+      if (f[0] == ULTRA_LIGHT_DEF)
+        sent = ultra_get16(f.data() + ULTRA_PAYLOAD + 3);
+    }
+    const uint32_t want = g > 0.0f ? static_cast<uint32_t>(g * 1000.0f + 0.5f) : 1000u;
+    CHECK(sent == want, "setup: gamma_correct %.1f goes out as gamma x 1000 = %u (%u)", g, want, sent);
+  }
+
   UltraTransition t;
   l.transition_ = &t;
   l.sent_ = true;
@@ -148,14 +173,139 @@ static void test_light() {
 
   CHECK(!l.is_lit(0x80000001u), "never on: not lit after 24.8 days");
   now_ms = 0xFFFFFFF0u;   // a fade-out across the wrap: 100 ms + the start delay (30 ms)
-  l.lit_(65535, 0);
-  l.lit_(0, 100);
+  l.lit_(65535, 0, hub.start_time_us());
+  l.lit_(0, 100, hub.start_time_us());
   CHECK(l.is_lit(now_ms + 50) && !l.is_lit(now_ms + 131) && !l.is_lit(now_ms + 0x80000100u),
         "fading out: lit until its end, across the wrap, and not again weeks later");
   now_ms = 0;
 }
 
+/// The supply stays requested until a fade-out has ended on the board: from the SET's own start (a group start or
+/// commands waiting before it can put it well after the call), also when a second fade-out moves the end, and across
+/// the millis() wrap.
+static void test_power_deadline() {
+  const uint16_t one[5] = {65535, 65535, 65535, 65535, 65535};
+  Hub hub;
+  UltraLight l(hub);
+  now_ms = 1000;
+  l.on_ = true;
+  l.send_pixel(0, one, one, 1000, 0, false, 1600000);   // a 1 s fade-out, starting 600 ms after the call
+  CHECK(l.is_lit(2500) && !l.is_lit(2602), "a fade-out starting later: lit until it ends at 2600 ms (%u)",
+        static_cast<unsigned>(l.off_until_ms_));
+  now_ms = 4000;
+  l.on_ = true;
+  l.send_pixel(0, one, one, 1000, 0, false, 4030000);
+  now_ms = 4500;
+  l.send_pixel(0, one, one, 5000, 0, false, 4530000);   // a second, longer fade-out
+  CHECK(l.is_lit(9000) && !l.is_lit(9532), "a second fade-out moves the end to 9530 ms (%u)",
+        static_cast<unsigned>(l.off_until_ms_));
+  now_ms = 0xFFFFFFF0u;
+  l.on_ = true;
+  l.send_pixel(0, one, one, 100, 0, false, (static_cast<int64_t>(now_ms) + 600) * 1000);
+  CHECK(l.is_lit(now_ms + 650) && !l.is_lit(now_ms + 702), "a later fade-out across the millis() wrap");
+  now_ms = 0;
+}
+
+/// start_effect: 0 is a start (a periodic effect's phase epoch during its first period after boot), NO_START asks
+/// the hub for one.
+static void test_effect_epoch() {
+  uint8_t breathe[3] = {};
+  ultra_put24(breathe, 4000);
+  const struct {
+    int64_t start, want;
+  } cases[] = {{0, 0}, {4000000, 4000000}, {NO_START, 130000}};   // the hub's: now (100 ms) + 30 ms
+  for (const auto &c : cases) {
+    Hub hub;
+    UltraLight l(hub);
+    now_ms = 100;
+    l.start_effect(ULTRA_FX_BREATHE, breathe, 3, nullptr, c.start);
+    std::vector<uint8_t> f(hub.sched.frame_bytes());
+    const int64_t end = hub.sched.build_frame(100000, f.data());
+    const int64_t at = end + static_cast<int32_t>(ultra_get32(f.data() + ULTRA_PAYLOAD + 1)) * 1000LL;
+    CHECK(f[0] == ULTRA_EFFECT && std::llabs(at - c.want) <= 1000, "effect start %lld us on the wire (want %lld)",
+          static_cast<long long>(at), static_cast<long long>(c.want));
+  }
+  now_ms = 0;
+}
+
 }  // namespace lights
+
+// ================================================================================================ sunrise / sunset
+namespace sun {
+
+static int performed = 0;   // light calls performed: the effect's end
+namespace light {
+struct LightCall {
+  void set_effect(uint32_t) {}
+  void set_transition_length(uint32_t) {}
+  void perform() { performed++; }
+};
+struct LightState {
+  void *get_output() { return nullptr; }
+  std::string get_name() const { return "sun"; }
+  LightCall make_call() { return {}; }
+  LightCall turn_off() { return {}; }
+};
+struct LightEffect {
+  explicit LightEffect(const char *name) : name_(name) {}
+  virtual ~LightEffect() = default;
+  virtual void start() {}
+  virtual void stop() {}
+  virtual void apply() {}
+  const char *name_;
+  LightState *state_{nullptr};
+};
+}  // namespace light
+
+/// The light and hub as the effects see them: the hub's start for the effect is `at`.
+struct Hub {
+  int64_t at{0};
+  int64_t start_time_us(uint16_t) const { return this->at; }
+};
+struct UltraLight {
+  Hub hub;
+  static UltraLight *find(void *);
+  Hub *get_hub() { return &this->hub; }
+  uint16_t get_board() const { return 0; }
+  void start_effect(uint8_t, const uint8_t *, size_t, const std::vector<Step> *, int64_t) {}
+  void stop_effect() {}
+};
+static UltraLight the_light;
+UltraLight *UltraLight::find(void *) { return &the_light; }
+static const char *const EFFECT_TAG = "test";
+
+#include "sun_effect.inc"
+
+/// Sunrise / sunset end (their light call) from the board's start of the effect, not the call: a start 600 ms ahead
+/// (a group start, commands waiting) ends 600 ms later, once, also across the millis() wrap.
+static void test_sun_end() {
+  for (bool rise : {true, false}) {
+    for (uint32_t begin : {1000u, 0xFFFFFF00u}) {
+      performed = 0;
+      now_ms = begin;
+      light::LightState state;
+      UltraSunEffect fx("sun", rise);
+      fx.state_ = &state;
+      fx.set_duration(1000);
+      the_light.hub.at = (static_cast<int64_t>(begin) + 600) * 1000;
+      fx.start();
+      bool early = false;
+      for (uint32_t t : {0u, 1100u, 1600u}) {   // the end: 1600 ms + 100 ms grace
+        now_ms = begin + t;
+        fx.apply();
+        early |= performed != 0;
+      }
+      now_ms = begin + 1700;
+      fx.apply();
+      fx.apply();
+      CHECK(!early && performed == 1, "%s from %u: ends 1.7 s after the call, once (%d)", rise ? "sunrise" : "sunset",
+            static_cast<unsigned>(begin), performed);
+    }
+  }
+  now_ms = 0;
+}
+
+}  // namespace sun
 
 // ================================================================================================ update entity
 namespace update {
@@ -488,6 +638,211 @@ static void test_transmit_retry() {
 
 }  // namespace hub_transmit
 
+// ================================================================================================ hub: power supply
+namespace hub_power {
+
+namespace power_supply {
+/// ESPHome's PowerSupply as it behaves (power_supply.cpp): the requests are counted; the pin goes high at the first
+/// request, and low keep_on_time after the last one (a timer the next request cancels). is_enabled() counts the
+/// requests, not the pin.
+struct PowerSupply {
+  uint32_t keep_on_ms{10000};
+  int requests{0};
+  bool pin{false};
+  bool off_timer{false};
+  uint32_t off_at{0};
+  bool is_enabled() const { return this->requests != 0; }
+  void request_high_power() {
+    if (this->requests == 0) {
+      this->off_timer = false;
+      this->pin = true;
+    }
+    this->requests++;
+  }
+  void unrequest_high_power() {
+    if (this->requests == 0)
+      return;
+    if (--this->requests == 0) {
+      this->off_timer = true;
+      this->off_at = now_ms + this->keep_on_ms;
+    }
+  }
+  /// the scheduler's turn: the keep-on timer
+  void tick() {
+    if (this->off_timer && static_cast<int32_t>(now_ms - this->off_at) >= 0) {
+      this->off_timer = false;
+      this->pin = false;
+    }
+  }
+};
+struct PowerSupplyRequester {
+  PowerSupply *parent_{nullptr};
+  bool requested_{false};
+  void set_parent(PowerSupply *p) { this->parent_ = p; }
+  void request() {
+    if (!this->requested_) {
+      this->parent_->request_high_power();
+      this->requested_ = true;
+    }
+  }
+  void unrequest() {
+    if (this->requested_) {
+      this->parent_->unrequest_high_power();
+      this->requested_ = false;
+    }
+  }
+};
+}  // namespace power_supply
+
+struct UltraLight {
+  bool lit{false};
+  bool is_lit(uint32_t) const { return this->lit; }
+};
+
+/// The hub around service_power_() and power_cycle() (build/lifecycle/hub_power.inc).
+struct UltraHub {
+  enum PowerCycle : uint8_t { CYCLE_NONE = 0, CYCLE_WAIT_OFF, CYCLE_OFF, CYCLE_DONE, CYCLE_FAILED };
+  void service_power_();   // the component's
+  void power_cycle();      // the component's
+  // stand-ins
+  bool has_power_supply() const { return this->psu_ != nullptr; }
+
+  power_supply::PowerSupply *psu_{nullptr};
+  power_supply::PowerSupplyRequester psu_req_;
+  uint32_t psu_keep_on_ms_{0};
+  bool psu_requested_{false}, psu_released_{false};
+  uint32_t psu_released_ms_{0};
+  bool power_waiting_{false};
+  uint32_t power_on_ms_{0}, power_on_delay_ms_{100};
+  bool cal_power_hold_{false}, upd_power_hold_{false};
+  std::vector<UltraLight *> lights_;
+  PowerCycle cycle_{CYCLE_NONE};
+  uint32_t cycle_ms_{0};
+  uint8_t pin_{16};
+};
+
+#define USE_POWER_SUPPLY
+#include "hub_power.inc"
+#undef USE_POWER_SUPPLY
+
+/// recover's power cycle (dig2analog_ultra.recover with power_cycle: true): the boards must really lose power.
+/// ESPHome's PowerSupply keeps its pin high for keep_on_time (10 s by default) after the hub's release and
+/// is_enabled() only counts the requests, so the cycle has to wait for that time; a re-request before it cancels the
+/// switch-off and the boards never reboot. Afterwards the supply is on again and the boards' state is replayed
+/// (power_waiting_).
+static void test_power_cycle() {
+  power_supply::PowerSupply psu;
+  psu.keep_on_ms = 10000;
+  UltraHub h;
+  h.psu_ = &psu;
+  h.psu_req_.set_parent(&psu);
+  h.psu_keep_on_ms_ = psu.keep_on_ms;
+  now_ms = 1000;
+  h.upd_power_hold_ = true;   // an update session holds the supply (fw_update.cpp image_ready_)
+  h.service_power_();
+  psu.tick();
+  CHECK(psu.pin && h.psu_requested_ && h.power_waiting_, "the update's hold switches the supply on");
+  h.power_waiting_ = false;
+  // the recovery's power cycle, serviced every 10 ms
+  h.power_cycle();
+  const uint32_t t0 = now_ms;
+  uint32_t low_ms = 0, low_from = 0;
+  for (int i = 0; i < 4000 && h.cycle_ != UltraHub::CYCLE_DONE && h.cycle_ != UltraHub::CYCLE_FAILED; i++) {
+    now_ms += 10;
+    h.service_power_();
+    psu.tick();
+    if (!psu.pin) {
+      if (low_ms == 0)
+        low_from = now_ms - t0;
+      low_ms += 10;
+    }
+  }
+  CHECK(h.cycle_ == UltraHub::CYCLE_DONE, "the cycle completes (state %u)", h.cycle_);
+  CHECK(low_ms >= 1500 && low_ms <= 1600, "the boards really lost power for 1.5 s (pin low %u ms, from +%u ms)", low_ms,
+        low_from);
+  CHECK(low_from >= psu.keep_on_ms && low_from <= psu.keep_on_ms + 50,
+        "... once the supply's keep-on time was over (+%u ms)",
+        low_from);
+  CHECK(psu.pin && h.psu_requested_, "the supply is on again afterwards");
+  CHECK(h.power_waiting_, "and the boards' state is replayed (power_waiting)");
+
+  // another component keeps the supply requested: the cycle gives up (the status tells the user to power-cycle by hand)
+  power_supply::PowerSupply psu2;
+  UltraHub h2;
+  h2.psu_ = &psu2;
+  h2.psu_req_.set_parent(&psu2);
+  h2.psu_keep_on_ms_ = psu2.keep_on_ms;
+  h2.upd_power_hold_ = true;
+  h2.service_power_();
+  psu2.request_high_power();   // e.g. a ws2915 line on the same supply
+  h2.power_cycle();
+  for (int i = 0; i < 4000 && h2.cycle_ == UltraHub::CYCLE_WAIT_OFF; i++) {
+    now_ms += 10;
+    h2.service_power_();
+    psu2.tick();
+  }
+  CHECK(h2.cycle_ == UltraHub::CYCLE_FAILED && psu2.pin,
+        "kept on by another requester: the cycle fails, the supply stays on");
+  now_ms = 0;
+}
+
+}  // namespace hub_power
+
+// ================================================================================================ hub: start times
+namespace hub_start {
+
+/// The hub around its start functions (build/lifecycle/hub_start.inc): a 50-board line, start_delay auto.
+struct UltraHub {
+  int64_t lead_us(size_t commands, size_t waiting = 0) const;   // the component's
+  int64_t command_lead_us_() const;                              // the component's
+  int64_t start_time_us(uint16_t board);                         // the component's
+  static int64_t now_us_() { return 10000000; }
+
+  Scheduler sched_;
+  uint32_t frame_us_{17670};   // 50 boards, the default timing
+  int64_t start_delay_us_{-1};
+  uint8_t max_lights_{5}, max_commands_{10};
+  static std::vector<UltraHub *> hubs_;
+  static GroupStart group_;
+};
+std::vector<UltraHub *> UltraHub::hubs_;
+GroupStart UltraHub::group_;
+
+#include "hub_start.inc"
+
+/// One Home Assistant call turning off five effect lights of one board: each light's EFFECT none and its fade-out go
+/// out at one start, budgeted by max_commands_ (codegen: two commands per effect light). A budget of one command per
+/// light splits the change between a light's EFFECT and its SET (test_effect_stop_fade: the light flashes to full).
+static void test_group_budget() {
+  const uint16_t one[5] = {65535, 65535, 65535, 65535, 65535};
+  size_t groups[2] = {};
+  const uint8_t budgets[2] = {10, 5};
+  for (int i = 0; i < 2; i++) {
+    UltraHub h;
+    h.sched_.init(50, 1, 3);
+    h.max_commands_ = budgets[i];
+    UltraHub::hubs_ = {&h};
+    UltraHub::group_ = GroupStart();
+    std::set<int64_t> starts;
+    for (uint8_t l = 0; l < 5; l++) {
+      const int64_t stop = h.start_time_us(0);
+      h.sched_.light_effect(0, l, ULTRA_FX_NONE, nullptr, 0, stop);
+      const int64_t fade = h.start_time_us(0);
+      h.sched_.light_set(0, l, ULTRA_SET_SMOOTH, 0, one, one, 1000, fade);
+      starts.insert(stop);
+      starts.insert(fade);
+    }
+    groups[i] = starts.size();
+  }
+  CHECK(groups[0] == 1, "five effect lights off in one call: one start for every EFFECT none and fade-out (%u)",
+        static_cast<unsigned>(groups[0]));
+  std::printf("  group budget: 5 effect lights off: %u start(s) with two commands per light, %u with one\n",
+              static_cast<unsigned>(groups[0]), static_cast<unsigned>(groups[1]));
+  UltraHub::hubs_.clear();
+}
+
+}  // namespace hub_start
+
 }  // namespace esphome::dig2analog_ultra
 
 using namespace esphome::dig2analog_ultra;
@@ -498,6 +853,11 @@ int main() {
   updates::test_fetch();
   hub_loop::test_update_confirmation();
   hub_transmit::test_transmit_retry();
+  hub_power::test_power_cycle();
+  lights::test_power_deadline();
+  lights::test_effect_epoch();
+  sun::test_sun_end();
+  hub_start::test_group_budget();
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "ALL ULTRA LIFECYCLE TESTS PASSED", failures);
   return failures ? 1 : 0;
 }

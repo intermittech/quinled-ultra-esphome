@@ -21,7 +21,8 @@ PIECES = {
     "light_methods.inc": (
         "ultra_light.cpp",
         ["static uint8_t scene_fade(", "static uint16_t mired10(", "void UltraLight::setup_state(",
-         "void UltraLight::send_opt_(", "void UltraLight::transition_done_(", "void UltraLight::lit_("],
+         "void UltraLight::send_opt_(", "void UltraLight::transition_done_(", "void UltraLight::lit_(",
+         "void UltraLight::send_pixel(", "void UltraLight::start_effect("],
     ),
     "update_methods.inc": (
         "fw_update.cpp",
@@ -30,7 +31,14 @@ PIECES = {
     ),
     "hub_loop.inc": ("dig2analog_ultra.cpp", ["void UltraHub::loop("]),
     "hub_transmit.inc": ("dig2analog_ultra.cpp", ["void UltraHub::transmit_("]),
+    "hub_power.inc": ("dig2analog_ultra.cpp", ["void UltraHub::power_cycle(", "void UltraHub::service_power_("]),
+    "hub_start.inc": (
+        "dig2analog_ultra.cpp",
+        ["int64_t UltraHub::lead_us(", "int64_t UltraHub::command_lead_us_(", "int64_t UltraHub::start_time_us("],
+    ),
 }
+# classes: the definition, then its ;
+CLASSES = {"sun_effect.inc": ("ultra_effects.h", ["class UltraEffect :", "class UltraSunEffect final"])}
 
 
 def definition(text: str, signature: str) -> str:
@@ -50,6 +58,9 @@ def main() -> int:
     for name, (src, signatures) in PIECES.items():
         text = (COMP / src).read_text(encoding="utf-8")
         (BUILD / name).write_text("\n\n".join(definition(text, s) for s in signatures) + "\n", encoding="utf-8")
+    for name, (src, signatures) in CLASSES.items():
+        text = (COMP / src).read_text(encoding="utf-8")
+        (BUILD / name).write_text("".join(definition(text, s) + ";\n\n" for s in signatures), encoding="utf-8")
     # loop()'s QUEUED case (an install's turn), up to the next case
     loop = definition((COMP / "fw_update.cpp").read_text(encoding="utf-8"), "void UltraFirmwareUpdate::loop(")
     (BUILD / "update_queued.inc").write_text(loop[loop.index("    case QUEUED:"):loop.index("    case DOWNLOADING:")],

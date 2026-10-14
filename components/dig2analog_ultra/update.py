@@ -117,6 +117,19 @@ def _final_validate(config):
     ]
     if len(same) > 1:
         raise cv.Invalid(f"dig2analog_ultra '{hub}' has {len(same)} firmware update entities; one per line")
+    # After a session the line stays quiet for a second (the boards that took the update commit and restart), then
+    # the hub sends everything again. Boards switch off without frames for signal_loss_timeout (sent in 100 ms): with
+    # off / fade_off it must outlast that quiet second, or every light of the line goes off after an update.
+    for h in full.get("dig2analog_ultra", []) or []:
+        if h[CONF_ID] != hub or h.get("signal_loss", "hold") == "hold":
+            continue
+        timeout = round(h["signal_loss_timeout"].total_milliseconds / 100) * 100
+        if timeout < 2000:
+            raise cv.Invalid(
+                f"dig2analog_ultra '{hub}': with a firmware update entity and signal_loss: {h['signal_loss']}, "
+                f"signal_loss_timeout ({timeout} ms) must be at least 2s: the line is quiet for a second after an "
+                f"update session, and the boards would switch their lights off"
+            )
     return config
 
 

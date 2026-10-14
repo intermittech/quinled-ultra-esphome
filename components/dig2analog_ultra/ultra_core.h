@@ -196,10 +196,15 @@ struct UnderrunWatch {
   int64_t drain_us{0};   // the RMT memory on the wire at the shortest bit
   int64_t last_us{0};
   volatile uint32_t count{0};
+  bool frame_bad{false};  // several late refills still describe only one broken frame
   /// a refill at now_us; first: the frame's first fill (before it starts)
   ULTRA_ALWAYS_INLINE void fill(int64_t now_us, bool first) {
-    if (!first && now_us - this->last_us > this->drain_us)
+    if (first)
+      this->frame_bad = false;
+    if (!first && !this->frame_bad && now_us - this->last_us > this->drain_us) {
       this->count = this->count + 1;
+      this->frame_bad = true;
+    }
     this->last_us = now_us;
   }
 };
@@ -752,10 +757,15 @@ class Scheduler {
 
   /// A periodic effect's start, moved forward by whole periods once it is more than a day old: the offset to a
   /// frame stays far inside the EFFECT slot's int32 ms (24.8 days), so a board that comes back after weeks still
-  /// joins in phase.
+  /// joins in phase. An effect without a period (candle, flicker, random; a sunrise or sunset is over after a day)
+  /// has no phase to keep: a day back. (Its start once clipped at -2^31 ms, and a board that powered up after 24.8
+  /// days of a candle never started it: the board takes a start 2^31 ms back as one still to come.)
   static int64_t recent_start_(const Item &it, int64_t now_us) {
-    if (it.start_us == NO_START || it.period_ms == 0 || now_us - it.start_us < 86400LL * 1000000)
+    static constexpr int64_t DAY_US = 86400LL * 1000000;
+    if (it.start_us == NO_START || now_us - it.start_us < DAY_US)
       return it.start_us;
+    if (it.period_ms == 0)
+      return it.slot[0] == ULTRA_EFFECT ? now_us - DAY_US : it.start_us;
     const int64_t p = static_cast<int64_t>(it.period_ms) * 1000;
     return it.start_us + (now_us - it.start_us) / p * p;
   }

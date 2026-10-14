@@ -95,8 +95,11 @@ void UltraLight::setup_state(light::LightState *state) {
     flags |= ULTRA_DEF_ZERO_MEANS_ZERO;
   if (this->constant_brightness_)
     flags |= ULTRA_DEF_CONSTANT_BRIGHTNESS;
+  // ESPHome's gamma_correct 0 is linear (its gamma table: i / 255), so gamma 1.0 on the board, whose x^0 would show
+  // every level that is on at 100 %
   const float gamma = state->get_gamma_correct();
-  const uint16_t g = static_cast<uint16_t>(std::lround(gamma < 0.0f ? 0.0f : gamma > 65.0f ? 65000.0f : gamma * 1000.0f));
+  const uint16_t g = !(gamma > 0.0f) ? 1000
+                     : static_cast<uint16_t>(std::max(1L, std::lround(gamma > 65.0f ? 65000.0f : gamma * 1000.0f)));
   this->hub_->scheduler().light_def(this->board_, this->index_, this->roles_, g, flags, this->min_, this->max_);
   // also without dim_to_warm, and no board effect (a restored one replaces this in the queue): a board that stayed
   // powered while the ESP rebooted drops what an earlier configuration or run left on it
@@ -248,19 +251,22 @@ void UltraLight::send_(const light::LightColorValues &v, uint32_t length, uint8_
   memcpy(this->last_b_, b, sizeof b);
   if (!this->layers_.empty())
     return;  // a strip shows on the light: kept, sent when it is gone
+  const int64_t start_us = stream ? this->hub_->stream_start_us() : this->hub_->start_time_us(this->board_);
   if (stream) {
-    this->hub_->scheduler().light_stream(this->board_, this->index_, m, a, b, length, this->hub_->stream_start_us());
+    this->hub_->scheduler().light_stream(this->board_, this->index_, m, a, b, length, start_us);
   } else {
     this->hub_->scheduler().light_set(this->board_, this->index_, flags, m, a, b, length,
-                                      this->hub_->start_time_us(this->board_));
+                                      start_us);
   }
-  this->lit_(m, length);
+  this->lit_(m, length, start_us);
   this->hub_->wake_();
 }
 
-void UltraLight::lit_(uint16_t m, uint32_t length_ms) {
-  if (this->on_ && m == 0) {
-    this->off_until_ms_ = millis() + length_ms + this->hub_->start_delay_ms();   // fading out on the board
+void UltraLight::lit_(uint16_t m, uint32_t length_ms, int64_t start_us) {
+  if ((this->on_ || this->fading_out_) && m == 0) {
+    // fading out on the board: from the SET's start (a group start on another line, commands waiting before it), in
+    // millis() (on the ESP32 the esp_timer us / 1000); a second fade-out moves the end
+    this->off_until_ms_ = static_cast<uint32_t>((start_us + 999) / 1000) + length_ms;
     this->fading_out_ = true;
   } else if (m != 0) {
     this->fading_out_ = false;
@@ -277,7 +283,7 @@ void UltraLight::send_pixel(uint16_t m, const uint16_t *a, const uint16_t *b, ui
   } else {
     this->hub_->scheduler().light_set(this->board_, this->index_, flags, m, a, b, length_ms, start_us);
   }
-  this->lit_(m, length_ms);
+  this->lit_(m, length_ms, start_us);
   this->hub_->wake_();
 }
 
@@ -352,8 +358,8 @@ void UltraLight::write_state(light::LightState *state) {
 
 void UltraLight::start_effect(uint8_t fx, const uint8_t *params, size_t n, const std::vector<Step> *steps,
                               int64_t start_us) {
-  this->hub_->scheduler().light_effect(this->board_, this->index_, fx, params, n,
-                                       start_us != 0 ? start_us : this->hub_->start_time_us(this->board_), steps);
+  const int64_t at = start_us != NO_START ? start_us : this->hub_->start_time_us(this->board_);
+  this->hub_->scheduler().light_effect(this->board_, this->index_, fx, params, n, at, steps);
   this->hub_->wake_();
 }
 

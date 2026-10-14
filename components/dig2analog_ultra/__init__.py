@@ -119,6 +119,23 @@ def _validate_stagger(value):
     return cv.one_of(*STAGGER, lower=True)(value)
 
 
+def _enum_or_bool(mapping, bools):
+    """A mode by name, or YAML's bare `on` / `off` (which YAML reads as booleans) where it is one of the modes:
+    `dithering: on`, `signal_loss: off`, `dim_floor: off` work without quotes."""
+
+    def validator(value):
+        if isinstance(value, bool):
+            if value in bools:
+                return bools[value]
+            raise cv.Invalid(
+                f"'{'on' if value else 'off'}' is not an option here; use one of {', '.join(mapping)} (quote 'on' / "
+                f"'off' in YAML, or write it as a word)"
+            )
+        return cv.enum(mapping, lower=True)(value)
+
+    return validator
+
+
 def light_roles(config):
     """(channel 0..4, role) of a dig2analog_ultra light. A light of only `white:` is monochromatic: its channel follows
     the brightness (ESPHome gives a monochromatic light no white value)."""
@@ -317,15 +334,15 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_REPEATS, default=3): cv.int_range(min=1, max=8),
             # Board settings (sent to every board; runtime setters change them per board)
             cv.Optional(CONF_PWM_FREQUENCY, default="25kHz"): _validate_pwm_frequency,
-            cv.Optional(CONF_DITHERING, default="on"): cv.enum(DITHERING, lower=True),
+            cv.Optional(CONF_DITHERING, default="on"): _enum_or_bool(DITHERING, {True: "on", False: "off"}),
             cv.Optional(CONF_DITHER_THRESHOLD, default="1.0%"): _validate_dither_threshold,
-            cv.Optional(CONF_DIM_FLOOR, default="skip"): cv.enum(DIM_FLOOR, lower=True),
+            cv.Optional(CONF_DIM_FLOOR, default="skip"): _enum_or_bool(DIM_FLOOR, {False: "off"}),
             cv.Optional(CONF_MIN_PULSE, default="200ns"): _validate_min_pulse,
             # off, fixed (channels a third of a period apart), fixed_spread, adaptive (phases follow the colour mix
             # for the least LED_+ ripple current; uses power_limit's channel_current as weights when given),
             # adaptive_spread (alias spread); *_spread adds spread-spectrum PWM (every period +-6 %, conducted EMC)
             cv.Optional(CONF_STAGGER, default="adaptive_spread"): _validate_stagger,
-            cv.Optional(CONF_SIGNAL_LOSS, default="hold"): cv.enum(SIGNAL_LOSS, lower=True),
+            cv.Optional(CONF_SIGNAL_LOSS, default="hold"): _enum_or_bool(SIGNAL_LOSS, {False: "off"}),
             cv.Optional(CONF_SIGNAL_LOSS_TIMEOUT, default="3s"): cv.All(
                 cv.positive_time_period_milliseconds,
                 cv.Range(min=cv.TimePeriod(milliseconds=500), max=cv.TimePeriod(seconds=60)),
@@ -361,6 +378,22 @@ CONFIG_SCHEMA = cv.All(
         }
     ).extend(cv.COMPONENT_SCHEMA),
 )
+
+
+def _max_group_commands(lights):
+    """The commands one Home Assistant change to every light can give the busiest board: per light a SET, with board
+    effects an EFFECT (stopping or starting one) and a strobe's STEPs, with power_on_scene the SCENE that follows. A
+    light's EFFECT and SET must share their start (the hub's start lead covers them all), or an effect stopped before
+    its light's fade-out starts shows the light at full brightness in between."""
+    counts = {}
+    for light in lights:
+        effects = light.get("effects", []) or []
+        board_effect = any(any(k.startswith("ultra_") for k in e) for e in effects)
+        steps = max((len(e["ultra_strobe"]["colors"]) for e in effects if "ultra_strobe" in e), default=0)
+        commands = 1 + int(board_effect) + steps + int(light.get("power_on_scene", False))
+        board = light["board"]
+        counts[board] = counts.get(board, 0) + commands
+    return max(counts.values(), default=1)
 
 
 def _lights_of(full_config, hub_id):
@@ -496,6 +529,7 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_num_boards(config[CONF_NUM_BOARDS]))
     # lights per board: the hub clears the other light indices on the boards (left by an earlier configuration)
     lights = _lights_of(CORE.config, config[CONF_ID])
+    cg.add(var.set_max_commands(_max_group_commands(lights)))
     cg.add(var.set_light_counts([
         sum(light["board"] == b for light in lights) for b in range(config[CONF_NUM_BOARDS])
     ]))

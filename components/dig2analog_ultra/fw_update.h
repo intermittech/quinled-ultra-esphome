@@ -137,7 +137,7 @@ class UltraFirmwareUpdate final : public update::UpdateEntity, public PollingCom
   uint32_t job_version_{0};
   std::string status_text_;
 
-  /// one download + session at a time on this ESP32 (each image takes up to 54 KB of heap); lines that install the
+  /// one download + session at a time on this ESP32 (each image takes up to ~56 KB of heap); lines that install the
   /// same image share one download (fw_image_cache.h)
   static UltraFirmwareUpdate *active_;
   static uint8_t entities_;

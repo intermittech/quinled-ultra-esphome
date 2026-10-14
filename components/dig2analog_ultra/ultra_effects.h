@@ -28,7 +28,6 @@ class UltraEffect : public light::LightEffect {
                this->name_);
       return;
     }
-    this->start_ms_ = millis();
     uint8_t p[ULTRA_FX_PARAMS] = {};
     const size_t n = this->params_(p);
     const std::vector<Step> *steps = this->steps_();
@@ -36,6 +35,7 @@ class UltraEffect : public light::LightEffect {
     // sends one call per light) run exactly in step, on all data lines.
     const uint8_t fx = this->fx_();
     const int64_t at = this->light_->get_hub()->start_time_us(this->light_->get_board());
+    this->start_ms_ = static_cast<uint32_t>((at + 999) / 1000);   // the board's start (millis() = us / 1000 on ESP32)
     const int64_t start = phase_start_us(at, effect_period_ms(fx, p, n, steps));
     this->light_->start_effect(fx, p, n, steps, start);
   }
@@ -225,7 +225,9 @@ class UltraSunEffect final : public UltraEffect {
     UltraEffect::start();
   }
   void apply() override {
-    if (this->light_ == nullptr || this->done_ || millis() - this->start_ms_ < this->duration_ms_ + 100)
+    // from the board's start (it may lie ahead: a queued or grouped start), signed against the millis() wrap
+    if (this->light_ == nullptr || this->done_ ||
+        static_cast<int32_t>(millis() - this->start_ms_) < static_cast<int32_t>(this->duration_ms_ + 100))
       return;
     this->done_ = true;
     if (this->rise_) {

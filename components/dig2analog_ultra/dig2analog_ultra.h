@@ -53,6 +53,7 @@ class UltraHub final : public Component {
   void set_inverted(bool inverted) { this->inverted_ = inverted; }
   void set_num_boards(uint16_t n) { this->num_boards_ = n; }
   void set_light_counts(const std::vector<uint8_t> &counts) { this->light_counts_ = counts; }
+  void set_max_commands(uint8_t n) { this->max_commands_ = n; }
   void set_rmt_symbols(uint32_t n) { this->rmt_symbols_ = n; }
   void set_use_dma(bool use_dma) { this->use_dma_ = use_dma; }
   void set_timing(uint32_t bit0_high_ns, uint32_t bit0_low_ns, uint32_t bit1_high_ns, uint32_t bit1_low_ns,
@@ -199,6 +200,15 @@ class UltraHub final : public Component {
   enum PowerCycle : uint8_t { CYCLE_NONE = 0, CYCLE_WAIT_OFF, CYCLE_OFF, CYCLE_DONE, CYCLE_FAILED };
   void power_cycle();
   PowerCycle power_cycle_state() const { return this->cycle_; }
+  /// How long a power cycle takes from power_cycle() until the boards have power again: the supply's keep_on_time
+  /// (its pin stays high that long after the hub's release), then 1.5 s off.
+  uint32_t power_cycle_ms() const {
+#ifdef USE_POWER_SUPPLY
+    return this->psu_keep_on_ms_ + 1500;
+#else
+    return 1500;
+#endif
+  }
 #endif
 
   // For UltraLight / effects / strips
@@ -210,7 +220,7 @@ class UltraHub final : public Component {
   /// How far ahead commands start when a board gets `commands` at once and `waiting` first copies are queued before
   /// them (start_delay auto: start_lead_us()); a fixed start_delay, + a frame per further command.
   int64_t lead_us(size_t commands, size_t waiting = 0) const;
-  /// The usual lead in ms (a light's power request covers its fade-out from there).
+  /// The lead of a streamed step in ms (dump_config).
   uint32_t start_delay_ms() const { return static_cast<uint32_t>(this->stream_lead_us_() / 1000); }
   /// One frame on the wire, worst case (us; 0 before setup)
   uint32_t get_frame_us() const { return this->frame_us_; }
@@ -258,6 +268,7 @@ class UltraHub final : public Component {
   uint32_t refresh_interval_ms_{200};
   int64_t start_delay_us_{-1};   // -1: auto (lead_us)
   uint8_t max_lights_{1};        // the most lights on one board of this line
+  uint8_t max_commands_{1};      // the commands a group change can give the busiest board (codegen)
   static std::vector<UltraHub *> hubs_;   // every line: a group start must reach all of them
   static GroupStart group_;
   uint8_t repeats_{3};

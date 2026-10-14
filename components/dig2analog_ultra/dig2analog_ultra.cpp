@@ -124,11 +124,12 @@ int64_t UltraHub::lead_us(size_t commands, size_t waiting) const {
   return start_lead_us(frame, commands, waiting);
 }
 
-// A group change: a command for every light of the fullest board, after what waits already.
+// A group change: every command it can give the busiest board (a SET per light, an effect's EFFECT and STEPs, a
+// power-on scene's SCENE: max_commands_), after what waits already.
 int64_t UltraHub::command_lead_us_() const {
   if (this->start_delay_us_ >= 0)
     return this->start_delay_us_;
-  return this->lead_us(this->max_lights_, this->sched_.waiting());
+  return this->lead_us(this->max_commands_, this->sched_.waiting());
 }
 
 int64_t UltraHub::start_time_us(uint16_t board) {
@@ -393,10 +394,14 @@ void UltraHub::service_power_() {
     lit |= l->is_lit(now);
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
   lit |= this->upd_power_hold_;
-  // power_cycle(): released until the supply reports off (other requesters may keep it on: give up after its
-  // keep-on time + 5 s), off for 1.5 s, then the normal rule again
+  // power_cycle(): released until the supply is really off, then off for 1.5 s, then the normal rule again.
+  // PowerSupply::is_enabled() counts the requests, not the pin: after the last request the pin stays high for the
+  // supply's keep_on_time, so the boards lose power only then. Other requesters may keep it on: give up after that
+  // time + 5 s.
   if (this->cycle_ == CYCLE_WAIT_OFF) {
-    if (!this->psu_->is_enabled()) {
+    const bool off = !this->psu_->is_enabled() &&
+                     (!this->psu_released_ || now - this->psu_released_ms_ >= this->psu_keep_on_ms_);
+    if (off) {
       this->cycle_ = CYCLE_OFF;
       this->cycle_ms_ = now;
     } else if (now - this->cycle_ms_ > this->psu_keep_on_ms_ + 5000) {

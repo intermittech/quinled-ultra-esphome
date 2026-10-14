@@ -48,6 +48,9 @@ jobs:
       - name: Lifecycle test (light setup, update entity, hub loop / transmit)
         working-directory: quinled-ultra-esphome
         run: python tests/run_ultra_lifecycle_test.py
+      - name: Contract test (the scheduler through the board's receive path and engine, 50 boards, two pins)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_contract_test.py
       - name: Schema tests
         working-directory: quinled-ultra-esphome
         run: python tests/validate_configs.py

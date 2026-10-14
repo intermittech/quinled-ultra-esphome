@@ -239,6 +239,10 @@ CASES = [
         None,
     ),
     ("ultra min_pulse 20 ns", ULTRA + "  min_pulse: 20ns\n", False, "min_pulse must be"),
+    # YAML reads a bare on / off as a boolean: the modes that are called on / off take it
+    ("ultra bare on / off (yaml booleans)", ULTRA + "  dithering: on\n  signal_loss: off\n  dim_floor: off\n", True, None),
+    ("ultra bare on for signal_loss", ULTRA + "  signal_loss: on\n", False, "'on' is not an option here; use one of hold, off, fade_off"),
+    ("ultra dithering bogus", ULTRA + "  dithering: maybe\n", False, "Unknown value 'maybe'"),
     ("ultra stagger adaptive", ULTRA + "  stagger: adaptive\n", True, None),
     ("ultra stagger adaptive_spread", ULTRA + "  stagger: adaptive_spread\n", True, None),
     ("ultra stagger spread", ULTRA + "  stagger: spread\n", True, None),
@@ -707,6 +711,25 @@ CASES = [
     ("ultra update bad source", ULTRA + UPD_NET + UPD + "    source: not a repo\n", False, "OWNER/REPO on GitHub"),
     ("ultra update channel bogus", ULTRA + UPD_NET + UPD + "    channel: nightly\n", False, "Unknown value"),
     ("ultra update two per line", ULTRA + UPD_NET + UPD + UPD.replace("id: fw", "id: fw2").replace("name: fw", "name: fw2").replace("update:\n", ""), False, "one per line"),
+    # the line is quiet for a second after an update session: signal_loss off / fade_off must outlast it
+    (
+        "ultra update with signal_loss fade_off 1s",
+        ULTRA + "  signal_loss: fade_off\n  signal_loss_timeout: 1s\n" + UPD_NET + UPD,
+        False,
+        "must be at least 2s",
+    ),
+    (
+        "ultra update with signal_loss off 2s",
+        ULTRA + "  signal_loss: \"off\"\n  signal_loss_timeout: 2s\n" + UPD_NET + UPD,
+        True,
+        None,
+    ),
+    (
+        "ultra update with signal_loss hold 500ms",
+        ULTRA + "  signal_loss_timeout: 500ms\n" + UPD_NET + UPD,
+        True,
+        None,
+    ),
     ("ultra update without http_request", ULTRA + "wifi:\n  ssid: x\n  password: xxxxxxxx\n" + UPD, False, "http_request"),
     (
         "ultra update actions",
@@ -759,15 +782,41 @@ def run_case(idx, name, body, expect_ok, needle, board="esp32dev"):
     return not problems
 
 
+def check_group_budget() -> bool:
+    """The codegen's group budget (__init__.py _max_group_commands): the commands one Home Assistant change to every
+    light can give the busiest board, which the hub's start lead covers."""
+    sys.path.insert(0, str(ROOT / "components"))
+    from dig2analog_ultra import _max_group_commands as budget
+
+    plain = [{"board": 0} for _ in range(5)]
+    effects = [{"board": 0, "effects": [{"ultra_breathe": {}}]} for _ in range(5)]
+    strobes = [{"board": 0, "effects": [{"ultra_strobe": {"colors": [{}] * 8}}], "power_on_scene": True}] * 5
+    cases = [
+        ("no lights", [], 1),
+        ("5 plain lights: a SET each", plain, 5),
+        ("5 effect lights: + an EFFECT each", effects, 10),
+        ("5 strobes with 8 steps and power_on_scene", strobes, 55),
+        ("the busiest board counts", plain + [{"board": 1, "effects": [{"ultra_breathe": {}}]}], 5),
+    ]
+    ok = True
+    for name, lights, want in cases:
+        got = budget(lights)
+        miss = "" if got == want else f" (want {want})"
+        print(f"{'ok  ' if got == want else 'FAIL'} group budget, {name}: {got}{miss}")
+        ok &= got == want
+    return ok
+
+
 def main() -> int:
     filters = [f.lower() for f in sys.argv[1:]]
     cases = list(enumerate(CASES))
     if filters:
         cases = [(i, c) for i, c in cases if any(f in c[0].lower() for f in filters)]
+    budget_ok = filters != [] or check_group_budget()
     results = [run_case(i, *case) for i, case in cases]
     failed = results.count(False)
     print(f"\n{len(results) - failed}/{len(results)} schema cases passed")
-    return 1 if failed else 0
+    return 1 if failed or not budget_ok else 0
 
 
 if __name__ == "__main__":

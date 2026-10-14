@@ -60,8 +60,19 @@ enum {
 #define UPD_BL_INFO          0x08000010u  /* upd_bl_info_t, inside the bootloader */
 #define UPD_APP_DESC         0x08002000u  /* descriptor page: descriptor (64) + status records (192) */
 #define UPD_APP_BODY         0x08002100u  /* app body: the app is linked here (alias 0x00002100) */
-#define UPD_APP_END          0x0800F700u  /* scene log 0x0800F700-0x0800FEFF, settings 0x0800FF00 */
-#define UPD_APP_BODY_MAX     (UPD_APP_END - UPD_APP_BODY)          /* 54,784 bytes */
+/* UPPER_RECORDS (0.6.5, Quindor 2026-10-14): 1 = the record pages in the upper
+ * (non-zero-wait) CodeFlash at 0x08010000-0x08011FFF (src/hal/board.h) and the app slot to the zero-wait flash's end,
+ * bootloader 2; 0 = 0.6.4's layout (the records at 0x0800F600-0x0800FFFF, the slot to 0x0800F700, bootloader 1): the
+ * bench fallback. An image for the upper layout says min_bootloader 2. */
+#ifndef UPPER_RECORDS
+#define UPPER_RECORDS        1
+#endif
+#if UPPER_RECORDS
+#define UPD_APP_END          0x08010000u  /* the zero-wait flash's end: no record inside the slot */
+#else
+#define UPD_APP_END          0x0800F700u  /* 0.6.4: scene log 0x0800F700-0x0800FEFF, settings 0x0800FF00 */
+#endif
+#define UPD_APP_BODY_MAX     (UPD_APP_END - UPD_APP_BODY)          /* 57,088 bytes (0.6.4's layout: 54,784) */
 #define UPD_PAGE_BYTES       256u
 #define UPD_SECTOR_BYTES     4096u
 #define UPD_CHUNKS_PER_PAGE  (UPD_PAGE_BYTES / UPD_CHUNK_BYTES)    /* 8 */

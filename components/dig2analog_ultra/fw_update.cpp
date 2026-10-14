@@ -169,6 +169,25 @@ bool UltraFirmwareUpdate::fetch_(const std::string &url, std::vector<uint8_t> &o
     out.resize(c->content_length);
     const auto rr = http_request::http_read_fully(c.get(), out.data(), out.size(), 512, this->http_->get_timeout());
     ok = rr.status == http_request::HttpReadStatus::OK && c->get_bytes_read() == out.size();
+  } else if (c->status_code == http_request::HTTP_STATUS_OK && c->content_length == 0) {
+    // no Content-Length (a chunked response, e.g. from a CDN): read it in pieces, at most max_len bytes
+    out.clear();
+    uint8_t chunk[512];
+    uint32_t last = millis();
+    for (;;) {
+      const int got = c->read(chunk, sizeof(chunk));
+      const auto result = http_request::http_read_loop_result(got, last, this->http_->get_timeout(),
+                                                              c->is_read_complete());
+      if (result == http_request::HttpReadLoopResult::RETRY)
+        continue;
+      if (result == http_request::HttpReadLoopResult::COMPLETE) {
+        ok = !out.empty();
+        break;
+      }
+      if (result != http_request::HttpReadLoopResult::DATA || static_cast<size_t>(got) > max_len - out.size())
+        break;
+      out.insert(out.end(), chunk, chunk + got);
+    }
   } else {
     ESP_LOGD(TAG, "%s: HTTP %d, %u bytes", url.c_str(), c->status_code, static_cast<unsigned>(c->content_length));
   }
@@ -306,6 +325,10 @@ void UltraFirmwareUpdate::recover(uint32_t lead_in_ms, bool power_cycle) {
 }
 
 void UltraFirmwareUpdate::start_install_() {
+  // this release, also when the install waits for another line meanwhile (a check or channel change may come)
+  this->job_image_ = this->image_;
+  this->job_url_ = this->image_url_;
+  this->job_version_ = this->latest_;
   this->dl_abort_.store(false);
   this->dl_bytes_.store(0);
   this->phase_ = QUEUED;
@@ -436,16 +459,16 @@ void UltraFirmwareUpdate::free_image_() {
 
 // QUEUED, our turn: the image another line already downloaded and checked (same SHA-256), or a download
 bool UltraFirmwareUpdate::take_shared_image_() {
-  uint8_t *img = image_cache.acquire(this->image_.sha256, this->image_.size);
+  uint8_t *img = image_cache.acquire(this->job_image_.sha256, this->job_image_.size);
   if (img == nullptr)
     return false;
   uint8_t sha[32];
-  const char *err = fw_hex_to_bytes(this->image_.sha256, sha, sizeof(sha))
-                        ? fw_check_image(img, this->image_.size, sha, this->image_, this->latest_, this->hw_rev_)
+  const char *err = fw_hex_to_bytes(this->job_image_.sha256, sha, sizeof(sha))
+                        ? fw_check_image(img, this->job_image_.size, sha, this->job_image_, this->job_version_,
+                                         this->hw_rev_)
                         : "bad SHA-256 in the manifest";
   this->img_ = img;
-  this->img_size_ = this->image_.size;
-  this->job_version_ = this->latest_;
+  this->img_size_ = this->job_image_.size;
   if (err != nullptr) {   // e.g. this line's board revision is not in the image
     this->finish_(std::string("failed: ") + err, false);
     return true;
@@ -506,9 +529,9 @@ void UltraFirmwareUpdate::loop() {
       image_cache.trim();
       auto *r = new DownloadResult();
       r->self = this;
-      r->image = this->image_;
-      r->url = this->image_url_;
-      r->version = this->latest_;
+      r->image = this->job_image_;
+      r->url = this->job_url_;
+      r->version = this->job_version_;
       r->hw_rev = this->hw_rev_;
       this->phase_ = DOWNLOADING;
       this->set_status_("downloading");
@@ -520,11 +543,11 @@ void UltraFirmwareUpdate::loop() {
       break;
     }
     case DOWNLOADING:
-      if (now - this->last_publish_ms_ >= PUBLISH_MS && this->image_.size != 0) {
+      if (now - this->last_publish_ms_ >= PUBLISH_MS && this->job_image_.size != 0) {
         const uint32_t n = this->dl_bytes_.load();
-        this->set_status_("downloading: " + std::to_string(n / 1024) + " of " + std::to_string(this->image_.size / 1024) +
-                          " KB");
-        this->publish_progress_(DOWNLOAD_SHARE * static_cast<float>(n) / static_cast<float>(this->image_.size), false);
+        const size_t size = this->job_image_.size;
+        this->set_status_("downloading: " + std::to_string(n / 1024) + " of " + std::to_string(size / 1024) + " KB");
+        this->publish_progress_(DOWNLOAD_SHARE * static_cast<float>(n) / static_cast<float>(size), false);
       }
       break;
     case WAIT_POWER:

@@ -49,8 +49,11 @@ static rmt_symbol_word_t make_symbol(uint32_t ticks0, uint32_t level0, uint32_t 
 static size_t IRAM_ATTR HOT encoder_callback(const void *data, size_t size, size_t symbols_written,
                                              size_t symbols_free, rmt_symbol_word_t *symbols, bool *done,
                                              void *arg) {
-  return encode_symbols(*static_cast<const EncoderParams *>(arg), static_cast<const uint8_t *>(data), size,
-                        symbols_written, symbols_free, symbols, done);
+  auto *e = static_cast<EncoderArg *>(arg);
+  if (e->watching)
+    e->watch.fill(esp_timer_get_time(), symbols_written == 0);
+  return encode_symbols(e->symbols, static_cast<const uint8_t *>(data), size, symbols_written, symbols_free, symbols,
+                        done);
 }
 
 int64_t UltraHub::now_us_() { return esp_timer_get_time(); }
@@ -89,6 +92,7 @@ void UltraHub::set_pwm_frequency(int board, float hz) {
 // A board forwards Ultra frames only once it is locked: a preamble of DARK frames (preamble_frames()) lets the
 // whole chain lock (boards that were locked to a WS protocol show dark meanwhile) before the commands come.
 void UltraHub::resync(bool power_on) {
+  this->tx_prepared_ = false;  // a frame the RMT refused: dropped, the replay sends everything again
   this->preamble_full_ = !(power_on && this->synced_once_);
   this->preamble_ = this->preamble_full_ ? preamble_frames(this->num_boards_) : power_on_preamble_frames(this->num_boards_);
   int64_t lead_us = static_cast<int64_t>(this->preamble_) * (this->frame_us_ + 200);
@@ -99,8 +103,42 @@ void UltraHub::resync(bool power_on) {
   lead_us += static_cast<int64_t>(this->ping_left_) * (this->update_frame_us() + 200) +
              static_cast<int64_t>(this->dark_tail_) * (this->frame_us_ + 200);
 #endif
-  this->sched_.replay(this->now_us_() + lead_us + this->start_delay_us_);
+  this->sched_.replay(this->now_us_() + lead_us + this->stream_lead_us_());
   this->wake_();
+}
+
+UltraHub::Diagnostics UltraHub::take_diagnostics() {
+  const Diagnostics d{this->sched_.take_queue_peak(), this->sched_.take_memory_peak(), this->build_peak_us_,
+                      this->enc_.watch.count, this->frames_};
+  this->build_peak_us_ = 0;
+  return d;
+}
+
+std::vector<UltraHub *> UltraHub::hubs_;
+GroupStart UltraHub::group_;
+
+int64_t UltraHub::lead_us(size_t commands, size_t waiting) const {
+  const uint32_t frame = this->frame_us_ + 500;   // a frame and the gap to the next
+  if (this->start_delay_us_ >= 0)
+    return this->start_delay_us_ + static_cast<int64_t>(commands > 1 ? commands - 1 : 0) * frame;
+  return start_lead_us(frame, commands, waiting);
+}
+
+// A group change: a command for every light of the fullest board, after what waits already.
+int64_t UltraHub::command_lead_us_() const {
+  if (this->start_delay_us_ >= 0)
+    return this->start_delay_us_;
+  return this->lead_us(this->max_lights_, this->sched_.waiting());
+}
+
+int64_t UltraHub::start_time_us(uint16_t board) {
+  int64_t lead = 0;
+  for (auto *hub : hubs_)
+    lead = std::max(lead, hub->command_lead_us_());
+  // a command joins the open group while its first copy gets out by its start: the frame on the wire, what waits
+  // on its board, its own frame
+  const int64_t reach = start_lead_us(this->frame_us_ + 500, 1, this->sched_.waiting(board)) - START_SLACK_US;
+  return group_.start(this->now_us_(), lead, reach);
 }
 
 // The boards have power as far as the hub knows: no supply configured, or it is on and its delay is over.
@@ -135,6 +173,7 @@ bool UltraHub::start_update(const uint8_t *image, size_t size, const UpdateSessi
   if (!this->upd_session_.begin(image, static_cast<uint32_t>(size), static_cast<uint8_t>(esp_random() | 1u), o,
                                 this->update_frame_us() + 50))
     return false;
+  this->tx_prepared_ = false;  // the session takes the buffer; post-session replay repairs normal state
   this->upd_total_ = this->upd_session_.total_frames();
   this->upd_sent_.store(0);
   this->upd_pass_.store(0);
@@ -401,6 +440,14 @@ void UltraHub::setup() {
   this->early_config_.clear();
   this->early_config_.shrink_to_fit();
   this->sched_.flush_config();
+  // light indices without a light in the YAML: cleared on the boards (an earlier configuration may have used them)
+  for (uint16_t b = 0; b < this->num_boards_; b++)
+    this->sched_.clear_unused_lights(b, b < this->light_counts_.size() ? this->light_counts_[b] : 0);
+  for (uint8_t n : this->light_counts_)
+    this->max_lights_ = std::max(this->max_lights_, n);
+  this->light_counts_.clear();
+  this->light_counts_.shrink_to_fit();
+  hubs_.push_back(this);
 
   RAMAllocator<uint8_t> alloc(RAMAllocator<uint8_t>::ALLOC_INTERNAL);
   size_t buf_bytes = std::max<size_t>(this->sched_.frame_bytes(), ultra_switch_frame_bytes(this->num_boards_));
@@ -426,9 +473,12 @@ void UltraHub::setup() {
     return;
   }
   this->sched_.set_bit_timing(this->bit0_high_ns_, this->bit0_low_ns_, this->bit1_high_ns_, this->bit1_low_ns_);
-  this->params_.bit0 = make_symbol(t0h, 1, t0l, 0);
-  this->params_.bit1 = make_symbol(t1h, 1, t1l, 0);
-  this->params_.reset = make_symbol(rst0, 0, rst1, 0);
+  this->enc_.symbols.bit0 = make_symbol(t0h, 1, t0l, 0);
+  this->enc_.symbols.bit1 = make_symbol(t1h, 1, t1l, 0);
+  this->enc_.symbols.reset = make_symbol(rst0, 0, rst1, 0);
+  // the RMT memory on the wire at the shorter bit: refills further apart ran it empty (an underrun)
+  const uint32_t shorter = std::min(this->bit0_high_ns_ + this->bit0_low_ns_, this->bit1_high_ns_ + this->bit1_low_ns_);
+  this->enc_.watch.drain_us = static_cast<int64_t>(this->rmt_symbols_) * shorter / 1000;
 
   rmt_tx_channel_config_t ch;
   memset(&ch, 0, sizeof(ch));
@@ -448,7 +498,7 @@ void UltraHub::setup() {
   rmt_simple_encoder_config_t enc;
   memset(&enc, 0, sizeof(enc));
   enc.callback = encoder_callback;
-  enc.arg = &this->params_;
+  enc.arg = &this->enc_;
   enc.min_chunk_size = 1;
   if (rmt_new_simple_encoder(&enc, &this->encoder_) != ESP_OK) {
     ESP_LOGE(TAG, "RMT encoder creation failed");
@@ -487,7 +537,8 @@ void UltraHub::loop() {
 #endif
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
   // An update session owns the line; afterwards it stays low for a second (the boards commit and restart), then
-  // the normal frames come back with a resync (preamble, PING burst, everything again).
+  // the normal frames come back with a resync (preamble, PING burst, everything again). The result is ready once the
+  // PING burst is out: the boards confirm their new firmware with it, so the update holds the supply until then.
   if (this->upd_state_.load() != UPD_IDLE) {
     if (this->upd_state_.load() == UPD_FINISHED) {
       this->upd_task_ = nullptr;
@@ -503,15 +554,20 @@ void UltraHub::loop() {
     if (millis() - this->upd_quiet_ms_ < 1000)
       return;
     this->upd_quiet_ = false;
-    this->upd_done_ = static_cast<UpdateResult>(this->upd_result_.load());
+    this->upd_resync_pending_ = true;
+    this->upd_confirm_ms_ = millis();
     this->resync();
+  }
+  if (this->upd_resync_pending_ && millis() - this->upd_confirm_ms_ >= 60000) {
+    this->upd_resync_pending_ = false;   // the transmitter can't send: failed, rather than holding the supply forever
+    this->upd_done_ = UPD_FAILED;
   }
   const bool ping_pending = this->ping_left_ > 0 || this->dark_tail_ > 0;
 #else
   const bool ping_pending = false;
 #endif
-  const bool urgent = this->preamble_ > 0 || ping_pending || this->switch_frame_ < ULTRA_SWITCH_WS_FRAMES ||
-                      this->sched_.pending();
+  const bool urgent = this->tx_prepared_ || this->preamble_ > 0 || ping_pending ||
+                      this->switch_frame_ < ULTRA_SWITCH_WS_FRAMES || this->sched_.pending();
   if (urgent)
     this->last_busy_ms_ = millis();
   if (this->high_freq_active_ && !urgent && millis() - this->last_busy_ms_ > BUSY_HOLD_MS) {
@@ -523,42 +579,63 @@ void UltraHub::loop() {
   // Non-blocking: if the previous frame (incl. its reset) is still on the wire, retry next loop.
   if (rmt_tx_wait_all_done(this->channel_, 0) != ESP_OK)
     return;
+#ifdef USE_DIG2ANALOG_ULTRA_UPDATE
+  if (this->upd_resync_pending_ && !this->tx_prepared_ && this->preamble_ == 0 && !ping_pending) {
+    this->upd_resync_pending_ = false;   // the PING burst and its dark tail are on the wire
+    this->upd_done_ = static_cast<UpdateResult>(this->upd_result_.load());
+  }
+#endif
   this->transmit_();
 }
 
 void UltraHub::transmit_() {
   // The header (the frame's trailer) carries the host clock at the frame's last bit: the start, taken right before
-  // the frame goes out, plus its bits on the wire.
-  size_t bytes = this->sched_.frame_bytes();
+  // the frame goes out, plus its bits on the wire. A frame the RMT refused is sent again (with a new TIME), not built
+  // anew: its commands were taken from the queues already.
   const int64_t start = now_us_();
-  if (this->switch_frame_ < ULTRA_SWITCH_WS_FRAMES) {
-    // switch_boards_to_ultra: a WS config frame (no Ultra header), with the same bit timing
-    bytes = ultra_switch_frame(this->tx_buf_, this->switch_frame_++, this->num_boards_);
-  } else if (this->preamble_ > 0) {
-    this->preamble_--;
-    this->sched_.build_dark_frame(start, this->tx_buf_);
-    if (this->preamble_ == 0 && this->preamble_full_ && this->boards_powered_())
-      this->synced_once_ = true;           // every board locked and stored Ultra: power-ons need a short preamble
+  if (!this->tx_prepared_) {
+    this->tx_normal_ = true;
+    this->tx_preamble_end_ = false;
+    size_t bytes = this->sched_.frame_bytes();
+    if (this->switch_frame_ < ULTRA_SWITCH_WS_FRAMES) {
+      // switch_boards_to_ultra: a WS config frame (no Ultra header), with the same bit timing
+      this->tx_normal_ = false;
+      bytes = ultra_switch_frame(this->tx_buf_, this->switch_frame_++, this->num_boards_);
+    } else if (this->preamble_ > 0) {
+      this->preamble_--;
+      this->sched_.build_dark_frame(start, this->tx_buf_);
+      this->tx_preamble_end_ = this->preamble_ == 0 && this->preamble_full_;
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
-  } else if (this->ping_left_ > 0) {
-    this->ping_left_--;
-    UpdateSession::ping_frame(this->tx_buf_, static_cast<uint32_t>(start));
-    bytes = UPD_FRAME_BYTES;
-  } else if (this->dark_tail_ > 0) {
-    this->dark_tail_--;
-    this->sched_.build_dark_frame(start, this->tx_buf_);
+    } else if (this->ping_left_ > 0) {
+      this->tx_normal_ = false;
+      this->ping_left_--;
+      UpdateSession::ping_frame(this->tx_buf_, static_cast<uint32_t>(start));
+      bytes = UPD_FRAME_BYTES;
+    } else if (this->dark_tail_ > 0) {
+      this->dark_tail_--;
+      this->sched_.build_dark_frame(start, this->tx_buf_);
 #endif
-  } else {
-    this->sched_.build_frame(start, this->tx_buf_);
+    } else {
+      this->sched_.build_frame(start, this->tx_buf_);
+      this->build_peak_us_ = std::max(this->build_peak_us_, static_cast<uint32_t>(now_us_() - start));
+    }
+    this->tx_bytes_ = bytes;
+    this->tx_prepared_ = true;
+  } else if (this->tx_normal_) {
+    this->sched_.retime_frame(start, this->tx_buf_);
   }
   rmt_transmit_config_t cfg;
   memset(&cfg, 0, sizeof(cfg));
-  const esp_err_t err = rmt_transmit(this->channel_, this->encoder_, this->tx_buf_, bytes, &cfg);
+  const esp_err_t err = rmt_transmit(this->channel_, this->encoder_, this->tx_buf_, this->tx_bytes_, &cfg);
   if (err != ESP_OK) {
-    ESP_LOGW(TAG, "RMT transmit failed: %s", esp_err_to_name(err));
+    if (!this->status_has_warning())   // the frame is retried every loop: log the first failure only
+      ESP_LOGW(TAG, "RMT transmit failed: %s", esp_err_to_name(err));
     this->status_set_warning();
     return;
   }
+  this->tx_prepared_ = false;
+  if (this->tx_preamble_end_ && this->boards_powered_())
+    this->synced_once_ = true;
   this->status_clear_warning();
   this->last_frame_ms_ = millis();
   this->has_sent_ = true;
@@ -578,12 +655,14 @@ void UltraHub::dump_config() {
                 "  RMT symbols: %" PRIu32 "%s\n"
                 "  Bit0: %" PRIu32 "/%" PRIu32 " ns, Bit1: %" PRIu32 "/%" PRIu32 " ns, Reset: %" PRIu32 " us\n"
                 "  Frame: %" PRIu32 " us (%" PRIu32 " frames/s max)\n"
-                "  Refresh: every %" PRIu32 " ms, start delay %" PRIu32 " ms, %u copies per command\n"
+                "  Refresh: every %" PRIu32 " ms, start delay %" PRIu32 " ms%s, %u copies per command\n"
                 "  Preamble: %u frames of DARK slots (after a supply switch-on: %u)",
                 this->num_boards_, this->pin_, this->inverted_ ? " (inverted)" : "", this->rmt_symbols_,
                 this->use_dma_ ? " (DMA)" : "", this->bit0_high_ns_, this->bit0_low_ns_, this->bit1_high_ns_,
                 this->bit1_low_ns_, this->reset_ns_ / 1000, frame_us, frame_us ? 1000000 / frame_us : 0,
-                this->refresh_interval_ms_, static_cast<uint32_t>(this->start_delay_us_ / 1000), this->repeats_,
+                this->refresh_interval_ms_, this->start_delay_ms(),
+                this->start_delay_us_ < 0 ? " (auto: + a frame per command waiting, group changes share a start)" : "",
+                this->repeats_,
                 preamble_frames(this->num_boards_), power_on_preamble_frames(this->num_boards_));
   if (this->num_boards_ > 0 && this->sched_.has_config(0, ULTRA_CFG_BOOT_PROTOCOL)) {
     static const char *const MODES[] = {"auto", "WS2915", "WS2805", "Ultra"};

@@ -35,7 +35,8 @@ class UltraEffect : public light::LightEffect {
     // A periodic effect starts on the host clock's phase: lights started one after the other (an HA group or scene
     // sends one call per light) run exactly in step, on all data lines.
     const uint8_t fx = this->fx_();
-    const int64_t start = phase_start_us(this->light_->get_hub()->start_time_us(), effect_period_ms(fx, p, n, steps));
+    const int64_t at = this->light_->get_hub()->start_time_us(this->light_->get_board());
+    const int64_t start = phase_start_us(at, effect_period_ms(fx, p, n, steps));
     this->light_->start_effect(fx, p, n, steps, start);
   }
   void stop() override {

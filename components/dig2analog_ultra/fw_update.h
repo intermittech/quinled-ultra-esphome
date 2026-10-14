@@ -132,7 +132,9 @@ class UltraFirmwareUpdate final : public update::UpdateEntity, public PollingCom
   std::atomic<bool> dl_abort_{false};
   uint8_t *img_{nullptr};
   size_t img_size_{0};
-  uint32_t job_version_{0};  // the version of the image being installed
+  FwImageInfo job_image_;    // the release being installed (taken when the install starts)
+  std::string job_url_;
+  uint32_t job_version_{0};
   std::string status_text_;
 
   /// one download + session at a time on this ESP32 (each image takes up to 54 KB of heap); lines that install the

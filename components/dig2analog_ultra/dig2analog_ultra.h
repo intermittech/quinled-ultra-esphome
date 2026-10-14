@@ -29,6 +29,12 @@ namespace esphome::dig2analog_ultra {
 
 class UltraLight;
 using EncoderParams = FrameSymbols<rmt_symbol_word_t>;
+/// The encoder's argument: the bit symbols, and the underrun watch (diagnostics, only when watching).
+struct EncoderArg {
+  EncoderParams symbols;
+  UnderrunWatch watch;
+  bool watching{false};
+};
 
 /// One data line with num_boards QuinLED dig2analog boards in Ultra mode. The boards run transitions, gamma and
 /// effects themselves; this hub sends them commands (one 32-byte slot per board per frame, then a header with
@@ -46,6 +52,7 @@ class UltraHub final : public Component {
   void set_pin(uint8_t pin) { this->pin_ = pin; }
   void set_inverted(bool inverted) { this->inverted_ = inverted; }
   void set_num_boards(uint16_t n) { this->num_boards_ = n; }
+  void set_light_counts(const std::vector<uint8_t> &counts) { this->light_counts_ = counts; }
   void set_rmt_symbols(uint32_t n) { this->rmt_symbols_ = n; }
   void set_use_dma(bool use_dma) { this->use_dma_ = use_dma; }
   void set_timing(uint32_t bit0_high_ns, uint32_t bit0_low_ns, uint32_t bit1_high_ns, uint32_t bit1_low_ns,
@@ -58,7 +65,7 @@ class UltraHub final : public Component {
   }
   /// A frame at least this often (clock sync, state refresh), also when nothing changes.
   void set_refresh_interval(uint32_t ms) { this->refresh_interval_ms_ = ms; }
-  /// Commands take effect this long after they are queued, so all boards and all copies start together.
+  /// Commands take effect this long after they are queued (instead of the automatic lead, lead_us()).
   void set_start_delay(uint32_t ms) { this->start_delay_us_ = static_cast<int64_t>(ms) * 1000; }
   void set_repeats(uint8_t n) { this->repeats_ = n; }
   void set_power_on_delay(uint32_t ms) { this->power_on_delay_ms_ = ms; }
@@ -171,13 +178,15 @@ class UltraHub final : public Component {
   enum UpdateResult : uint8_t { UPD_NONE = 0, UPD_DONE, UPD_ABORTED, UPD_FAILED };
   /// image (descriptor + body) must stay valid until the session ends; false: busy, or the image is too small
   bool start_update(const uint8_t *image, size_t size, const UpdateSession::Options &opt);
-  bool update_running() const { return this->upd_state_.load() != UPD_IDLE || this->upd_quiet_; }
+  bool update_running() const {
+    return this->upd_state_.load() != UPD_IDLE || this->upd_quiet_ || this->upd_resync_pending_;
+  }
   /// 0..1 of the running session, and its pass (0-based)
   float update_progress() const;
   uint8_t update_pass() const { return this->upd_pass_.load(); }
   /// ABORT frames, then the session ends (boards that erased stay in their bootloader, waiting for a session)
   void abort_update() { this->upd_abort_.store(true); }
-  /// the result of the last session once its follow-up resync started (UPD_NONE until then); read once
+  /// the result of the last session once the resync after it sent its PING burst (UPD_NONE until then); read once
   UpdateResult take_update_result();
   /// One UPD frame on the wire incl. its reset (us)
   uint32_t update_frame_us() const;
@@ -192,14 +201,35 @@ class UltraHub final : public Component {
   PowerCycle power_cycle_state() const { return this->cycle_; }
 #endif
 
-  // For UltraLight / effects
-  int64_t start_time_us() const { return this->now_us_() + this->start_delay_us_; }
-  uint32_t start_delay_ms() const { return static_cast<uint32_t>(this->start_delay_us_ / 1000); }
+  // For UltraLight / effects / strips
+  /// The start of a command queued now (SET, EFFECT, ...). Commands queued close together share it, on every line
+  /// (GroupStart): a Home Assistant change to a light group or a scene starts at the same moment on every board.
+  int64_t start_time_us(uint16_t board);
+  /// The start of a streamed step (ESPHome's own effects): the same lead for every step, no groups.
+  int64_t stream_start_us() const { return this->now_us_() + this->stream_lead_us_(); }
+  /// How far ahead commands start when a board gets `commands` at once and `waiting` first copies are queued before
+  /// them (start_delay auto: start_lead_us()); a fixed start_delay, + a frame per further command.
+  int64_t lead_us(size_t commands, size_t waiting = 0) const;
+  /// The usual lead in ms (a light's power request covers its fade-out from there).
+  uint32_t start_delay_ms() const { return static_cast<uint32_t>(this->stream_lead_us_() / 1000); }
   /// One frame on the wire, worst case (us; 0 before setup)
   uint32_t get_frame_us() const { return this->frame_us_; }
   Scheduler &scheduler() { return this->sched_; }
+  uint8_t get_pin() const { return this->pin_; }
   void wake_();
   void add_light(UltraLight *light) { this->lights_.push_back(light); }
+
+  // Diagnostics (sensor platform dig2analog_ultra)
+  struct Diagnostics {
+    size_t queue_peak;    // the most commands queued for one board, since the last call
+    size_t memory_peak;   // the line's heap at its highest (state + queues), since the last call
+    uint32_t build_us;    // the longest frame build (us), since the last call
+    uint32_t underruns;   // RMT underruns since boot (watch_underruns)
+    uint32_t frames;      // frames sent since boot
+  };
+  Diagnostics take_diagnostics();
+  /// Count RMT underruns: the encoder notes the time of every RMT refill (~1 us each, in its interrupt).
+  void watch_underruns() { this->enc_.watching = true; }
 
  protected:
   static uint16_t clamp_u16_(float v, uint16_t lo, uint16_t hi) {
@@ -207,6 +237,10 @@ class UltraHub final : public Component {
   }
   static int64_t now_us_();
   void transmit_();
+  int64_t command_lead_us_() const;
+  int64_t stream_lead_us_() const {
+    return this->start_delay_us_ >= 0 ? this->start_delay_us_ : this->lead_us(this->max_lights_);
+  }
   void service_power_();
   void service_calibration_();
   bool any_lit_(uint32_t now) const;
@@ -222,10 +256,14 @@ class UltraHub final : public Component {
   uint32_t bit1_low_ns_{650};
   uint32_t reset_ns_{300000};
   uint32_t refresh_interval_ms_{200};
-  int64_t start_delay_us_{30000};
+  int64_t start_delay_us_{-1};   // -1: auto (lead_us)
+  uint8_t max_lights_{1};        // the most lights on one board of this line
+  static std::vector<UltraHub *> hubs_;   // every line: a group start must reach all of them
+  static GroupStart group_;
   uint8_t repeats_{3};
 
   Scheduler sched_;
+  std::vector<uint8_t> light_counts_;   // lights per board (setup: the other indices are cleared), then freed
   struct PendingConfig {
     int board;
     uint8_t id;
@@ -277,7 +315,12 @@ class UltraHub final : public Component {
 #endif
 
   uint8_t *tx_buf_{nullptr};
-  EncoderParams params_{};
+  bool tx_prepared_{false};      // tx_buf_ holds a frame the RMT refused: sent again first
+  bool tx_normal_{true};         // it is a normal / DARK frame (retime_frame gives it a new TIME)
+  bool tx_preamble_end_{false};  // it is the last frame of a full preamble
+  size_t tx_bytes_{0};
+  EncoderArg enc_{};
+  uint32_t build_peak_us_{0};   // the longest frame build since take_diagnostics()
   rmt_channel_handle_t channel_{nullptr};
   rmt_encoder_handle_t encoder_{nullptr};
 
@@ -293,6 +336,8 @@ class UltraHub final : public Component {
   std::atomic<uint32_t> upd_sent_{0};
   std::atomic<uint8_t> upd_pass_{0};
   uint32_t upd_total_{0};
+  bool upd_resync_pending_{false};  // after a session: the resync's PING burst is not out yet (result held back)
+  uint32_t upd_confirm_ms_{0};
   bool upd_quiet_{false};         // after a session: the line stays low while the boards commit and restart
   uint32_t upd_quiet_ms_{0};
   UpdateResult upd_done_{UPD_NONE};

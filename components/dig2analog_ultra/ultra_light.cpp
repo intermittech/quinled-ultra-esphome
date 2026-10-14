@@ -98,8 +98,10 @@ void UltraLight::setup_state(light::LightState *state) {
   const float gamma = state->get_gamma_correct();
   const uint16_t g = static_cast<uint16_t>(std::lround(gamma < 0.0f ? 0.0f : gamma > 65.0f ? 65000.0f : gamma * 1000.0f));
   this->hub_->scheduler().light_def(this->board_, this->index_, this->roles_, g, flags, this->min_, this->max_);
-  if (this->dtw_available_)
-    this->send_opt_();
+  // also without dim_to_warm, and no board effect (a restored one replaces this in the queue): a board that stayed
+  // powered while the ESP rebooted drops what an earlier configuration or run left on it
+  this->send_opt_();
+  this->stop_effect();
   if (this->power_on_effect_ != nullptr) {
     // power_on_effect: a fixed power-on scene (its values) and the effect the board runs on it. Fixed, so the board
     // writes them once, not with every change of the light.
@@ -247,24 +249,29 @@ void UltraLight::send_(const light::LightColorValues &v, uint32_t length, uint8_
   if (!this->layers_.empty())
     return;  // a strip shows on the light: kept, sent when it is gone
   if (stream) {
-    this->hub_->scheduler().light_stream(this->board_, this->index_, m, a, b, length, this->hub_->start_time_us());
+    this->hub_->scheduler().light_stream(this->board_, this->index_, m, a, b, length, this->hub_->stream_start_us());
   } else {
-    this->hub_->scheduler().light_set(this->board_, this->index_, flags, m, a, b, length, this->hub_->start_time_us());
+    this->hub_->scheduler().light_set(this->board_, this->index_, flags, m, a, b, length,
+                                      this->hub_->start_time_us(this->board_));
   }
   this->lit_(m, length);
   this->hub_->wake_();
 }
 
 void UltraLight::lit_(uint16_t m, uint32_t length_ms) {
-  if (this->on_ && m == 0)
+  if (this->on_ && m == 0) {
     this->off_until_ms_ = millis() + length_ms + this->hub_->start_delay_ms();   // fading out on the board
+    this->fading_out_ = true;
+  } else if (m != 0) {
+    this->fading_out_ = false;
+  }
   this->on_ = m != 0;
 }
 
 void UltraLight::send_pixel(uint16_t m, const uint16_t *a, const uint16_t *b, uint32_t length_ms, uint8_t flags,
                             bool stream, int64_t start_us) {
   if (start_us == 0)
-    start_us = this->hub_->start_time_us();
+    start_us = this->hub_->start_time_us(this->board_);
   if (stream) {
     this->hub_->scheduler().light_stream(this->board_, this->index_, m, a, b, length_ms, start_us);
   } else {
@@ -282,7 +289,7 @@ void UltraLight::layer_begin(UltraLayer *layer) {
     }
   }
   if (this->layers_.empty())
-    this->hub_->scheduler().hold_effect(this->board_, this->index_, this->hub_->start_time_us());
+    this->hub_->scheduler().hold_effect(this->board_, this->index_, this->hub_->start_time_us(this->board_));
   this->layers_.push_back(layer);
   this->hub_->wake_();
 }
@@ -322,8 +329,11 @@ void UltraLight::transition_start_(UltraTransition *t, const light::LightColorVa
 }
 
 void UltraLight::transition_done_(UltraTransition *t) {
-  if (this->transition_ == t)
+  if (this->transition_ == t) {
+    if (!t->is_finished())
+      this->sent_ = false;   // cut short: the board still fades to its end, so send the next values even if equal
     this->transition_ = nullptr;
+  }
 }
 
 // Instant changes (calls without transition, the end of a transition): the board jumps. Steps of ESPHome's own
@@ -343,13 +353,13 @@ void UltraLight::write_state(light::LightState *state) {
 void UltraLight::start_effect(uint8_t fx, const uint8_t *params, size_t n, const std::vector<Step> *steps,
                               int64_t start_us) {
   this->hub_->scheduler().light_effect(this->board_, this->index_, fx, params, n,
-                                       start_us != 0 ? start_us : this->hub_->start_time_us(), steps);
+                                       start_us != 0 ? start_us : this->hub_->start_time_us(this->board_), steps);
   this->hub_->wake_();
 }
 
 void UltraLight::stop_effect() {
   this->hub_->scheduler().light_effect(this->board_, this->index_, ULTRA_FX_NONE, nullptr, 0,
-                                       this->hub_->start_time_us());
+                                       this->hub_->start_time_us(this->board_));
   this->hub_->wake_();
 }
 

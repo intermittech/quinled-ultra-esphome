@@ -211,6 +211,26 @@ CASES = [
     ),
     ("ultra pwm_frequency 150 kHz", ULTRA + "  pwm_frequency: 150kHz\n", False, "pwm_frequency must be"),
     ("ultra pwm_frequency 33 kHz", ULTRA + "  pwm_frequency: 33kHz\n", True, None),
+    # start_delay: auto (default) or a fixed time up to 1 s
+    ("ultra start_delay auto", ULTRA + "  start_delay: auto\n", True, None),
+    ("ultra start_delay fixed", ULTRA + "  start_delay: 50ms\n", True, None),
+    ("ultra start_delay too long", ULTRA + "  start_delay: 2s\n", False, "start_delay must be auto or at most 1s"),
+    ("ultra start_delay bogus", ULTRA + "  start_delay: soon\n", False, "start_delay"),
+    # the line's diagnostics: optional sensors
+    (
+        "ultra diagnostics sensors",
+        ULTRA + "sensor:\n  - platform: dig2analog_ultra\n    update_interval: 10s\n    queue_peak:\n      name: q\n"
+        "    memory_peak:\n      name: m\n    frame_build_time:\n      name: b\n    rmt_underruns:\n      name: u\n"
+        "    frame_rate:\n      name: r\n",
+        True,
+        None,
+    ),
+    (
+        "ultra diagnostics unknown sensor",
+        ULTRA + "sensor:\n  - platform: dig2analog_ultra\n    heap_free:\n      name: h\n",
+        False,
+        "heap_free",
+    ),
     (
         "ultra settings",
         ULTRA + "  dithering: off_at_low_levels\n  dither_threshold: 2%\n  dim_floor: clamp\n  min_pulse: 150ns\n"
@@ -249,6 +269,56 @@ CASES = [
         ULTRA + "  power_limit:\n    max_channel_current: 3A\n",
         False,
         "max_channel_current needs channel_current",
+    ),
+    # currents go to the boards in mA (16 bit)
+    (
+        "ultra channel_current negative",
+        ULTRA + "  power_limit:\n    channel_current: -1A\n    max_channel_current: 2A\n",
+        False,
+        "value must be at least",
+    ),
+    (
+        "ultra channel_current above 65.535 A",
+        ULTRA + "  power_limit:\n    channel_current: 100A\n    max_channel_current: 2A\n",
+        False,
+        "value must be at most",
+    ),
+    (
+        "ultra max_channel_current above 65.535 A",
+        ULTRA + "  power_limit:\n    channel_current: 2A\n    max_channel_current: 100A\n",
+        False,
+        "value must be at most",
+    ),
+    (
+        "ultra power_limit currents at 0 and 65.535 A",
+        ULTRA + "  power_limit:\n    channel_current: {default: 65.535A, ch5: 0A}\n    max_channel_current: 65.535A\n",
+        True,
+        None,
+    ),
+    # signal_loss off / fade_off: a frame at least every half signal_loss_timeout (as sent: x 100 ms)
+    (
+        "ultra signal_loss with a slow refresh",
+        ULTRA + "  refresh_interval: 2s\n  signal_loss: fade_off\n  signal_loss_timeout: 500ms\n",
+        False,
+        "refresh_interval (2000 ms) must be at most half of signal_loss_timeout (500 ms)",
+    ),
+    (
+        "ultra signal_loss refresh at half the timeout",
+        ULTRA + "  refresh_interval: 250ms\n  signal_loss: \"off\"\n  signal_loss_timeout: 500ms\n",
+        True,
+        None,
+    ),
+    (
+        "ultra signal_loss timeout as sent (549 ms = 500 ms)",
+        ULTRA + "  refresh_interval: 260ms\n  signal_loss: \"off\"\n  signal_loss_timeout: 549ms\n",
+        False,
+        "must be at most half of signal_loss_timeout (500 ms)",
+    ),
+    (
+        "ultra signal_loss hold with a slow refresh",
+        ULTRA + "  refresh_interval: 2s\n  signal_loss: hold\n  signal_loss_timeout: 500ms\n",
+        True,
+        None,
     ),
     (
         "ultra calibrate_current lambda",

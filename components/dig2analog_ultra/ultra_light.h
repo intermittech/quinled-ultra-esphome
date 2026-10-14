@@ -143,7 +143,11 @@ class UltraLight final : public light::LightOutput, public light::LightRemoteVal
   void layer_end(UltraLayer *layer, uint32_t fade_ms);
   bool layer_top(const UltraLayer *layer) const { return !this->layers_.empty() && this->layers_.back() == layer; }
   /// On, or still fading out on the board (power supply request).
-  bool is_lit(uint32_t now_ms) const { return this->on_ || static_cast<int32_t>(this->off_until_ms_ - now_ms) > 0; }
+  bool is_lit(uint32_t now_ms) {
+    if (this->fading_out_ && static_cast<int32_t>(this->off_until_ms_ - now_ms) <= 0)
+      this->fading_out_ = false;
+    return this->on_ || this->fading_out_;
+  }
   bool has_rgb() const;
 
   /// The UltraLight behind a light's output, nullptr for other light platforms (no RTTI in ESPHome).
@@ -192,6 +196,7 @@ class UltraLight final : public light::LightOutput, public light::LightRemoteVal
 
   bool sent_{false};
   bool on_{false};
+  bool fading_out_{false};  // off_until_ms_ is a fade-out still running (is_lit retires it: no millis() wrap)
   uint32_t off_until_ms_{0};
   uint16_t last_m_{0}, last_a_[CHANNELS]{}, last_b_[CHANNELS]{};
 

@@ -102,6 +102,22 @@ update:
     status:
       name: Board firmware status
 
+# the line's diagnostics (sensor.py)
+sensor:
+  - platform: dig2analog_ultra
+    dig2analog_ultra_id: ultra
+    update_interval: 30s
+    queue_peak:
+      name: Ultra queue peak
+    memory_peak:
+      name: Ultra memory peak
+    frame_build_time:
+      name: Ultra frame build time
+    rmt_underruns:
+      name: Ultra RMT underruns
+    frame_rate:
+      name: Ultra frame rate
+
 button:
   - platform: template
     name: Calibrate board 1 at 25 %

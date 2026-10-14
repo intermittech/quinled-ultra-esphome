@@ -204,6 +204,16 @@ def _validate_reset(value):
     return value
 
 
+def _validate_start_delay(value):
+    """auto (default): the hub works out how far ahead commands start; or a fixed time up to 1 s."""
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    value = cv.positive_time_period_milliseconds(value)
+    if value.total_milliseconds > 1000:
+        raise cv.Invalid("start_delay must be auto or at most 1s")
+    return value
+
+
 def _validate_min_pulse(value):
     value = cv.positive_time_period_nanoseconds(value)
     ns = value.total_nanoseconds
@@ -223,10 +233,13 @@ POWER_LIMIT_SCHEMA = cv.Schema(
     {
         # LED current of each channel at 100 % (same on every board of this line). Needed for max_channel_current
         # and for boards without current sense; boards with it measure the board current (max_board_current).
-        cv.Optional(CONF_CHANNEL_CURRENT): _channel_map(cv.current, "channel_current"),
+        # (both are sent in mA: up to 65.535 A)
+        cv.Optional(CONF_CHANNEL_CURRENT): _channel_map(
+            cv.All(cv.current, cv.Range(min=0, max=65.535)), "channel_current"
+        ),
         # Limit per channel (e.g. its terminal / MOSFET rating); only that channel is held back.
         cv.Optional(CONF_MAX_CHANNEL_CURRENT): _channel_map(
-            cv.All(cv.current, cv.Range(min=0.01)), "max_channel_current", require_all=False
+            cv.All(cv.current, cv.Range(min=0.01, max=65.535)), "max_channel_current", require_all=False
         ),
         # Limit per board (e.g. below its fuse); all its channels are dimmed together. Boards with the input
         # current sense hold their measured current to it (without channel_current); the others estimate it.
@@ -296,11 +309,10 @@ CONFIG_SCHEMA = cv.All(
                 cv.positive_time_period_milliseconds,
                 cv.Range(min=cv.TimePeriod(milliseconds=20), max=cv.TimePeriod(seconds=10)),
             ),
-            # Commands take effect this long after they are sent, so all copies and boards start together.
-            cv.Optional(CONF_START_DELAY, default="30ms"): cv.All(
-                cv.positive_time_period_milliseconds,
-                cv.Range(max=cv.TimePeriod(milliseconds=1000)),
-            ),
+            # How far ahead commands start, so every copy and every board starts together. auto: from the frame
+            # time, the most lights on one board and what is queued; a Home Assistant change to a light group or a
+            # scene starts at the same moment everywhere (also across data lines).
+            cv.Optional(CONF_START_DELAY, default="auto"): _validate_start_delay,
             # Copies of every command (a corrupted frame does not lose it).
             cv.Optional(CONF_REPEATS, default=3): cv.int_range(min=1, max=8),
             # Board settings (sent to every board; runtime setters change them per board)
@@ -407,6 +419,15 @@ def _final_validate(configs):
     full = fv.full_config.get()
     _validate_rmt_memory(full)
     for conf in configs if isinstance(configs, list) else [configs]:
+        # signal_loss off / fade_off: a board switches off after signal_loss_timeout (sent in 100 ms) without a good
+        # frame; at rest a frame comes every refresh_interval, so one lost frame must not reach the timeout
+        refresh = int(conf[CONF_REFRESH_INTERVAL].total_milliseconds)
+        timeout = round(conf[CONF_SIGNAL_LOSS_TIMEOUT].total_milliseconds / 100) * 100
+        if conf[CONF_SIGNAL_LOSS] != "hold" and 2 * refresh > timeout:
+            raise cv.Invalid(
+                f"refresh_interval ({refresh} ms) must be at most half of signal_loss_timeout ({timeout} ms) with "
+                f"signal_loss: {conf[CONF_SIGNAL_LOSS]}, or a single lost frame switches the lights off"
+            )
         used = {}
         count = {}
         for light in _lights_of(full, conf[CONF_ID]):
@@ -473,6 +494,11 @@ async def to_code(config: ConfigType) -> None:
     if config[CONF_PIN][CONF_INVERTED]:
         cg.add(var.set_inverted(True))
     cg.add(var.set_num_boards(config[CONF_NUM_BOARDS]))
+    # lights per board: the hub clears the other light indices on the boards (left by an earlier configuration)
+    lights = _lights_of(CORE.config, config[CONF_ID])
+    cg.add(var.set_light_counts([
+        sum(light["board"] == b for light in lights) for b in range(config[CONF_NUM_BOARDS])
+    ]))
     cg.add(var.set_rmt_symbols(config[CONF_RMT_SYMBOLS]))
     if CONF_USE_DMA in config:
         cg.add(var.set_use_dma(config[CONF_USE_DMA]))
@@ -486,7 +512,8 @@ async def to_code(config: ConfigType) -> None:
         )
     )
     cg.add(var.set_refresh_interval(config[CONF_REFRESH_INTERVAL].total_milliseconds))
-    cg.add(var.set_start_delay(config[CONF_START_DELAY].total_milliseconds))
+    if config[CONF_START_DELAY] != "auto":
+        cg.add(var.set_start_delay(config[CONF_START_DELAY].total_milliseconds))
     cg.add(var.set_repeats(config[CONF_REPEATS]))
 
     # board settings: all boards (-1), sent at boot

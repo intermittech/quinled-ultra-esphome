@@ -1,0 +1,93 @@
+# Host tests, schema tests and ESP32 compiles of the QuinLED dig2analog Ultra components, on pinned versions.
+# The host tests compile the board firmware's light engine and check the protocol's test vectors: the firmware and
+# protocol repositories are checked out next to this one, where the tests look for them.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.13"
+  ESPHOME_VERSION: "2026.9.1"   # brings ESP-IDF 5.5.5 for the esp-idf framework
+  ZIGLANG_VERSION: "0.16.0"     # the host tests' C / C++ compiler
+  FIRMWARE_REF: main            # intermittech/quinled-ultra-firmware
+  PROTOCOL_REF: v0.2.3          # intermittech/quinled-ultra-protocol (ultra_protocol.h must match this tag)
+
+jobs:
+  host:
+    name: Host and schema tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: quinled-ultra-esphome
+      - uses: actions/checkout@v4
+        with:
+          repository: intermittech/quinled-ultra-firmware
+          ref: ${{ env.FIRMWARE_REF }}
+          path: quinled-ultra-firmware
+      - uses: actions/checkout@v4
+        with:
+          repository: intermittech/quinled-ultra-protocol
+          ref: ${{ env.PROTOCOL_REF }}
+          path: quinled-ultra-protocol
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install ESPHome and zig
+        run: pip install "esphome==${ESPHOME_VERSION}" "ziglang==${ZIGLANG_VERSION}"
+      - name: Ultra host test (scheduler, frames, the board engine)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_host_test.py
+      - name: Stream host test (glide of streamed steps)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_stream_host_test.py
+      - name: Lifecycle test (light setup, update entity, hub loop / transmit)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_lifecycle_test.py
+      - name: Schema tests
+        working-directory: quinled-ultra-esphome
+        run: python tests/validate_configs.py
+
+  compile:
+    name: Compile ${{ matrix.config }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - ultra/ultra-example.yaml
+          - ultra/ultra-strip.yaml
+          - examples-local/quinled-dig2analog-ultra-rgbcct.yaml
+          - examples-local/quinled-dig2analog-ultra-downlights.yaml
+          - examples-local/quinled-dig2analog-ultra-candle-niche.yaml
+          - examples-local/quinled-dig2analog-ultra-strip.yaml
+          - examples-local/quinled-dig2analog-ultra-strip-partition.yaml
+    env:
+      ESPHOME_ESP_IDF_PREFIX: /home/runner/esphome-idf   # ESPHome's ESP-IDF install, kept between runs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: /home/runner/esphome-idf
+          key: esp-idf-esphome-${{ env.ESPHOME_VERSION }}
+      - name: Install ESPHome
+        run: pip install "esphome==${ESPHOME_VERSION}"
+      - name: Configurations with the local components
+        run: |
+          python tests/local_examples.py
+          python tests/make_ultra_compile_config.py
+      - name: Compile
+        shell: bash   # with pipefail: the compile's exit status, not tee's
+        run: esphome compile "tests/build/${{ matrix.config }}" 2>&1 | tee compile.log
+      - name: RAM and flash
+        if: always()
+        run: |
+          echo "### ${{ matrix.config }}" >> "$GITHUB_STEP_SUMMARY"
+          grep -E "^(RAM|Flash):" compile.log | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY" || true

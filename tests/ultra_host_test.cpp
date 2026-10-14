@@ -1,8 +1,9 @@
 // Host test for components/dig2analog_ultra/ultra_core.h: ESPHome value mapping, PWM presets, the frame scheduler
-// (copies, ordering, replacement, refresh, start offsets, the power-on effect) and the bit encoder. With the board
-// firmware next to this repo (../quinled-ultra-firmware or ../dig2analog-ultra-5ch/firmware, or $ULTRA_FIRMWARE), the
-// frames also go through the boards' real engine: a chain of boards with drifting clocks, lost frames and a board that
-// reboots.
+// (copies, ordering, replacement, refresh, start offsets, the power-on effect, a full queue, streams taking turns) and
+// the bit encoder. With the board firmware next to this repo (../quinled-ultra-firmware or
+// ../dig2analog-ultra-5ch/firmware, or $ULTRA_FIRMWARE), the frames also go through the boards' real engine: a chain
+// of boards with drifting clocks, lost frames and a board that reboots; a board replaced during a stream, a long
+// transition joined late, a light removed from the YAML, the frames back after a signal-loss shutdown.
 // Build: python tests/run_ultra_host_test.py   (uses the ziglang pip package as C/C++ compiler)
 
 #include "../components/dig2analog_ultra/ultra_core.h"
@@ -19,6 +20,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -1088,6 +1090,8 @@ static void test_cal_sequencer() {
 struct SchedPeek : Scheduler {
   static size_t board_bytes() { return sizeof(Board); }
   static size_t light_bytes() { return sizeof(LightItems); }
+  static size_t cmd_bytes() { return sizeof(Cmd); }
+  void set_order(uint32_t order) { this->order_ = order; }
   size_t lights_allocated() const {
     size_t n = 0;
     for (const auto &b : this->boards_) {
@@ -1131,12 +1135,38 @@ static void test_fifty_boards() {
     s.build_frame(100000 + frames * 20000, f.data());
   CHECK(!s.pending() && frames == 6 && s.queue_capacity() == 0, "2 commands x 3 copies in %d frames, queues freed (%u)",
         frames, static_cast<unsigned>(s.queue_capacity()));
+  // the hub's boot: per board its CONFIG pages, one light (DEF, OPT, EFFECT none, SCENE, SCENE_EFFECT, SET) and the
+  // clearing of the 4 unused light indices, queued at once
+  size_t boot_bytes = 0;
+  {
+    SchedPeek boot;
+    boot.init(N, 5, 3);
+    bool all = true;
+    for (uint16_t b = 0; b < N; b++) {
+      for (uint8_t id = 1; id < ULTRA_CFG_COUNT; id++)
+        boot.set_config(b, id, 1);
+    }
+    boot.flush_config();
+    for (uint16_t b = 0; b < N; b++) {
+      boot.clear_unused_lights(b, 1);
+      boot.light_def(b, 0, MONO1, 1000, 0, z, one);
+      boot.light_opt(b, 0, 0, 0, 0, 0, 0);
+      boot.light_effect(b, 0, ULTRA_FX_NONE, nullptr, 0, 0);
+      boot.light_scene(b, 0, 0, 0, 0, z, one);
+      boot.light_scene_effect(b, 0, ULTRA_FX_NONE, nullptr, 0);
+      boot.light_set(b, 0, 0, 30000, one, one, 0, 0);
+      all &= boot.queued(b) == 3 + 4 * 3 + 6;
+    }
+    boot_bytes = boot.queue_capacity() * SchedPeek::cmd_bytes();
+    CHECK(all, "boot: 21 commands per board queued (%u)", static_cast<unsigned>(boot.queued(0)));
+  }
   std::printf("  frame %lld us (%lld frames/s), preamble 202 frames (~%.1f s), after a supply switch-on 10 (~%.2f s); hub RAM "
               "per board %u B + %u B per light in use (this host's pointer size)\n",
               static_cast<long long>(t_idle), 1000000LL / (t_idle + 300), 202 * (t_idle + 500) / 1e6,
               10 * (t_idle + 500) / 1e6, static_cast<unsigned>(SchedPeek::board_bytes()),
               static_cast<unsigned>(SchedPeek::light_bytes()));
   CHECK(SchedPeek::board_bytes() <= 512, "per-board state stays small (%u B)", static_cast<unsigned>(SchedPeek::board_bytes()));
+  std::printf("  boot: 21 commands per board, the queues take %.1f KB until they are sent\n", boot_bytes / 1024.0);
   // a pin calibration of all 50: dark, one board after the other in chain order, the dark hold covers it
   {
     CalRun r = run_cal(N, {}, -1, 0, true);
@@ -1156,6 +1186,382 @@ static void test_fifty_boards() {
   }
 }
 
+/// All of a board's commands queued at once (5 lights with an 8-step strobe each, every setting, IDENTIFY: 74
+/// commands, on each of 50 boards): none is dropped, every one goes out with its copies.
+static void test_queue_keeps_all() {
+  const uint16_t N = 50;
+  const uint16_t z[5] = {0, 0, 0, 0, 0}, one[5] = {65535, 65535, 65535, 65535, 65535};
+  std::vector<Step> steps(ULTRA_MAX_STEPS, Step{100, 0, 30000, {65535, 65535, 65535, 65535, 65535},
+                                                {65535, 65535, 65535, 65535, 65535}});
+  SchedPeek s;
+  s.init(N, 31, 3);
+  for (uint16_t b = 0; b < N; b++) {
+    for (uint8_t id = 1; id < ULTRA_CFG_COUNT; id++)
+      s.set_config(b, id, 1);
+    for (uint8_t l = 0; l < ULTRA_LIGHTS; l++) {
+      uint8_t roles[5] = {0, 0, 0, 0, 0};
+      roles[l] = ULTRA_ROLE_BRIGHTNESS;
+      const uint8_t strobe[1] = {ULTRA_MAX_STEPS};
+      s.light_def(b, l, roles, 1000, 0, z, one);
+      s.light_opt(b, l, 0, 0, 0, 0, 0);
+      s.light_set(b, l, 0, 30000, one, one, 100, 0);
+      s.light_scene(b, l, 0, 0, 0, z, one);
+      s.light_scene_effect(b, l, ULTRA_FX_NONE, nullptr, 0);
+      s.light_effect(b, l, ULTRA_FX_STROBE, strobe, 1, 0, &steps);
+    }
+    s.identify(b, true);
+  }
+  s.flush_config();
+  bool all = true;
+  for (uint16_t b = 0; b < N; b++)
+    all &= s.queued(b) == 74;
+  CHECK(all, "74 commands per board queued, none dropped (board 0: %u)", static_cast<unsigned>(s.queued(0)));
+  const size_t queue_bytes = s.queue_capacity() * SchedPeek::cmd_bytes();
+  // board 0's slots until the queues are empty (the refresh takes every 16th: counts are at least the copies)
+  std::vector<uint8_t> f(s.frame_bytes());
+  int light[ULTRA_LIGHTS][ULTRA_TYPES] = {}, board[ULTRA_TYPES] = {}, frames = 0;
+  for (; s.pending() && frames < 1000; frames++) {
+    s.build_frame(frames * 20000, f.data());
+    const uint8_t *sl = slot_of(f, 0), l = sl[1] >> 4;
+    if (sl[0] < ULTRA_TYPES)
+      (l < ULTRA_LIGHTS ? light[l][sl[0]] : board[sl[0]])++;
+  }
+  bool copies = board[ULTRA_CONFIG] >= 9 && board[ULTRA_IDENTIFY] == 3;
+  for (uint8_t l = 0; l < ULTRA_LIGHTS; l++) {
+    for (uint8_t t : {ULTRA_LIGHT_DEF, ULTRA_LIGHT_OPT, ULTRA_SET, ULTRA_EFFECT, ULTRA_SCENE, ULTRA_SCENE_EFFECT})
+      copies &= light[l][t] >= 3;
+    copies &= light[l][ULTRA_STEP] >= 3 * static_cast<int>(ULTRA_MAX_STEPS);
+  }
+  CHECK(!s.pending() && copies, "every command went out with its 3 copies (%d frames)", frames);
+  std::printf("  74 commands on each of 50 boards: all sent in %d frames; queues %.1f KB at most (%u B per command)\n",
+              frames, queue_bytes / 1024.0, static_cast<unsigned>(SchedPeek::cmd_bytes()));
+}
+
+/// Five lights of one board streamed faster than the line can send (a strip, ESPHome effects): they take turns, also
+/// when the queue's order counter wraps.
+static void test_stream_turns() {
+  const uint16_t one[5] = {65535, 65535, 65535, 65535, 65535};
+  for (uint32_t first : {0u, 0xFFFFFFFDu}) {
+    SchedPeek s;
+    s.init(50, 22, 1);
+    s.set_order(first);
+    std::vector<uint8_t> f(s.frame_bytes());
+    int sent[ULTRA_LIGHTS] = {};
+    for (int frame = 0; frame < 200; frame++) {
+      for (uint8_t l = 0; l < ULTRA_LIGHTS; l++)
+        s.light_stream(0, l, static_cast<uint16_t>(10000 + frame), one, one, 20, frame * 20000);
+      s.build_frame(frame * 20000, f.data());
+      if (f[0] == ULTRA_SET)
+        sent[f[1] >> 4]++;
+    }
+    const int least = *std::min_element(sent, sent + ULTRA_LIGHTS);
+    CHECK(least >= 30, "5 streamed lights take turns (order from %08x): the least served got %d of 200 slots",
+          static_cast<unsigned>(first), least);
+  }
+}
+
+/// One data line in test_group_start: its scheduler, frame time, when its next frame starts, and per board and light
+/// the start a command got and the end (TIME) of the frame that carried its first copy.
+struct GroupLine {
+  SchedPeek s;
+  uint16_t boards{0}, lights{0};
+  uint32_t frame_us{0};   // a frame, its reset and the gap to the next
+  int64_t next{0};
+  std::vector<uint8_t> f;
+  std::vector<int64_t> start, arrived;
+  void init(uint16_t n, uint16_t per_board, uint32_t seed, int64_t t0) {
+    const uint16_t z[5] = {0, 0, 0, 0, 0}, one[5] = {65535, 65535, 65535, 65535, 65535};
+    this->boards = n;
+    this->lights = per_board;
+    this->s.init(n, seed, 3);
+    this->f.assign(this->s.frame_bytes(), 0);
+    for (uint16_t b = 0; b < n; b++) {
+      for (uint8_t l = 0; l < per_board; l++) {
+        uint8_t roles[5] = {0, 0, 0, 0, 0};
+        roles[l] = ULTRA_ROLE_BRIGHTNESS;
+        this->s.light_def(b, l, roles, 1000, 0, z, one);
+      }
+    }
+    while (this->s.pending())
+      this->s.build_frame(0, this->f.data());
+    this->frame_us = static_cast<uint32_t>(this->s.build_idle_frame(0, this->f.data())) + 300 + 500;
+    this->next = t0 - 5000 + this->frame_us;   // a refresh frame went out 5 ms before the change
+    this->start.assign(static_cast<size_t>(n) * per_board, NO_START);
+    this->arrived.assign(static_cast<size_t>(n) * per_board, NO_START);
+  }
+};
+
+/// One Home Assistant change to every light of two lines (50 boards with 5 lights each, 10 boards with one), its calls
+/// arriving over 8 ms: with start_delay auto (start_lead_us, GroupStart, as UltraHub::start_time_us) they all share one
+/// start and every first copy is on the wire before it. A fixed 30 ms start delay is shown for comparison.
+static int run_group(bool automatic, int64_t &worst_late_us) {
+  const uint16_t one[5] = {65535, 65535, 65535, 65535, 65535};
+  const int64_t t0 = 10000000;
+  GroupLine a, b;
+  a.init(50, 5, 61, t0);
+  b.init(10, 1, 62, t0);
+  GroupStart group;
+  std::set<int64_t> starts;
+  // the calls: lights 0 and 1 (and the other line), 4 ms later lights 2 and 3, 4 ms later light 4
+  const struct {
+    int64_t at;
+    uint8_t first, last;
+    bool other;
+  } calls[] = {{t0, 0, 1, true}, {t0 + 4000, 2, 3, false}, {t0 + 8000, 4, 4, false}};
+  size_t call = 0;
+  while (call < 3 || a.s.pending() || b.s.pending()) {
+    const int64_t ta = a.s.pending() ? a.next : INT64_MAX, tb = b.s.pending() ? b.next : INT64_MAX;
+    if (call < 3 && calls[call].at <= std::min(ta, tb)) {
+      const auto &c = calls[call++];
+      for (GroupLine *line : {&a, &b}) {
+        if (line == &b && !c.other)
+          continue;
+        for (uint16_t bd = 0; bd < line->boards; bd++) {
+          for (uint8_t l = c.first; l <= c.last && l < line->lights; l++) {
+            int64_t start;
+            if (automatic) {
+              const int64_t lead = std::max(start_lead_us(a.frame_us, a.lights, a.s.waiting()),
+                                            start_lead_us(b.frame_us, b.lights, b.s.waiting()));
+              start = group.start(c.at, lead, start_lead_us(line->frame_us, 1, line->s.waiting(bd)) - START_SLACK_US);
+            } else {
+              start = c.at + 30000;
+            }
+            starts.insert(start);
+            line->start[bd * line->lights + l] = start;
+            line->s.light_set(bd, l, 0, 40000, one, one, 1000, start);
+          }
+        }
+        line->next = std::max(line->next, c.at);   // an idle line sends at once
+      }
+      continue;
+    }
+    GroupLine &line = ta <= tb ? a : b;
+    const int64_t end = line.s.build_frame(line.next, line.f.data());
+    for (uint16_t bd = 0; bd < line.boards; bd++) {
+      const uint8_t *sl = slot_of(line.f, bd);
+      const size_t i = bd * line.lights + (sl[1] >> 4);
+      if (sl[0] == ULTRA_SET && line.arrived[i] == NO_START)
+        line.arrived[i] = end;
+    }
+    line.next += line.frame_us;
+  }
+  int late = 0;
+  worst_late_us = INT64_MIN;
+  for (GroupLine *line : {&a, &b}) {
+    for (size_t i = 0; i < line->start.size(); i++) {
+      const int64_t by = line->arrived[i] - line->start[i];
+      late += by > 0;
+      worst_late_us = std::max(worst_late_us, by);
+    }
+  }
+  return automatic ? (starts.size() == 1 ? late : -1) : late;
+}
+
+static void test_group_start() {
+  GroupStart g;
+  CHECK(g.start(1000, 50000, 20000) == 51000 && g.start(21000, 50000, 20000) == 51000 &&
+            g.start(31001, 50000, 20000) == 81001,
+        "group start: joined while reachable, a new group after");
+  CHECK(start_lead_us(18000, 5, 2) == 18000 * 9 + START_SLACK_US && start_lead_us(18000, 10, 6) == 18000 * 19 + START_SLACK_US,
+        "lead: the frame on the wire, the commands and those waiting, a refresh slot per 15");
+  int64_t worst_auto = 0, worst_fixed = 0;
+  const int late_auto = run_group(true, worst_auto), late_fixed = run_group(false, worst_fixed);
+  CHECK(late_auto == 0, "start_delay auto: one start for the whole change, every first copy before it (%d late, by up to "
+        "%lld us)", late_auto, static_cast<long long>(worst_auto));
+  std::printf("  group change, 50 boards x 5 lights + 10 boards x 1, calls over 8 ms: auto: one start, the last first "
+              "copy %.1f ms before it; fixed 30 ms: %d of 260 first copies late (up to %.1f ms)\n",
+              -worst_auto / 1000.0, late_fixed, worst_fixed / 1000.0);
+}
+
+/// Diagnostics: first copies waiting (start_lead_us), the queue's peak, the line's memory, RMT underruns.
+static void test_diagnostics_counts() {
+  const uint16_t one[5] = {65535, 65535, 65535, 65535, 65535};
+  SchedPeek s;
+  s.init(2, 9, 3);
+  std::vector<uint8_t> f(s.frame_bytes());
+  for (uint8_t l = 0; l < 3; l++)
+    s.light_set(0, l, 0, 1000, one, one, 0, 0);
+  s.light_set(1, 0, 0, 1000, one, one, 0, 0);
+  s.light_set(0, 0, 0, 2000, one, one, 0, 0);   // replaces an unsent one: still 3 waiting
+  CHECK(s.waiting() == 3, "3 first copies waiting on board 0 (%u)", static_cast<unsigned>(s.waiting()));
+  s.build_frame(0, f.data());
+  CHECK(s.waiting() == 2, "one frame later 2 (%u)", static_cast<unsigned>(s.waiting()));
+  CHECK(s.take_queue_peak() == 3 && s.take_queue_peak() == 0, "queue peak 3, then reset");
+  const size_t mem = s.take_memory_peak();
+  CHECK(mem >= 2 * SchedPeek::board_bytes() + 4 * SchedPeek::light_bytes() + 4 * SchedPeek::cmd_bytes(),
+        "memory peak: boards, lights in use and the queue (%u B)", static_cast<unsigned>(mem));
+  while (s.pending())
+    s.build_frame(0, f.data());
+  s.take_memory_peak();   // the queues' peak since the last call
+  CHECK(s.waiting() == 0 && s.take_memory_peak() == 2 * SchedPeek::board_bytes() + 4 * SchedPeek::light_bytes(),
+        "queues empty and freed: memory is the state only");
+
+  UnderrunWatch w;
+  w.drain_us = 250;   // 192 symbols at 1.3 us
+  const int64_t fills[] = {0, 120, 245, 370, 495, 900, 1020};   // a 405 us gap after 495
+  for (size_t i = 0; i < 7; i++)
+    w.fill(fills[i], i == 0);
+  w.fill(50000, true);   // the next frame's first fill, after a pause: not an underrun
+  w.fill(50125, false);
+  CHECK(w.count == 1, "underruns: one refill came too late (%u)", static_cast<unsigned>(w.count));
+}
+
+#ifdef WITH_ENGINE
+/// One frame to the board on slot `slot`, whose clock ticks with the host's (50 us per tick, + tick_offset).
+static void feed(ultra_t &u, const std::vector<uint8_t> &f, int slot, int64_t frame_end_us, uint32_t tick_offset = 0) {
+  uint32_t hus;
+  ultra_parse_header(hdr_of(f), &hus);
+  const uint32_t tick = static_cast<uint32_t>(frame_end_us / 50) + tick_offset;
+  ultra_on_header(&u, tick, hus);
+  ultra_on_slot(&u, slot_of(f, slot), tick);
+}
+
+/// Every queued command sent (to boards that miss them).
+static void drain(Scheduler &s, std::vector<uint8_t> &f, int64_t start_us) {
+  for (int i = 0; s.pending() && i < 1000; i++)
+    s.build_frame(start_us + i * 20000, f.data());
+}
+
+/// A board replaced (or rebooted) while its light streams every frame: the stream leaves every 16th slot to the
+/// refresh, so the new board gets its CONFIG and light definition and shows the stream.
+static void test_refresh_under_stream() {
+  const uint16_t z[5] = {0, 0, 0, 0, 0}, one[5] = {65535, 65535, 65535, 65535, 65535};
+  Scheduler s;
+  s.init(50, 2, 3);
+  s.set_config(0, ULTRA_CFG_PWM_PRESET, 8);
+  s.flush_config();
+  s.light_def(0, 0, MONO1, 1000, 0, z, one);
+  s.light_set(0, 0, 0, 30000, one, one, 0, 0);
+  std::vector<uint8_t> f(s.frame_bytes());
+  drain(s, f, 0);
+  ultra_t u;
+  ultra_init(&u, 3);   // the new board
+  int64_t end = 0;
+  for (int i = 0; i < 256; i++) {
+    const int64_t now = 10000000 + i * 20000;
+    s.light_stream(0, 0, static_cast<uint16_t>(30000 + i), one, one, 20, now);
+    end = s.build_frame(now, f.data());
+    feed(u, f, 0, end);
+  }
+  uint16_t out[5];
+  ultra_render(&u, static_cast<uint32_t>(end / 50) + 40, out);
+  CHECK(u.light[0].defined && (u.cfg_valid & (1u << ULTRA_CFG_PWM_PRESET)) && out[4] > 29000,
+        "a board new during a stream gets its CONFIG and definition (defined %u, output %u)", u.light[0].defined, out[4]);
+}
+
+/// A long transition refreshed to a board that missed it (a 120 s fade; the board joins after 40 s, after 300 s):
+/// past the SET's 32.8 s start offset it still ends on time, and an expired one shows its target at once.
+static void test_old_transition() {
+  const uint16_t z[5] = {0, 0, 0, 0, 0}, one[5] = {65535, 65535, 65535, 65535, 65535};
+  for (int late_s : {40, 300}) {
+    Scheduler s;
+    s.init(1, 4, 1);
+    s.light_def(0, 0, MONO1, 1000, 0, z, one);
+    s.light_set(0, 0, 0, 40000, one, one, 120000, 0);   // from host time 0 to 120 s
+    std::vector<uint8_t> f(s.frame_bytes());
+    drain(s, f, 0);
+    ultra_t u;
+    ultra_init(&u, 5);
+    int64_t end = 0;
+    for (int i = 0; i < 6; i++) {   // the refresh: DEF, SET, ...
+      end = s.build_frame(late_s * 1000000LL + i * 1000, f.data());
+      feed(u, f, 0, end);
+    }
+    uint16_t before[5], after[5];
+    if (late_s == 40) {
+      ultra_render(&u, 119000000 / 50, before);
+      ultra_render(&u, 121000000 / 50, after);
+      CHECK(before[4] < 40000 && after[4] == 40000, "joined after 40 s: the fade ends at 120 s (%u at 119 s, %u at 121 s)",
+            before[4], after[4]);
+    } else {
+      ultra_render(&u, static_cast<uint32_t>(end / 50) + 20, after);
+      CHECK(after[4] == 40000, "joined after 300 s: the target at once (%u)", after[4]);
+    }
+  }
+}
+
+/// A light removed from the YAML (index 4 of a board that stayed powered while the ESP rebooted): the new hub clears
+/// the index, also by the refresh alone (the board missed the queued copies): no output, no scene, no effect.
+static void test_removed_light() {
+  const uint16_t z[5] = {0, 0, 0, 0, 0}, one[5] = {65535, 65535, 65535, 65535, 65535};
+  const uint8_t CH1[5] = {ULTRA_ROLE_BRIGHTNESS, 0, 0, 0, 0};
+  ultra_t u;
+  ultra_init(&u, 10);
+  {
+    Scheduler old;   // the earlier configuration: light 4 on CH1, on, in the power-on scene with a breathe
+    old.init(1, 6, 1);
+    old.light_def(0, 4, CH1, 1000, 0, z, one);
+    old.light_set(0, 4, 0, 40000, one, one, 0, 0);
+    old.light_scene(0, 4, 1, 0, 40000, one, one);
+    uint8_t breathe[7] = {};
+    ultra_put24(breathe, 4000);
+    old.light_scene_effect(0, 4, ULTRA_FX_BREATHE, breathe, 3);
+    std::vector<uint8_t> f(old.frame_bytes());
+    for (int i = 0; i < 8; i++)
+      feed(u, f, 0, old.build_frame(100000 + i * 1000, f.data()));
+  }
+  CHECK(u.light[4].mask == 1 && u.light[4].scene_mode == 1 && u.light[4].scene_fx == ULTRA_FX_BREATHE,
+        "light 4 set up by the earlier configuration");
+  Scheduler next;   // the new configuration: one light (index 0) on this board
+  next.init(1, 7, 1);
+  next.clear_unused_lights(0, 1);
+  std::vector<uint8_t> f(next.frame_bytes());
+  drain(next, f, 500000);
+  int64_t end = 0;
+  for (int i = 0; i < 50; i++) {
+    end = next.build_frame(1000000 + i * 1000, f.data());
+    feed(u, f, 0, end, 200000);   // the board's clock ran on, the host's restarted
+  }
+  uint16_t out[5];
+  ultra_render(&u, static_cast<uint32_t>(end / 50) + 200000 + 20, out);
+  CHECK(out[0] == 0 && u.light[4].mask == 0 && u.light[4].scene_mode == 0 && u.light[4].scene_fx == ULTRA_FX_NONE,
+        "removed light 4 cleared by the refresh (output %u, mask %u, scene %u, effect %u)", out[0], u.light[4].mask,
+        u.light[4].scene_mode, u.light[4].scene_fx);
+}
+
+/// signal_loss off / fade_off: a board switches its lights off by itself (ultra_all_off, as its main loop does) and
+/// keeps its state otherwise; once the frames are back, the unchanged refresh brings back the light and its effect.
+/// Board firmware without the fix keeps the SEQs it applied and ignores that refresh: reported, not failed.
+static void test_signal_loss_recovery() {
+  const uint16_t z[5] = {0, 0, 0, 0, 0}, one[5] = {65535, 65535, 65535, 65535, 65535};
+  for (uint32_t fade_ms : {0u, 500u}) {
+    Scheduler s;
+    s.init(1, 18, 1);
+    s.light_def(0, 0, MONO1, 1000, 0, z, one);
+    s.light_set(0, 0, 0, 40000, one, one, 0, 0);
+    uint8_t breathe[7] = {};
+    ultra_put24(breathe, 4000);
+    ultra_put16(breathe + 3, 10000);
+    ultra_put16(breathe + 5, 65535);
+    s.light_effect(0, 0, ULTRA_FX_BREATHE, breathe, 7, 0);
+    ultra_t u;
+    ultra_init(&u, 19);
+    std::vector<uint8_t> f(s.frame_bytes());
+    for (int i = 0; i < 12; i++)
+      feed(u, f, 0, s.build_frame(100000 + i * 1000, f.data()));
+    const uint32_t lost = 2400;   // tick: the data line went quiet for signal_loss_timeout
+    uint16_t out[5];
+    ultra_all_off(&u, lost, fade_ms);
+    ultra_render(&u, lost + fade_ms * 20 + 100, out);
+    CHECK(out[4] == 0, "signal loss (fade %u ms): the light goes off (%u)", fade_ms, out[4]);
+    if (u.last_seq[0][ULTRA_SET] != 0x100u) {
+      if (fade_ms == 0)
+        std::printf("  signal loss: this board firmware keeps its SEQs after switching off; the unchanged refresh "
+                    "can't bring the light back (it stays off until the next change)\n");
+      continue;
+    }
+    for (int i = 0; i < 12; i++)
+      feed(u, f, 0, s.build_frame(1000000 + i * 1000, f.data()));
+    ultra_render(&u, 20300, out);
+    CHECK(out[4] > 0 && u.light[0].fx == ULTRA_FX_BREATHE,
+          "signal loss (fade %u ms): the refresh brings back the light and its effect (%u, effect %u)", fade_ms,
+          out[4], u.light[0].fx);
+    if (fade_ms == 0)
+      std::printf("  signal loss off / fade off: the unchanged refresh brings the light and its effect back\n");
+  }
+}
+#endif
+
 int main() {
   test_mapping();
   test_scheduler();
@@ -1165,12 +1571,20 @@ int main() {
   test_cal_sequencer();
   test_fifty_boards();
   test_scene_effect();
+  test_queue_keeps_all();
+  test_stream_turns();
+  test_group_start();
+  test_diagnostics_counts();
 #ifdef WITH_ENGINE
   test_config_frames();
   test_scene_path();
   test_dtw_path();
   test_dtw_points_path();
   test_chain();
+  test_refresh_under_stream();
+  test_old_transition();
+  test_removed_light();
+  test_signal_loss_recovery();
 #else
   std::printf("  (board firmware not found: chain test with the board engine skipped)\n");
 #endif

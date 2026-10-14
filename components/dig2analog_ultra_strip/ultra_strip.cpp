@@ -111,7 +111,7 @@ bool UltraStrip::buffer_lit_() const {
   return false;
 }
 
-// When a write starts on the boards: the hub's start delay, plus one frame for every further pixel on the busiest board.
+// When a write starts on the boards: the hub's lead for as many commands as the busiest board gets (its pixels there).
 // A board gets one slot per frame (first copies first), so all pixels of a step are there before they start, and a
 // chase over several lights of one board stays in step at any chain length.
 int64_t UltraStrip::start_now_() {
@@ -124,7 +124,7 @@ int64_t UltraStrip::start_now_() {
       for (const auto &q : this->pixels_)
         count += q.light->get_hub() == hub && q.light->get_board() == p.light->get_board();
       ready &= hub->get_frame_us() != 0;  // known after the hub's setup
-      const int64_t l = static_cast<int64_t>(hub->start_delay_ms()) * 1000 + (count - 1) * (hub->get_frame_us() + 500);
+      const int64_t l = hub->lead_us(static_cast<size_t>(count));
       lead = l > lead ? l : lead;
     }
     if (!ready)

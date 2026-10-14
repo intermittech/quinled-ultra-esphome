@@ -163,6 +163,47 @@ inline uint16_t power_on_preamble_frames(uint16_t boards) {
   return full < POWER_ON_PREAMBLE_FRAMES ? full : POWER_ON_PREAMBLE_FRAMES;
 }
 
+/// How far ahead a command starts (start_delay: auto), so it is on the wire before it starts: the frame that may be on
+/// the wire now, then one frame per command for the busiest board (a board gets one slot per frame, first copies
+/// first): `commands` new ones and `waiting` first copies queued before them, and every 16th slot may be a refresh
+/// (Scheduler::build_frame); + slack for ESPHome's loop. frame_us: one frame and the gap after it. One Home Assistant
+/// change to a light group or a scene gives every light a command: with commands = the most lights on one board,
+/// they all start together.
+static constexpr int64_t START_SLACK_US = 10000;
+inline int64_t start_lead_us(uint32_t frame_us, size_t commands, size_t waiting) {
+  const size_t n = commands + waiting;
+  return static_cast<int64_t>(frame_us) * static_cast<int64_t>(1 + n + (n + 14) / 15) + START_SLACK_US;
+}
+
+/// Commands queued close together (one Home Assistant call to a light group or a scene, an automation: a call per
+/// light, a few ms apart) share one start, also across data lines. The first opens a group, lead_us ahead; the next
+/// ones join while their own first copy is still out by then (reach_us), else they open the next group.
+class GroupStart {
+ public:
+  int64_t start(int64_t now_us, int64_t lead_us, int64_t reach_us) {
+    if (this->start_ == NO_START || now_us + reach_us > this->start_)
+      this->start_ = now_us + lead_us;
+    return this->start_;
+  }
+
+ protected:
+  int64_t start_{NO_START};
+};
+
+/// RMT underruns (diagnostics): the encoder refills the RMT memory from its interrupt. Two refills further apart than
+/// the whole memory takes to go out at the shortest bit mean the line ran out of symbols: that frame was broken.
+struct UnderrunWatch {
+  int64_t drain_us{0};   // the RMT memory on the wire at the shortest bit
+  int64_t last_us{0};
+  volatile uint32_t count{0};
+  /// a refill at now_us; first: the frame's first fill (before it starts)
+  ULTRA_ALWAYS_INLINE void fill(int64_t now_us, bool first) {
+    if (!first && now_us - this->last_us > this->drain_us)
+      this->count = this->count + 1;
+    this->last_us = now_us;
+  }
+};
+
 /// Builds the frames: one slot per board, then the header (a trailer: its TIME is the host clock at the frame's
 /// last bit, the moment every board sees the line go quiet). Each board has an urgent queue (commands, each sent
 /// `repeats` times, first copies first) and a refresh list (its current CONFIG, light definitions, states and
@@ -174,9 +215,11 @@ class Scheduler {
   void init(uint16_t num_boards, uint32_t seed, uint8_t repeats = 3) {
     this->repeats_ = repeats == 0 ? 1 : repeats;
     this->boards_.clear();
+    this->queue_peak_ = this->queue_bytes_ = this->queue_bytes_peak_ = 0;
     this->boards_.resize(num_boards);
     this->starts_.assign(num_boards, NO_START);
     this->floors_.assign(num_boards, 0);
+    this->durations_.assign(num_boards, 0);
     for (auto &b : this->boards_) {
       for (auto &row : b.seq) {
         for (auto &s : row) {
@@ -252,7 +295,7 @@ class Scheduler {
           continue;
         ultra_slot_config(it.slot, this->next_seq_(b, ULTRA_LIGHT_BOARD, ULTRA_CONFIG), ids, vals, n);
         it.start_us = NO_START;
-        this->queue_(b, it, key_(ULTRA_LIGHT_BOARD, ULTRA_CONFIG, page));
+        this->queue_(b, key_(ULTRA_LIGHT_BOARD, ULTRA_CONFIG, page));
       }
     }
   }
@@ -267,7 +310,7 @@ class Scheduler {
                          max_p);
     it.valid = true;
     it.start_us = NO_START;
-    this->queue_(b, it, key_(light, ULTRA_LIGHT_DEF, 0));
+    this->queue_(b, key_(light, ULTRA_LIGHT_DEF, 0));
   }
 
   void light_set(uint16_t board, uint8_t light, uint8_t flags, uint16_t m, const uint16_t *a, const uint16_t *bb,
@@ -280,7 +323,7 @@ class Scheduler {
     it.valid = true;
     it.start_us = start_us;
     it.stream = false;
-    this->queue_(b, it, key_(light, ULTRA_SET, 0));
+    this->queue_(b, key_(light, ULTRA_SET, 0));
   }
 
   /// A streamed step (a host-side effect step, a strip pixel): a linear SET over glide_ms, sent once (a lost one is
@@ -298,7 +341,7 @@ class Scheduler {
     it.start_us = start_us;
     it.stream = true;
     it.glide_ms = glide_ms;
-    this->queue_(b, it, key_(light, ULTRA_SET, 0), 1);
+    this->queue_(b, key_(light, ULTRA_SET, 0), 1);
   }
 
   /// Light options (LIGHT_OPT): dim to warm with the LEDs' and the warm end's mireds x 10, red assist (Q16), and
@@ -314,7 +357,7 @@ class Scheduler {
                                 ww_mired10, warm_mired10, red_assist, n, pt_m, pt_mired10);
     it.valid = true;
     it.start_us = NO_START;
-    this->queue_(b, it, key_(light, ULTRA_LIGHT_OPT, 0));
+    this->queue_(b, key_(light, ULTRA_LIGHT_OPT, 0));
   }
 
   /// Power-on scene of a light (stored by the board when its outputs change): mode 0 = not in the scene, 1 = show
@@ -328,7 +371,7 @@ class Scheduler {
     ultra_slot_scene(it.slot, light, this->next_seq_(b, light, ULTRA_SCENE), mode, fade_100ms, m, a, bb);
     it.valid = true;
     it.start_us = NO_START;
-    this->queue_(b, it, key_(light, ULTRA_SCENE, 0));
+    this->queue_(b, key_(light, ULTRA_SCENE, 0));
   }
 
   /// Power-on effect of a light (SCENE_EFFECT, protocol 0.2.3): fx (FX_NONE = none) and its parameters (as EFFECT),
@@ -348,7 +391,7 @@ class Scheduler {
                             static_cast<uint32_t>(n));
     it.valid = true;
     it.start_us = NO_START;
-    this->queue_(b, it, key_(light, ULTRA_SCENE_EFFECT, 0));
+    this->queue_(b, key_(light, ULTRA_SCENE_EFFECT, 0));
   }
 
   /// Effect (FX_NONE stops it) at start_us; strobe steps are sent along (count in params[0]). While the light's
@@ -377,11 +420,11 @@ class Scheduler {
     // a new effect drops the old one's steps, also from the queue
     li.steps.clear();
     this->unqueue_(b, key_(light, ULTRA_STEP, 0), true);
-    this->queue_(b, li.effect, key_(light, ULTRA_EFFECT, 0));
+    this->queue_(b, key_(light, ULTRA_EFFECT, 0));
     if (steps != nullptr) {
       this->make_steps_(li.steps, light, seq, *steps);
       for (size_t i = 0; i < li.steps.size(); i++)
-        this->queue_(b, li.steps[i], key_(light, ULTRA_STEP, static_cast<uint8_t>(i)));
+        this->queue_(b, key_(light, ULTRA_STEP, static_cast<uint8_t>(i)));
     }
   }
 
@@ -421,9 +464,9 @@ class Scheduler {
       ultra_slot_seal(st.slot);
     }
     this->unqueue_(b, key_(light, ULTRA_STEP, 0), true);
-    this->queue_(b, li.effect, key_(light, ULTRA_EFFECT, 0));
+    this->queue_(b, key_(light, ULTRA_EFFECT, 0));
     for (size_t i = 0; i < li.steps.size(); i++)
-      this->queue_(b, li.steps[i], key_(light, ULTRA_STEP, static_cast<uint8_t>(i)));
+      this->queue_(b, key_(light, ULTRA_STEP, static_cast<uint8_t>(i)));
   }
   bool effect_held(uint16_t board, uint8_t light) const {
     return this->valid_(board, light) && this->boards_[board].light[light] && this->boards_[board].light[light]->held;
@@ -433,11 +476,11 @@ class Scheduler {
     if (board >= this->boards_.size())
       return;
     Board &b = this->boards_[board];
-    Item it;
+    Item &it = b.identify;
     ultra_slot_identify(it.slot, this->next_seq_(b, ULTRA_LIGHT_BOARD, ULTRA_IDENTIFY), on ? 1 : 0);
     it.valid = true;
     it.start_us = NO_START;
-    this->queue_(b, it, key_(ULTRA_LIGHT_BOARD, ULTRA_IDENTIFY, 0));
+    this->queue_(b, key_(ULTRA_LIGHT_BOARD, ULTRA_IDENTIFY, 0));
   }
 
   /// The board blinks its firmware version once on its feedback channel (IDENTIFY 5, protocol 0.2.1). Boards with
@@ -446,11 +489,11 @@ class Scheduler {
     if (board >= this->boards_.size())
       return;
     Board &b = this->boards_[board];
-    Item it;
+    Item &it = b.identify;
     ultra_slot_identify(it.slot, this->next_seq_(b, ULTRA_LIGHT_BOARD, ULTRA_IDENTIFY), ULTRA_IDENT_VERSION);
     it.valid = true;
     it.start_us = NO_START;
-    this->queue_(b, it, key_(ULTRA_LIGHT_BOARD, ULTRA_IDENTIFY, 0));
+    this->queue_(b, key_(ULTRA_LIGHT_BOARD, ULTRA_IDENTIFY, 0));
   }
 
   /// Dark hold: the board fades dark (0.3 s) and stays dark for hold_s seconds (0 = 60) or until release_dark();
@@ -459,21 +502,21 @@ class Scheduler {
     if (board >= this->boards_.size())
       return;
     Board &b = this->boards_[board];
-    Item it;
+    Item &it = b.identify;
     ultra_slot_hold_dark(it.slot, this->next_seq_(b, ULTRA_LIGHT_BOARD, ULTRA_IDENTIFY), hold_s);
     it.valid = true;
     it.start_us = NO_START;
-    this->queue_(b, it, key_(ULTRA_LIGHT_BOARD, ULTRA_IDENTIFY, 0));
+    this->queue_(b, key_(ULTRA_LIGHT_BOARD, ULTRA_IDENTIFY, 0));
   }
   void release_dark(uint16_t board) {
     if (board >= this->boards_.size())
       return;
     Board &b = this->boards_[board];
-    Item it;
+    Item &it = b.identify;
     ultra_slot_identify(it.slot, this->next_seq_(b, ULTRA_LIGHT_BOARD, ULTRA_IDENTIFY), ULTRA_IDENT_RELEASE);
     it.valid = true;
     it.start_us = NO_START;
-    this->queue_(b, it, key_(ULTRA_LIGHT_BOARD, ULTRA_IDENTIFY, 0));
+    this->queue_(b, key_(ULTRA_LIGHT_BOARD, ULTRA_IDENTIFY, 0));
   }
   /// The board's last IDENTIFY (identify, calibrate, dark, release) still has copies to send.
   bool identify_pending(uint16_t board) const {
@@ -493,11 +536,11 @@ class Scheduler {
     if (board >= this->boards_.size())
       return;
     Board &b = this->boards_[board];
-    Item it;
+    Item &it = b.identify;
     ultra_slot_calibrate(it.slot, this->next_seq_(b, ULTRA_LIGHT_BOARD, ULTRA_IDENTIFY), duty_pct);
     it.valid = true;
     it.start_us = NO_START;
-    this->queue_(b, it, key_(ULTRA_LIGHT_BOARD, ULTRA_IDENTIFY, 0));
+    this->queue_(b, key_(ULTRA_LIGHT_BOARD, ULTRA_IDENTIFY, 0));
   }
 
   /// Everything again as urgent commands, transitions restarted at start_us (boards that were powered up meanwhile
@@ -507,28 +550,44 @@ class Scheduler {
     for (auto &b : this->boards_) {
       for (uint8_t p = 0; p < CONFIG_PAGES; p++) {
         if (b.config[p].valid)
-          this->queue_(b, b.config[p], key_(ULTRA_LIGHT_BOARD, ULTRA_CONFIG, p));
+          this->queue_(b, key_(ULTRA_LIGHT_BOARD, ULTRA_CONFIG, p));
       }
       for (uint8_t l = 0; l < ULTRA_LIGHTS; l++) {
         if (!b.light[l])
           continue;
         LightItems &li = *b.light[l];
         if (li.def.valid)
-          this->queue_(b, li.def, key_(l, ULTRA_LIGHT_DEF, 0));
+          this->queue_(b, key_(l, ULTRA_LIGHT_DEF, 0));
         if (li.opt.valid)
-          this->queue_(b, li.opt, key_(l, ULTRA_LIGHT_OPT, 0));
+          this->queue_(b, key_(l, ULTRA_LIGHT_OPT, 0));
         if (li.set.valid) {
           li.set.start_us = start_us;
-          this->queue_(b, li.set, key_(l, ULTRA_SET, 0));
+          this->queue_(b, key_(l, ULTRA_SET, 0));
         }
         if (li.effect.valid)
-          this->queue_(b, li.effect, key_(l, ULTRA_EFFECT, 0));
+          this->queue_(b, key_(l, ULTRA_EFFECT, 0));
         if (li.scene.valid)
-          this->queue_(b, li.scene, key_(l, ULTRA_SCENE, 0));
+          this->queue_(b, key_(l, ULTRA_SCENE, 0));
         if (li.scene_fx.valid)
-          this->queue_(b, li.scene_fx, key_(l, ULTRA_SCENE_EFFECT, 0));
+          this->queue_(b, key_(l, ULTRA_SCENE_EFFECT, 0));
         for (size_t i = 0; i < li.steps.size(); i++)
-          this->queue_(b, li.steps[i], key_(l, ULTRA_STEP, static_cast<uint8_t>(i)));
+          this->queue_(b, key_(l, ULTRA_STEP, static_cast<uint8_t>(i)));
+      }
+    }
+  }
+
+  /// The board's lights from first_unused on are not in the YAML (any more): an empty LIGHT_DEF (no channels), SCENE
+  /// mode 0 and SCENE_EFFECT none clear what an earlier configuration left on a board that stayed powered or stored
+  /// it. Built on the fly (no per-light state), queued now and part of the refresh.
+  void clear_unused_lights(uint16_t board, uint8_t first_unused) {
+    if (board >= this->boards_.size())
+      return;
+    Board &b = this->boards_[board];
+    b.first_unused = first_unused > ULTRA_LIGHTS ? ULTRA_LIGHTS : first_unused;
+    for (uint8_t l = b.first_unused; l < ULTRA_LIGHTS; l++) {
+      for (uint8_t type : {ULTRA_LIGHT_DEF, ULTRA_SCENE, ULTRA_SCENE_EFFECT}) {
+        this->next_seq_(b, l, type);
+        this->queue_(b, key_(l, type, 0));
       }
     }
   }
@@ -542,6 +601,34 @@ class Scheduler {
     return false;
   }
   size_t queued(uint16_t board) const { return board < this->boards_.size() ? this->boards_[board].queue.size() : 0; }
+  /// First copies waiting on a board: frames before a new command's first copy goes out.
+  size_t waiting(uint16_t board) const { return board < this->boards_.size() ? this->boards_[board].unsent : 0; }
+  /// ... on the busiest board.
+  size_t waiting() const {
+    size_t n = 0;
+    for (const auto &b : this->boards_)
+      n = b.unsent > n ? b.unsent : n;
+    return n;
+  }
+  /// The most commands queued for one board since the last call (diagnostics).
+  size_t take_queue_peak() {
+    const size_t n = this->queue_peak_;
+    this->queue_peak_ = 0;
+    return n;
+  }
+  /// The heap this line took at most since the last call (diagnostics): its state (boards, lights in use, effect
+  /// steps) and its queues at their peak.
+  size_t take_memory_peak() {
+    size_t n = this->boards_.capacity() * sizeof(Board) + this->queue_bytes_peak_;
+    for (const auto &b : this->boards_) {
+      for (const auto &l : b.light) {
+        if (l)
+          n += sizeof(LightItems) + (l->steps.capacity() + l->held_steps.capacity()) * sizeof(Item);
+      }
+    }
+    this->queue_bytes_peak_ = this->queue_bytes_;
+    return n;
+  }
 
   /// Builds one frame into out (frame_bytes()) that starts on the wire at start_us (host clock). Returns its TIME:
   /// the host clock at the last bit (the header carries the low 32 bits).
@@ -550,11 +637,26 @@ class Scheduler {
     for (size_t i = 0; i < this->boards_.size(); i++, s += ULTRA_SLOT_BYTES) {
       this->starts_[i] = NO_START;
       this->floors_[i] = 0;
-      if (!this->take_urgent_(this->boards_[i], s, i, start_us) && !this->take_refresh_(this->boards_[i], s, i, start_us))
-        ultra_slot_nop(s);
+      Board &b = this->boards_[i];
+      // every 16th slot of a board with a continuous stream is a refresh: a board that rebooted meanwhile still gets
+      // its CONFIG and light definitions
+      if (b.urgent_run >= 15 && this->take_refresh_(b, s, i, start_us)) {
+        b.urgent_run = 0;
+      } else if (this->take_urgent_(b, s, i, start_us)) {
+        b.urgent_run++;
+      } else {
+        b.urgent_run = 0;
+        if (!this->take_refresh_(b, s, i, start_us))
+          ultra_slot_nop(s);
+      }
+      this->durations_[i] = s[0] == ULTRA_SET ? ultra_get24(s + ULTRA_PAYLOAD + 22) : 0;
     }
     return this->finish_(start_us, out);
   }
+
+  /// The frame build_frame() / build_dark_frame() last built, again (its transmit failed): a new TIME and start
+  /// offsets, the same slots, nothing more taken from the queues.
+  int64_t retime_frame(int64_t start_us, uint8_t *out) { return this->finish_(start_us, out); }
 
   /// A frame with only NOP slots (nothing to do).
   int64_t build_idle_frame(int64_t start_us, uint8_t *out) {
@@ -587,7 +689,6 @@ class Scheduler {
     bool valid{false};
   };
   struct Cmd {
-    Item item;
     uint16_t key;
     uint8_t sends;
     uint8_t copies;  // sends before it leaves the queue
@@ -602,18 +703,39 @@ class Scheduler {
     std::vector<Item> held_steps;
     int64_t last_stream_us{NO_START};  // when its last streamed SET went out
   };
-  /// Per board ~340 B, + ~435 B per light in use (allocated with its first command): 50 boards with one light each
-  /// take ~39 KB of the ESP32's heap (wiki: Ultra Mode). The queue is freed whenever it empties.
+  /// Per board ~410 B, + ~430 B per light in use (allocated with its first command): 50 boards with one light each
+  /// take ~42 KB of the ESP32's heap (wiki: Ultra Mode). The queue holds keys (12 B per command) and is freed whenever
+  /// it empties.
   struct Board {
     std::vector<Cmd> queue;
     Item config[CONFIG_PAGES];
+    Item identify;  // the last IDENTIFY (identify, version, dark, release, calibrate)
     std::unique_ptr<LightItems> light[ULTRA_LIGHTS];
     uint16_t cfg[ULTRA_CFG_COUNT]{};
     bool cfg_have[ULTRA_CFG_COUNT]{};
     bool cfg_dirty{false};
     uint8_t seq[ULTRA_LIGHTS + 1][ULTRA_TYPES]{};
     uint16_t rr{0};
+    uint8_t urgent_run{0};   // queued commands sent in a row (build_frame: every 16th slot a refresh)
+    uint8_t first_unused{ULTRA_LIGHTS};   // light indices from here on are not in the YAML
+    uint8_t unsent{0};                    // queued commands of which no copy went out yet
   };
+
+  /// The commands that clear a light index not in the YAML (clear_unused_lights), with its current sequence number.
+  static Item unused_item_(const Board &b, uint8_t light, uint8_t type) {
+    Item it;
+    const uint16_t zero[CHANNELS] = {};
+    const uint8_t roles[CHANNELS] = {};
+    const uint8_t seq = b.seq[light][type];
+    if (type == ULTRA_LIGHT_DEF)
+      ultra_slot_light_def(it.slot, light, seq, roles, 1000, 0, zero, zero);
+    else if (type == ULTRA_SCENE)
+      ultra_slot_scene(it.slot, light, seq, 0, 0, 0, zero, zero);
+    else
+      ultra_slot_scene_effect(it.slot, light, seq, ULTRA_FX_NONE, nullptr, 0);
+    it.valid = true;
+    return it;
+  }
 
   static void make_steps_(std::vector<Item> &out, uint8_t light, uint8_t seq, const std::vector<Step> &steps) {
     const uint8_t count = static_cast<uint8_t>(steps.size() > ULTRA_MAX_STEPS ? ULTRA_MAX_STEPS : steps.size());
@@ -651,22 +773,63 @@ class Scheduler {
     return ++b.seq[light < ULTRA_LIGHTS ? light : ULTRA_LIGHTS][type];
   }
 
-  /// A newer command replaces a queued one with the same key (same light and type, same page / step). copies: how
-  /// often it is sent (0 = repeats).
-  void queue_(Board &b, const Item &it, uint16_t key, uint8_t copies = 0) {
+  /// The item a queued key stands for: the queue holds keys, the items live in the board's state, so a copy that goes
+  /// out is always the latest command of its key.
+  static Item queued_item_(const Board &b, uint16_t key) {
+    const uint8_t light = key >> 12, type = (key >> 8) & 15, sub = key & 255;
+    if (type == ULTRA_CONFIG)
+      return b.config[sub];
+    if (type == ULTRA_IDENTIFY)
+      return b.identify;
+    if (!b.light[light])
+      return unused_item_(b, light, type);
+    const LightItems &li = *b.light[light];
+    switch (type) {
+      case ULTRA_LIGHT_DEF:
+        return li.def;
+      case ULTRA_LIGHT_OPT:
+        return li.opt;
+      case ULTRA_SET:
+        return li.set;
+      case ULTRA_EFFECT:
+        return li.effect;
+      case ULTRA_SCENE:
+        return li.scene;
+      case ULTRA_SCENE_EFFECT:
+        return li.scene_fx;
+      default:  // STEP (a new effect drops the old steps from the queue; an empty slot is never valid)
+        return sub < li.steps.size() ? li.steps[sub] : Item{};
+    }
+  }
+
+  /// A newer command replaces a queued one with the same key (same light and type, same page / step) and keeps its
+  /// place while no copy of it went out (so lights that change every frame take turns). copies: how often it is sent
+  /// (0 = repeats). One entry per key: at most 3 CONFIG pages, IDENTIFY and per light 6 items + 8 STEPs (74), so
+  /// nothing is ever dropped.
+  void queue_(Board &b, uint16_t key, uint8_t copies = 0) {
     bool behind = false;
-    for (const auto &c : b.queue)
-      behind |= c.key == key && c.sends == 0;
+    uint32_t order = this->order_++;
+    for (const auto &c : b.queue) {
+      if (c.key == key && c.sends == 0) {
+        behind = true;
+        order = c.order;
+      }
+    }
     this->unqueue_(b, key, false);
-    if (b.queue.size() >= MAX_QUEUE)
-      b.queue.erase(b.queue.begin());
-    b.queue.push_back(Cmd{it, key, 0, copies ? copies : this->repeats_, behind, this->order_++});
+    const size_t cap = b.queue.capacity();
+    b.queue.push_back(Cmd{key, 0, copies ? copies : this->repeats_, behind, order});
+    b.unsent++;
+    this->queue_bytes_ += (b.queue.capacity() - cap) * sizeof(Cmd);
+    this->queue_peak_ = b.queue.size() > this->queue_peak_ ? b.queue.size() : this->queue_peak_;
+    if (this->queue_bytes_ > this->queue_bytes_peak_)
+      this->queue_bytes_peak_ = this->queue_bytes_;
   }
   /// steps: drop every STEP of that light, whatever its index
   static void unqueue_(Board &b, uint16_t key, bool steps) {
     for (size_t i = 0; i < b.queue.size();) {
       const bool same = steps ? (b.queue[i].key & 0xFF00) == (key & 0xFF00) : b.queue[i].key == key;
       if (same) {
+        b.unsent -= b.queue[i].sends == 0;
         b.queue.erase(b.queue.begin() + static_cast<std::ptrdiff_t>(i));
       } else {
         i++;
@@ -675,13 +838,20 @@ class Scheduler {
   }
 
   /// Start offset of SET (int16 ms) / EFFECT (int32 ms) relative to this frame's TIME, then the CRC. floor: not
-  /// before TIME (a streamed SET starts when it arrives, at the latest).
-  static void stamp_(uint8_t *s, int64_t start_us, int64_t hdr_us, bool floor) {
+  /// before TIME (a streamed SET starts when it arrives, at the latest). A SET that started more than 32.8 s ago (a
+  /// long transition refreshed to a board that missed it) starts at that limit with its duration (the SET's own)
+  /// shortened by the rest: it still ends on time, and one that is over shows its target at once.
+  static void stamp_(uint8_t *s, int64_t start_us, int64_t hdr_us, bool floor, uint32_t duration) {
     if (start_us == NO_START)
       return;
     const int64_t d = floor && start_us < hdr_us ? 0 : start_us - hdr_us;
     int64_t ms = d >= 0 ? (d + 500) / 1000 : -((-d + 499) / 1000);
     if (s[0] == ULTRA_SET) {
+      if (ms < -32768) {
+        const uint64_t lost = static_cast<uint64_t>(-32768 - ms);
+        duration = lost >= duration ? 0 : duration - static_cast<uint32_t>(lost);
+      }
+      ultra_put24(s + ULTRA_PAYLOAD + 22, duration);
       ms = ms < -32768 ? -32768 : ms > 32767 ? 32767 : ms;
       ultra_put16(s + ULTRA_PAYLOAD + 25, static_cast<uint16_t>(static_cast<int16_t>(ms)));
     } else if (s[0] == ULTRA_EFFECT) {
@@ -699,15 +869,16 @@ class Scheduler {
     size_t best = 0;
     for (size_t i = 1; i < b.queue.size(); i++) {
       const Cmd &c = b.queue[i], &o = b.queue[best];
-      if (c.sends < o.sends || (c.sends == o.sends && c.order < o.order))
+      if (c.sends < o.sends || (c.sends == o.sends && static_cast<int32_t>(c.order - o.order) < 0))
         best = i;
     }
     Cmd &c = b.queue[best];
-    std::memcpy(s, c.item.slot, ULTRA_SLOT_BYTES);
-    this->starts_[slot] = recent_start_(c.item, now_us);
-    if (c.item.stream) {
+    const Item item = queued_item_(b, c.key);
+    std::memcpy(s, item.slot, ULTRA_SLOT_BYTES);
+    this->starts_[slot] = recent_start_(item, now_us);
+    if (item.stream) {
       LightItems &li = li_(b, static_cast<uint8_t>((s[1] >> 4) % ULTRA_LIGHTS));
-      uint64_t glide = c.item.glide_ms;
+      uint64_t glide = item.glide_ms;
       if (c.behind && li.last_stream_us != NO_START) {
         const uint64_t since = static_cast<uint64_t>(now_us - li.last_stream_us) / 1000;
         glide = since > glide ? since : glide;
@@ -717,16 +888,19 @@ class Scheduler {
       li.last_stream_us = now_us;
       this->floors_[slot] = 1;
     }
+    b.unsent -= c.sends == 0;
     if (++c.sends >= c.copies) {
       b.queue.erase(b.queue.begin() + static_cast<std::ptrdiff_t>(best));
-      if (b.queue.empty())
+      if (b.queue.empty()) {
+        this->queue_bytes_ -= b.queue.capacity() * sizeof(Cmd);
         std::vector<Cmd>().swap(b.queue);   // nothing stays allocated between bursts (boot: every board's items)
+      }
     }
     return true;
   }
 
   /// Next item of the board's refresh list: CONFIG pages, then per light DEF, OPT, SET, EFFECT, SCENE, SCENE_EFFECT,
-  /// STEPs.
+  /// STEPs; for a light index not in the YAML its clearing DEF, SCENE and SCENE_EFFECT (clear_unused_lights).
   bool take_refresh_(Board &b, uint8_t *s, size_t slot, int64_t now_us) {
     const uint16_t per_light = 6 + ULTRA_MAX_STEPS;
     const uint16_t total = CONFIG_PAGES + ULTRA_LIGHTS * per_light;
@@ -738,8 +912,13 @@ class Scheduler {
         it = &b.config[pos];
       } else {
         const uint16_t l = (pos - CONFIG_PAGES) / per_light, k = (pos - CONFIG_PAGES) % per_light;
-        if (!b.light[l])
-          continue;
+        if (!b.light[l]) {
+          if (l < b.first_unused || (k != 0 && k != 4 && k != 5))
+            continue;
+          const uint8_t type = k == 0 ? ULTRA_LIGHT_DEF : k == 4 ? ULTRA_SCENE : ULTRA_SCENE_EFFECT;
+          std::memcpy(s, unused_item_(b, static_cast<uint8_t>(l), type).slot, ULTRA_SLOT_BYTES);
+          return true;
+        }
         const LightItems &li = *b.light[l];
         it = k == 0   ? &li.def
              : k == 1 ? &li.opt
@@ -769,7 +948,7 @@ class Scheduler {
     int64_t t = start_us + static_cast<int64_t>((this->frame_bytes() * 8 * avg) / 1000);
     for (int pass = 0; pass < 2; pass++) {
       for (size_t i = 0; i < n; i++)
-        stamp_(out + ULTRA_SLOT_BYTES * i, this->starts_[i], t, this->floors_[i] != 0);
+        stamp_(out + ULTRA_SLOT_BYTES * i, this->starts_[i], t, this->floors_[i] != 0, this->durations_[i]);
       ultra_build_header(h, static_cast<uint32_t>(t));
       t = start_us + static_cast<int64_t>((this->wire_ns(out, slots + ULTRA_HDR_BYTES) + 500) / 1000);
     }
@@ -777,14 +956,16 @@ class Scheduler {
     return t;
   }
 
-  // 5 lights x (EFFECT + 8 STEPs) + 3 CONFIG pages: a strobe on every light of a board, started at once, fits
-  static constexpr size_t MAX_QUEUE = 48;
   std::vector<Board> boards_;
-  std::vector<int64_t> starts_;   // per slot of the frame being built: its absolute start (SET / EFFECT)
-  std::vector<uint8_t> floors_;   // per slot: a streamed SET (start not before the frame's TIME)
+  std::vector<int64_t> starts_;      // per slot of the frame being built: its absolute start (SET / EFFECT)
+  std::vector<uint32_t> durations_;  // per slot: a SET's own duration (stamp_ may shorten it in the frame)
+  std::vector<uint8_t> floors_;      // per slot: a streamed SET (start not before the frame's TIME)
   uint32_t t0h_{250}, t0l_{1050}, t1h_{700}, t1l_{650};
   uint8_t repeats_{3};
   uint32_t order_{0};
+  size_t queue_peak_{0};        // the most commands queued for one board (take_queue_peak)
+  size_t queue_bytes_{0};       // the queues' heap now, and its peak (take_memory_peak)
+  size_t queue_bytes_peak_{0};
 };
 
 /// The current calibration of one pin (firmware wiki: Current Sense):

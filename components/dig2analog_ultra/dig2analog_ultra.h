@@ -189,8 +189,9 @@ class UltraHub final : public Component {
   void abort_update() { this->upd_abort_.store(true); }
   /// the result of the last session once the resync after it sent its PING burst (UPD_NONE until then); read once
   UpdateResult take_update_result();
-  /// One UPD frame on the wire incl. its reset (us)
+  /// One UPD frame on the wire incl. its reset (us), at the longer bit; update_frame_min_us(): at the shorter one
   uint32_t update_frame_us() const;
+  uint32_t update_frame_min_us() const;
   /// PING bursts after the start-up preamble and every resync: freshly installed boards confirm themselves
   void set_ping_burst(bool on) { this->ping_burst_ = on; }
   /// Keep the power supply requested (update sessions)

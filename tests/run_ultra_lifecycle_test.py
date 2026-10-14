@@ -36,6 +36,10 @@ PIECES = {
         "dig2analog_ultra.cpp",
         ["int64_t UltraHub::lead_us(", "int64_t UltraHub::command_lead_us_(", "int64_t UltraHub::start_time_us("],
     ),
+    "hub_update.inc": (
+        "dig2analog_ultra.cpp",
+        ["uint32_t UltraHub::update_frame_us(", "uint32_t UltraHub::update_frame_min_us(", "void UltraHub::update_task_("],
+    ),
 }
 # classes: the definition, then its ;
 CLASSES = {"sun_effect.inc": ("ultra_effects.h", ["class UltraEffect :", "class UltraSunEffect final"])}

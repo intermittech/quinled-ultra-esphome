@@ -843,6 +843,185 @@ static void test_group_budget() {
 
 }  // namespace hub_start
 
+// ================================================================================================ hub: update sender
+namespace hub_update {
+
+struct rmt_transmit_config_t {
+  uint32_t loop_count;
+};
+static uint32_t portTICK_PERIOD_MS = 1;   // ESPHome's 1 kHz FreeRTOS tick; also run at 100 Hz
+static void vTaskDelete(void *) {}
+
+/// The hub around its update task and frame times (build/lifecycle/hub_update.inc).
+struct UltraHub {
+  enum UpdateResult : uint8_t { UPD_NONE = 0, UPD_DONE, UPD_ABORTED, UPD_FAILED };
+  enum UpdateState : uint8_t { UPD_IDLE = 0, UPD_RUNNING, UPD_FINISHED };
+  static void update_task_(void *arg);    // the component's
+  uint32_t update_frame_us() const;       // the component's
+  uint32_t update_frame_min_us() const;   // the component's
+  static int64_t now_us_() { return 5000000; }
+
+  int channel_{0}, encoder_{1};
+  uint8_t buf_[64]{};
+  uint8_t *tx_buf_{buf_};
+  uint32_t bit0_high_ns_{250}, bit0_low_ns_{1050}, bit1_high_ns_{700}, bit1_low_ns_{650}, reset_ns_{300000};
+  UpdateSession upd_session_;
+  std::atomic<bool> upd_abort_{false};
+  std::atomic<uint32_t> upd_sent_{0};
+  std::atomic<uint8_t> upd_pass_{0}, upd_result_{UPD_NONE}, upd_state_{UPD_RUNNING};
+};
+
+/// The line as the task sees it: rmt_transmit hands one frame over, rmt_tx_wait_all_done returns once it and its
+/// reset are out, vTaskDelay(n) keeps the line low for n - 1 to n ticks (it ends at the n-th tick from a random phase).
+struct Line {
+  UltraHub *hub{nullptr};
+  std::vector<std::vector<uint8_t>> wire;   // the frames, in order
+  std::vector<uint32_t> quiet_us;           // per frame: the least low time after its reset (the delays' worst phase)
+  bool on_wire{false};
+  int overlapped{0}, refused{0};
+  size_t abort_at{SIZE_MAX};                // the abort request comes with this frame
+};
+static Line line;
+static esp_err_t rmt_transmit(int, int, const uint8_t *data, size_t n, const rmt_transmit_config_t *) {
+  if (n != UPD_FRAME_BYTES) {
+    line.refused++;
+    return -1;
+  }
+  line.overlapped += line.on_wire;   // a frame handed over while the last one is still out
+  line.wire.emplace_back(data, data + n);
+  line.quiet_us.push_back(0);
+  line.on_wire = true;
+  if (line.wire.size() == line.abort_at)
+    line.hub->upd_abort_.store(true);
+  return ESP_OK;
+}
+static esp_err_t rmt_tx_wait_all_done(int, int) {
+  line.on_wire = false;
+  return ESP_OK;
+}
+static void vTaskDelay(uint32_t ticks) {
+  line.overlapped += line.on_wire;   // a pause that starts before its frame and reset are out
+  if (!line.quiet_us.empty() && ticks > 0)
+    line.quiet_us.back() += (ticks - 1) * portTICK_PERIOD_MS * 1000;
+}
+
+#include "hub_update.inc"
+
+/// The bootloader's page pause after a frame's reset (its README: "the host's 2.7 ms pause" covers a page program at
+/// HCLK / 2 and the decoder's resync): the update task keeps the line low at least that long after every page's last
+/// chunk, at any tick phase, at a 1 kHz and a 100 Hz FreeRTOS tick; the default asks for no less. An abort request
+/// still ends with 12 ABORT frames.
+static void test_update_task() {
+  const uint32_t bl_page_pause_us = 2700;
+  CHECK(UpdateSession::Options().page_pause_us >= bl_page_pause_us, "the default page pause is the bootloader's "
+        "2.7 ms or more (%u us)", static_cast<unsigned>(UpdateSession::Options().page_pause_us));
+  static uint8_t img[UPD_DESC_BYTES + 2000];
+  for (size_t i = 0; i < sizeof(img); i++)
+    img[i] = static_cast<uint8_t>(i * 7 + 3);
+  UpdateSession::Options o;
+  o.lead_in_us = 20000;
+  o.end_us = 10000;
+  for (uint32_t tick_ms : {1u, 10u}) {
+    portTICK_PERIOD_MS = tick_ms;
+    for (int run = 0; run < 2; run++) {   // a whole session, an abort
+      UltraHub h;
+      line = Line();
+      line.hub = &h;
+      h.upd_session_.begin(img, sizeof(img), 0x42, o, h.update_frame_min_us());
+      UpdateSession ref;   // the same session, frame by frame
+      ref.begin(img, sizeof(img), 0x42, o, h.update_frame_min_us());
+      if (run == 1)
+        line.abort_at = 100;
+      UltraHub::update_task_(&h);
+      size_t session = 0, pauses = 0;
+      uint32_t least = UINT32_MAX;
+      bool same = true, paused = true;
+      for (size_t i = 0; i < line.wire.size(); i++) {
+        uint8_t f[UPD_FRAME_BYTES];
+        uint32_t pause_us = 0;
+        if (line.wire[i][UPD_B_TYPE] == UPD_ABORT)
+          break;
+        same &= ref.next(f, static_cast<uint32_t>(UltraHub::now_us_()), &pause_us) &&
+                std::memcmp(f, line.wire[i].data(), UPD_FRAME_BYTES) == 0;
+        if (pause_us != 0 && i + 1 < line.wire.size()) {   // the next frame waits for the page program
+          paused &= pause_us >= bl_page_pause_us && line.quiet_us[i] >= pause_us;
+          least = std::min(least, line.quiet_us[i]);
+          pauses++;
+        }
+        session++;
+      }
+      const size_t aborts = line.wire.size() - session;
+      CHECK(same && paused && line.overlapped == 0 && line.refused == 0, "update task, %u ms tick, run %d: %u frames "
+            "as the session built them, after %u pages the line low >= the page pause (least %u us)", tick_ms, run,
+            static_cast<unsigned>(session), static_cast<unsigned>(pauses), least);
+      if (run == 0) {
+        CHECK(h.upd_result_.load() == UltraHub::UPD_DONE && session == ref.total_frames() && pauses == 3 * 8,
+              "a whole session: done, %u frames, %u page pauses (3 passes x 8 pages)", static_cast<unsigned>(session),
+              static_cast<unsigned>(pauses));
+      } else {
+        CHECK(h.upd_result_.load() == UltraHub::UPD_ABORTED && session == 100 && aborts == 12,
+              "an abort with frame 100: the frames up to it, then 12 ABORT frames (%u, %u)",
+              static_cast<unsigned>(session), static_cast<unsigned>(aborts));
+      }
+    }
+  }
+  portTICK_PERIOD_MS = 1;
+  std::printf("  update task: after every page the line stays low >= %u us (1 kHz and 100 Hz tick)\n",
+              static_cast<unsigned>(UpdateSession::Options().page_pause_us));
+}
+
+/// The lead-in (the boards erase meanwhile) and END, counted in update_frame_min_us(): on the wire at least as long as
+/// asked even with no gap at all between frames, at 1 and 50 boards, for the default bit timing and one where the '1'
+/// is the shorter bit. Before, they were counted at the longer bit + 50 us.
+static void test_update_lead_in() {
+  static uint8_t img[UPD_DESC_BYTES + 2000];
+  for (size_t i = 0; i < sizeof(img); i++)
+    img[i] = static_cast<uint8_t>(i * 13 + 5);
+  struct Timing {
+    uint32_t b0h, b0l, b1h, b1l, reset;
+  };
+  const Timing timings[] = {{250, 1050, 700, 650, 300000}, {700, 800, 300, 600, 280000}};
+  for (const Timing &t : timings) {
+    UltraHub h;
+    h.bit0_high_ns_ = t.b0h;
+    h.bit0_low_ns_ = t.b0l;
+    h.bit1_high_ns_ = t.b1h;
+    h.bit1_low_ns_ = t.b1l;
+    h.reset_ns_ = t.reset;
+    for (uint16_t boards : {1, 50}) {
+      UpdateSession::Options o;
+      o.boards = boards;
+      uint64_t lead_ns[2] = {0, 0}, end_ns[2] = {0, 0};
+      for (int k = 0; k < 2; k++) {   // now, before
+        UpdateSession s;
+        s.begin(img, sizeof(img), 0x42, o, k == 0 ? h.update_frame_min_us() : h.update_frame_us() + 50);
+        uint8_t f[UPD_FRAME_BYTES];
+        uint32_t pause_us;
+        bool lead = true;
+        while (s.next(f, 0, &pause_us)) {
+          uint64_t ns = t.reset;   // the frame on the wire: its bits at their own length, then the reset
+          for (size_t b = 0; b < UPD_FRAME_BITS; b++)
+            ns += (f[b >> 3] & (0x80u >> (b & 7u))) ? t.b1h + t.b1l : t.b0h + t.b0l;
+          lead &= f[UPD_B_TYPE] == UPD_ANNOUNCE;
+          lead_ns[k] += lead ? ns : 0;
+          end_ns[k] += f[UPD_B_TYPE] == UPD_END ? ns : 0;
+        }
+      }
+      const uint64_t lead_asked = (o.lead_in_us + static_cast<uint64_t>(o.lead_in_per_board_us) * boards) * 1000;
+      CHECK(lead_ns[0] >= lead_asked && end_ns[0] >= o.end_us * 1000ULL, "lead-in %.1f ms (%.1f asked), END %.1f ms "
+            "(%.1f asked) with no gap between frames", lead_ns[0] / 1e6, lead_asked / 1e6, end_ns[0] / 1e6,
+            o.end_us / 1e3);
+      if (t.b0h == 250 && boards == 50)
+        std::printf("  lead-in at 50 boards with no gap between frames: %.0f ms for %.0f asked (before: %.0f ms, %.1f %% "
+                    "short); END %.0f ms for %.0f (before: %.0f)\n", lead_ns[0] / 1e6, lead_asked / 1e6,
+                    lead_ns[1] / 1e6, 100.0 * (1.0 - static_cast<double>(lead_ns[1]) / lead_asked), end_ns[0] / 1e6,
+                    o.end_us / 1e3, end_ns[1] / 1e6);
+    }
+  }
+}
+
+}  // namespace hub_update
+
 }  // namespace esphome::dig2analog_ultra
 
 using namespace esphome::dig2analog_ultra;
@@ -858,6 +1037,8 @@ int main() {
   lights::test_effect_epoch();
   sun::test_sun_end();
   hub_start::test_group_budget();
+  hub_update::test_update_task();
+  hub_update::test_update_lead_in();
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "ALL ULTRA LIFECYCLE TESTS PASSED", failures);
   return failures ? 1 : 0;
 }

@@ -165,14 +165,20 @@ uint32_t UltraHub::update_frame_us() const {
   return (UPD_FRAME_BITS * worst) / 1000 + this->reset_ns_ / 1000;
 }
 
+uint32_t UltraHub::update_frame_min_us() const {
+  const uint32_t best = std::min(this->bit0_high_ns_ + this->bit0_low_ns_, this->bit1_high_ns_ + this->bit1_low_ns_);
+  return (UPD_FRAME_BITS * best) / 1000 + this->reset_ns_ / 1000;
+}
+
 bool UltraHub::start_update(const uint8_t *image, size_t size, const UpdateSession::Options &opt) {
   if (!this->started_ || this->is_failed() || this->update_running())
     return false;
   UpdateSession::Options o = opt;
   o.boards = this->num_boards_;
-  // the task's own pacing adds ~50 us per frame to the wire time
+  // the lead-in and END are counted in the shortest frame (the task's own pacing only adds to it), so they last at
+  // least as long as asked (the boards erase during the lead-in)
   if (!this->upd_session_.begin(image, static_cast<uint32_t>(size), static_cast<uint8_t>(esp_random() | 1u), o,
-                                this->update_frame_us() + 50))
+                                this->update_frame_min_us()))
     return false;
   this->tx_prepared_ = false;  // the session takes the buffer; post-session replay repairs normal state
   this->upd_total_ = this->upd_session_.total_frames();

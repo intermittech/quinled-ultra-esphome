@@ -61,7 +61,7 @@ enum {
 #define UPD_APP_DESC         0x08002000u  /* descriptor page: descriptor (64) + status records (192) */
 #define UPD_APP_BODY         0x08002100u  /* app body: the app is linked here (alias 0x00002100) */
 /* UPPER_RECORDS (0.6.5, Quindor 2026-10-14): 1 = the record pages in the upper
- * (non-zero-wait) CodeFlash at 0x08010000-0x08011FFF (src/hal/board.h) and the app slot to the zero-wait flash's end,
+ * (non-zero-wait) CodeFlash from 0x08010000 (src/hal/board.h) and the app slot to the zero-wait flash's end,
  * bootloader 2; 0 = 0.6.4's layout (the records at 0x0800F600-0x0800FFFF, the slot to 0x0800F700, bootloader 1): the
  * bench fallback. An image for the upper layout says min_bootloader 2. */
 #ifndef UPPER_RECORDS
@@ -183,6 +183,16 @@ static inline void upd_put32(uint8_t *p, uint32_t v)
     p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
 }
 
+#ifdef UPD_CRC_ULTRA
+/* (0.6.6) the firmware (tools/build_target.sh, the host test builds: -DUPD_CRC_ULTRA) checks the update frames with
+ * its one copy of these CRCs (core/config.h crc16_ccitt / crc8_smbus = ultra_protocol.h's, out of line for the
+ * records) instead of a second, bitwise copy here (-100 B). The bootloader, the tools and the hub keep the bitwise
+ * ones below; test/test_update.c checks the two agree. */
+uint8_t  crc8_smbus(const uint8_t *d, uint32_t n);
+uint16_t crc16_ccitt(const uint8_t *d, uint32_t n);
+#define upd_crc16 crc16_ccitt
+#define upd_crc8  crc8_smbus
+#else
 /* CRC-16 CCITT-FALSE (poly 0x1021, init 0xFFFF), as ultra_crc16 */
 static inline uint16_t upd_crc16(const uint8_t *d, uint32_t n)
 {
@@ -210,6 +220,7 @@ static inline uint8_t upd_crc8(const uint8_t *d, uint32_t n)
     }
     return c;
 }
+#endif
 
 /* CRC-32/MPEG-2 (poly 0x04C11DB7, init 0xFFFFFFFF, no reflection, no final XOR) over n little-endian 32-bit words,
  * each word MSB first: exactly what the CH32 CRC unit computes when the CPU writes the words as it reads them from

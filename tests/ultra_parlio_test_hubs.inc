@@ -291,6 +291,9 @@ struct UltraHub {
   TelemetryPoller poller_;
   PortMonitor port_monitor_;
   LedgerKeeper keeper_;   // (not attached: nothing to prepare; tests/ultra_telemetry_test.cpp runs it)
+  EnergyCounter port_energy_;
+  bool port_seeded_{false}, rw_rx_tied_{false};
+  float port_power_w() const { return this->port_standby() ? 0.0f : this->port_monitor_.power_w(); }
   const char *tel_name_{"Port"};
   void ledger_service_() {}
   static void ledger_save_(bool) {}

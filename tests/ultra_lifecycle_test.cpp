@@ -15,6 +15,7 @@
 #include "../components/dig2analog_ultra/update_retry.h"
 #include "../components/dig2analog_ultra/update_session.h"
 #include "../components/dig2analog_ultra/ultra_ledger.h"
+#include "../components/dig2analog_ultra/ultra_pacing.h"
 #include "../components/dig2analog_ultra/ultra_telemetry.h"
 #include "../components/diffpower/diffpower_core.h"
 
@@ -1170,6 +1171,9 @@ struct UltraHub {
   volatile int64_t rw_released_us_{0};
   TelemetryPoller poller_;
   PortMonitor port_monitor_;
+  EnergyCounter port_energy_;
+  bool port_seeded_{false}, rw_rx_tied_{false};
+  float port_power_w() const { return this->port_standby() ? 0.0f : this->port_monitor_.power_w(); }
   LedgerKeeper keeper_;   // (not attached here: tests/ultra_telemetry_test.cpp runs it)
   const char *tel_name_{"Port"};
   void ledger_service_() {}
@@ -1542,6 +1546,74 @@ static void test_several_lines() {
   std::printf("  telemetry: %d lines polling at once, %d samples with overlapping windows\n", N, overlap);
 }
 
+/// Lines sharing one UART with DE and /RE tied (receiver_enable_pin: direction_pin): a line's receiver is on only while
+/// its direction pin is low (its window), and the hub drives the line again as soon as its window is read, so no two
+/// lines ever have their receivers on at once; every line polls its own receivers. Negative control: without the tie
+/// a line keeps its receiver on until its next frame, and the receivers collide.
+static void test_tied_shared_uart() {
+  constexpr int N = 3;
+  for (int tied = 1; tied >= 0; tied--) {
+    clock_us = 0;
+    now_ms = 0;
+    for (auto &r : rmts)
+      r = Rmt();
+    for (auto &a : answers_of)
+      a = Answers();
+    UltraHub::hubs_.clear();
+    Uart uart;
+    Pin pins[N];
+    UltraHub hubs[N];
+    for (int k = 0; k < N; k++) {
+      hubs[k].channel_ = k;
+      hubs[k].pin_ = static_cast<uint8_t>(16 + k);
+      rmts[k].hub = &hubs[k];
+      hubs[k].start(&uart, &pins[k]);
+      hubs[k].rw_rx_tied_ = tied != 0;
+    }
+    int both_on = 0, lost = 0;
+    auto run = [&](int64_t us) {
+      const int64_t end = clock_us + us;
+      while (clock_us < end) {
+        advance(50);
+        for (int k = 0; k < N; k++) {
+          Rmt &r = rmts[k];
+          if (r.busy && clock_us >= r.done_us) {
+            r.busy = false;
+            UltraHub::rw_done_isr_(k, nullptr, &hubs[k]);
+          }
+          Answers &a = answers_of[k];
+          if (a.pending && clock_us >= a.at_us) {   // (its port's receiver hears them only while it is on)
+            if (!pins[k].level)
+              uart.rx.insert(uart.rx.end(), a.bytes.begin(), a.bytes.end());
+            else
+              lost++;
+            a.pending = false;
+          }
+          hubs[k].loop();
+        }
+        int on = 0;
+        for (auto &pin : pins)
+          on += !pin.level;
+        both_on += on >= 2;
+      }
+    };
+    run(4000000);
+    bool all = true;
+    for (int k = 0; k < N; k++)
+      all &= hubs[k].poller_.answering(0) && hubs[k].poller_.answering(1) && hubs[k].poller_.stats().stale == 0;
+    if (tied) {
+      CHECK(all && both_on == 0 && lost == 0,
+            "%d lines on one UART, DE and /RE tied: each polls its own receivers (%d), never two receivers on at once "
+            "(%d samples), no answer lost (%d)", N, all, both_on, lost);
+    } else {
+      CHECK(both_on > 0, "negative control: without the tie two receivers are on at once (%d samples)", both_on);
+    }
+  }
+  UltraHub::hubs_.clear();
+  now_ms = 0;
+  std::printf("  telemetry: 3 lines on one UART with DE and /RE tied, never two receivers on at once\n");
+}
+
 /// A hub on a Diff-Power port (rw_publish_): a receiver without ULTRA_FEAT_STANDBY (0.2.6) is warned about once, one
 /// with it not; without a port nobody is.
 static void test_standby_support() {
@@ -1666,11 +1738,14 @@ struct Sensor {
   bool has{false};
   float state{NAN};
   int publishes{0};
+  std::vector<std::pair<uint32_t, float>> history;   // (when, what)
   bool has_state() const { return this->has; }
+  float get_raw_state() const { return this->state; }
   void publish_state(float v) {
     this->state = v;
     this->has = true;
     this->publishes++;
+    this->history.push_back({now_ms, v});
   }
 };
 }  // namespace sensor
@@ -1701,10 +1776,20 @@ struct UltraHub {
   LedgerKeeper keeper;
   UltraHub() {
     this->led.init(4, 2);
-    this->keeper.attach(&this->led, 5, 2);
+    this->keeper.attach(&this->led, 5u << 16, 2);
   }
   bool standby{false};    // its Diff-Power port in standby
   bool settling{false};   // ... just woken: the receivers not heard yet
+  uint32_t rate{1000};    // the update rate
+  double port_wh{-1.0};
+  uint32_t update_rate_ms() const { return this->rate; }
+  const char *telemetry_name() const { return "Port 4"; }
+  float port_power_w() const { return this->standby ? 0.0f : this->m.power_w(); }
+  double port_energy_wh() const { return this->port_wh; }
+  static LifetimeLedger &ledger() {
+    static LifetimeLedger l;
+    return l;
+  }
   double position_energy_wh(uint16_t receiver) const { return this->keeper.energy_wh(receiver); }
   const LifeCounters *ledger_counters(uint16_t receiver) const { return this->keeper.counters(receiver); }
   const TelemetryPoller &telemetry() const { return this->p; }
@@ -1719,40 +1804,54 @@ struct UltraReceiver {   // as ultra_receiver.h
   enum Value : uint8_t {
     POWER = 0, ENERGY, BUS_VOLTAGE, MCU_TEMPERATURE, INPUT_CURRENT, UPTIME, TRIPS, SUPPLY_DIPS, LIMIT_EVENTS,
     MISSED_POLLS, VOLTAGE_DROP, CABLE_RESISTANCE, LED_SUPPLY, CURRENT_PEAK, SUPPLY_IMPEDANCE, LIT_HOURS, POWER_UPS,
-    VALUE_COUNT,
+    LIVE_POWER, VALUE_COUNT,
   };
   enum Text : uint8_t {
-    STATUS = 0, STATUS_DETAIL, FIRMWARE, LAST_RESET, LAST_TRIP, LAST_DIP, LINK, CHANNEL_HEALTH, TEXT_COUNT,
+    STATUS = 0, STATUS_DETAIL, FIRMWARE, LAST_RESET, LAST_TRIP, LAST_DIP, LINK, CHANNEL_HEALTH, PORT, TEXT_COUNT,
   };
   void update_(uint32_t updates);
-  void value_(uint8_t which, float v);
+  void value_(uint8_t which, float v, bool force = false);
   void text_(uint8_t which, const std::string &s);
   UltraHub *hub_{nullptr};
   uint16_t board_{0};
+  uint32_t unpaced_{0};
   sensor::Sensor *values_[VALUE_COUNT]{};
   text_sensor::TextSensor *texts_[TEXT_COUNT]{};
   binary_sensor::BinarySensor *problem_{nullptr};
-  uint32_t slow_ms_{0};
-  bool slow_sent_{false};
+  Paced paced_[VALUE_COUNT]{};
+  MeanPaced power_mean_;
 };
 struct UltraTelemetryPort {   // as ultra_receiver.h
-  enum Value : uint8_t { POWER = 0, CURRENT, LOAD, CABLE_LOSS, CABLE_LOSS_PCT, PEAK_LOAD, VALUE_COUNT };
+  enum Value : uint8_t {
+    POWER = 0, CURRENT, LOAD, CABLE_LOSS, CABLE_LOSS_PCT, PEAK_LOAD, LIVE_POWER, ENERGY, VALUE_COUNT,
+  };
   enum Text : uint8_t { RECEIVERS = 0, STATUS, STATUS_DETAIL, TEXT_COUNT };
   void update_();
+  void value_(uint8_t which, float v, bool force);
   UltraHub *hub_{nullptr};
+  uint32_t unpaced_{0};
   sensor::Sensor *values_[VALUE_COUNT]{};
   text_sensor::TextSensor *texts_[TEXT_COUNT]{};
   binary_sensor::BinarySensor *problem_{nullptr};
+  Paced paced_[VALUE_COUNT]{};
+  MeanPaced power_mean_;
+  bool standby_was_{false};
 };
-struct UltraLightTelemetry {
+struct UltraLightTelemetry {   // as ultra_receiver.h
   void update_(uint32_t updates);
+  void store_energy_(bool force);
   UltraHub *hub_{nullptr};
   uint16_t board_{0};
-  uint8_t mask_{0};
+  uint8_t mask_{0}, unpaced_{0};
+  bool seeded_{false};
+  uint32_t key_{0};
   sensor::Sensor *power_{nullptr};
   sensor::Sensor *energy_{nullptr};
   text_sensor::TextSensor *status_{nullptr};
+  text_sensor::TextSensor *port_{nullptr};
   EnergyCounter energy_count_;
+  MeanPaced power_mean_;
+  Paced power_paced_, energy_paced_;
 };
 
 #include "receiver_methods.inc"
@@ -1817,6 +1916,7 @@ static void answer(const uint8_t *s, uint16_t uid, const ReceiverData &model, ui
 /// estimate and status.
 static void test_receiver_entities() {
   now_ms = 0;
+  UltraHub::ledger().init(4, 8);   // (the ESP32's ledger, loaded: the lights' estimated energy is kept there)
   UltraHub hub;
   hub.p.init(2, ULTRA_RW_RATE_1M, TelemetryIntervals{});
   hub.p.set_outputs(1, true);
@@ -1837,7 +1937,7 @@ static void test_receiver_entities() {
   sensor::Sensor port_values[UltraTelemetryPort::VALUE_COUNT], light_power, light_energy;
   sensor::Sensor &port_power = port_values[UltraTelemetryPort::POWER];
   binary_sensor::BinarySensor port_problem;
-  text_sensor::TextSensor port_texts[UltraTelemetryPort::TEXT_COUNT], light_status;
+  text_sensor::TextSensor port_texts[UltraTelemetryPort::TEXT_COUNT], light_status, light_port;
   text_sensor::TextSensor &port_receivers = port_texts[UltraTelemetryPort::RECEIVERS];
   UltraTelemetryPort port;
   port.hub_ = &hub;
@@ -1856,6 +1956,8 @@ static void test_receiver_entities() {
   light.power_ = &light_power;
   light.energy_ = &light_energy;
   light.status_ = &light_status;
+  light.port_ = &light_port;
+  hub.port_wh = 5.0;   // (the hub's port energy: published every 5 min, at once the first time)
 
   ReceiverData model[2];
   for (auto &m : model) {
@@ -1914,6 +2016,21 @@ static void test_receiver_entities() {
     }
   };
   run(20000);
+  // (R25 / R12) the live twin at the update rate, the recorded Power the 10 s mean of the same samples (at most every
+  // 10 s after its first value); the port's live power and energy; the light's Port (R10)
+  bool spaced = true;
+  const auto &ph = vals[0][UltraReceiver::POWER].history;
+  for (size_t i = 2; i < ph.size(); i++)
+    spaced &= ph[i].first - ph[i - 1].first >= 10000;
+  CHECK(std::fabs(vals[0][UltraReceiver::LIVE_POWER].state - 34.0f) < 1e-3f && spaced &&
+            std::fabs(vals[0][UltraReceiver::POWER].state - 34.0f) < 1e-3f,
+        "Live power %.1f W, Power %.1f W (%d sent, 10 s apart: %d)", vals[0][UltraReceiver::LIVE_POWER].state,
+        vals[0][UltraReceiver::POWER].state, vals[0][UltraReceiver::POWER].publishes, spaced);
+  CHECK(std::fabs(port_values[UltraTelemetryPort::LIVE_POWER].state - 51.0f * 1.36f) < 1e-3f &&
+            port_values[UltraTelemetryPort::ENERGY].state == 5.0f && light_port.state == "Port 4 \xC2\xB7 receiver 2",
+        "the port's live power %.1f W, its energy %.1f Wh; the light's Port '%s'",
+        port_values[UltraTelemetryPort::LIVE_POWER].state, port_values[UltraTelemetryPort::ENERGY].state,
+        light_port.state.c_str());
   CHECK(texts[0][UltraReceiver::STATUS].state == "OK" && !problems[0].state &&
             texts[0][UltraReceiver::STATUS_DETAIL].state == "OK." &&
             std::fabs(vals[0][UltraReceiver::POWER].state - 34.0f) < 1e-3f &&
@@ -1958,8 +2075,8 @@ static void test_receiver_entities() {
         vals[0][UltraReceiver::ENERGY].state);
   model[1].lt_lit = 12345;
   model[1].lt_power_ups = 41;
-  CHECK(vals[0][UltraReceiver::UPTIME].publishes == 1 && vals[0][UltraReceiver::POWER].publishes <= 3,
-        "the uptime at most once a minute, unchanged values not again (%d, %d)",
+  CHECK(vals[0][UltraReceiver::UPTIME].publishes == 2 && vals[0][UltraReceiver::POWER].publishes <= 3,
+        "the uptime: unknown, then its first value, then hourly (R15); unchanged values not again (%d, %d)",
         vals[0][UltraReceiver::UPTIME].publishes, vals[0][UltraReceiver::POWER].publishes);
   // (0.2.5) receiver 2's new entities; receiver 1 (0.2.4): unknown; the port's peak load: 0.68 + 0.90 A
   CHECK(std::fabs(vals[1][UltraReceiver::LED_SUPPLY].state - 24.0f) < 1e-3f &&
@@ -3273,6 +3390,7 @@ int main() {
   hub_update::test_update_lead_in();
   hub_rw::test_telemetry_window();
   hub_rw::test_several_lines();
+  hub_rw::test_tied_shared_uart();
   hub_rw::test_standby_support();
   hub_rw::test_wake_settling();
   hub_rw::test_lock_from_end();

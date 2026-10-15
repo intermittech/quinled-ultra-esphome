@@ -293,9 +293,15 @@ class UltraHub final : public Component {
                      uint32_t power_ms, uint32_t energy_ms, uint32_t supply_ms, uint32_t health_ms,
                      uint32_t lifetime_ms, uint32_t diag_ms) {
     this->rw_uart_ = uart;
+    this->rate_ms_ = status_ms;
     this->poller_.init(receivers, rate,
                        TelemetryIntervals{status_ms, power_ms, energy_ms, supply_ms, health_ms, lifetime_ms, diag_ms});
   }
+  /// the update rate (STATUS, ms): the live values' pace (update_rate: fast 1 s, normal 2 s, slow 5 s)
+  uint32_t update_rate_ms() const { return this->rate_ms_; }
+  /// the line's key in the lifetime ledger (its id's hash): its receivers' positions and its port's energy stay with
+  /// it when its pin, names or devices change
+  void set_telemetry_key(uint32_t key) { this->tel_key_ = key; }
   /// The hub's RS-485 driver enable (high: it drives the line). Low within ~10 us of an RW frame's last bit (the
   /// RMT's interrupt; on a PARLIO lane a timer alarm from the stream's timing), high again before the next frame.
   /// Without it the hardware must let go of the line itself.
@@ -303,6 +309,9 @@ class UltraHub final : public Component {
   /// The port's RS-485 receiver enable (high: its output drives the UART's RX): on from this line's RW frame until its
   /// window is read, off otherwise, so several lines can share one UART (one window open per UART at a time).
   void set_telemetry_receiver_enable_pin(GPIOPin *pin) { this->rw_rx_enable_pin_ = pin; }
+  /// DE and /RE tied (receiver_enable_pin: direction_pin): the direction pin is the receiver enable too. It drives the
+  /// line again as soon as the window is read (its receiver off), so lines can share a UART that way.
+  void set_telemetry_receiver_tied(bool tied) { this->rw_rx_tied_ = tied; }
   /// receiver k has several lights: read its OUTPUTS too (their estimated power, why they're dim)
   void set_telemetry_outputs(uint16_t k, bool on) { this->poller_.set_outputs(k, on); }
   /// the sender port: its current limit (A), its voltage (V, NAN: learned), the load's warning / problem (%) and how
@@ -315,6 +324,22 @@ class UltraHub final : public Component {
   const TelemetryPoller &telemetry() const { return this->poller_; }
   /// the port's name (its telemetry `name:`): the logs say which receiver
   void set_telemetry_name(const char *name) { this->tel_name_ = name; }
+  const char *telemetry_name() const { return this->tel_name_; }
+  /// The port's power at the sender now (W; 0 in standby, NAN unknown) and its energy (Wh, kept in the ledger, never
+  /// down; < 0 until the ledger is loaded)
+  float port_power_w() const { return this->port_standby() ? 0.0f : this->port_monitor_.power_w(); }
+  double port_energy_wh() const { return this->port_seeded_ ? this->port_energy_.wh : -1.0; }
+  /// The ESP32's lifetime ledger (a light's estimated energy is a counter there, by its id's hash)
+  static LifetimeLedger &ledger() { return ultra_ledger(); }
+  /// At the shutdown (OTA, a reboot): the energies one last time
+  void add_on_shutdown_callback(std::function<void()> &&callback) { this->shutdown_callback_.add(std::move(callback)); }
+  /// Every line (the controller's totals)
+  static const std::vector<UltraHub *> &hubs() { return hubs_; }
+  /// The receiver blinks its identify pattern for ms, then stops (a button: find it on the ceiling)
+  void identify_for(uint16_t board, uint32_t ms) {
+    this->identify(board, true);
+    this->set_timeout(0x1D000000u | board, ms, [this, board]() { this->identify(board, false); });
+  }
   /// A position's Energy (Wh: its boards' lifetime energy through the ledger, never down; < 0: not known yet)
   double position_energy_wh(uint16_t receiver) const { return this->keeper_.energy_wh(receiver); }
   /// The lifetime counters the ledger keeps for the board at a position (nullptr: not known yet)
@@ -381,6 +406,10 @@ class UltraHub final : public Component {
   PortMonitor port_monitor_;              // the port's load and cable, after each window
   LedgerKeeper keeper_;                   // this line's receivers in the lifetime ledger (ultra_ledger.h)
   const char *tel_name_{"Port"};
+  uint32_t tel_key_{0}, rate_ms_{3000};
+  EnergyCounter port_energy_;             // the port's energy at the sender (its ledger counter)
+  bool port_seeded_{false}, rw_rx_tied_{false};
+  CallbackManager<void()> shutdown_callback_;
   void ledger_service_();                 // (the ESP32's one ledger: loaded at the first loop, stored as it changes)
   static void ledger_save_(bool now);
   std::vector<uint8_t> rw_slots_;         // the POLL slots of the next RW frame

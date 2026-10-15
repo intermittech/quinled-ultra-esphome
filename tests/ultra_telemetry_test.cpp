@@ -9,6 +9,7 @@
 // Build and run: python tests/run_ultra_telemetry_test.py
 
 #include "../components/dig2analog_ultra/ultra_ledger.h"
+#include "../components/dig2analog_ultra/ultra_pacing.h"
 #include "../components/dig2analog_ultra/ultra_telemetry.h"
 
 #include <cmath>
@@ -766,7 +767,7 @@ static void test_status() {
   d.factor = 57671;   // 88 %
   CHECK(receiver_status(d, true) == RS_LIMITING && !receiver_status_problem(RS_LIMITING) &&
             receiver_status_detail(d, RS_LIMITING, 1, -1) ==
-                "The board limit (2.0 A, user limit) is reducing the outputs by about 12 %.",
+                "The board limit (2.0 A, user limit) is reducing the outputs by about 10 %.",
         "limiting: '%s'", receiver_status_detail(d, RS_LIMITING, 1, -1).c_str());
   d.have_supply = true;
   d.dips = 3;
@@ -785,8 +786,9 @@ static void test_status() {
   d.dip_age_s = 90000;   // older than a day
   CHECK(receiver_status(d, true) == RS_LIMITING, "dips older than a day: no longer a problem");
   d.mcu_temp = 880;
-  CHECK(receiver_status(d, true) == RS_TOO_HOT && receiver_status_detail(d, RS_TOO_HOT, 0, -1).find("88.0") != std::string::npos,
-        "too hot: '%s'", receiver_status_detail(d, RS_TOO_HOT, 0, -1).c_str());
+  CHECK(receiver_status(d, true) == RS_TOO_HOT && receiver_status_detail(d, RS_TOO_HOT, 0, -1).find("85 \xC2\xB0" "C or more") != std::string::npos &&
+            receiver_status_detail(d, RS_TOO_HOT, 0, -1).find("88") == std::string::npos,
+        "too hot, without its live temperature (R14): '%s'", receiver_status_detail(d, RS_TOO_HOT, 0, -1).c_str());
   d.mcu_temp = 412;
   d.power_state = ULTRA_ST_TRIPPED;
   d.short_trips = 1;
@@ -796,7 +798,7 @@ static void test_status() {
   d.retry_s = 8;
   CHECK(receiver_status(d, true) == RS_TRIPPED && std::string(receiver_status_name(RS_TRIPPED)) == "Tripped" &&
             receiver_status_detail(d, RS_TRIPPED, 0, -1) ==
-                "Tripped by a short circuit at 12.40 A; retry in 8 s. Check the wiring of its outputs." &&
+                "Tripped by a short circuit at 12.40 A; it tries again by itself. Check the wiring of its outputs." &&
             telemetry_last_trip(d) == "short circuit at 12.40 A",
         "tripped: '%s'", receiver_status_detail(d, RS_TRIPPED, 0, -1).c_str());
   d.power_state = 0;
@@ -884,7 +886,7 @@ static void test_port() {
             std::fabs(m.resistance(2) - 1.3f / 0.54f) < 1e-4f,
         "drop to receiver 3: %.2f V; segments %.0f / %.0f / %.0f mOhm", m.drop_v(2), m.resistance(0) * 1000,
         m.resistance(1) * 1000, m.resistance(2) * 1000);
-  CHECK(port_status(m, p) == "OK" && port_status_detail(m, c.now_ms) == "OK.", "port status: '%s'",
+  CHECK(port_status(m, p) == "OK" && port_status_detail(m) == "OK.", "port status: '%s'",
         port_status(m, p).c_str());
 
   // the sender's voltage learned: receiver 1's highest
@@ -904,9 +906,9 @@ static void test_port() {
     r.current = 683;   // 2.05 A: 91 %
   c.run(p, 4000);
   m.update(c.now_ms, p);
-  CHECK(m.warning() && !m.problem() && port_status(m, p) == "91 % load" &&
-            port_status_detail(m, c.now_ms) == "2.05 A of 2.25 A (91 %): near the port's limit.",
-        "91 %%: '%s' / '%s'", port_status(m, p).c_str(), port_status_detail(m, c.now_ms).c_str());
+  CHECK(m.warning() && !m.problem() && port_status(m, p) == "90 % load" &&
+            port_status_detail(m) == "2.0 A of 2.25 A (90 %): near the port's limit.",
+        "91 %%: '%s' / '%s'", port_status(m, p).c_str(), port_status_detail(m).c_str());
   for (auto &r : c.rx)
     r.current = 720;   // 2.16 A: 96 %
   bool early = false;
@@ -915,8 +917,8 @@ static void test_port() {
     m.update(c.now_ms, p);
     early |= s < 25 && m.problem();
   }
-  CHECK(!early && m.problem() && port_status_detail(m, c.now_ms).find("may trip") != std::string::npos,
-        "96 %%: a problem only after 30 s ('%s')", port_status_detail(m, c.now_ms).c_str());
+  CHECK(!early && m.problem() && port_status_detail(m).find("may trip") != std::string::npos,
+        "96 %%: a problem only after 30 s ('%s')", port_status_detail(m).c_str());
   for (auto &r : c.rx)
     r.current = 760;   // 2.28 A: 101 %
   PortMonitor o;
@@ -933,9 +935,9 @@ static void test_port() {
   m.update(c.now_ms, p);
   CHECK(!m.complete() && m.missing() == 2 && std::fabs(m.current_a() - 1.08f) < 1e-4f && std::isnan(m.cable_loss_w()) &&
             port_status(m, p) == "No answer" &&
-            port_status_detail(m, c.now_ms) == "Receiver 3 doesn't report: the port's current and power are without it.",
+            port_status_detail(m) == "Receiver 3 doesn't report: the port's current and power are without it.",
         "incomplete: %.2f A, '%s' / '%s'", m.current_a(), port_status(m, p).c_str(),
-        port_status_detail(m, c.now_ms).c_str());
+        port_status_detail(m).c_str());
 }
 
 /// Protocol 0.2.5: LIFETIME and DIAG's two parts read after IDENTITY (and again after a restart), not from a board
@@ -1007,7 +1009,7 @@ static void test_025() {
   const Case cases[] = {
       {ULTRA_ST_WHY_RETRIES_OUT, ULTRA_ST_TRIPPED, 0, RS_TRIPPED, "retries are used up"},
       {ULTRA_ST_WHY_SHORT, ULTRA_ST_TRIPPED, 0, RS_TRIPPED, "Tripped by a short circuit"},
-      {ULTRA_ST_WHY_HOT, 0, 0, RS_TOO_HOT, "over its warning level (41.2"},
+      {ULTRA_ST_WHY_HOT, 0, 0, RS_TOO_HOT, "over its warning level. Check"},
       {ULTRA_ST_WHY_NONE, 0, ULTRA_HE_F_HOT, RS_TOO_HOT, "over its warning level"},
       {ULTRA_ST_WHY_SUPPLY, 0, 0, RS_SUPPLY_DIPS, "in the last 30 s"},
       {ULTRA_ST_WHY_SIGNAL_LOSS, 0, 0, RS_SIGNAL_LOSS, "signal_loss setting"},
@@ -1060,10 +1062,10 @@ static void test_025() {
   e.run(q, 8000);
   PortMonitor pm;
   pm.update(e.now_ms, q);
-  CHECK(std::fabs(pm.peak_a() - 2.4f) < 1e-4f && pm.peaks() && port_status(pm, q) == "Peaks 107 %" &&
-            port_status_detail(pm, e.now_ms).find("Peaks up to 2.40 A (107 %) in the last minute, 1.08 A on average") ==
+  CHECK(std::fabs(pm.peak_a() - 2.4f) < 1e-4f && pm.peaks() && port_status(pm, q) == "Peaks 105 %" &&
+            port_status_detail(pm).find("Peaks up to 2.4 A (105 %) in the last minute: short peaks are fine") ==
                 0,
-        "peaks: %.2f A, '%s' / '%s'", pm.peak_a(), port_status(pm, q).c_str(), port_status_detail(pm, e.now_ms).c_str());
+        "peaks: %.2f A, '%s' / '%s'", pm.peak_a(), port_status(pm, q).c_str(), port_status_detail(pm).c_str());
   e.rx[1].features &= ~(ULTRA_FEAT_LIFETIME | ULTRA_FEAT_DIAG | ULTRA_FEAT_RETRY | ULTRA_FEAT_LOSS_SCENE);
   for (auto &b : e.rx[1].uid)
     b ^= 0x33;   // (a 0.6.8 board swapped in: IDENTITY again)
@@ -1105,7 +1107,7 @@ static void ledger_board(Model &m) {
 static void start_hub(LedgerHub &h, Chain &c, LifetimeLedger &l, uint8_t pin = 5) {
   h = LedgerHub{};
   h.p = started(c, static_cast<uint16_t>(c.rx.size()), ULTRA_RW_RATE_1M, ledger_iv());
-  h.k.attach(&l, pin, static_cast<uint16_t>(c.rx.size()), c.now_ms);
+  h.k.attach(&l, static_cast<uint32_t>(pin) << 16, static_cast<uint16_t>(c.rx.size()), c.now_ms);
 }
 
 /// the line runs for ms: each window's news to the keeper, the positions' Energy to Home Assistant
@@ -1340,7 +1342,7 @@ static void test_ledger_boards() {
   LedgerHub h2;
   HaView ha2;
   start_hub(h2, c2, led, 6);
-  h2.k.attach(&led, 6, 1, 0);   // (the same ESP32: its hub started at 0)
+  h2.k.attach(&led, 6u << 16, 1, 0);   // (the same ESP32: its hub started at 0)
   drive(c2, h2, ha2, 15000);
   drive(c, h, ha, 15000);
   CHECK(h2.k.counters(0) != nullptr && h2.k.counters(0)->lit == moved.lit && c2.rx[0].lit_01h == moved.lit &&
@@ -1571,6 +1573,130 @@ static void test_ledger_misc() {
   std::printf("  ledger: no 0x0E without bit 22, the stored copies, the age-out\n");
 }
 
+// --------------------------------------------------------------------------------------- Home Assistant's pacing
+/// A paced sensor: what it sent, when (ultra_pacing.h)
+struct PacedOut {
+  bool have{false};
+  float last{NAN};
+  std::vector<std::pair<uint32_t, float>> sent;
+  void send(uint32_t ms, float v) {
+    this->have = true;
+    this->last = v;
+    this->sent.push_back({ms, v});
+  }
+};
+
+/// R12 / R25: the deadband (the larger of abs and rel), the minimum interval, a fade's end sent with the first sample
+/// after the interval, NAN and the first value at once, a forced value at once; a recorded power is the time-weighted
+/// mean of each 10 s (its live twin at the update rate from the same samples), so the energy from either is the same.
+static void test_pacing() {
+  // the deadband and the interval (bus voltage: 0.2 V, 10 s)
+  Paced pv;
+  PacedOut v;
+  auto feed = [&](Paced &p, const Pace &c, PacedOut &o, uint32_t ms, float x, bool force = false) {
+    if (p.due(c, x, o.last, o.have, ms, force))
+      o.send(ms, x);
+  };
+  feed(pv, PACE_VOLTAGE, v, 0, 24.00f);
+  feed(pv, PACE_VOLTAGE, v, 1000, 24.10f);    // under the deadband
+  feed(pv, PACE_VOLTAGE, v, 2000, 24.30f);    // over it, within 10 s: waits
+  feed(pv, PACE_VOLTAGE, v, 9000, 24.35f);
+  feed(pv, PACE_VOLTAGE, v, 10000, 24.40f);   // 10 s: the value now (the fade's end so far)
+  feed(pv, PACE_VOLTAGE, v, 11000, 24.40f);
+  feed(pv, PACE_VOLTAGE, v, 30000, 24.40f);   // settled: nothing
+  CHECK(v.sent.size() == 2 && v.sent[0].second == 24.00f && v.sent[1].first == 10000 && v.sent[1].second == 24.40f,
+        "deadband + interval: %u sent, the second %.2f V at %u ms", static_cast<unsigned>(v.sent.size()),
+        v.sent.size() > 1 ? v.sent[1].second : 0.0f, v.sent.size() > 1 ? v.sent[1].first : 0u);
+  // unavailable and back: at once, whatever the interval; a forced value at once
+  feed(pv, PACE_VOLTAGE, v, 31000, NAN);
+  feed(pv, PACE_VOLTAGE, v, 32000, 24.40f);
+  feed(pv, PACE_VOLTAGE, v, 33000, 26.0f, true);
+  CHECK(v.sent.size() == 5 && std::isnan(v.sent[2].second) && v.sent[3].second == 24.40f && v.sent[4].second == 26.0f,
+        "NAN, back, forced: at once (%u)", static_cast<unsigned>(v.sent.size()));
+  // the relative deadband: 2 % of 200 W is 4 W (the larger)
+  CHECK(!pace_moved(PACE_POWER, 203.0f, 200.0f, true) && pace_moved(PACE_POWER, 204.0f, 200.0f, true) &&
+            !pace_moved(PACE_POWER, 10.4f, 10.0f, true) && pace_moved(PACE_POWER, 10.5f, 10.0f, true),
+        "power's deadband: 0.5 W or 2 %%, the larger");
+  // a fade: live at 1 s (0.2 W), recorded as the 10 s mean; their energy the same
+  MeanPaced mean;
+  Paced live;
+  PacedOut rec, liv;
+  const Pace live_c{0.2f, 0.0f, 750};
+  double e_true = 0.0;
+  float prev = NAN;
+  for (uint32_t ms = 0; ms <= 60000; ms += 1000) {
+    const float w = ms < 20000 ? 10.0f : ms < 40000 ? 10.0f + (ms - 20000) / 200.0f : 110.0f;   // 10 W, a fade to 110 W
+    if (!std::isnan(prev))
+      e_true += prev * 1.0;   // (W x s, held until the next sample)
+    prev = w;
+    float out;
+    if (mean.sample(PACE_POWER, w, rec.last, rec.have, ms, false, &out))
+      rec.send(ms, out);
+    feed(live, live_c, liv, ms, w);
+  }
+  // each mean covers the 10 s before it; a window not sent was within the deadband of the value before
+  double e_rec = 0.0;
+  float cur = rec.sent.front().second;
+  for (uint32_t b = 10000; b <= 60000; b += 10000) {
+    for (const auto &s : rec.sent) {
+      if (s.first == b)
+        cur = s.second;
+    }
+    e_rec += cur * 10.0;
+  }
+  bool spaced = true;
+  for (size_t i = 2; i < rec.sent.size(); i++)
+    spaced &= rec.sent[i].first - rec.sent[i - 1].first >= 10000;
+  CHECK(rec.sent.size() == 4 && spaced && std::fabs(rec.sent.back().second - 110.0f) < 1e-3f &&
+            std::fabs(e_rec - e_true) < 0.5,
+        "the recorded power: the first value, then 10 s means while it moves (%u: %.1f .. %.1f W), its energy %.1f Ws "
+        "(true %.1f)", static_cast<unsigned>(rec.sent.size()), rec.sent.front().second, rec.sent.back().second, e_rec,
+        e_true);
+  CHECK(liv.sent.size() >= 20 && liv.sent.size() <= 23 && liv.sent.back().second == 110.0f,
+        "the live twin: every second while it moves (%u), steady not again", static_cast<unsigned>(liv.sent.size()));
+  // energy: any growth, every 5 min at most
+  Paced pe;
+  PacedOut e;
+  for (uint32_t s = 0; s <= 900; s += 10)
+    feed(pe, PACE_ENERGY, e, s * 1000, 1000.0f + s * 0.01f);
+  CHECK(e.sent.size() == 4 && e.sent[1].first == 300000 && e.sent[3].first == 900000,
+        "energy: every 5 min while it grows (%u)", static_cast<unsigned>(e.sent.size()));
+  // the user's own filters: every change
+  Paced pc;
+  PacedOut c;
+  for (uint32_t ms = 0; ms < 5000; ms += 1000)
+    feed(pc, PACE_CHANGE, c, ms, static_cast<float>(ms / 2000));
+  CHECK(c.sent.size() == 3, "unpaced: every change (%u)", static_cast<unsigned>(c.sent.size()));
+}
+
+/// The ledger's counters (a port's energy, a light's) and its keys: kept with the line's id (not its pin), never
+/// down, stored and loaded with the receivers' positions.
+static void test_ledger_counters() {
+  LifetimeLedger led;
+  CHECK(!led.ready() && led.counter_mwh(1) == 0, "not loaded: nothing kept");
+  led.init(4, 4);
+  const uint32_t port = (ledger_key("port4") & 0xFFFF0000u) | 0xFFFFu, light = ledger_key("bookshelf_1");
+  led.set_counter(port, 1500);
+  led.set_counter(port, 1200);   // (never down)
+  led.set_counter(light, 250);
+  CHECK(led.counter_mwh(port) == 1500 && led.counter_mwh(light) == 250 && led.dirty(), "counters: up only (%llu)",
+        ull(led.counter_mwh(port)));
+  std::vector<uint8_t> blob(led.blob_size());
+  led.save(blob.data(), 1);
+  LifetimeLedger l2;
+  l2.init(4, 4);
+  uint32_t gen = 0;
+  CHECK(l2.load(blob.data(), blob.size(), &gen) && l2.counter_mwh(port) == 1500 && l2.counter_mwh(light) == 250,
+        "stored and loaded");
+  // a counter and a receiver position with the same key: apart
+  LedgerKeeper k;
+  k.attach(&l2, ledger_key("port4"), 2);
+  CHECK(k.key(1) == ((ledger_key("port4") & 0xFFFF0000u) | 1u) && k.port_key() == port,
+        "a line's keys: its id's hash, the receiver's index, 0xFFFF its port");
+  CHECK(ledger_key("port4") == 0x9A093BD6u, "the key: FNV-1a as receiver_schema.py's ledger_key (%08X)",
+        static_cast<unsigned>(ledger_key("port4")));
+}
+
 /// (0.2.6) DIAG 20 bit 7: the receiver's lifetime record held: a note after the Status detail, no problem
 static void test_record_held() {
   Chain c(1);
@@ -1619,6 +1745,8 @@ int main() {
   test_ledger_erased();
   test_ledger_restart();
   test_ledger_misc();
+  test_ledger_counters();
+  test_pacing();
   test_record_held();
   test_status();
   test_port();

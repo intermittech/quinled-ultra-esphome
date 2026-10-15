@@ -1257,7 +1257,9 @@ inline std::string receivers_before(uint16_t pos) {
 }
 
 /// The plain-language line under the Status: short and factual, from the pages (no clock: Home Assistant shows since
-/// when). pos: the receiver's position on the port (0-based); cut: the receiver that cuts the port off (-1: none).
+/// when). It changes only when its meaning does (Home Assistant records every change): no countdowns or running
+/// durations, live numbers rounded. pos: the receiver's position on the port (0-based); cut: the receiver that cuts
+/// the port off (-1: none).
 inline std::string receiver_status_detail(const ReceiverData &d, ReceiverStatus s, uint16_t pos, int cut) {
   char b[160];
   const uint8_t why = receiver_why(d);
@@ -1286,7 +1288,7 @@ inline std::string receiver_status_detail(const ReceiverData &d, ReceiverStatus 
         return t + "; off, its retries are used up. Fix the wiring of its outputs, then switch its lights off and on "
                    "(or its power).";
       if (d.have_power && d.retry_s != 0)
-        t += d.retry_s == 255 ? "; retry in 255 s or more" : "; retry in " + std::to_string(d.retry_s) + " s";
+        t += "; it tries again by itself";   // (no countdown: the text changes with its meaning only)
       else if (!(d.power_state & ULTRA_ST_TRIPPED))
         t += "; on again";
       return t + ". Check the wiring of its outputs.";
@@ -1312,16 +1314,10 @@ inline std::string receiver_status_detail(const ReceiverData &d, ReceiverStatus 
         t += std::string(t.empty() ? "" : " ") + "Current flows with every output off: a MOSFET may be stuck on.";
       return t;
     }
-    case RS_TOO_HOT:
-      if (receiver_025(d) && d.mcu_temp != ULTRA_ST_NA)
-        snprintf(b, sizeof(b), "Its MCU is over its warning level (%.1f \xC2\xB0" "C on its own sensor). Check the "
-                 "cooling around the receiver.", static_cast<int16_t>(d.mcu_temp) / 10.0);
-      else if (receiver_025(d))
-        snprintf(b, sizeof(b), "Its MCU is over its warning level. Check the cooling around the receiver.");
-      else
-        snprintf(b, sizeof(b), "Its MCU is at %.1f \xC2\xB0" "C. Check the cooling around the receiver.",
-                 static_cast<int16_t>(d.mcu_temp) / 10.0);
-      return b;
+    case RS_TOO_HOT:   // (its temperature is the MCU temperature entity: not here)
+      if (receiver_025(d))
+        return "Its MCU is over its warning level. Check the cooling around the receiver.";
+      return "Its MCU is at 85 \xC2\xB0" "C or more. Check the cooling around the receiver.";
     case RS_SIGNAL_LOSS:
       return "No frames from the hub: the outputs follow its signal_loss setting.";
     case RS_SUPPLY_DIPS: {
@@ -1340,9 +1336,14 @@ inline std::string receiver_status_detail(const ReceiverData &d, ReceiverStatus 
              "connected.";
     case RS_LIMITING:
       if (d.have_power && d.limit_ma != 0xFFFF && (d.power_state & ULTRA_ST_LIMITING)) {
+        // (by about 10 / 20 / ... %: the factor moves with every fade)
         const unsigned pct = static_cast<unsigned>(((65535u - d.factor) * 100u + 32767u) / 65535u);
-        snprintf(b, sizeof(b), "The board limit (%.1f A, %s) is reducing the outputs by about %u %%.",
-                 d.limit_ma / 1000.0, telemetry_limit_source(d.limit_source), pct);
+        if (pct < 5)
+          snprintf(b, sizeof(b), "The board limit (%.1f A, %s) is reducing the outputs a little.", d.limit_ma / 1000.0,
+                   telemetry_limit_source(d.limit_source));
+        else
+          snprintf(b, sizeof(b), "The board limit (%.1f A, %s) is reducing the outputs by about %u %%.",
+                   d.limit_ma / 1000.0, telemetry_limit_source(d.limit_source), (pct + 5) / 10 * 10);
         return b;
       }
       if (d.power_state & ULTRA_ST_CH_LIMITING)
@@ -1561,12 +1562,15 @@ class PortMonitor {
   std::vector<float> drop_, res_;
 };
 
-/// The port's status, for its chip: "96 % load" (from the warning on), "No answer", the worst receiver problem,
-/// "Peaks 104 %", "2 limiting", or "OK".
+/// A load in 5 % steps (the texts: they change only with a step, not with every reading)
+inline unsigned load_step5(float pct) { return pct <= 0.0f ? 0u : static_cast<unsigned>((pct + 2.5f) / 5.0f) * 5u; }
+
+/// The port's status, for its chip: "95 % load" (from the warning on; in 5 % steps), "No answer", the worst receiver
+/// problem, "Peaks 105 %", "2 limiting", or "OK".
 inline std::string port_status(const PortMonitor &m, const TelemetryPoller &p) {
   char b[24];
   if (m.warning()) {
-    snprintf(b, sizeof(b), "%.0f %% load", m.load_pct());
+    snprintf(b, sizeof(b), "%u %% load", load_step5(m.load_pct()));
     return b;
   }
   ReceiverStatus worst = RS_OK;
@@ -1579,7 +1583,7 @@ inline std::string port_status(const PortMonitor &m, const TelemetryPoller &p) {
   if (receiver_status_problem(worst))
     return receiver_status_name(worst);
   if (m.peaks()) {
-    snprintf(b, sizeof(b), "Peaks %.0f %%", m.peak_load_pct());
+    snprintf(b, sizeof(b), "Peaks %u %%", load_step5(m.peak_load_pct()));
     return b;
   }
   if (limiting) {
@@ -1589,18 +1593,16 @@ inline std::string port_status(const PortMonitor &m, const TelemetryPoller &p) {
   return "OK";
 }
 
-/// The port's plain line: near / over its limit (how long), peaks over it, or a receiver missing from its values, or
-/// "OK."
-inline std::string port_status_detail(const PortMonitor &m, uint32_t now_ms) {
+/// The port's plain line: near / over its limit, peaks over it, or a receiver missing from its values, or "OK.". Its
+/// numbers rounded (0.1 A, 5 %), no running duration: it changes with its meaning only (Home Assistant records every
+/// change, and shows since when).
+inline std::string port_status_detail(const PortMonitor &m) {
   char b[200];
   const float limit = m.config().limit_a;
   if (m.warning()) {
-    const uint32_t min = m.high_ms(now_ms) / 60000;
     std::string t;
-    snprintf(b, sizeof(b), "%.2f A of %.2f A (%.0f %%)", m.current_a(), limit, m.load_pct());
+    snprintf(b, sizeof(b), "%.1f A of %.2f A (%u %%)", m.current_a(), limit, load_step5(m.load_pct()));
     t = b;
-    if (min >= 1)
-      t += " for " + std::to_string(min) + " min";
     if (m.problem())
       t += ". The port's fuses (PTCs) may trip: lower the brightness or move a receiver to a quieter port.";
     else
@@ -1608,8 +1610,8 @@ inline std::string port_status_detail(const PortMonitor &m, uint32_t now_ms) {
     return t;
   }
   if (m.peaks()) {
-    snprintf(b, sizeof(b), "Peaks up to %.2f A (%.0f %%) in the last minute, %.2f A on average: short peaks are fine; "
-             "if they last, the port's fuses (PTCs) may trip.", m.peak_a(), m.peak_load_pct(), m.current_a());
+    snprintf(b, sizeof(b), "Peaks up to %.1f A (%u %%) in the last minute: short peaks are fine; if they last, the "
+             "port's fuses (PTCs) may trip.", m.peak_a(), load_step5(m.peak_load_pct()));
     return b;
   }
   if (!m.complete() && m.missing() >= 0) {

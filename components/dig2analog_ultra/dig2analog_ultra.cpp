@@ -563,9 +563,14 @@ void UltraHub::finish_window_(bool wait) {
       break;
     this->rw_rx_.insert(this->rw_rx_.end(), buf, buf + n);
   }
-  // the window's bytes are read: the port's receiver off, the UART free for the next line on it
+  // the window's bytes are read: the port's receiver off, the UART free for the next line on it (DE and /RE tied:
+  // the line driven again, which turns its receiver off)
   if (this->rw_rx_enable_pin_ != nullptr)
     this->rw_rx_enable_pin_->digital_write(false);
+  if (this->rw_rx_tied_ && this->rw_dir_pin_ != nullptr && !this->rw_driving_) {
+    this->rw_dir_pin_->digital_write(true);
+    this->rw_driving_ = true;
+  }
   this->rw_turn_ = false;
   this->poller_.finish(millis(), this->rw_rx_.data(), this->rw_rx_.size());
   this->rw_publish_();
@@ -574,6 +579,16 @@ void UltraHub::finish_window_(bool wait) {
 // What changed per receiver: the port's load first (the receivers show their part), the log, then the sensors.
 void UltraHub::rw_publish_() {
   this->port_monitor_.update(millis(), this->poller_);
+  // the port's energy at the sender (standby: 0 W), kept in the ledger (never down; across reboots)
+  this->port_energy_.add(this->port_power_w(), millis());
+  LifetimeLedger &led = ultra_ledger();
+  if (led.ready()) {
+    if (!this->port_seeded_) {
+      this->port_energy_.wh = std::max(this->port_energy_.wh, led.counter_mwh(this->keeper_.port_key()) / 1000.0);
+      this->port_seeded_ = true;
+    }
+    led.set_counter(this->keeper_.port_key(), static_cast<uint64_t>(this->port_energy_.wh * 1000.0));
+  }
   for (uint16_t i = 0; i < this->poller_.receivers(); i++) {
     uint32_t u = this->poller_.take_updates(i);
     uint8_t note = i < this->rx_note_.size() ? this->rx_note_[i] : 0;
@@ -888,8 +903,8 @@ void UltraHub::setup() {
 #endif
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   if (this->rw_uart_ != nullptr) {
-    this->keeper_.attach(&ultra_ledger(), static_cast<uint8_t>(this->pin_), this->poller_.receivers());
-    ledger_receivers() += this->poller_.receivers();
+    this->keeper_.attach(&ultra_ledger(), this->tel_key_, this->poller_.receivers());
+    ledger_receivers() += this->poller_.receivers() + 1u;   // (its receivers' positions, its port's energy)
     this->rw_slots_.assign(static_cast<size_t>(ULTRA_SLOT_BYTES) * this->num_boards_, 0);
     this->rw_extra_us_ = this->poller_.max_window_us() + ULTRA_RW_HOLDOFF_US;
     if (this->rw_dir_pin_ != nullptr) {
@@ -1062,6 +1077,7 @@ void UltraHub::ledger_save_(bool now) {
 
 void UltraHub::on_shutdown() {
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  this->shutdown_callback_.call();   // (the energies one last time)
   ledger_save_(true);
 #endif
 }

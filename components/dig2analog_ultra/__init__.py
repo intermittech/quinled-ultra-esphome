@@ -51,7 +51,7 @@ def AUTO_LOAD(config=None):
     """The entity types of the Diff-Power receivers' telemetry, only for a line with telemetry: (no config: all)."""
     confs = config if isinstance(config, list) else [config]
     if config is None or any(isinstance(c, dict) and c.get(CONF_TELEMETRY) for c in confs):
-        return ["sensor", "binary_sensor", "text_sensor"]
+        return ["sensor", "binary_sensor", "text_sensor", "button"]
     return []
 
 

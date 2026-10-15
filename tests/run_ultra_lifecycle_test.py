@@ -71,8 +71,10 @@ PIECES = {
     ),
     "receiver_methods.inc": (
         "ultra_receiver.cpp",
-        ["void UltraReceiver::value_(", "void UltraReceiver::text_(", "void UltraReceiver::update_(",
-         "void UltraTelemetryPort::update_(", "void UltraLightTelemetry::update_("],
+        ["static Pace live_pace(", "static void publish_paced(", "static Pace receiver_pace(", "static Pace port_pace(",
+         "void UltraReceiver::value_(", "void UltraReceiver::text_(", "void UltraReceiver::update_(",
+         "void UltraTelemetryPort::value_(", "void UltraTelemetryPort::update_(", "void UltraLightTelemetry::store_energy_(",
+         "void UltraLightTelemetry::update_("],
     ),
 }
 # classes: the definition, then its ;
@@ -108,7 +110,7 @@ def main() -> int:
                                               encoding="utf-8")
     # the receiver entities' constants (the pages each value comes from)
     rx = (COMP / "ultra_receiver.cpp").read_text(encoding="utf-8")
-    first, last = "static constexpr uint32_t ALL_NEW", "static constexpr uint32_t SLOW_MS = 60000;\n"
+    first, last = "static constexpr uint32_t ALL_NEW", "PG_SYNC = 1u << TP_SYNC;\n"
     (BUILD / "receiver_consts.inc").write_text(rx[rx.index(first):rx.index(last) + len(last)], encoding="utf-8")
     exe = BUILD / ("ultra_lifecycle_test.exe" if sys.platform == "win32" else "ultra_lifecycle_test")
     cmd = ZIG + ["c++", "-std=c++17", "-O1", "-Wall", "-Wno-unused-variable", "-Wno-unused-function",

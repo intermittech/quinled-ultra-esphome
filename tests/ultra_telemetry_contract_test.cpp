@@ -421,7 +421,7 @@ struct Bench {
     for (uint16_t i = 0; i < receivers; i++)
       this->fakes[i].init(i, ucrx_hub_ms(), FAKE_FEATURES);
     this->led.init(receivers + 4u, receivers);
-    this->keeper.attach(&this->led, 5, receivers, ucrx_hub_ms());
+    this->keeper.attach(&this->led, 5u << 16, receivers, ucrx_hub_ms());
     this->p.locked(ucrx_hub_ms());   // (the hub's preamble: the soak's frames from the power-up on)
   }
 
@@ -892,7 +892,7 @@ static void sc_power() {
     const std::string det = receiver_status_detail(b.d(), receiver_status(b.d(), true), 0, -1);
     CHECK(receiver_status(b.d(), true) == RS_TRIPPED && receiver_status_problem(RS_TRIPPED) &&
               !receiver_status_problem(RS_SOFT_START) && contains(det, "Tripped by a short circuit at 16.") &&
-              contains(det, "; retry in 1 s") && contains(telemetry_last_trip(b.d()), "short circuit at 16."),
+              contains(det, "; it tries again by itself") && contains(telemetry_last_trip(b.d()), "short circuit at 16."),
           "power: status %s, '%s', last trip '%s'", receiver_status_name(receiver_status(b.d(), true)), det.c_str(),
           telemetry_last_trip(b.d()).c_str());
   }

@@ -4,12 +4,13 @@ and light.py; the logic is ultra_telemetry.h, the entities ultra_receiver.h."""
 
 from esphome import pins
 import esphome.codegen as cg
-from esphome.components import binary_sensor, sensor, text_sensor, uart
+from esphome.components import binary_sensor, button, sensor, text_sensor, uart
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_BAUD_RATE,
     CONF_DEVICE_ID,
     CONF_DISABLED_BY_DEFAULT,
+    CONF_FILTERS,
     CONF_ID,
     CONF_NAME,
     CONF_RX_BUFFER_SIZE,
@@ -18,10 +19,12 @@ from esphome.const import (
     DEVICE_CLASS_CURRENT,
     DEVICE_CLASS_DURATION,
     DEVICE_CLASS_ENERGY,
+    DEVICE_CLASS_IDENTIFY,
     DEVICE_CLASS_POWER,
     DEVICE_CLASS_PROBLEM,
     DEVICE_CLASS_TEMPERATURE,
     DEVICE_CLASS_VOLTAGE,
+    ENTITY_CATEGORY_CONFIG,
     ENTITY_CATEGORY_DIAGNOSTIC,
     STATE_CLASS_MEASUREMENT,
     STATE_CLASS_TOTAL_INCREASING,
@@ -41,6 +44,9 @@ ns = cg.esphome_ns.namespace("dig2analog_ultra")
 UltraReceiver = ns.class_("UltraReceiver", cg.Component)
 UltraTelemetryPort = ns.class_("UltraTelemetryPort", cg.Component)
 UltraLightTelemetry = ns.class_("UltraLightTelemetry")   # not a Component: made at codegen, attach()ed
+UltraTotals = ns.class_("UltraTotals", cg.Component)
+UltraIdentifyButton = ns.class_("UltraIdentifyButton", button.Button)
+UltraLineButton = ns.class_("UltraLineButton", button.Button)
 
 CONF_TELEMETRY = "telemetry"
 CONF_RECEIVERS = "receivers"
@@ -55,6 +61,11 @@ CONF_SUPPLY_VOLTAGE = "supply_voltage"
 CONF_LOAD_WARNING = "load_warning"
 CONF_LOAD_PROBLEM = "load_problem"
 CONF_LOAD_PROBLEM_TIME = "load_problem_time"
+CONF_UPDATE_RATE = "update_rate"
+# the update rate: STATUS (voltage, current, power) and the live values (R13)
+UPDATE_RATES = {"fast": 1000, "normal": 2000, "slow": 5000}
+# receiver_enable_pin: direction_pin: DE and /RE tied to one pin (it is the receiver enable too)
+RX_TIED = "direction_pin"
 POLL_PAGES = ["status", "power", "energy", "supply", "health", "lifetime", "diag"]
 # the UART's baud rate is the rate the receivers answer at (ULTRA_RW_RATE_*)
 RW_RATES = {1000000: 0, 500000: 1, 250000: 2}
@@ -75,6 +86,12 @@ def _value(unit, decimals, device_class=None, state_class=STATE_CLASS_MEASUREMEN
     return sensor.sensor_schema(**kw)
 
 
+def _live():
+    """A live power twin (R25): W, no state class (no statistics), its name ends in "live power": one recorder glob
+    (sensor.*_live_power) keeps every twin out of Home Assistant's database"""
+    return sensor.sensor_schema(unit_of_measurement=UNIT_WATT, accuracy_decimals=1, device_class=DEVICE_CLASS_POWER)
+
+
 def _count(icon):
     return sensor.sensor_schema(
         icon=icon, accuracy_decimals=0, state_class=STATE_CLASS_TOTAL_INCREASING, entity_category=ENTITY_CATEGORY_DIAGNOSTIC
@@ -88,10 +105,13 @@ def _text(icon, diagnostic=True):
 
 
 # A receiver's entities: key -> (kind, index in its C++ list, level, name, schema). Level 0: shown on its device (the
-# few that matter every day); 1: diagnostics, shown; 2: diagnostics, disabled in Home Assistant until enabled.
+# few that matter every day); 1: diagnostics, shown; 2: diagnostics, disabled in Home Assistant until enabled. Every
+# number is paced for Home Assistant's database (ultra_pacing.h); a user's own `filters:` replace that.
 RECEIVER_ENTITIES = {
-    # what it draws now, measured (W); its lifetime energy (Wh, counting up: the energy dashboard)
+    # what it draws, measured (W): the mean of each 10 s (recorded), and live at the update rate (not recorded: R25);
+    # its lifetime energy (Wh, counting up: the energy dashboard)
     "power": ("sensor", 0, 0, "Power", _value(UNIT_WATT, 1, DEVICE_CLASS_POWER, diagnostic=False)),
+    "live_power": ("sensor", 17, 0, "Live power", _live()),
     "energy": (
         "sensor", 1, 0, "Energy",
         _value(UNIT_WATT_HOURS, 0, DEVICE_CLASS_ENERGY, STATE_CLASS_TOTAL_INCREASING, diagnostic=False),
@@ -140,12 +160,27 @@ RECEIVER_ENTITIES = {
         _value(UNIT_HOUR, 1, DEVICE_CLASS_DURATION, STATE_CLASS_TOTAL_INCREASING, "mdi:lightbulb-on-outline"),
     ),
     "power_ups": ("sensor", 16, 2, "Power-ups", _count("mdi:power")),
+    # (with a device_id) its port and position, "Port 4 · receiver 2": Home Assistant groups receivers by it
+    "port": ("text", 8, 0, "Port", _text("mdi:ethernet")),
+    # it blinks its identify pattern for 10 s: find it on the ceiling
+    "identify": (
+        "button", 0, 0, "Identify",
+        button.button_schema(UltraIdentifyButton, device_class=DEVICE_CLASS_IDENTIFY, entity_category=ENTITY_CATEGORY_CONFIG),
+    ),
 }
+# (only on a receiver's own device)
+DEVICE_ONLY = {"port"}
 
 # The port's summary (on the hub's device, or the telemetry's own device_id): key -> (kind, index, name, schema)
 PORT_ENTITIES = {
     # at the sender: its voltage x the port current (without a supply_voltage: learned, else the receivers' power)
     "port_power": ("sensor", 0, "power", _value(UNIT_WATT, 1, DEVICE_CLASS_POWER, diagnostic=False)),
+    "port_live_power": ("sensor", 6, "live power", _live()),
+    # its energy at the sender (Wh: kept across reboots, never down): the receivers' upstream in the energy dashboard
+    "port_energy": (
+        "sensor", 7, "energy",
+        _value(UNIT_WATT_HOURS, 0, DEVICE_CLASS_ENERGY, STATE_CLASS_TOTAL_INCREASING, diagnostic=False),
+    ),
     # the receivers' input currents together, and against the port's limit (3 x 750 mA PTCs = 2.25 A)
     "port_current": ("sensor", 1, "current", _value(UNIT_AMPERE, 2, DEVICE_CLASS_CURRENT, diagnostic=False)),
     "port_load": ("sensor", 2, "load", _value(UNIT_PERCENT, 0, icon="mdi:gauge", diagnostic=False)),
@@ -160,6 +195,26 @@ PORT_ENTITIES = {
     # "OK", "91 % load", "No answer", a receiver's problem, "Peaks 104 %", "2 limiting"; and the plain line under it
     "port_status": ("text", 1, "status", _text("mdi:list-status", diagnostic=False)),
     "port_status_detail": ("text", 2, "status detail", _text("mdi:text-box-outline", diagnostic=False)),
+    # the line's buttons (disabled until enabled in Home Assistant): its current calibration (the whole line goes
+    # dark ~1 s per board), its boards blink their firmware version
+    "port_calibrate_current": (
+        "button", 0, "calibrate current",
+        button.button_schema(UltraLineButton, icon="mdi:tune-vertical", entity_category=ENTITY_CATEGORY_CONFIG),
+    ),
+    "port_show_version": (
+        "button", 1, "show firmware version",
+        button.button_schema(UltraLineButton, icon="mdi:numeric", entity_category=ENTITY_CATEGORY_CONFIG),
+    ),
+}
+PORT_DISABLED = {"port_calibrate_current", "port_show_version"}
+
+# The controller's totals (its own device: every port's power at its sender, their energy), made once
+TOTAL_ENTITIES = {
+    "total_power": (0, "Total power", _value(UNIT_WATT, 1, DEVICE_CLASS_POWER, diagnostic=False)),
+    "total_live_power": (1, "Total live power", _live()),
+    "total_energy": (
+        2, "Total energy", _value(UNIT_WATT_HOURS, 0, DEVICE_CLASS_ENERGY, STATE_CLASS_TOTAL_INCREASING, diagnostic=False)
+    ),
 }
 
 # The estimates of a light on a receiver with several lights (on the light's own device): key -> (kind, name, schema)
@@ -170,7 +225,24 @@ LIGHT_ENTITIES = {
         _value(UNIT_WATT_HOURS, 1, DEVICE_CLASS_ENERGY, STATE_CLASS_TOTAL_INCREASING, diagnostic=False),
     ),
     "status": ("text", "Status", _text("mdi:list-status", diagnostic=False)),
+    # (on the light's own device) its receiver: "Port 4 · receiver 2"
+    "port": ("text", "Port", _text("mdi:ethernet")),
 }
+
+
+def ledger_key(s):
+    """The lifetime ledger's key of a line or a light (ultra_ledger.h ledger_key: FNV-1a, 32 bit)"""
+    h = 2166136261
+    for c in str(s).encode("utf-8"):
+        h ^= c
+        h = (h * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def _receiver_enable(value):
+    if isinstance(value, str) and value.strip().lower() == RX_TIED:
+        return RX_TIED
+    return pins.gpio_output_pin_schema(value)
 
 
 def _poll_interval(key, default, low, high):
@@ -216,12 +288,18 @@ TELEMETRY_SCHEMA = cv.Schema(
         # the port's RS-485 receiver enable (high = its output drives the UART's RX; `inverted: true` for a /RE): on
         # from this line's poll frame until its window is read. With it on every line of a UART, several lines share
         # that UART (one window at a time); without, each line needs a UART of its own.
-        cv.Optional(CONF_RECEIVER_ENABLE_PIN): pins.gpio_output_pin_schema,
+        # (receiver_enable_pin: direction_pin: DE and /RE tied to the direction pin; it drives the line again as
+        # soon as its window is read, which turns its receiver off: such lines share a UART too)
+        cv.Optional(CONF_RECEIVER_ENABLE_PIN): _receiver_enable,
+        # how often the receivers' voltage, current and power are read, and the live values sent (Live power): fast
+        # 1 s, normal 2 s, slow 5 s (the recorded values are 10 s means either way)
+        cv.Optional(CONF_UPDATE_RATE, default="fast"): cv.one_of(*UPDATE_RATES, lower=True),
         cv.Optional(CONF_POLL_INTERVALS, default={}): cv.Schema(
             dict(
                 [
-                    # STATUS: voltage, current, temperature, the power state
-                    _poll_interval("status", "3s", cv.TimePeriod(seconds=1), cv.TimePeriod(seconds=60)),
+                    # STATUS: voltage, current, temperature, the power state (default: the update rate)
+                    (cv.Optional("status"), cv.All(cv.positive_time_period_milliseconds,
+                                                   cv.Range(min=cv.TimePeriod(seconds=1), max=cv.TimePeriod(seconds=60)))),
                     # POWER: limit, trips, power events; OUTPUTS (receivers with several lights): their currents
                     _poll_interval("power", "5s", cv.TimePeriod(seconds=1), cv.TimePeriod(seconds=60)),
                     _poll_interval("energy", "60s", cv.TimePeriod(seconds=10), cv.TimePeriod(hours=1)),
@@ -286,6 +364,9 @@ def telemetry_defaults(config):
         for key, (_kind, _index, ent_level, name, _schema) in RECEIVER_ENTITIES.items():
             if key not in item and ent_level > lvl:
                 continue
+            if key in DEVICE_ONLY and device is None:
+                item.pop(key, None)
+                continue
             label = name if device is not None else f"{port} R{k + 1} {name[0].lower()}{name[1:]}"
             item[key] = _entity(item.get(key), label, device, ent_level == 2)
         out.append(item)
@@ -293,7 +374,7 @@ def telemetry_defaults(config):
     device = tel.get(CONF_DEVICE_ID)
     for key, (_kind, _index, name, _schema) in PORT_ENTITIES.items():
         label = f"{name[0].upper()}{name[1:]}" if device is not None else f"{port} {name}"
-        tel[key] = _entity(tel.get(key), label, device, False)
+        tel[key] = _entity(tel.get(key), label, device, key in PORT_DISABLED)
     config[CONF_TELEMETRY] = tel
     return config
 
@@ -343,6 +424,10 @@ def validate_telemetry(full, conf, num_boards):
     u = uart_of(full, tel[CONF_UART_ID])
     if u is None:
         return
+    if tel.get(CONF_RECEIVER_ENABLE_PIN) == RX_TIED and CONF_DIRECTION_PIN not in tel:
+        raise cv.Invalid(
+            f"telemetry of '{conf[CONF_ID]}': receiver_enable_pin: direction_pin (DE and /RE tied) needs a direction_pin"
+        )
     name = f"telemetry of '{conf[CONF_ID]}': uart '{tel[CONF_UART_ID]}'"
     if CONF_RX_PIN not in u:
         raise cv.Invalid(f"{name} needs an rx_pin (the RS-485 receiver's output)")
@@ -373,14 +458,30 @@ async def _new(kind, conf):
         return await sensor.new_sensor(conf)
     if kind == "text":
         return await text_sensor.new_text_sensor(conf)
+    if kind == "button":
+        return await button.new_button(conf)
     return await binary_sensor.new_binary_sensor(conf)
+
+
+async def _totals_to_code():
+    """The controller's totals, once (the first line with telemetry)"""
+    if CORE.data.get("dig2analog_ultra_totals"):
+        return
+    CORE.data["dig2analog_ultra_totals"] = True
+    var = cg.new_Pvariable(ID("dig2analog_ultra_totals", is_declaration=True, type=UltraTotals))
+    CORE.component_ids.add("dig2analog_ultra_totals")   # (made here, not in the configuration)
+    await cg.register_component(var, {})
+    for key, (index, name, schema) in TOTAL_ENTITIES.items():
+        ent = await sensor.new_sensor(schema({CONF_ID: f"dig2analog_ultra_{key}", CONF_NAME: name}))
+        cg.add(var.set_value(index, ent))
 
 
 async def telemetry_to_code(hub, config):
     """The hub's telemetry: the poller, the receivers' entities, the port's summary."""
     tel = config[CONF_TELEMETRY]
     cg.add_define("USE_DIG2ANALOG_ULTRA_TELEMETRY")
-    iv = tel[CONF_POLL_INTERVALS]
+    iv = dict(tel[CONF_POLL_INTERVALS])
+    iv.setdefault("status", cv.TimePeriod(milliseconds=UPDATE_RATES[tel[CONF_UPDATE_RATE]]))
     receivers = tel[CONF_RECEIVERS]
     cg.add(
         hub.set_telemetry(
@@ -391,9 +492,12 @@ async def telemetry_to_code(hub, config):
         )
     )
     cg.add(hub.set_telemetry_name(tel[CONF_NAME]))
+    cg.add(hub.set_telemetry_key(ledger_key(config[CONF_ID].id)))
     if CONF_DIRECTION_PIN in tel:
         cg.add(hub.set_telemetry_direction_pin(await cg.gpio_pin_expression(tel[CONF_DIRECTION_PIN])))
-    if CONF_RECEIVER_ENABLE_PIN in tel:
+    if tel.get(CONF_RECEIVER_ENABLE_PIN) == RX_TIED:
+        cg.add(hub.set_telemetry_receiver_tied(True))
+    elif CONF_RECEIVER_ENABLE_PIN in tel:
         cg.add(hub.set_telemetry_receiver_enable_pin(await cg.gpio_pin_expression(tel[CONF_RECEIVER_ENABLE_PIN])))
     cg.add(
         hub.set_telemetry_port(
@@ -418,8 +522,13 @@ async def telemetry_to_code(hub, config):
             ent = await _new(kind, rec[key])
             if kind == "sensor":
                 cg.add(var.set_value(index, ent))
+                if CONF_FILTERS in rec[key]:
+                    cg.add(var.set_unpaced(index))   # (the user's own filters replace the pacing)
             elif kind == "text":
                 cg.add(var.set_text(index, ent))
+            elif kind == "button":
+                cg.add(ent.set_hub(hub))
+                cg.add(ent.set_board(k))
             else:
                 cg.add(var.set_problem(ent))
     port = cg.new_Pvariable(tel[CONF_PORT_ID])
@@ -431,10 +540,16 @@ async def telemetry_to_code(hub, config):
         ent = await _new(kind, tel[key])
         if kind == "sensor":
             cg.add(port.set_value(index, ent))
+            if CONF_FILTERS in tel[key]:
+                cg.add(port.set_unpaced(index))
         elif kind == "text":
             cg.add(port.set_text(index, ent))
+        elif kind == "button":
+            cg.add(ent.set_hub(hub))
+            cg.add(ent.set_kind(index))
         else:
             cg.add(port.set_problem(ent))
+    await _totals_to_code()
 
 
 async def light_telemetry_to_code(light_var, config, channels_mask):
@@ -459,7 +574,10 @@ async def light_telemetry_to_code(light_var, config, channels_mask):
     cg.add(var.set_hub(await cg.get_variable(config["dig2analog_ultra_id"])))
     cg.add(var.set_board(board))
     cg.add(var.set_channels(channels_mask))
+    cg.add(var.set_key(ledger_key(light_id)))   # (its estimated energy kept in the ledger)
     for key, (kind, name, schema) in LIGHT_ENTITIES.items():
+        if key == "port" and device is None:
+            continue   # (on the light's own device only)
         conf = {CONF_ID: f"{light_id}_{key}"}
         conf[CONF_NAME] = name if device is not None else f"{config.get(CONF_NAME, light_id)} {name[0].lower()}{name[1:]}"
         if device is not None:

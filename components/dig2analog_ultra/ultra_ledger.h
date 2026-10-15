@@ -4,8 +4,10 @@
 // lifetime counters by its full 12-byte UID, as the highest it has seen (the board may lose what it hadn't stored at a
 // power cut; the hub doesn't), and gives them back to the board once per power-up when it is ahead. The Home Assistant
 // Energy of a position (a line's receiver slot) is the board's ledger energy plus the position's offset: it continues
-// over a replaced board, a restart, a wake and a restart of the ESP32 itself, never down. Pure logic: the host tests
-// run it (tests/ultra_telemetry_test.cpp); dig2analog_ultra.cpp keeps it on the ESP32.
+// over a replaced board, a restart, a wake and a restart of the ESP32 itself, never down. It also keeps the counters
+// that belong to no board (a port's energy at the sender, a light's estimated energy): only up. Positions and
+// counters are keyed by the line's id (not its pin: a moved line keeps them) or the light's. Pure logic: the host
+// tests run it (tests/ultra_telemetry_test.cpp); dig2analog_ultra.cpp keeps it on the ESP32.
 
 #include <cstdint>
 #include <cstring>
@@ -52,18 +54,31 @@ struct LedgerEntry {
   bool used{false};
 };
 
-/// A line's receiver slot: the board there and its Energy (the board's ledger energy + offset).
+/// A line's receiver slot: the board there and its Energy (the board's ledger energy + offset); or (counter) a value of
+/// its own that only goes up (a port's energy, a light's).
 struct LedgerPosition {
-  uint32_t key{0};        // the line (its pin) and the receiver index
+  uint32_t key{0};        // the line (its id's hash) and the receiver index; a counter's own key
   uint8_t uid[12]{};
   bool have_uid{false};
+  bool counter{false};
   int64_t offset_mwh{0};
-  uint64_t value_mwh{0};  // its Energy as last computed (the base when its board changes)
+  uint64_t value_mwh{0};  // its Energy as last computed (the base when its board changes); a counter's value
   bool used{false};
 };
 
+/// A 32-bit FNV-1a of a string (the keys: a line's id, a light's id; the same as ESPHome's fnv1a_32bit_hash)
+inline uint32_t ledger_key(const char *s) {
+  uint32_t h = 2166136261u;
+  for (; *s != 0; s++) {
+    h ^= static_cast<uint8_t>(*s);
+    h *= 16777619u;
+  }
+  return h;
+}
+
 class LifetimeLedger;
-/// the ESP32's one ledger (every line's receivers) and their count (each line adds its own at its setup)
+/// the ESP32's one ledger (every line's receivers) and their count (each line adds its own at its setup: its receivers,
+/// its port, its lights' estimates)
 inline LifetimeLedger &ultra_ledger();
 inline size_t &ledger_receivers() {
   static size_t n = 0;
@@ -78,6 +93,21 @@ class LifetimeLedger {
     this->positions_.assign(positions, LedgerPosition{});
   }
   size_t capacity() const { return this->entries_.size(); }
+  /// loaded (init): before it, nothing is kept (counters read 0)
+  bool ready() const { return !this->positions_.empty(); }
+  /// A counter's value (mWh; 0: none yet)
+  uint64_t counter_mwh(uint32_t key) {
+    LedgerPosition *p = this->position_(key, true);
+    return p != nullptr ? p->value_mwh : 0;
+  }
+  /// A counter raised to mwh (never lowered; dirty from a whole Wh)
+  void set_counter(uint32_t key, uint64_t mwh) {
+    LedgerPosition *p = this->position_(key, true);
+    if (p == nullptr || mwh <= p->value_mwh)
+      return;
+    this->dirty_ |= mwh / 1000 != p->value_mwh / 1000;
+    p->value_mwh = mwh;
+  }
   uint32_t day() const { return this->day_; }
   /// a hub day passed: boards not seen for LEDGER_AGE_DAYS that no position holds go
   void set_day(uint32_t day) {
@@ -235,7 +265,7 @@ class LifetimeLedger {
     }
     for (const auto &p : this->positions_) {
       if (p.used) {
-        b[0] = static_cast<uint8_t>(1 | (p.have_uid ? 2 : 0));
+        b[0] = static_cast<uint8_t>(1 | (p.have_uid ? 2 : 0) | (p.counter ? 4 : 0));
         ultra_put32(b + 1, p.key);
         std::memcpy(b + 5, p.uid, 12);
         put64_(b + 17, static_cast<uint64_t>(p.offset_mwh));
@@ -277,6 +307,7 @@ class LifetimeLedger {
       LedgerPosition &p = this->positions_[i];
       p.used = true;
       p.have_uid = (b[0] & 2) != 0;
+      p.counter = (b[0] & 4) != 0;
       p.key = ultra_get32(b + 1);
       std::memcpy(p.uid, b + 5, 12);
       p.offset_mwh = static_cast<int64_t>(get64_(b + 17));
@@ -331,10 +362,10 @@ class LifetimeLedger {
     }
     return false;
   }
-  LedgerPosition *position_(uint32_t key) {
+  LedgerPosition *position_(uint32_t key, bool counter = false) {
     LedgerPosition *free = nullptr;
     for (auto &p : this->positions_) {
-      if (p.used && p.key == key)
+      if (p.used && p.key == key && p.counter == counter)
         return &p;
       if (!p.used && free == nullptr)
         free = &p;
@@ -343,6 +374,7 @@ class LifetimeLedger {
       *free = LedgerPosition{};
       free->used = true;
       free->key = key;
+      free->counter = counter;
     }
     return free;
   }
@@ -375,15 +407,17 @@ class LedgerKeeper {
   /// what on_updates() saw (the hub logs it)
   enum Event : uint8_t { EV_NONE = 0, EV_NEW_BOARD = 1, EV_RESTORE = 2, EV_ATTENTION = 4, EV_SYNCED = 8 };
 
-  /// boot_ms: millis() when the ESP32 started (0; the tests: their hub's start)
-  void attach(LifetimeLedger *ledger, uint8_t pin, uint16_t receivers, uint32_t boot_ms = 0) {
+  /// key_base: the line's (its id's hash, low 16 bits clear: the receiver's index goes there; 0xFFFF: its port's
+  /// counter); boot_ms: millis() when the ESP32 started (0; the tests: their hub's start)
+  void attach(LifetimeLedger *ledger, uint32_t key_base, uint16_t receivers, uint32_t boot_ms = 0) {
     this->ledger_ = ledger;
-    this->pin_ = pin;
+    this->key_base_ = key_base & 0xFFFF0000u;
     this->rx_.assign(receivers, Rx{});
     this->up_ms_ = 0;
     this->last_ms_ = boot_ms;
   }
-  uint32_t key(uint16_t i) const { return static_cast<uint32_t>(this->pin_) << 16 | i; }
+  uint32_t key(uint16_t i) const { return this->key_base_ | i; }
+  uint32_t port_key() const { return this->key_base_ | 0xFFFFu; }
 
   /// A receiver's news (TelemetryPoller::take_updates bits): merge, sync, the position. Returns Event bits.
   uint8_t on_updates(TelemetryPoller &p, uint16_t i, uint32_t updates, uint32_t now_ms) {
@@ -612,7 +646,7 @@ class LedgerKeeper {
   }
 
   LifetimeLedger *ledger_{nullptr};
-  uint8_t pin_{0};
+  uint32_t key_base_{0};
   std::vector<Rx> rx_;
   uint64_t up_ms_{0};
   uint32_t last_ms_{0};

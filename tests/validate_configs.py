@@ -986,10 +986,10 @@ CASES = [
     (
         "diffpower two ports with one name",
         DP_PORT + "    status: false\n    problem: false\n    standby_cycles: false\n    standby_hours: false\n"
-        "    detect_drops: false\n    power_mode_select: false\n"
+        "    detect_drops: false\n    power_mode_select: false\n    wake: false\n"
         "  - id: p2\n    name: Port 1\n    enable_pin: GPIO32\n    detect_pin: GPIO33\n    status: false\n"
         "    problem: false\n    standby_cycles: false\n    standby_hours: false\n    detect_drops: false\n"
-        "    power_mode_select: false\n",
+        "    power_mode_select: false\n    wake: false\n",
         True,
         None,
     ),
@@ -1204,6 +1204,37 @@ CASES = [
         True,
         None,
     ),
+    # Home Assistant (quinled-ultra-homeassistant esphome-requirements): the update rate, the live twins, the Port text,
+    # the Identify button, the controller's totals, DE and /RE tied on a shared UART
+    ("ultra telemetry update_rate normal", ULTRA + TELEMETRY + "    update_rate: normal\n" + RX_UART, True, None),
+    ("ultra telemetry update_rate bogus", ULTRA + TELEMETRY + "    update_rate: ludicrous\n" + RX_UART, False,
+     "Unknown value"),
+    ("ultra telemetry live twins on devices", ULTRA + TELEMETRY + RX_LIST + RX_UART, True, "name: Live power"),
+    ("ultra telemetry Port text on a receiver's device", ULTRA + TELEMETRY + RX_LIST + RX_UART, True, "name: Port\n"),
+    ("ultra telemetry Identify button", ULTRA + TELEMETRY + RX_LIST + RX_UART, True, "name: Identify"),
+    ("ultra telemetry no Port text without a device", ULTRA + TELEMETRY + RX_UART, True, "!R1 port"),
+    ("ultra telemetry port live power and energy", ULTRA + TELEMETRY + RX_LIST + RX_UART, True, "name: Port 1 energy"),
+    ("ultra telemetry line buttons (disabled)", ULTRA + TELEMETRY + RX_LIST + RX_UART, True,
+     "name: Port 1 calibrate current"),
+    (
+        "ultra telemetry 2 lines on one UART, DE and /RE tied",
+        tel_lines(2, uarts=[0, 0]).replace(
+            "      receivers: 1\n", "      receivers: 1\n      direction_pin: GPIO{}\n      receiver_enable_pin: direction_pin\n"
+        ).format(4, 5),
+        True,
+        None,
+    ),
+    (
+        "ultra telemetry DE and /RE tied without a direction pin",
+        ULTRA + TELEMETRY + "    receiver_enable_pin: direction_pin\n" + RX_UART,
+        False,
+        "needs a direction_pin",
+    ),
+    ("diffpower on its own device: names without the port's", DP_PORT + "    device_id: r1\n", True, "name: Power state"),
+    ("diffpower on its own device: a Wake button", DP_PORT + "    device_id: r1\n", True, "name: Wake\n"),
+    ("diffpower on the controller: '<port> wake'", DP_PORT, True, "name: Port 1 wake"),
+    ("diffpower wake_timeout", DP_PORT + "    wake_timeout: 30min\n", True, None),
+    ("diffpower wake_timeout 2 days", DP_PORT + "    wake_timeout: 48h\n", False, "wake_timeout"),
     # PARLIO: up to 16 lanes on an ESP32-P4, telemetry on 4 UARTs shared by 4 lanes each
     ("parlio 16 lanes, 4 UARTs x 4 lanes with receiver enable pins", parlio(), True, None, P4),
     ("parlio lanes on Diff-Power ports",

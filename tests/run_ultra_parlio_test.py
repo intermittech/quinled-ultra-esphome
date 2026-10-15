@@ -59,7 +59,7 @@ NEGATIVE = [
      "  int64_t deadline_of_(int64_t k) const {\n    return ParlioClock",
      "  int64_t deadline_of_(int64_t k) const {\n    return 0 * ParlioClock"),
     ("a stop leaves the releases of the frames it cut armed", "ultra_parlio.h",
-     "      this->release_us_[k] = 0;\n      this->lanes_[k].cut_at(", "      this->lanes_[k].cut_at("),
+     "      this->release_us_[k] = 0;\n    }\n    this->clock_.note_stop(", "    }\n    this->clock_.note_stop("),
     ("a stop cancels the release of a frame that was out", "ultra_parlio.h",
      "      if (this->release_us_[k] != 0 && this->release_end_us_[k] <= cut_us)\n", "      if (false)\n"),
     ("a handover accepted after its deadline (as long as the timer hasn't stopped the stream yet)", "ultra_parlio.h",
@@ -75,8 +75,12 @@ NEGATIVE = [
      "    if (this->tx_prepared_ && this->tx_rw_ && !this->rw_open_) {\n      this->tx_prepared_ = false;\n"
      "      this->tx_rw_ = false;\n      this->rw_release_ = false;\n      this->rw_drop_turn_();\n    }\n", ""),
     ("a lane's notice copy counted once its end passed, refused or cut", "dig2analog_ultra.cpp",
-     "  const uint8_t outcome = this->lane_->outcome(this->notice_id_, this->notice_end_us_, now_us_());\n",
+     "  const uint8_t outcome =\n      this->lane_->outcome(this->notice_id_, this->notice_epoch_, this->notice_end_us_, now_us_());\n",
      "  const uint8_t outcome = now_us_() >= this->notice_end_us_ ? ParlioLane::ON_WIRE : ParlioLane::PENDING;\n"),
+    ("a stop marks only the lane's last taken frame as cut", "ultra_parlio.h",
+     "    if (this->clock_->cut_in(epoch, static_cast<uint32_t>(end_us)) != 0)\n      return FAILED;\n",
+     "    if (this->clock_->cut_in(epoch, static_cast<uint32_t>(end_us)) != 0 &&\n"
+     "        this->taken_id_.load(std::memory_order_acquire) == id)\n      return FAILED;\n"),
     ("the lane's release callback named without telemetry", "dig2analog_ultra.cpp",
      "#else\n    const ParlioLane::ReleaseFn release = nullptr;\n#endif\n",
      "#else\n    const ParlioLane::ReleaseFn release = UltraHub::rw_lane_release_;\n#endif\n"),
@@ -100,6 +104,7 @@ NEGATIVE = [
      "  this->rw_drop_turn_();\n", ""),
     ("a lane's notice copy reported to its port as it is posted (not as it starts on the wire)", "dig2analog_ultra.cpp",
      "      this->notice_id_ = this->lane_->posted_id();   // (once out on the wire the port is told: service_notice_())\n"
+     "      this->notice_epoch_ = this->lane_->posted_epoch();\n"
      "      this->notice_end_us_ = this->lane_->frame_end_us();\n",
      "      this->port_->notice_sent();\n"),
     ("the lock interval after a preamble on a lane waits for the RMT", "dig2analog_ultra.cpp",

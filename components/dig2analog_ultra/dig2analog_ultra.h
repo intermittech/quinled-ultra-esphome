@@ -491,6 +491,7 @@ class UltraHub final : public Component {
   bool port_attached_{false};           // its loads registered (the first loop: the lights have their states)
   uint32_t notices_{0};
   uint32_t notice_id_{0};               // a lane's notice copy: its post (counted once out on the wire; 0: none)
+  uint32_t notice_epoch_{0};            // ... the stream's epoch it was posted in
   int64_t notice_end_us_{0};            // ... its last bit
   void attach_port_();
   void pump_notice_();

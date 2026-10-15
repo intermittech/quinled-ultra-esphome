@@ -15,6 +15,7 @@
 //     wrong boards' positions); the stream restarts and frames flow again;
 //  5. a late switch interrupt changes nothing; a kill cancels the releases of the frames it cuts, never moves one;
 //     the handover around its deadline, a start whose clock was read late, a poll frame that ends just before a stop;
+//     a notice cut by a stop while the lane's next frame was already taken;
 //  6. 16 lanes on the hub's own code, 4 UARTs shared by 4 lanes each (also through a kill): windows of one UART never
 //     overlap, windows of different UARTs do, every receiver answers with its own data, a silent lane leaves the
 //     others answering; RMT lines sharing a UART; a busy line can't starve the others; a poll that failed to go out
@@ -1059,6 +1060,78 @@ static void test_release_at_stop() {
               complete);
 }
 
+/// A notice frame (8 boards: longer than a buffer) and the lane's next frame, taken by the renderer while the notice
+/// is still on the wire; the stream stops: before the notice's last bit (it was cut: FAILED, also with the next frame
+/// taken), or after it (out whole: ON_WIRE; the next frame cut: FAILED).
+static void test_notice_pipelined() {
+  struct Case {
+    bool next;
+    int stop_at;   // the chunk whose handover misses its deadline
+    uint8_t notice, next_outcome;
+  };
+  const Case cases[] = {{false, 6, ParlioLane::FAILED, 0}, {true, 6, ParlioLane::FAILED, ParlioLane::FAILED},
+                        {true, 7, ParlioLane::ON_WIRE, ParlioLane::FAILED}};
+  int bad = 0;
+  for (const Case &c : cases) {
+    ParlioLaneTiming timing[16]{};
+    timing[0] = {5, 14};
+    ParlioStream s;
+    s.init(timing, 1, 0, 50, 8, 27, 96, 459500);
+    ParlioLane *lane = s.lane(0);
+    const size_t bytes = ultra_frame_bytes(8);
+    lane->begin(bytes, nullptr, nullptr);
+    std::vector<uint8_t> b0(s.chunk_bytes()), b1(s.chunk_bytes());
+    void *bufs[] = {b0.data(), b1.data()};
+    s.clear(bufs[0], 0);
+    s.clear(bufs[1], 1);
+    s.start(0, 0, 0, 0);
+    Scheduler sched;
+    sched.init(8, 123);
+    sched.set_bit_timing(250, 1100, 700, 650);
+    std::vector<uint8_t> notice(bytes), next(bytes);
+    for (uint16_t i = 0; i < 8; i++)
+      sched.power_off(i, true);
+    sched.build_frame(lane->reserve_us(), notice.data());
+    lane->post(notice.data(), bytes, 300, false);
+    const uint32_t id = lane->posted_id(), epoch = lane->posted_epoch();
+    const int64_t end = lane->frame_end_us();
+    uint32_t next_id = 0, next_epoch = 0;
+    int64_t next_end = 0, stop = 0;
+    bool taken_while_on_wire = false;
+    for (int k = 2; k <= 8; k++) {
+      const int64_t chunk = s.render(bufs);
+      if (k == 3 && c.next) {   // the notice taken: the hub posts its next frame
+        if (!lane->busy()) {
+          sched.build_frame(lane->reserve_us(), next.data());
+          if (lane->post(next.data(), bytes, 300, false)) {
+            next_id = lane->posted_id();
+            next_epoch = lane->posted_epoch();
+            next_end = lane->frame_end_us();
+          }
+        }
+      }
+      if (k == c.stop_at) {
+        stop = s.deadline_us();   // rendered, but its handover misses the deadline: the stream stops
+        taken_while_on_wire = next_id != 0 && lane->taken_id() == next_id && stop < end;
+        if (s.handed_over(chunk, stop))
+          bad++;
+        s.stop(stop);
+        break;
+      }
+      s.handed_over(chunk, static_cast<int64_t>((k - 1) * s.chunk_ns() / 1000 + 50));
+    }
+    const int64_t later = std::max(end, next_end) + 100;
+    const uint8_t o = lane->outcome(id, epoch, end, later);
+    const uint8_t n = c.next ? lane->outcome(next_id, next_epoch, next_end, later) : 0;
+    bad += o != c.notice || n != c.next_outcome || (c.next && c.stop_at == 6 && !taken_while_on_wire);
+  }
+  CHECK(bad == 0, "a notice and the lane's next frame taken while it is on the wire: a stop before its last bit marks "
+        "the notice cut (also with the next frame taken), one after it leaves it out whole and the next frame cut (%d "
+        "wrong)", bad);
+  std::printf("  notice and its next frame in the pipeline: a stop before the notice's end fails it, one after it "
+              "fails the next frame\n");
+}
+
 //BUS_TESTS_END
 }  // namespace esphome::dig2analog_ultra
 
@@ -1143,6 +1216,7 @@ int main(int argc, char **argv) {
   test_deadline_boundary();
   test_start_origin();
   test_release_at_stop();
+  test_notice_pipelined();
   hub_lanes::test_sixteen_lanes();
   hub_lanes::test_rmt_shared_uart();
   hub_lanes::test_fair_uart();
@@ -1152,6 +1226,7 @@ int main(int argc, char **argv) {
   hub_lanes::test_port_on_lane(928, "10 ms buffers");
   hub_lanes::test_port_on_lane(96, "1 ms buffers, stops at notices", true);
   hub_lanes::test_port_on_lane(928, "10 ms buffers, stops at notices", true);
+  hub_lanes::test_port_on_lane(96, "1 ms buffers, 8 boards, stops at notices, one in the pipeline", true, 8);
   hub_lanes::test_port_down_unsent_poll();
   hub_update::test_update_on_lane();
   hub_update::test_update_failures();

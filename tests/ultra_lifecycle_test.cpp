@@ -2944,7 +2944,7 @@ struct UltraHub {
   diffpower::DiffPowerPort *port_{nullptr};
   bool port_attached_{false}, cal_power_hold_{false}, upd_power_hold_{false};
   uint32_t notices_{0};
-  uint32_t notice_id_{0};
+  uint32_t notice_id_{0}, notice_epoch_{0};
   int64_t notice_end_us_{0};
   uint8_t pin_{16};
   int resyncs{0}, wakes{0};

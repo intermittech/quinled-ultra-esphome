@@ -313,7 +313,7 @@ struct UltraHub {
   DiffPowerPort *port_{nullptr};
   bool port_attached_{false};
   uint32_t notices_{0};
-  uint32_t notice_id_{0};
+  uint32_t notice_id_{0}, notice_epoch_{0};
   int64_t notice_end_us_{0};
   uint8_t rw_dir_gpio_{0}, rw_dir_idle_{0};
   std::vector<TestLight *> lights_;
@@ -992,7 +992,7 @@ static void test_group_cadence() {
 ///    the wire, every copy out before the enable drops, the enable at least 100 ms after the third copy's start (as
 ///    on an RMT line, where a copy starts as it is handed over);
 ///  - the shutdown hook: the same 3 copies through the stream while the loop no longer runs, the enable low after.
-static void test_port_on_lane(uint32_t chunk_groups, const char *what, bool inject = false) {
+static void test_port_on_lane(uint32_t chunk_groups, const char *what, bool inject = false, uint16_t boards = 2) {
   set_clock(400000000);
   UltraHub::hubs_.clear();
   DiffPowerPort::ports_.clear();
@@ -1013,6 +1013,8 @@ static void test_port_on_lane(uint32_t chunk_groups, const char *what, bool inje
   renew(port);
   uart = Uart();
   light = TestLight();
+  hub.num_boards_ = boards;
+  tel.boards_of[0] = boards;
   enable.reset(false);
   detect.reset(true);
   PortConfig pc = port.core_.config();
@@ -1043,10 +1045,13 @@ static void test_port_on_lane(uint32_t chunk_groups, const char *what, bool inje
   size_t decoded = 0;
   std::vector<std::pair<int64_t, uint8_t>> states{{clock_us, port.core_.state()}};
   // inject: the stream stops (a late render) at notice copies: right after the planned power-off's first post (the
-  // copy is refused: it never went out), within its third post's last bytes and the shutdown's first (cut)
-  int phase = 0, posts = 0, injected = 0;
-  uint32_t last_id = 0;
-  int64_t kill_at = 0;
+  // copy is refused: it never went out), within its third post's last bytes and the shutdown's first (cut); with
+  // frames longer than a buffer, also within the second post's last bytes once the lane's next frame (a command
+  // queued with it) was taken: the notice is cut while a later frame is in the pipeline
+  int phase = 0, posts = 0, injected = 0, pipelined = 0;
+  uint32_t last_id = 0, watch_id = 0, watch_next = 0;
+  int64_t kill_at = 0, watch_end = 0;
+  const uint16_t a[CHANNELS] = {100, 200, 300, 400, 500}, b[CHANNELS] = {65535, 65535, 65535, 65535, 65535};
   auto step = [&](int64_t until_us, bool loops) {
     while (clock_us < until_us) {
       const int64_t next = std::min(until_us, clock_us + 50);
@@ -1095,10 +1100,28 @@ static void test_port_on_lane(uint32_t chunk_groups, const char *what, bool inje
       if (hub.notice_id_ != 0 && hub.notice_id_ != last_id) {   // a notice copy posted
         last_id = hub.notice_id_;
         posts++;
-        if (inject && phase == 1 && posts == 1)
+        if (inject && phase == 1 && posts == 1) {
           kill_at = clock_us + 1;
-        else if (inject && ((phase == 1 && posts == 3) || (phase == 2 && posts == 1)))
+        } else if (inject && ((phase == 1 && posts == 3) || (phase == 2 && posts == 1))) {
           kill_at = hub.notice_end_us_ - 30;
+        } else if (inject && boards > 2 && phase == 1 && posts == 2) {
+          watch_id = hub.notice_id_;
+          watch_end = hub.notice_end_us_;
+          watch_next = 0;
+          hub.sched_.light_set(0, 0, 0, 1000, a, b, 100, clock_us + 500000);   // the lane's next frame follows
+        }
+      }
+      if (watch_id != 0) {   // the next frame taken while the notice is on the wire: cut the notice before its end
+        ParlioLane *lane = bus.s.lane(0);
+        if (watch_next == 0 && lane->posted_id() != watch_id)
+          watch_next = lane->posted_id();
+        if (watch_next != 0 && lane->taken_id() == watch_next && clock_us < watch_end - 30) {
+          kill_at = watch_end - 30;
+          pipelined++;
+          watch_id = 0;
+        } else if (clock_us >= watch_end) {
+          watch_id = 0;
+        }
       }
     }
   };
@@ -1190,12 +1213,18 @@ static void test_port_on_lane(uint32_t chunk_groups, const char *what, bool inje
         "notice copies at least %.1f ms apart on the wire, all out before the enable drops, it %.1f ms after the third "
         "one's start at least; no poll frame from the first copy until powered again", what, least_gap / 1000.0,
         least_tail / 1000.0);
-  CHECK(!inject || injected == 3, "%s: the stream stopped at 3 notice copies (%d)", what, injected);
+  CHECK(!inject || injected == 3 + (boards > 2), "%s: the stream stopped at %d notice copies (%d)", what,
+        3 + (boards > 2), injected);
+  CHECK(!inject || boards <= 2 || pipelined == 1, "%s: a notice copy cut while the lane's next frame was already "
+        "taken (%d)", what, pipelined);
   CHECK(psram_in_isr == 0, "%s: the timer's interrupt touched no ISR pin's own allocation (%d)", what, psram_in_isr);
   std::printf("  a line on a Diff-Power port, on a lane (%s): preamble after each wake, polls after the lock interval, "
-              "notice copies >= %.1f ms apart, the enable %.1f ms after the third, the shutdown in %lld ms%s\n", what,
-              least_gap / 1000.0, least_tail / 1000.0, static_cast<long long>(sd_ms),
-              inject ? "; 3 copies refused or cut by stops of the stream, sent again" : "");
+              "notice copies >= %.1f ms apart, the enable %.1f ms after the third, the shutdown in %lld ms", what,
+              least_gap / 1000.0, least_tail / 1000.0, static_cast<long long>(sd_ms));
+  if (inject)
+    std::printf("; %d copies refused or cut by stops of the stream (%d with the next frame taken), sent again", injected,
+                pipelined);
+  std::printf("\n");
   UltraHub::hubs_.clear();
   DiffPowerPort::ports_.clear();
 }

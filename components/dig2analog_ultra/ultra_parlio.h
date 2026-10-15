@@ -108,9 +108,39 @@ class ParlioClock {
   }
   static int64_t floor_div_(int64_t a, int64_t b) { return a >= 0 ? a / b : -((-a + b - 1) / b); }
 
+  /// (the stream's stop, under the bus' lock; also the timer's interrupt: inline) epoch ended with its pins idle by
+  /// cut_us. The last STOPS stops are kept.
+  ULTRA_ALWAYS_INLINE void note_stop(uint32_t epoch, uint32_t cut_us) {
+    const uint32_t n = this->stops_.load(std::memory_order_relaxed);
+    this->stop_epoch_[n % STOPS] = epoch;
+    this->stop_cut_[n % STOPS] = cut_us;
+    this->stops_.store(n + 1, std::memory_order_release);
+  }
+  /// Whether a frame of `epoch` whose last bit is out at end_us (host us, low 32 bits) was cut: 1 the stop of its
+  /// epoch came before that (or that stop is no longer known: too many since), 0 not (no stop, or one after it).
+  int cut_in(uint32_t epoch, uint32_t end_us) const {
+    for (;;) {
+      const uint32_t n = this->stops_.load(std::memory_order_acquire);
+      int cut = this->read().epoch == epoch ? 0 : 1;   // (an earlier epoch ended with a stop: unknown unless kept)
+      for (uint32_t i = 0; i < STOPS && i < n; i++) {
+        const uint32_t k = (n - 1 - i) % STOPS;
+        if (this->stop_epoch_[k] == epoch) {
+          cut = static_cast<int32_t>(this->stop_cut_[k] - end_us) < 0 ? 1 : 0;
+          break;
+        }
+      }
+      std::atomic_thread_fence(std::memory_order_acquire);
+      if (this->stops_.load(std::memory_order_relaxed) == n)
+        return cut;
+    }
+  }
+
  protected:
+  static constexpr uint32_t STOPS = 4;
   std::atomic<uint32_t> seq_{0};
   State state_{};
+  uint32_t stop_epoch_[STOPS]{}, stop_cut_[STOPS]{};
+  std::atomic<uint32_t> stops_{0};
   uint32_t sample_ns_{50}, group_samples_{216}, group_ns_{10800}, chunk_groups_{96};
 };
 
@@ -192,24 +222,28 @@ class ParlioLane {
     this->last_refused_ = false;
     this->end_us_ = this->clock_->group_us(this->clock_state_, this->start_ + static_cast<int64_t>(bytes) + this->p_quiet_);
     this->frame_end_us_ = this->clock_->group_us(this->clock_state_, this->start_ + static_cast<int64_t>(bytes));
-    this->p_end32_ = static_cast<uint32_t>(this->frame_end_us_);
     this->p_id_ = ++this->post_seq_;
     this->state_.store(POSTED, std::memory_order_release);
     return true;
   }
   /// When the last posted frame and its quiet are over on the wire (host us; a restart ends them sooner).
   int64_t end_us() const { return this->end_us_; }
-  /// The last post: its id (outcome()) and when its last bit is out (host us).
+  /// The last post: its id and epoch (outcome()) and when its last bit is out (host us).
   uint32_t posted_id() const { return this->p_id_; }
+  uint32_t posted_epoch() const { return this->p_epoch_; }
+  /// the last post the renderer took (tests, diagnostics)
+  uint32_t taken_id() const { return this->taken_id_.load(std::memory_order_acquire); }
   int64_t frame_end_us() const { return this->frame_end_us_; }
-  /// What became of post `id` by now_us, whose last bit is out at end_us: refused (the stream restarted before it went
-  /// out, or its start passed) or cut by a stop of the stream: FAILED; taken by the renderer and its last bit out, no
-  /// stop before: ON_WIRE (complete, as the boards see it); else PENDING. (The hub asks every loop: a failure is seen
-  /// before the next post of the lane.)
-  uint8_t outcome(uint32_t id, int64_t end_us, int64_t now_us) const {
+  /// What became of post `id` (of `epoch`, its last bit out at end_us) by now_us: refused (the stream restarted before
+  /// it went out, or its start passed), or cut by the stop of its epoch (before its last bit, whatever the renderer
+  /// took after it): FAILED; taken by the renderer and its last bit out, no stop before: ON_WIRE (complete, as the
+  /// boards see it); else PENDING. (A refusal is seen at the hub's next loop, before its next post of the lane.)
+  uint8_t outcome(uint32_t id, uint32_t epoch, int64_t end_us, int64_t now_us) const {
     if (id == 0)
       return PENDING;
-    if (this->refused_id_.load(std::memory_order_acquire) == id || this->cut_id_.load(std::memory_order_acquire) == id)
+    if (this->refused_id_.load(std::memory_order_acquire) == id)
+      return FAILED;
+    if (this->clock_->cut_in(epoch, static_cast<uint32_t>(end_us)) != 0)
       return FAILED;
     const uint32_t taken = this->taken_id_.load(std::memory_order_acquire);
     if (static_cast<int32_t>(taken - id) >= 0 && now_us >= end_us)
@@ -232,13 +266,6 @@ class ParlioLane {
   ULTRA_ALWAYS_INLINE void release_now() const {
     if (this->release_fn_ != nullptr)
       this->release_fn_(this->release_arg_);
-  }
-  /// (a stop of the stream at cut_us, inline: the timer's interrupt) the frame the renderer took last: cut, unless its
-  /// last bit was out by then
-  ULTRA_ALWAYS_INLINE void cut_at(uint32_t cut_us) {
-    const uint32_t taken = this->taken_id_.load(std::memory_order_relaxed);
-    if (taken != 0 && static_cast<int32_t>(this->taken_end32_ - cut_us) > 0)
-      this->cut_id_.store(taken, std::memory_order_release);
   }
 
  protected:
@@ -265,10 +292,8 @@ class ParlioLane {
   uint32_t p_epoch_{0};
   bool p_release_{false};
   uint32_t p_id_{0};
-  uint32_t p_end32_{0};          // its last bit (host us, low 32 bits)
-  // what became of the posts (outcome()): the renderer's and the stop's
-  std::atomic<uint32_t> taken_id_{0}, refused_id_{0}, cut_id_{0};
-  uint32_t taken_end32_{0};      // the taken frame's last bit (host us, low 32 bits)
+  // what became of the posts (outcome(); the stops: ParlioClock::cut_in())
+  std::atomic<uint32_t> taken_id_{0}, refused_id_{0};
   // the renderer's (free_: the hub reads it once the frame was taken)
   int64_t free_{0};            // the first group after the last frame taken and its quiet
   std::unique_ptr<uint8_t[]> copy_;
@@ -453,7 +478,6 @@ class ParlioRenderer {
       lane->cur_start_ = lane->p_start_;
       lane->cur_bytes_ = lane->p_bytes_;
       lane->free_ = lane->p_start_ + lane->p_bytes_ + lane->p_quiet_;
-      lane->taken_end32_ = lane->p_end32_;
       lane->taken_id_.store(lane->p_id_, std::memory_order_release);
       if (lane->p_release_ && this->releases_ < PARLIO_MAX_LANES) {
         // the last bit's falling edge: its period's start + its high time
@@ -754,17 +778,17 @@ class ParlioStream {
     return mask;
   }
   /// The stream stops: the pins went to their idle level by cut_us. The frames whose last bit can have been out by
-  /// then are complete: their releases now (the returned lanes); the others were cut: no release; each lane's taken
-  /// frame is marked cut unless it was surely out (ParlioLane::outcome()). No deadline any more; killed() until the
-  /// next start().
+  /// then are complete: their releases now (the returned lanes); the others were cut: no release. The stop is noted
+  /// with its epoch (ParlioLane::outcome(): every frame of it not out by then was cut). No deadline any more;
+  /// killed() until the next start().
   ULTRA_ALWAYS_INLINE uint16_t stop(int64_t cut_us) {
     uint16_t mask = 0;
     for (uint8_t k = 0; k < PARLIO_MAX_LANES; k++) {
       if (this->release_us_[k] != 0 && this->release_end_us_[k] <= cut_us)
         mask |= static_cast<uint16_t>(1u << k);
       this->release_us_[k] = 0;
-      this->lanes_[k].cut_at(static_cast<uint32_t>(cut_us));
     }
+    this->clock_.note_stop(this->st_.epoch, static_cast<uint32_t>(cut_us));
     this->deadline_us_ = 0;
     this->kills_++;
     this->killed_.store(true, std::memory_order_release);

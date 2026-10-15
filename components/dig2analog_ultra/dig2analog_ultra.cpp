@@ -1223,7 +1223,8 @@ void UltraHub::service_notice_() {
 #ifdef USE_DIG2ANALOG_ULTRA_PARLIO
   if (this->notice_id_ == 0)
     return;
-  const uint8_t outcome = this->lane_->outcome(this->notice_id_, this->notice_end_us_, now_us_());
+  const uint8_t outcome =
+      this->lane_->outcome(this->notice_id_, this->notice_epoch_, this->notice_end_us_, now_us_());
   if (outcome == ParlioLane::PENDING)
     return;
   this->notice_id_ = 0;
@@ -1451,6 +1452,7 @@ void UltraHub::transmit_() {
 #ifdef USE_DIG2ANALOG_ULTRA_PARLIO
     if (this->lane_ != nullptr) {
       this->notice_id_ = this->lane_->posted_id();   // (once out on the wire the port is told: service_notice_())
+      this->notice_epoch_ = this->lane_->posted_epoch();
       this->notice_end_us_ = this->lane_->frame_end_us();
     } else
 #endif

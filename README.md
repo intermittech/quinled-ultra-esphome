@@ -14,6 +14,7 @@ other board on the line.
 | `dig2analog_ultra` | The data line (hub), the `dig2analog_ultra` light platform with board effects, board settings, current calibration and board firmware updates |
 | `dig2analog_ultra_strip` | ESPHome's addressable effects (rainbow, scan, twinkle, ...) across Ultra lights, one light per pixel |
 | `diffpower` | QuinLED Diff-Power sender ports: 55 V only while a light on the port needs it (standby at 4.5 V, board detection, pre-wake, the dark window), for any ESPHome light |
+| `dig2analog_ultra_parlio` | Up to 16 data lines from the ESP32-P4's PARLIO TX unit (one DMA stream) instead of the RMT's 4 |
 
 ## Install
 

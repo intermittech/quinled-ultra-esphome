@@ -108,6 +108,12 @@ def find_bus(full, bus_id):
 
 def _final_validate(configs):
     full = fv.full_config.get()
+    every = full.get("dig2analog_ultra_parlio", []) or []   # (ESPHome calls this per bus)
+    if len(every) > 1:
+        raise cv.Invalid(
+            f"the ESP32-P4 has one PARLIO TX unit: one dig2analog_ultra_parlio (up to {MAX_LANES} pins), not "
+            f"{len(every)}"
+        )
     for bus in configs if isinstance(configs, list) else [configs]:
         lay = bus_layout(bus, full)
         if lay["errors"]:
@@ -134,3 +140,6 @@ async def to_code(config):
         cg.add(var.set_lane_timing(lane, h0, h1))
     cg.add(var.set_layout(config[CONF_SAMPLE_RATE], lay["width"], lay["period"], lay["chunk_groups"],
                           config[CONF_PSRAM]))
+    # only the render path this layout takes is built (ultra_parlio.h)
+    cg.add_define("PARLIO_ONLY_WIDTH", lay["width"])
+    cg.add_define("PARLIO_ONLY_GRID", lay["grid"] if lay["highs"] else 0)   # (no lane: nothing renders)

@@ -27,6 +27,7 @@ bool IRAM_ATTR UltraParlioBus::on_switch_(parlio_tx_unit_handle_t, const parlio_
                                           void *arg) {
   auto *bus = static_cast<UltraParlioBus *>(arg);
   bus->switch_us_ = esp_timer_get_time();
+  bus->switches_ = bus->switches_ + 1;
   BaseType_t woken = pdFALSE;
   vTaskNotifyGiveFromISR(bus->task_, &woken);
   return woken == pdTRUE;
@@ -114,7 +115,10 @@ void UltraParlioBus::render_next_() {
     const ParlioRenderer::Release &r = this->renderer_.release(i);
     this->schedule_release_(r.lane, (r.at_ns + 999) / 1000);
   }
-  parlio_tx_unit_transmit(this->unit_, buf, this->renderer_.chunk_bytes() * 8, &this->tx_cfg_);
+  // (it can't fail with a valid buffer; if it did, the DMA would play the last chunk forever: tried again, counted)
+  if (parlio_tx_unit_transmit(this->unit_, buf, this->renderer_.chunk_bytes() * 8, &this->tx_cfg_) != ESP_OK &&
+      parlio_tx_unit_transmit(this->unit_, buf, this->renderer_.chunk_bytes() * 8, &this->tx_cfg_) != ESP_OK)
+    this->tx_errors_++;
   const int64_t took = esp_timer_get_time() - t_start;
   this->render_ns_est_ += (took * 1000 - this->render_ns_est_) / 8;
   this->render_us_max_ = std::max(this->render_us_max_, static_cast<uint32_t>(took));
@@ -220,13 +224,23 @@ void UltraParlioBus::setup() {
 }
 
 void UltraParlioBus::loop() {
+  if (millis() - this->log_ms_ < 10000)
+    return;
   // the stream slipped (the render task was late: a chunk played twice): frames in flight were lost
   const uint32_t slips = this->slips_;
-  if (slips != this->slips_logged_ && millis() - this->log_ms_ > 10000) {
+  if (slips != this->slips_logged_) {
     ESP_LOGW(TAG, "The stream slipped %" PRIu32 " chunk(s) so far (the render task was late; frames lost)", slips);
     this->slips_logged_ = slips;
     this->log_ms_ = millis();
   }
+  // no buffer switch in 10 s: the stream stopped (the driver refused a buffer)
+  const uint32_t switches = this->switches_;
+  if (switches == this->switches_seen_ || this->tx_errors_ != 0) {
+    ESP_LOGE(TAG, "The stream stopped (%" PRIu32 " buffer(s) refused by the driver)", this->tx_errors_);
+    this->status_set_error();
+  }
+  this->switches_seen_ = switches;
+  this->log_ms_ = millis();
 }
 
 void UltraParlioBus::dump_config() {

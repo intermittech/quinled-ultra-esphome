@@ -352,6 +352,14 @@ class ParlioRenderer {
       this->grid_ = 1;
     else if (same && h0 == 3 && h1 == 7 && period == 14)
       this->grid_ = 2;
+#ifdef PARLIO_ONLY_GRID
+    if (this->grid_ != PARLIO_ONLY_GRID)
+      return false;   // (the code generation built another path)
+#endif
+#ifdef PARLIO_ONLY_WIDTH
+    if (this->width_ != PARLIO_ONLY_WIDTH)
+      return false;
+#endif
     this->acc_.reset(new Acc[chunk_groups]);
     this->dirty_[0].reset(new uint8_t[chunk_groups]());
     this->dirty_[1].reset(new uint8_t[chunk_groups]());
@@ -381,8 +389,8 @@ class ParlioRenderer {
     this->releases_ = 0;
     for (uint8_t l = 0; l < this->lanes_; l++) {
       ParlioLane *lane = lanes[l];
-      if (lane == nullptr || !lane->copy_)
-        continue;
+      if (lane == nullptr)
+        continue;   // (a lane whose hub hasn't begun yet: nothing on the wire, nothing posted)
       // the frame on the wire: its part in this chunk
       if (lane->cur_bytes_ != 0) {
         const int64_t end = lane->cur_start_ + lane->cur_bytes_;
@@ -416,23 +424,15 @@ class ParlioRenderer {
       if (lane->cur_start_ + lane->cur_bytes_ <= g1)
         lane->cur_bytes_ = 0;
     }
-    if (this->width_ == 8) {
-      auto *o = static_cast<uint8_t *>(out);
-      if (this->grid_ == 1)
-        this->expand_grid_<uint8_t, 5, 14, 27>(o, buffer);
-      else if (this->grid_ == 2)
-        this->expand_grid_<uint8_t, 3, 7, 14>(o, buffer);
-      else
-        this->expand_(o, buffer);
-    } else {
-      auto *o = static_cast<uint16_t *>(out);
-      if (this->grid_ == 1)
-        this->expand_grid_<uint16_t, 5, 14, 27>(o, buffer);
-      else if (this->grid_ == 2)
-        this->expand_grid_<uint16_t, 3, 7, 14>(o, buffer);
-      else
-        this->expand_(o, buffer);
-    }
+    // (the bus' code generation names its width and grid, so only that path is built: PARLIO_ONLY_WIDTH / _GRID)
+#if !defined(PARLIO_ONLY_WIDTH) || PARLIO_ONLY_WIDTH == 8
+    if (this->width_ == 8)
+      this->expand_any_(static_cast<uint8_t *>(out), buffer);
+#endif
+#if !defined(PARLIO_ONLY_WIDTH) || PARLIO_ONLY_WIDTH == 16
+    if (this->width_ == 16)
+      this->expand_any_(static_cast<uint16_t *>(out), buffer);
+#endif
   }
   /// the unrolled path's grid (0: the runs)
   uint8_t grid() const { return this->grid_; }
@@ -491,6 +491,21 @@ class ParlioRenderer {
       *q++ = w;
     for (p = reinterpret_cast<uint8_t *>(q); n != 0; n--)
       *p++ = v;
+  }
+
+  template<typename T> void expand_any_(T *o, uint8_t buffer) {
+#if !defined(PARLIO_ONLY_GRID) || PARLIO_ONLY_GRID == 1
+    if (this->grid_ == 1)
+      this->expand_grid_<T, 5, 14, 27>(o, buffer);
+#endif
+#if !defined(PARLIO_ONLY_GRID) || PARLIO_ONLY_GRID == 2
+    if (this->grid_ == 2)
+      this->expand_grid_<T, 3, 7, 14>(o, buffer);
+#endif
+#if !defined(PARLIO_ONLY_GRID) || PARLIO_ONLY_GRID == 0
+    if (this->grid_ == 0)
+      this->expand_(o, buffer);
+#endif
   }
 
   /// The accumulators into samples on a default grid (ParlioGrid).

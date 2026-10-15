@@ -1331,6 +1331,9 @@ static void test_update_on_lane() {
 /// The render per chunk, built with -O2 and no sanitizers by tests/run_ultra_parlio_test.py: every lane busy with
 /// 8-board frames back to back (the worst case), and the same bus idle. Prints ns per chunk and the share of a core.
 static int bench() {
+  std::printf("bench sizes: a lane %u B (+ its frame's copy), the renderer %u B + %u B per group of a chunk "
+              "(96 groups: %u B)\n", static_cast<unsigned>(sizeof(ParlioLane)), static_cast<unsigned>(sizeof(ParlioRenderer)),
+              20u + 2u, static_cast<unsigned>(sizeof(ParlioRenderer) + 96 * 22));
   struct Case {
     const char *name;
     uint8_t lanes, width;

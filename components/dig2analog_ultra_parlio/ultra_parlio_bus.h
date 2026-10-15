@@ -91,6 +91,9 @@ class UltraParlioBus final : public Component {
   uint32_t render_us_max_{0}, render_us_sum_{0}, renders_{0};
   int64_t render_ns_est_{0};          // the render's time, smoothed: a late one is foreseen
   volatile uint32_t slips_{0};        // chunks played again (the task was late) or foreseen as late
+  uint32_t tx_errors_{0};             // buffers the driver refused
+  volatile uint32_t switches_{0};     // buffer switches (the interrupt), and as last seen by loop()
+  uint32_t switches_seen_{0};
   uint32_t slips_logged_{0};
   uint32_t log_ms_{0};
 };

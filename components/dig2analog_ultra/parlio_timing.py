@@ -59,6 +59,11 @@ def layout(rate_hz: int, lane_count: int, lanes: dict, buffer_ns: int) -> dict:
             if not TL_LIMITS[0] <= low * sample_ns <= TL_LIMITS[1]:
                 errors.append(f"lane {lane}: {what} becomes {low * sample_ns} ns, outside the Physical Layer's "
                               f"{TL_LIMITS[0]}-{TL_LIMITS[1]} ns")
+    # the renderer's unrolled path (ultra_parlio.h ParlioGrid): every lane 5 / 14 of 27 samples (20 MHz) or 3 / 7 of 14
+    # (10 MHz); else the generic runs
+    same = len(set(highs.values())) == 1
+    h = next(iter(highs.values()))
+    out["grid"] = 1 if same and h == (5, 14) and period == 27 else 2 if same and h == (3, 7) and period == 14 else 0
     group_ns = 8 * period * sample_ns
     group_bytes = 8 * period * width // 8
     groups = max(1, -(-buffer_ns // group_ns))

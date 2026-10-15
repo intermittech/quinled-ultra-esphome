@@ -79,49 +79,58 @@ static constexpr uint32_t TU_AVAILABILITY = 1u << 30;  // it started or stopped 
 static constexpr uint32_t TU_RESTART = 1u << 29;       // it restarted (or is a different board now)
 
 /// What one receiver said, page by page (big-endian fields decoded; `have_*`: the page was read since the board
-/// answers / since it changed).
+/// answers / since it changed). (The pages in an order, and each one's fields in a size order, that leave no padding.)
 struct ReceiverData {
-  // IDENTITY
-  bool have_identity{false};
-  uint8_t uid[12]{};
-  uint32_t fw_word{0};  // major << 24 | minor << 16 | patch << 8 | pre-release (0 = unknown)
-  uint8_t bl_version{0}, hw_id{0};
-  uint16_t hw_caps{0};
-  uint32_t features{0};
-  // STATUS
-  bool have_status{false};
-  uint32_t fw_version{0};  // major << 16 | minor << 8 | patch (0 = a development build)
-  uint8_t hw{0};
-  uint32_t uptime_s{0};
-  uint8_t reset_cause{0}, power_state{0};
-  uint16_t mcu_temp{ULTRA_ST_NA}, board_temp{ULTRA_ST_NA};  // int16 0.1 C as u16; ULTRA_ST_NA = none
-  uint16_t vbus_10mv{0xFFFF}, vdda_mv{0}, current_ma{0};
-  uint8_t measured{0}, pwm_preset{0};
-  uint16_t config_crc{0};
-  uint8_t modes{0};
+  // ENERGY
+  double energy_wh{0};     // the board's lifetime energy, exact (TOTAL_WH + the mWh of this power-up's last Wh); the
+                           // Energy sensor shows its position's (ultra_ledger.h: never down)
+  uint32_t boot_mwh{0}, total_wh{0}, power_mw{0}, saved_age_s{0xFFFFFF};
+  uint16_t vb_10mv{0xFFFF};  // (0.2.5) the LED supply after the buck; 0xFFFF = not measured
+  uint16_t peak_ma{0};       // (0.2.5) the input current's highest ~100 ms average since the ENERGY answer before
+  bool have_energy{false};
   // OUTPUTS
   bool have_outputs{false};
-  uint16_t level[5]{}, ch_ma[5]{};
   uint8_t effects{0}, defined{0}, scene{0}, why{0};
-  // POWER
-  bool have_power{false};
-  uint8_t pw_now{0}, pw_latched{0};
-  uint16_t limit_events{0}, overload_trips{0}, short_trips{0};
-  uint32_t limit_age_s{0xFFFFFF}, trip_age_s{0xFFFFFF};
-  uint16_t limit_ma{0xFFFF};
-  uint8_t limit_source{0}, trip_cause{0};
-  uint16_t event_ma{0}, trip_ma{0}, factor{65535};
-  uint8_t retry_s{0};
+  uint16_t level[5]{}, ch_ma[5]{};
   // SUPPLY
   bool have_supply{false};
-  uint16_t dips{0}, ref_mv{0}, now_mv{0}, deep_mv{0};
   uint8_t deep_pct{0};
-  uint32_t deep_age_s{0xFFFFFF};
   uint8_t logged{0};
-  uint32_t dip_age_s{0xFFFFFF};  // the newest logged dip
-  uint16_t dip_mv{0};
   uint8_t dip_pct{0};
+  uint16_t dips{0}, ref_mv{0}, now_mv{0}, deep_mv{0};
+  uint16_t dip_mv{0};
   uint16_t dip_ms{0}, dip_ma{0};
+  uint32_t deep_age_s{0xFFFFFF};
+  uint32_t dip_age_s{0xFFFFFF};  // the newest logged dip
+  // IDENTITY
+  uint32_t fw_word{0};  // major << 24 | minor << 16 | patch << 8 | pre-release (0 = unknown)
+  uint32_t features{0};
+  uint16_t hw_caps{0};
+  bool have_identity{false};
+  uint8_t uid[12]{};
+  uint8_t bl_version{0}, hw_id{0};
+  // STATUS
+  bool have_status{false};
+  uint8_t hw{0};
+  uint8_t reset_cause{0}, power_state{0};
+  uint8_t measured{0}, pwm_preset{0};
+  uint8_t modes{0};
+  uint16_t mcu_temp{ULTRA_ST_NA}, board_temp{ULTRA_ST_NA};  // int16 0.1 C as u16; ULTRA_ST_NA = none
+  uint16_t vbus_10mv{0xFFFF}, vdda_mv{0}, current_ma{0};
+  uint16_t config_crc{0};
+  uint32_t fw_version{0};  // major << 16 | minor << 8 | patch (0 = a development build)
+  uint32_t uptime_s{0};
+  // LIFETIME (0.2.5): the odometer, kept across power cuts
+  uint32_t lt_powered{0}, lt_lit{0};   // 0.1 h
+  uint32_t lt_power_ups{0}, lt_dips{0};
+  uint32_t lt_records{0};
+  uint16_t lt_overload_trips{0}, lt_short_trips{0}, lt_updates{0};
+  bool have_lifetime{false};
+  uint8_t lt_temp_peak{0}, lt_current_peak{0}, lt_watchdog{0};   // 0.5 C, 0.1 A
+  // LIFE_SYNC (0.2.6): the last sync's answer (its LIFETIME bytes and Wh go to the fields above)
+  uint16_t ls_records16{0};
+  bool have_sync{false};
+  uint8_t ls_result{0}, ls_applied{0};
   // HEALTH
   bool have_health{false};
   uint8_t he_flags{0};
@@ -130,42 +139,33 @@ struct ReceiverData {
   int8_t model_dev[5]{ULTRA_HE_NA, ULTRA_HE_NA, ULTRA_HE_NA, ULTRA_HE_NA, ULTRA_HE_NA};
   int16_t dark_ma{0}, temp_peak{static_cast<int16_t>(ULTRA_ST_NA)};
   uint32_t temp_age_s{0xFFFFFF};
-  // ENERGY
-  bool have_energy{false};
-  uint32_t boot_mwh{0}, total_wh{0}, power_mw{0}, saved_age_s{0xFFFFFF};
-  double energy_wh{0};     // the board's lifetime energy, exact (TOTAL_WH + the mWh of this power-up's last Wh); the
-                           // Energy sensor shows its position's (ultra_ledger.h: never down)
-  uint16_t vb_10mv{0xFFFF};  // (0.2.5) the LED supply after the buck; 0xFFFF = not measured
-  uint16_t peak_ma{0};       // (0.2.5) the input current's highest ~100 ms average since the ENERGY answer before
-  // LIFETIME (0.2.5): the odometer, kept across power cuts
-  bool have_lifetime{false};
-  uint32_t lt_powered{0}, lt_lit{0};   // 0.1 h
-  uint32_t lt_power_ups{0}, lt_dips{0};
-  uint16_t lt_overload_trips{0}, lt_short_trips{0}, lt_updates{0};
-  uint8_t lt_temp_peak{0}, lt_current_peak{0}, lt_watchdog{0};   // 0.5 C, 0.1 A
-  uint32_t lt_records{0};
-  // LIFE_SYNC (0.2.6): the last sync's answer (its LIFETIME bytes and Wh go to the fields above)
-  bool have_sync{false};
-  uint8_t ls_result{0}, ls_applied{0};
-  uint16_t ls_records16{0};
-  // DIAG part 0 (0.2.5): the running board
-  bool have_diag{false};
-  uint8_t dg_reset{0}, bc_cause{0xFF};   // this start's reset cause; the run before's exception (0xFF: none kept)
-  uint16_t bc_pc{0};
-  uint32_t bc_uptime_s{0};
-  uint16_t cpu_pm{0}, cpu_peak_pm{0};    // 0.1 %
-  uint16_t ovr_captures{0}, ovr_frame_ends{0}, ovr_late_ms{0};
-  uint16_t supply_z_mohm{0};             // 0: not known yet
-  uint8_t flash_errs{0}, flash_pending{0}, save_wait{0}, c10_load{0xFF}, c10_peak{0xFF};
+  // POWER
+  bool have_power{false};
+  uint8_t pw_now{0}, pw_latched{0};
+  uint8_t limit_source{0}, trip_cause{0};
+  uint8_t retry_s{0};
+  uint16_t limit_events{0}, overload_trips{0}, short_trips{0};
+  uint16_t limit_ma{0xFFFF};
+  uint16_t event_ma{0}, trip_ma{0}, factor{65535};
+  uint32_t limit_age_s{0xFFFFFF}, trip_age_s{0xFFFFFF};
   // DIAG part 1 (0.2.5): the fault memory (across power cuts) and the calibration trend
   bool have_faults{false};
   uint8_t fm_trip{0};        // 1 short / 2 overload (bits 0-1) | its current, 0.5 A (bits 2-7); 0 = none
-  uint16_t fm_trip_lit_h{0};
   uint8_t fm_dip_pct{0}, fm_dip_10ms{0}, fm_dip_a10{0};
   uint8_t fm_rst{0}, fm_rst_up_h{0};   // 1 watchdog / 2 exception (bits 0-1) | mcause (bits 2-7); 0 = none
   int8_t trend[5]{ULTRA_HE_NA, ULTRA_HE_NA, ULTRA_HE_NA, ULTRA_HE_NA, ULTRA_HE_NA};
-  uint16_t trend_lit_h{0xFFFF};
   uint8_t trend_tests{0};
+  uint16_t fm_trip_lit_h{0};
+  uint16_t trend_lit_h{0xFFFF};
+  // DIAG part 0 (0.2.5): the running board
+  bool have_diag{false};
+  uint8_t dg_reset{0}, bc_cause{0xFF};   // this start's reset cause; the run before's exception (0xFF: none kept)
+  uint8_t flash_errs{0}, flash_pending{0}, save_wait{0}, c10_load{0xFF}, c10_peak{0xFF};
+  uint16_t bc_pc{0};
+  uint16_t cpu_pm{0}, cpu_peak_pm{0};    // 0.1 %
+  uint16_t ovr_captures{0}, ovr_frame_ends{0}, ovr_late_ms{0};
+  uint16_t supply_z_mohm{0};             // 0: not known yet
+  uint32_t bc_uptime_s{0};
 };
 
 /// A 0.2.5 receiver: its STATUS reason, ENERGY's LED supply and peak, HEALTH's hot flag are set (0 before).
@@ -925,25 +925,25 @@ class TelemetryPoller {
   uint8_t seq(uint16_t i) const { return this->rx_[i].seq; }
 
  protected:
-  struct Receiver {
+  struct Receiver {   // (the fields in size order: no padding)
     ReceiverData d;
-    bool have_uid{false};
+    uint32_t next[TP_COUNT]{};
+    uint32_t hold_until{0};    // restarted: not polled past before this (hold)
+    uint32_t status_ms{0};     // when its last STATUS was read (restart detection)
+    uint32_t polls{0}, missed{0};   // POLLs that asked it for an answer, and the ones without one
+    uint32_t updated{0};
     uint16_t uid16{0};
+    uint16_t unsupported{0};   // bit 1 << TP_*: answered UNSUPPORTED (until the board restarts or changes)
+    bool have_uid{false};
     bool answering{false};
     bool reported{false};      // its "unavailable" went out (take_updates TU_AVAILABILITY)
     uint8_t misses{0};
     uint8_t seq{0};
     bool need_identity{true};
-    uint16_t unsupported{0};   // bit 1 << TP_*: answered UNSUPPORTED (until the board restarts or changes)
-    uint32_t next[TP_COUNT]{};
-    uint32_t hold_until{0};    // restarted: not polled past before this
     bool hold{false};          // (build() forgets it once over: it can't come back half a millis() wrap later)
-    uint32_t status_ms{0};     // when its last STATUS was read (restart detection)
     bool ack_due{false};       // POWER showed a latch: acknowledge with the next POWER poll
     bool ack_sent{false};      // ... it went out with the last one
     bool outputs{false};       // OUTPUTS is read too (a receiver with several lights: their power, why they're dim)
-    uint32_t polls{0}, missed{0};   // POLLs that asked it for an answer, and the ones without one
-    uint32_t updated{0};
     // LIFE_SYNC: asked by the ledger (its arguments), until it answers
     bool sync_due{false};
     uint8_t sync_args[23]{};

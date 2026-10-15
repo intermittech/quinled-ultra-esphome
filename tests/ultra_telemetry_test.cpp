@@ -1308,18 +1308,20 @@ static void test_ledger_boards() {
   start_hub(h, c, led);
   drive(c, h, ha, 10000);
   // a receiver ahead (it ran on another controller, back with a power-up): what the hub didn't see taken at its
-  // session's start (its time a unit short: the board's own remainder may ride on a sync), its power-ups and energy;
-  // no sync
+  // session's start, a unit (a Wh) short (the board's own remainder may ride on a sync), the hub's own remainders
+  // kept (its powered time below 0.1 h, its 0.567 Wh); its power-ups; no sync
   c.rx[0].power_up();
   c.rx[0].lit_01h += 100;
   c.rx[0].powered_01h += 150;
   c.rx[0].power_ups += 2;
   c.rx[0].total_wh += 50;
   drive(c, h, ha, 10000);
+  const LedgerEntry *ahead = led.find(c.rx[0].uid);
   CHECK(h.k.counters(0)->lit == 12444 && h.k.counters(0)->powered == 24839 && h.k.counters(0)->ups == 44 &&
-            ledger_mwh(h, 0) == 1284000 && c.rx[0].syncs == 0,
-        "a receiver ahead: taken (lit %u, powered %u, ups %u, %llu mWh), no sync", h.k.counters(0)->lit,
-        h.k.counters(0)->powered, h.k.counters(0)->ups, ull(ledger_mwh(h, 0)));
+            ledger_mwh(h, 0) == 1283567 && ahead != nullptr && ahead->pow_rem > 15000 && c.rx[0].syncs == 0,
+        "a receiver ahead: taken (lit %u, powered %u, ups %u, %llu mWh), its own %u ms below 0.1 h kept, no sync",
+        h.k.counters(0)->lit, h.k.counters(0)->powered, h.k.counters(0)->ups, ull(ledger_mwh(h, 0)),
+        ahead != nullptr ? ahead->pow_rem : 0);
   // R1: position 1's board replaced by a used one (50 kWh): a new entry, the position goes on, the old one kept
   uint8_t old_uid[12];
   std::memcpy(old_uid, c.rx[1].uid, 12);

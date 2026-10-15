@@ -3176,7 +3176,7 @@ static void test_ledger_resize() {
   reboot(21);
   h.ledger_service_();
   LedgerEntry *e = ultra_ledger().touch(uid, &made);
-  ultra_ledger().add_energy(*e, 150000, 0);
+  ultra_ledger().add_energy(*e, 150000);
   ultra_ledger().position_energy(5u << 16, *e, &swapped);
   h.ledger_save_(true);
   const size_t small = ultra_ledger().blob_size();
@@ -3188,7 +3188,7 @@ static void test_ledger_resize() {
         static_cast<unsigned>(ultra_ledger().blob_size()), static_cast<unsigned long long>(e ? e->c.mwh : 0));
   if (e == nullptr)
     return;
-  ultra_ledger().add_energy(*e, 10000, 0);
+  ultra_ledger().add_energy(*e, 10000);
   h.ledger_save_(true);
   reboot(21);   // (back: the newer copy is the bigger one)
   h.ledger_service_();
@@ -3206,12 +3206,12 @@ static void test_ledger_resize() {
   if (e == nullptr)
     return;
   // a cut between a copy (another size now) and its size record: that copy refused, the other one loads
-  ultra_ledger().add_energy(*e, 10000, 0);
+  ultra_ledger().add_energy(*e, 10000);
   h.ledger_save_(true);   // (170 Wh, sizes recorded)
   reboot(70);
   h.ledger_service_();
   e = ultra_ledger().find(uid);
-  ultra_ledger().add_energy(*e, 10000, 0);
+  ultra_ledger().add_energy(*e, 10000);
   cut_after = 1;          // (180 Wh: the copy written, its size record not)
   h.ledger_save_(true);
   cut_after = -1;
@@ -3225,9 +3225,9 @@ static void test_ledger_resize() {
   reboot(1);
   h.ledger_service_();
   LedgerEntry *a = ultra_ledger().touch(uid, &made);
-  ultra_ledger().add_energy(*a, 1000, 0);
+  ultra_ledger().add_energy(*a, 1000);
   h.ledger_save_(true);
-  ultra_ledger().add_energy(*a, 1000, 0);
+  ultra_ledger().add_energy(*a, 1000);
   h.ledger_save_(true);
   ultra_ledger().set_day(LEDGER_AGE_DAYS);   // (aged out: no position holds it)
   h.ledger_save_(true);

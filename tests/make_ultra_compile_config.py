@@ -618,8 +618,16 @@ def main() -> None:
     (OUT / "ultra-p4-parlio-lights.yaml").write_text(p4_parlio_lights_config(), encoding="utf-8")
     (OUT / "ultra-p4-parlio-ports.yaml").write_text(p4_parlio_config(ports=True), encoding="utf-8")
     secrets = OUT / "secrets.yaml"
-    if not secrets.exists():
-        secrets.write_text('wifi_ssid: "test"\nwifi_password: "testtest"\n', encoding="utf-8")
+    have = secrets.read_text(encoding="utf-8") if secrets.exists() else ""
+    need = (
+        'wifi_ssid: "test"\nwifi_password: "testtest"\n'
+        'api_encryption_key: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="\n'
+        'ota_password: "testtest"\nfallback_ap_password: "testtest"\n'
+    )
+    for line in need.splitlines():   # (the examples' secrets: any missing added)
+        if line.split(":")[0] + ":" not in have:
+            have += ("" if not have or have.endswith("\n") else "\n") + line + "\n"
+    secrets.write_text(have, encoding="utf-8")
     print(f"written {OUT / 'ultra-example.yaml'}, {OUT / 'ultra-strip.yaml'}, {OUT / 'ultra-telemetry.yaml'}, "
           f"{OUT / 'ultra-p4-telemetry.yaml'}, {OUT / 'ultra-diffpower.yaml'}, {OUT / 'ultra-p4-parlio.yaml'}, "
           f"{OUT / 'ultra-p4-parlio-lights.yaml'}, {OUT / 'ultra-p4-parlio-ports.yaml'}")

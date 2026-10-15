@@ -21,6 +21,7 @@ esp32:
     type: esp-idf
 
 external_components:
+  # @main until the first release; then pin one (@v0.x.y, wiki: Installation)
   - source: github://intermittech/quinled-ultra-esphome@main
     components: [dig2analog_ultra, dig2analog_ultra_strip]
     # Developing the component itself? Use the local copy instead:
@@ -30,12 +31,17 @@ external_components:
 
 logger:
 api:
+  encryption:
+    key: !secret api_encryption_key
+  reboot_timeout: 0s   # lights keep running without Home Assistant (the default reboots after 15 min)
 ota:
   - platform: esphome
+    password: !secret ota_password
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  ap: {}
+  ap:                 # the fallback hotspot (captive portal) if the Wi-Fi is gone
+    password: !secret fallback_ap_password
 captive_portal:
 
 dig2analog_ultra:

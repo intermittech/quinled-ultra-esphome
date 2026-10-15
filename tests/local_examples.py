@@ -36,7 +36,11 @@ def main() -> int:
     secrets = SRC / "secrets.yaml"
     (OUT / "secrets.yaml").write_text(
         secrets.read_text(encoding="utf-8") if secrets.exists()
-        else 'wifi_ssid: "test"\nwifi_password: "testtest"\n',
+        else (
+            'wifi_ssid: "test"\nwifi_password: "testtest"\n'
+            'api_encryption_key: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="\n'
+            'ota_password: "testtest"\nfallback_ap_password: "testtest"\n'
+        ),
         encoding="utf-8",
     )
     print(f"{len(names)} example(s) in {OUT}")

@@ -426,9 +426,16 @@ class UltraHub final : public Component {
   bool rw_powered_{true};
   bool rw_lock_end_{false};               // a lock frame is out: the lock interval from its end (rw_due_)
   // per receiver: RX_WOKE (its port just woke: its restart is expected), RX_WARNED (no standby support: said once)
-  // RX_SETTLING (its line's power just came back: not heard, not missed enough to be gone)
-  static constexpr uint8_t RX_WOKE = 1, RX_WARNED = 2, RX_SETTLING = 4;
+  // RX_SETTLING (its line's power just came back: not heard, not missed enough to be gone), RX_NO_STANDBY (counted
+  // in no_standby_)
+  static constexpr uint8_t RX_WOKE = 1, RX_WARNED = 2, RX_SETTLING = 4, RX_NO_STANDBY = 8;
   std::vector<uint8_t> rx_note_;
+#ifdef USE_DIFFPOWER
+  uint8_t no_standby_{0};   // receivers on the port without standby support: its planned power-offs capped
+  bool standby_held_{false};
+  PowerOffCap off_cap_;
+  bool standby_hold_(uint32_t now);
+#endif
   uint32_t woke_ms_{0};
   uint32_t rw_late_{0};                   // windows where the line was let go of later than ULTRA_RW_RELEASE_US
   uint32_t rw_extra_us_{0};               // a command queued at a window's start waits this much longer (lead_us)

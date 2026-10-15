@@ -1514,6 +1514,47 @@ inline float light_power_estimate(const ReceiverData &d, uint8_t mask) {
 /// A receiver that doesn't answer makes the port values incomplete (complete() false): the current and power without
 /// its share, no cable loss. The peak (0.2.5): each receiver's highest ~100 ms input current since its ENERGY read
 /// before (about a minute), added up: at most what the port carried (the peaks needn't coincide).
+/// The planned power-offs of a Diff-Power port with receivers that lack standby support (firmware before 0.6.10: each
+/// power-off and wake is a flash write and a power-on scene on them): at most CAP in 24 h. Once CAP are inside the
+/// last 24 h, hold() keeps the port powered until the oldest of them is 24 h old. Entries older than that are
+/// forgotten at every hold() (it runs every loop), so a millis() wrap can't bring one back.
+class PowerOffCap {
+ public:
+  static constexpr uint8_t CAP = 10;
+  static constexpr uint32_t WINDOW_MS = 24u * 3600u * 1000u;
+  /// a planned power-off now
+  void note(uint32_t now_ms) {
+    uint8_t slot = 0;
+    for (uint8_t k = 0; k < CAP; k++) {   // a free slot, else the oldest
+      if (!(this->used_ & (1u << k))) {
+        slot = k;
+        break;
+      }
+      if (now_ms - this->at_[k] > now_ms - this->at_[slot])
+        slot = k;
+    }
+    this->at_[slot] = now_ms;
+    this->used_ |= static_cast<uint16_t>(1u << slot);
+  }
+  /// CAP planned power-offs within the last 24 h: keep the port powered
+  bool hold(uint32_t now_ms) {
+    uint8_t n = 0;
+    for (uint8_t k = 0; k < CAP; k++) {
+      if (!(this->used_ & (1u << k)))
+        continue;
+      if (now_ms - this->at_[k] >= WINDOW_MS)
+        this->used_ &= static_cast<uint16_t>(~(1u << k));
+      else
+        n++;
+    }
+    return n >= CAP;
+  }
+
+ protected:
+  uint32_t at_[CAP]{};
+  uint16_t used_{0};
+};
+
 class PortMonitor {
  public:
   struct Config {

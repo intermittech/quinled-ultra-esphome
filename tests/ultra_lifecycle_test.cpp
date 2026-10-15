@@ -1202,8 +1202,9 @@ struct UltraHub {
   bool rw_open_{false};
   int64_t rw_t0_us_{0}, rw_end_us_{0}, rw_read_us_{0};
   bool rw_powered_{true}, rw_lock_end_{false};
-  static constexpr uint8_t RX_WOKE = 1, RX_WARNED = 2, RX_SETTLING = 4;
+  static constexpr uint8_t RX_WOKE = 1, RX_WARNED = 2, RX_SETTLING = 4, RX_NO_STANDBY = 8;
   std::vector<uint8_t> rx_note_;
+  uint8_t no_standby_{0};
   bool rx_settling(uint16_t receiver) const;   // (hub_rw.inc)
   bool port_standby() const { return this->port_ != nullptr && !this->powered; }
   uint32_t woke_ms_{0};
@@ -1381,6 +1382,28 @@ static double rw_fast_share(bool hold_at_rw, double *rw_per_s = nullptr) {
   if (rw_per_s != nullptr)
     *rw_per_s = static_cast<double>(rws) / 60.0;
   return 100.0 * static_cast<double>(fast) / static_cast<double>(steps);
+}
+
+/// A Diff-Power port's receivers without standby support are counted once (receiver 0 here; receiver 1 has it), and
+/// warned about once: the port's planned power-offs are capped while one is there.
+static void test_rw_no_standby() {
+  clock_us = 0;
+  now_ms = 0;
+  rmt = Rmt();
+  answers = Answers();
+  UltraHub::hubs_.clear();
+  Uart uart;
+  Pin pin;
+  UltraHub h;
+  UltraHub::PortStub port;
+  h.port_ = &port;
+  rmt.hub = &h;
+  h.start(&uart, &pin);
+  h.rx_note_.assign(h.poller_.receivers(), 0);
+  run_us(h, uart, 20000000);
+  CHECK(h.no_standby_ == 1 && (h.rx_note_[0] & UltraHub::RX_NO_STANDBY) && !(h.rx_note_[1] & UltraHub::RX_NO_STANDBY) &&
+            (h.rx_note_[0] & UltraHub::RX_WARNED),
+        "receivers without standby support: %u counted (receiver 0), warned once", h.no_standby_);
 }
 
 static void test_rw_fast_share() {

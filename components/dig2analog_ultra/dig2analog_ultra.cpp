@@ -625,10 +625,18 @@ void UltraHub::rw_publish_() {
       note &= ~RX_WOKE;
     }
 #ifdef USE_DIFFPOWER
-    if (this->port_ != nullptr && d.have_identity && !(d.features & ULTRA_FEAT_STANDBY) && !(note & RX_WARNED)) {
-      note |= RX_WARNED;
-      ESP_LOGW(TAG, "Receiver %u on GPIO%u has no standby support (firmware before 0.6.10): it shows its power-on "
-               "scene at each wake of its port; update it", i, this->pin_);
+    if (this->port_ != nullptr && d.have_identity && i < this->rx_note_.size()) {
+      const bool none = !(d.features & ULTRA_FEAT_STANDBY);
+      if (none != ((note & RX_NO_STANDBY) != 0)) {   // (counted once each way: an update, a replaced board)
+        note ^= RX_NO_STANDBY;
+        this->no_standby_ = static_cast<uint8_t>(this->no_standby_ + (none ? 1 : -1));
+      }
+      if (none && !(note & RX_WARNED)) {
+        note |= RX_WARNED;
+        ESP_LOGW(TAG, "Receiver %u on GPIO%u has no standby support (firmware before 0.6.10): it shows its power-on "
+                 "scene and writes its flash at each wake of its port, so the port powers off at most %u times a "
+                 "day; update it", i, this->pin_, PowerOffCap::CAP);
+      }
     }
 #endif
     if (i < this->rx_note_.size())
@@ -1162,13 +1170,35 @@ void UltraHub::on_shutdown() {
 }
 
 #ifdef USE_DIFFPOWER
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+// Receivers without standby support on the port: once PowerOffCap::CAP planned power-offs fall within 24 h, the port
+// stays powered until the oldest is a day old (said once each way).
+bool UltraHub::standby_hold_(uint32_t now) {
+  const bool hold = this->no_standby_ != 0 && this->off_cap_.hold(now);
+  if (hold != this->standby_held_) {
+    this->standby_held_ = hold;
+    if (hold) {
+      ESP_LOGW(TAG, "GPIO%u: %u planned power-offs in 24 h with receivers without standby support on the port: it "
+               "stays powered until the oldest is a day old (update the receivers)", this->pin_, PowerOffCap::CAP);
+    } else {
+      ESP_LOGI(TAG, "GPIO%u: the port may power off again", this->pin_);
+    }
+  }
+  return hold;
+}
+#endif
+
 // The port powers this line while a light here is lit (or within its turn-off period) and while a calibration or an
 // update holds it; once powered, everything again (the boards booted dark); before it drops, the notice.
 void UltraHub::attach_port_() {
   this->port_attached_ = true;
   for (auto *l : this->lights_)
     this->port_->add_load(l->get_standby_after(), [l](uint32_t now) { return l->is_lit(now); }, l->get_state());
-  this->port_->add_load(1, [this](uint32_t) {
+  this->port_->add_load(1, [this](uint32_t now) {
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+    if (this->standby_hold_(now))
+      return true;
+#endif
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
     return this->cal_power_hold_ || this->upd_power_hold_;
 #else
@@ -1206,6 +1236,10 @@ void UltraHub::send_power_off_notice(uint8_t copy) {
   if (copy == 0) {
     this->notices_++;
     ESP_LOGD(TAG, "GPIO%u: the planned power-off notice to %u board(s)", this->pin_, this->num_boards_);
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+    if (this->no_standby_ != 0)
+      this->off_cap_.note(millis());   // (receivers without standby support: counted against the cap)
+#endif
   }
   this->wake_();
 }

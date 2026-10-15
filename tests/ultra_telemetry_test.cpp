@@ -2081,8 +2081,73 @@ static void test_due_memo() {
               scan, memo);
 }
 
+/// Every RW frame's POLL slots over 10 minutes at 20 and 50 receivers (the 16-of-N selection, receivers that don't
+/// answer, OUTPUTS, 0.2.5 boards): their hash, the same before and after a change of build()'s implementation.
+static void test_window_hash() {
+  uint64_t all = 0;
+  for (uint16_t n : {20, 50}) {
+    Chain c(n);
+    for (uint16_t k = 0; k < n; k += 2)
+      c.rx[k].set025();
+    c.rx[7].has_channel = false;   // (it, and the ones behind it, silent for a while)
+    TelemetryIntervals iv;
+    iv.status_ms = 1000;
+    TelemetryPoller p = started(c, n, ULTRA_RW_RATE_1M, iv);
+    for (uint16_t k = 0; k < n; k += 3)
+      p.set_outputs(k, true);
+    c.run(p, 120000);
+    c.rx[7].has_channel = true;
+    c.run(p, 480000);
+    std::printf("  RW frames at %u receivers: %u, hash %016llx\n", n, c.frames,
+                static_cast<unsigned long long>(c.frame_hash));
+    all ^= c.frame_hash;
+  }
+  CHECK(all != 0, "the window hash");
+}
+
+/// PowerOffCap (receivers without standby support on a port): 9 planned power-offs never hold; the 10th within 24 h
+/// holds until the oldest is a day old; one a day for a month never holds; across the millis() wrap; and with the
+/// check every minute for 50 days after a burst, no old entry comes back after the wrap.
+static void test_power_off_cap() {
+  PowerOffCap c;
+  const uint32_t first = 0xFFFF0000u;   // (the burst crosses the millis() wrap)
+  uint32_t t = first;
+  bool early = false;
+  for (int k = 0; k < 9; k++) {
+    c.note(t);
+    early |= c.hold(t);
+    t += 600000;   // every 10 min
+  }
+  CHECK(!early && !c.hold(t), "9 power-offs in 1.5 h: no hold");
+  c.note(t);
+  CHECK(c.hold(t) && c.hold(first + PowerOffCap::WINDOW_MS - 1), "the 10th: held until the oldest is a day old");
+  CHECK(!c.hold(first + PowerOffCap::WINDOW_MS), "... then the port may power off again");
+  PowerOffCap d;
+  bool held = false;
+  for (uint32_t day = 0, now = 5000; day < 30; day++, now += PowerOffCap::WINDOW_MS) {
+    d.note(now);
+    held |= d.hold(now);
+  }
+  CHECK(!held, "one a day for a month: never held");
+  PowerOffCap e;
+  uint32_t now = 1000;
+  for (int k = 0; k < 10; k++, now += 1000)
+    e.note(now);
+  bool back = false, first_day = true;
+  for (uint32_t m = 0; m < 50u * 24 * 60; m++, now += 60000) {
+    const bool h = e.hold(now);
+    if (m > 24 * 60 + 1)
+      back |= h;
+    else if (m < 23 * 60)
+      first_day &= h;
+  }
+  CHECK(first_day && !back, "a burst, then 50 days checked every minute: held the first day, never after the wrap");
+}
+
 int main() {
   std::printf("ultra telemetry test (the return channel's hub side)\n");
+  test_power_off_cap();
+  test_window_hash();
   test_due_memo();
   test_basic();
   test_parser();

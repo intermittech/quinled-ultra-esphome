@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstring>
+#include <memory>
+#include <new>
 #include <esp_attr.h>
 #include <esp_clk_tree.h>
 #include <esp_random.h>
@@ -1013,12 +1015,12 @@ bool UltraHub::setup_rmt_() {
 // The ESP32's one lifetime ledger (every line's receivers: a board moved between lines keeps its entry). Two stored
 // copies alternate: the newer valid one loads (a cut while one is written keeps the other). Each has its size stored
 // beside it (written after it): a copy stored with more or fewer receivers loads too. Stored at most every 15 min
-// while it changes by a wire unit, at a planned power-off (the notice) and at a reboot.
+// while it changes by a wire unit, at a planned power-off (the notice) and at a reboot; its stored form is built only
+// for a save (no copy of it kept in RAM).
 namespace {
 const char *const LEDGER_KEYS[2] = {"ultra_ledger_a", "ultra_ledger_b"};
 const char *const LEDGER_SIZE_KEYS[2] = {"ultra_ledger_a_size", "ultra_ledger_b_size"};
 ESPPreferenceObject g_ledger_pref[2], g_ledger_size[2];
-std::vector<uint8_t> g_ledger_blob;
 uint32_t g_ledger_generation = 0, g_ledger_saved_ms = 0, g_ledger_day_ms = 0;
 bool g_ledger_loaded = false;
 }  // namespace
@@ -1059,9 +1061,8 @@ void UltraHub::ledger_service_() {
     l.init(room, pos);
     if (any)
       l.load(best.data(), best.size(), &newest);
-    g_ledger_blob.assign(l.blob_size(), 0);
     for (int k = 0; k < 2; k++)
-      g_ledger_pref[k] = global_preferences->make_preference(g_ledger_blob.size(), fnv1_hash(LEDGER_KEYS[k]), true);
+      g_ledger_pref[k] = global_preferences->make_preference(l.blob_size(), fnv1_hash(LEDGER_KEYS[k]), true);
     g_ledger_generation = newest;
     g_ledger_saved_ms = g_ledger_day_ms = now;
     ESP_LOGD(TAG, "Lifetime ledger: %u board(s) room, %s", static_cast<unsigned>(l.capacity()),
@@ -1082,11 +1083,19 @@ void UltraHub::ledger_save_(bool now) {
     return;
   if (l.dirty()) {
     // the next generation into the other copy, its size after it, on the flash now; clean only once it is there (a
-    // failed write stays dirty: the next save, periodic or forced, writes it again)
+    // failed write stays dirty: the next save, periodic or forced, writes it again; so does one without the memory
+    // for its stored form)
+    const size_t n = l.blob_size();
+    std::unique_ptr<uint8_t[]> blob(new (std::nothrow) uint8_t[n]);
+    if (!blob) {
+      ESP_LOGW(TAG, "Lifetime ledger: no memory to store it; again at the next save");
+      g_ledger_saved_ms = millis();
+      return;
+    }
     g_ledger_generation++;
-    l.save(g_ledger_blob.data(), g_ledger_generation);
-    const uint32_t size = static_cast<uint32_t>(g_ledger_blob.size());
-    bool ok = g_ledger_pref[g_ledger_generation & 1].save(g_ledger_blob.data(), g_ledger_blob.size());
+    l.save(blob.get(), g_ledger_generation);
+    const uint32_t size = static_cast<uint32_t>(n);
+    bool ok = g_ledger_pref[g_ledger_generation & 1].save(blob.get(), n);
     ok = g_ledger_size[g_ledger_generation & 1].save(reinterpret_cast<const uint8_t *>(&size), sizeof(size)) && ok;
     ok = global_preferences->sync() && ok;
     if (ok) {

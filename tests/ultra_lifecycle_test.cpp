@@ -23,13 +23,22 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
+#include <new>
 #include <set>
 #include <string>
 #include <vector>
+
+// a nothrow array new that fails on demand (the ledger's stored form, built only for a save, without the memory)
+static bool fail_nothrow_new = false;
+void *operator new[](std::size_t n, const std::nothrow_t &) noexcept {
+  return fail_nothrow_new ? nullptr : std::malloc(n);
+}
+void operator delete[](void *p) noexcept { std::free(p); }
 
 #define USE_DIG2ANALOG_ULTRA_UPDATE
 #define ESP_LOGE(...) ((void) 0)
@@ -3159,7 +3168,6 @@ static void reboot(size_t receivers) {
   ultra_ledger() = LifetimeLedger{};
   ledger_receivers() = receivers;
   g_ledger_loaded = false;
-  g_ledger_blob.clear();
   g_ledger_generation = g_ledger_saved_ms = g_ledger_day_ms = 0;
   now_ms = 0;
   pending.clear();
@@ -3270,7 +3278,21 @@ static void test_ledger_flush_failure() {
   reboot(1);
   h.ledger_service_();
   CHECK(ultra_ledger().find(uid2) != nullptr, "the periodic save after a failed one writes it again");
-  std::printf("  ledger store: a failed flush written again (forced and periodic)\n");
+  // no memory for its stored form: nothing written, still dirty; the next save writes it
+  uint8_t uid3[12] = {0x45};
+  ultra_ledger().touch(uid3, &made);
+  const int before = saves;
+  fail_nothrow_new = true;
+  h.ledger_save_(true);
+  fail_nothrow_new = false;
+  const bool waited = saves == before && ultra_ledger().dirty();
+  h.ledger_save_(true);
+  reboot(1);
+  h.ledger_service_();
+  CHECK(waited && ultra_ledger().find(uid3) != nullptr,
+        "no memory for the stored form: nothing written, still dirty (%d); the next save writes it (%d)", waited,
+        ultra_ledger().find(uid3) != nullptr);
+  std::printf("  ledger store: a failed flush written again (forced and periodic), a save without memory too\n");
 }
 }  // namespace ledger_store
 

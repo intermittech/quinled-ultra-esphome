@@ -12,8 +12,8 @@ substitutions:
   name: sender-1
   friendly_name: Sender 1
   port1_data: GPIO16      # port 1's Ultra data line
-  port1_enable: GPIO25    # its ChannelEnable / RemoteDetected
-  port1_detect: GPIO35
+  port1_enable: GPIO25    # its ChannelEnable (the sender switches the 55 V: this AND its own board detection)
+  port1_detect: GPIO35    # its Detect output (3.3 V; Sender-1 revisions that have it): a placeholder pin
   port1_rx: GPIO34        # its RS-485 receiver output (the answers)
   port1_de: GPIO4         # its RS-485 driver enable (DE)
   port2_data: GPIO17
@@ -97,12 +97,12 @@ diffpower:
     name: Port 1
     device_id: port_1
     enable_pin: ${port1_enable}
-    detect_pin: ${port1_detect}
+    detect_pin: ${port1_detect}     # Sender-1 revision with the Detect output; leave it out for the first revision
   - id: port2
     name: Port 2
     device_id: port_2
     enable_pin: ${port2_enable}
-    detect_pin: ${port2_detect}
+    detect_pin: ${port2_detect}     # (as port 1)
 
 dig2analog_ultra:
   - id: line1

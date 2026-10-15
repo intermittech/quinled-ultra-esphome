@@ -2962,6 +2962,30 @@ static void test_port() {
   run({&n}, 5000);
   CHECK(st4.state == "No board" && en4.level && pr4.state && l4.out.writes == 0,
         "a light on, no board: enabled, a problem, nothing sent");
+  // without a detect pin (a sender without its Detect output): a board assumed, never 'No board'; a light on powers
+  // the port, off: back to standby after its turn-off period
+  Pin en5;
+  LightState l5;
+  TextSensor st5;
+  BinarySensor pr5;
+  DiffPowerPort w;
+  w.enable_pin_ = &en5;
+  w.status_ = &st5;
+  w.problem_ = &pr5;
+  w.add_light(&l5, 0);
+  run({&w}, 500);
+  const bool w_standby = st5.state == "Standby" && !en5.level;
+  l5.remote_values.on = true;
+  run({&w}, 5000);
+  const bool w_on = st5.state == "On" && en5.level && l5.out.writes > 0;
+  l5.remote_values.on = false;
+  run({&w}, 11 * 60000);
+  bool no_board = false;
+  for (const auto &s : st5.history)
+    no_board |= s == "No board";
+  CHECK(w_standby && w_on && st5.state == "Standby" && !en5.level && !pr5.state && !no_board,
+        "without a detect pin: Standby, a light on: On, off: Standby again; never 'No board' (%zu states, last '%s')",
+        st5.history.size(), st5.state.c_str());
   // negative control: a light not on a port is never touched
   CHECK(other.out.writes == 0, "a light not on the port: untouched");
   // the power mode select without a dark source: Standby, Always on

@@ -23,6 +23,7 @@ static constexpr uint32_t LEDGER_AGE_DAYS = 90;         // a board not seen this
 static constexpr uint32_t LEDGER_SAVE_MS = 15 * 60000;  // saved at most this often while on (and at a planned cut)
 static constexpr uint32_t LEDGER_DAY_MS = 86400000;
 static constexpr uint32_t SYNC_DAILY_MS = 86400000;     // a long run: compared (and synced if ahead) once a day
+static constexpr size_t LEDGER_MAX_BLOB = 1u << 20;       // a stored copy's size at most (its size record checked)
 static constexpr uint32_t BOOT_SLACK_MS = 2000;         // a board up this much longer than the hub: on before it
 
 /// A board's lifetime counters in the wire's units (LIFETIME bytes 0-15), its energy in exact mWh.
@@ -275,13 +276,26 @@ class LifetimeLedger {
     }
     ultra_put16(out + this->blob_size() - 2, ultra_crc16(out, static_cast<uint32_t>(this->blob_size() - 2)));
   }
-  /// A stored copy (any size: the entries and positions that fit), replacing everything (what isn't in it is gone);
-  /// false: not a valid one (nothing changed).
-  bool load(const uint8_t *in, size_t n, uint32_t *generation) {
-    if (n < HDR + 2 || ultra_get32(in) != LEDGER_MAGIC || ultra_get16(in + n - 2) != ultra_crc16(in, static_cast<uint32_t>(n - 2)))
+  /// A stored copy: valid (magic, size, CRC)? Its generation and how many entries / positions it uses (the
+  /// allocation it needs: a copy stored with more or fewer receivers loads too).
+  static bool peek(const uint8_t *in, size_t n, uint32_t *generation, size_t *entries, size_t *positions) {
+    size_t ne, np;
+    if (!valid_(in, n, &ne, &np))
       return false;
-    const size_t ne = ultra_get16(in + 12), np = ultra_get16(in + 14);
-    if (HDR + ENTRY * ne + POS * np + 2 != n)
+    *generation = ultra_get32(in + 4);
+    *entries = *positions = 0;
+    const uint8_t *b = in + HDR;
+    for (size_t i = 0; i < ne; i++, b += ENTRY)
+      *entries += b[0] & 1;
+    for (size_t i = 0; i < np; i++, b += POS)
+      *positions += b[0] & 1;
+    return true;
+  }
+  /// A stored copy (any size: its entries and positions moved into this allocation, as many as fit), replacing
+  /// everything (what isn't in it is gone); false: not a valid one (nothing changed).
+  bool load(const uint8_t *in, size_t n, uint32_t *generation) {
+    size_t ne, np;
+    if (!valid_(in, n, &ne, &np))
       return false;
     for (auto &e : this->entries_)
       e = LedgerEntry{};
@@ -290,10 +304,11 @@ class LifetimeLedger {
     *generation = ultra_get32(in + 4);
     this->day_ = ultra_get32(in + 8);
     const uint8_t *b = in + HDR;
+    size_t to = 0;
     for (size_t i = 0; i < ne; i++, b += ENTRY) {
-      if (!(b[0] & 1) || i >= this->entries_.size())
+      if (!(b[0] & 1) || to >= this->entries_.size())
         continue;
-      LedgerEntry &e = this->entries_[i];
+      LedgerEntry &e = this->entries_[to++];
       e.used = true;
       std::memcpy(e.uid, b + 1, 12);
       e.c.powered = ultra_get32(b + 13);
@@ -306,10 +321,11 @@ class LifetimeLedger {
       e.records = ultra_get24(b + 41);
       e.last_day = ultra_get32(b + 44);
     }
+    to = 0;
     for (size_t i = 0; i < np; i++, b += POS) {
-      if (!(b[0] & 1) || i >= this->positions_.size())
+      if (!(b[0] & 1) || to >= this->positions_.size())
         continue;
-      LedgerPosition &p = this->positions_[i];
+      LedgerPosition &p = this->positions_[to++];
       p.used = true;
       p.have_uid = (b[0] & 2) != 0;
       p.counter = (b[0] & 4) != 0;
@@ -325,6 +341,13 @@ class LifetimeLedger {
 
  protected:
   static constexpr size_t HDR = 16, ENTRY = 48, POS = 33;
+  static bool valid_(const uint8_t *in, size_t n, size_t *ne, size_t *np) {
+    if (n < HDR + 2 || ultra_get32(in) != LEDGER_MAGIC || ultra_get16(in + n - 2) != ultra_crc16(in, static_cast<uint32_t>(n - 2)))
+      return false;
+    *ne = ultra_get16(in + 12);
+    *np = ultra_get16(in + 14);
+    return HDR + ENTRY * *ne + POS * *np + 2 == n;
+  }
   static bool raise_(uint32_t &v, uint32_t rx) {
     if (rx <= v)
       return false;

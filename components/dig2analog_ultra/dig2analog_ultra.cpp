@@ -1011,10 +1011,13 @@ bool UltraHub::setup_rmt_() {
 
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
 // The ESP32's one lifetime ledger (every line's receivers: a board moved between lines keeps its entry). Two stored
-// copies alternate: the newer valid one loads (a cut while one is written keeps the other). Stored at most every
-// 15 min while it changes by a wire unit, at a planned power-off (the notice) and at a reboot.
+// copies alternate: the newer valid one loads (a cut while one is written keeps the other). Each has its size stored
+// beside it (written after it): a copy stored with more or fewer receivers loads too. Stored at most every 15 min
+// while it changes by a wire unit, at a planned power-off (the notice) and at a reboot.
 namespace {
-ESPPreferenceObject g_ledger_pref[2];
+const char *const LEDGER_KEYS[2] = {"ultra_ledger_a", "ultra_ledger_b"};
+const char *const LEDGER_SIZE_KEYS[2] = {"ultra_ledger_a_size", "ultra_ledger_b_size"};
+ESPPreferenceObject g_ledger_pref[2], g_ledger_size[2];
 std::vector<uint8_t> g_ledger_blob;
 uint32_t g_ledger_generation = 0, g_ledger_saved_ms = 0, g_ledger_day_ms = 0;
 bool g_ledger_loaded = false;
@@ -1025,30 +1028,40 @@ void UltraHub::ledger_service_() {
   const uint32_t now = millis();
   if (!g_ledger_loaded) {   // the first loop: every line has its receivers counted
     g_ledger_loaded = true;
-    // (blocks of 32: a receiver more or less keeps the stored size, so the ledger loads)
-    const size_t n = ledger_receivers(), pos = (n + 31) / 32 * 32, room = (n + std::max<size_t>(4, n / 2) + 31) / 32 * 32;
-    l.init(room, pos);
-    g_ledger_blob.assign(l.blob_size(), 0);
-    // the newer valid copy, loaded alone (what the newer one dropped stays dropped)
+    // the newer valid copy (by its stored size: whatever the receivers were then), loaded alone (what the newer one
+    // dropped stays dropped)
     uint32_t newest = 0;
+    size_t used_e = 0, used_p = 0;
     bool any = false;
     std::vector<uint8_t> best;
     for (int k = 0; k < 2; k++) {
-      g_ledger_pref[k] = global_preferences->make_preference(g_ledger_blob.size(), fnv1_hash(k == 0 ? "ultra_ledger_a" : "ultra_ledger_b"),
-                                                             true);
-      std::vector<uint8_t> b(g_ledger_blob.size());
-      LifetimeLedger probe;
-      probe.init(room, pos);
+      g_ledger_size[k] = global_preferences->make_preference(sizeof(uint32_t), fnv1_hash(LEDGER_SIZE_KEYS[k]), true);
+      uint32_t size = 0;
+      if (!g_ledger_size[k].load(reinterpret_cast<uint8_t *>(&size), sizeof(size)) || size < 18 || size > LEDGER_MAX_BLOB)
+        continue;
+      ESPPreferenceObject stored = global_preferences->make_preference(size, fnv1_hash(LEDGER_KEYS[k]), true);
+      std::vector<uint8_t> b(size);
       uint32_t gen = 0;
-      if (g_ledger_pref[k].load(b.data(), b.size()) && probe.load(b.data(), b.size(), &gen) &&
+      size_t ne = 0, np = 0;
+      if (stored.load(b.data(), b.size()) && LifetimeLedger::peek(b.data(), b.size(), &gen, &ne, &np) &&
           (!any || static_cast<int32_t>(gen - newest) > 0)) {
         best.swap(b);
         newest = gen;
+        used_e = ne;
+        used_p = np;
         any = true;
       }
     }
+    // (blocks of 32: a receiver more or less keeps the size; never fewer than the stored copy uses)
+    const size_t n = ledger_receivers();
+    const size_t pos = std::max((n + 31) / 32 * 32, (used_p + 31) / 32 * 32);
+    const size_t room = std::max((n + std::max<size_t>(4, n / 2) + 31) / 32 * 32, (used_e + 31) / 32 * 32);
+    l.init(room, pos);
     if (any)
       l.load(best.data(), best.size(), &newest);
+    g_ledger_blob.assign(l.blob_size(), 0);
+    for (int k = 0; k < 2; k++)
+      g_ledger_pref[k] = global_preferences->make_preference(g_ledger_blob.size(), fnv1_hash(LEDGER_KEYS[k]), true);
     g_ledger_generation = newest;
     g_ledger_saved_ms = g_ledger_day_ms = now;
     ESP_LOGD(TAG, "Lifetime ledger: %u board(s) room, %s", static_cast<unsigned>(l.capacity()),
@@ -1070,7 +1083,9 @@ void UltraHub::ledger_save_(bool now) {
   if (l.dirty()) {
     g_ledger_generation++;
     l.save(g_ledger_blob.data(), g_ledger_generation);
+    const uint32_t size = static_cast<uint32_t>(g_ledger_blob.size());
     g_ledger_pref[g_ledger_generation & 1].save(g_ledger_blob.data(), g_ledger_blob.size());
+    g_ledger_size[g_ledger_generation & 1].save(reinterpret_cast<const uint8_t *>(&size), sizeof(size));   // (after it)
     l.clear_dirty();
   }
   g_ledger_saved_ms = millis();

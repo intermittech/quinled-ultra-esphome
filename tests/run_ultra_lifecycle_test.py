@@ -63,6 +63,12 @@ PIECES = {
          "bool DiffPowerPort::has_light(", "uint8_t PowerModeSelect::mode_of_(", "size_t PowerModeSelect::index_of_(",
          "void PowerModeSelect::setup(", "void PowerModeSelect::control("],
     ),
+    # the ESP32's lifetime ledger on the preferences: its stored copies (review r9 F2, F6, F8)
+    "hub_ledger.inc": (
+        "dig2analog_ultra.cpp",
+        ["// The ESP32's one lifetime ledger (every line's", "void UltraHub::ledger_service_(",
+         "void UltraHub::ledger_save_("],
+    ),
     "hub_port.inc": (
         "dig2analog_ultra.cpp",
         ["void UltraHub::attach_port_(", "void UltraHub::send_power_off_notice(", "void UltraHub::pump_notice_(",

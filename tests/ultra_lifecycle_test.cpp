@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -3092,6 +3093,152 @@ static void test_hub_port() {
 #undef USE_DIFFPOWER
 }  // namespace hub_port
 
+// ================================================================================================ ledger store
+// The ESP32's lifetime ledger on its preferences (dig2analog_ultra.cpp: ledger_service_, ledger_save_, cut into
+// build/lifecycle/hub_ledger.inc) on a stand-in for ESPHome's ESP32 backend (components/esp32/preferences.cpp): by
+// key, a load only with the stored length, saves queued until sync(), which writes them in order and forgets the
+// queue even when a write fails; a reboot loses the queue.
+namespace ledger_store {
+static std::map<uint32_t, std::vector<uint8_t>> stored, pending;
+static std::vector<uint32_t> order;
+static int saves = 0;
+static bool fail_sync = false;
+static int cut_after = -1;   // sync() writes this many queued saves, then the power goes
+struct ESPPreferenceObject {
+  uint32_t key{0};
+  bool load(uint8_t *out, size_t size) {
+    auto &src = pending.count(this->key) ? pending : stored;
+    auto it = src.find(this->key);
+    if (it == src.end() || it->second.size() != size)
+      return false;
+    std::copy(it->second.begin(), it->second.end(), out);
+    return true;
+  }
+  bool save(const uint8_t *in, size_t size) {
+    if (!pending.count(this->key))
+      order.push_back(this->key);
+    pending[this->key] = std::vector<uint8_t>(in, in + size);
+    saves++;
+    return true;
+  }
+};
+struct Preferences {
+  ESPPreferenceObject make_preference(size_t, uint32_t key, bool) { return ESPPreferenceObject{key}; }
+  bool sync() {
+    int n = 0;
+    for (uint32_t k : order) {
+      if (cut_after >= 0 && n++ >= cut_after)
+        break;
+      if (!fail_sync)
+        stored[k] = pending[k];
+    }
+    pending.clear();
+    order.clear();
+    return !fail_sync;
+  }
+};
+static Preferences prefs;
+static Preferences *const global_preferences = &prefs;
+static uint32_t fnv1_hash(const char *s) {
+  uint32_t h = 2166136261u;
+  for (; *s != 0; s++) {
+    h *= 16777619u;
+    h ^= static_cast<uint8_t>(*s);
+  }
+  return h;
+}
+struct UltraHub {
+  void ledger_service_();
+  static void ledger_save_(bool now);
+};
+#include "hub_ledger.inc"
+
+/// the ESP32 restarts (its queue lost) with this many receivers counted
+static void reboot(size_t receivers) {
+  ultra_ledger() = LifetimeLedger{};
+  ledger_receivers() = receivers;
+  g_ledger_loaded = false;
+  g_ledger_blob.clear();
+  g_ledger_generation = g_ledger_saved_ms = g_ledger_day_ms = 0;
+  now_ms = 0;
+  pending.clear();
+  order.clear();
+}
+
+/// Review r9 F2: receivers added or removed across an allocation boundary (21 -> 22 receivers: 32 -> 64 entries; 32
+/// -> 33: the positions too) keep the stored ledger; a cut between a copy and its size record keeps the other copy.
+static void test_ledger_resize() {
+  UltraHub h;
+  uint8_t uid[12] = {0x42};
+  bool made = false, swapped = false;
+  stored.clear();
+  reboot(21);
+  h.ledger_service_();
+  LedgerEntry *e = ultra_ledger().touch(uid, &made);
+  ultra_ledger().add_energy(*e, 150000, 0);
+  ultra_ledger().position_energy(5u << 16, *e, &swapped);
+  h.ledger_save_(true);
+  const size_t small = ultra_ledger().blob_size();
+  reboot(22);
+  h.ledger_service_();
+  e = ultra_ledger().find(uid);
+  const bool grown = e != nullptr && e->c.mwh == 150000 && ultra_ledger().blob_size() > small;
+  CHECK(grown, "F2: 21 -> 22 receivers (%u -> %u B): the stored ledger kept (%llu mWh)", static_cast<unsigned>(small),
+        static_cast<unsigned>(ultra_ledger().blob_size()), static_cast<unsigned long long>(e ? e->c.mwh : 0));
+  if (e == nullptr)
+    return;
+  ultra_ledger().add_energy(*e, 10000, 0);
+  h.ledger_save_(true);
+  reboot(21);   // (back: the newer copy is the bigger one)
+  h.ledger_service_();
+  e = ultra_ledger().find(uid);
+  CHECK(e != nullptr && e->c.mwh == 160000, "F2: back to 21: the newer, bigger copy loads (%llu mWh)",
+        static_cast<unsigned long long>(e ? e->c.mwh : 0));
+  if (e == nullptr)
+    return;
+  reboot(33);   // (the positions over their boundary: 32 -> 64)
+  h.ledger_service_();
+  e = ultra_ledger().find(uid);
+  bool sw = false;
+  CHECK(e != nullptr && ultra_ledger().position_energy(5u << 16, *e, &sw) == 160000 && !sw,
+        "F2: 33 receivers: the position kept (no new board)");
+  if (e == nullptr)
+    return;
+  // a cut between a copy (another size now) and its size record: that copy refused, the other one loads
+  ultra_ledger().add_energy(*e, 10000, 0);
+  h.ledger_save_(true);   // (170 Wh, sizes recorded)
+  reboot(70);
+  h.ledger_service_();
+  e = ultra_ledger().find(uid);
+  ultra_ledger().add_energy(*e, 10000, 0);
+  cut_after = 1;          // (180 Wh: the copy written, its size record not)
+  h.ledger_save_(true);
+  cut_after = -1;
+  reboot(70);
+  h.ledger_service_();
+  e = ultra_ledger().find(uid);
+  CHECK(e != nullptr && e->c.mwh == 170000, "F2: a cut between a copy and its size: the other copy (%llu mWh)",
+        static_cast<unsigned long long>(e ? e->c.mwh : 0));
+  // (F8 on the boot loader: the newer copy, without an entry it aged out, wins whole; GPT's PRODUCTION_LOAD)
+  stored.clear();
+  reboot(1);
+  h.ledger_service_();
+  LedgerEntry *a = ultra_ledger().touch(uid, &made);
+  ultra_ledger().add_energy(*a, 1000, 0);
+  h.ledger_save_(true);
+  ultra_ledger().add_energy(*a, 1000, 0);
+  h.ledger_save_(true);
+  ultra_ledger().set_day(LEDGER_AGE_DAYS);   // (aged out: no position holds it)
+  h.ledger_save_(true);
+  reboot(1);
+  h.ledger_service_();
+  CHECK(g_ledger_generation == 3 && ultra_ledger().find(uid) == nullptr,
+        "F8: the newer copy (generation %u) without the aged entry: it stays gone", g_ledger_generation);
+  std::printf("  ledger store: receivers added and removed across the allocation boundaries, a cut mid-save, the newer "
+              "copy whole\n");
+}
+}  // namespace ledger_store
+
 }  // namespace esphome::dig2analog_ultra
 
 using namespace esphome::dig2analog_ultra;
@@ -3396,6 +3543,7 @@ int main() {
   hub_rw::test_lock_from_end();
   receiver_entities::test_receiver_entities();
   update_retry::test_auto_retry();
+  ledger_store::test_ledger_resize();
   port_power::test_port();
   port_power::test_port_prepare();
   hub_port::test_hub_port();

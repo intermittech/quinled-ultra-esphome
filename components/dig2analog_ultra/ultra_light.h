@@ -177,6 +177,7 @@ class UltraLight final : public light::LightOutput, public light::LightRemoteVal
   bool zero_means_zero_{false};
   bool constant_brightness_{false};
   bool color_interlock_{false};
+  uint8_t dtw_n_{0};                         // dim to warm's set points (0: the straight line to dtw_warm_)
   float cold_white_temperature_{0};
   float warm_white_temperature_{0};
 
@@ -186,7 +187,6 @@ class UltraLight final : public light::LightOutput, public light::LightRemoteVal
   bool dtw_on_{false};
   float dtw_warm_{0};
   float dtw_assist_{0};
-  uint8_t dtw_n_{0};                         // set points (0: the straight line to dtw_warm_)
   float dtw_pb_[ULTRA_OPT_POINTS_MAX]{};     // brightness 0..1
   float dtw_pt_[ULTRA_OPT_POINTS_MAX]{};     // mireds
   uint8_t scene_mode_{SCENE_NONE};

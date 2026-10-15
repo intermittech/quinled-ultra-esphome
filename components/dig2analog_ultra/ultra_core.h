@@ -752,16 +752,16 @@ class Scheduler {
   /// Per board ~410 B, + ~430 B per light in use (allocated with its first command): 50 boards with one light each
   /// take ~42 KB of the ESP32's heap (wiki: Ultra Mode). The queue holds keys (12 B per command) and is freed whenever
   /// it empties.
-  struct Board {
-    std::vector<Cmd> queue;
+  struct Board {   // (the slots first: no padding)
     Item config[CONFIG_PAGES];
     Item identify;  // the last IDENTIFY (identify, version, dark, release, calibrate)
+    std::vector<Cmd> queue;
     std::unique_ptr<LightItems> light[ULTRA_LIGHTS];
     uint16_t cfg[ULTRA_CFG_COUNT]{};
+    uint16_t rr{0};
     bool cfg_have[ULTRA_CFG_COUNT]{};
     bool cfg_dirty{false};
     uint8_t seq[ULTRA_LIGHTS + 1][ULTRA_TYPES]{};
-    uint16_t rr{0};
     uint8_t urgent_run{0};   // queued commands sent in a row (build_frame: every 16th slot a refresh)
     uint8_t first_unused{ULTRA_LIGHTS};   // light indices from here on are not in the YAML
     uint8_t unsent{0};                    // queued commands of which no copy went out yet

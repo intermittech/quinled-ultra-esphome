@@ -1081,16 +1081,23 @@ void UltraHub::ledger_save_(bool now) {
   if (!g_ledger_loaded || (!l.dirty() && !now))
     return;
   if (l.dirty()) {
+    // the next generation into the other copy, its size after it, on the flash now; clean only once it is there (a
+    // failed write stays dirty: the next save, periodic or forced, writes it again)
     g_ledger_generation++;
     l.save(g_ledger_blob.data(), g_ledger_generation);
     const uint32_t size = static_cast<uint32_t>(g_ledger_blob.size());
-    g_ledger_pref[g_ledger_generation & 1].save(g_ledger_blob.data(), g_ledger_blob.size());
-    g_ledger_size[g_ledger_generation & 1].save(reinterpret_cast<const uint8_t *>(&size), sizeof(size));   // (after it)
-    l.clear_dirty();
+    bool ok = g_ledger_pref[g_ledger_generation & 1].save(g_ledger_blob.data(), g_ledger_blob.size());
+    ok = g_ledger_size[g_ledger_generation & 1].save(reinterpret_cast<const uint8_t *>(&size), sizeof(size)) && ok;
+    ok = global_preferences->sync() && ok;
+    if (ok) {
+      l.clear_dirty();
+    } else {
+      ESP_LOGW(TAG, "Lifetime ledger: storing it failed; again at the next save");
+    }
+  } else {
+    global_preferences->sync();   // (a planned power-off, a reboot: the rest on the flash now)
   }
   g_ledger_saved_ms = millis();
-  if (now)
-    global_preferences->sync();   // (a planned power-off, a reboot: on the flash now)
 }
 #endif
 

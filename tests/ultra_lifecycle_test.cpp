@@ -3237,6 +3237,40 @@ static void test_ledger_resize() {
   std::printf("  ledger store: receivers added and removed across the allocation boundaries, a cut mid-save, the newer "
               "copy whole\n");
 }
+
+/// Review r9 F6: a flush that fails (the NVS write) keeps the ledger dirty: a later forced save (a planned cut) with
+/// nothing new writes it again, and so does the periodic save. GPT's NVS_FAILURE probe.
+static void test_ledger_flush_failure() {
+  UltraHub h;
+  uint8_t uid[12] = {0x43};
+  bool made = false;
+  stored.clear();
+  reboot(1);
+  h.ledger_service_();
+  ultra_ledger().touch(uid, &made);
+  fail_sync = true;
+  h.ledger_save_(true);   // (the flush fails)
+  fail_sync = false;
+  const bool kept = ultra_ledger().dirty();
+  h.ledger_save_(true);   // a planned cut, nothing new: written again
+  reboot(1);
+  h.ledger_service_();
+  CHECK(kept && ultra_ledger().find(uid) != nullptr, "F6: a failed flush stays dirty (%d) and the next forced save "
+        "writes it (%d)", kept, ultra_ledger().find(uid) != nullptr);
+  // the periodic save retries too
+  uint8_t uid2[12] = {0x44};
+  ultra_ledger().touch(uid2, &made);
+  fail_sync = true;
+  now_ms = LEDGER_SAVE_MS + 1;
+  h.ledger_service_();
+  fail_sync = false;
+  now_ms = 2 * LEDGER_SAVE_MS + 2;
+  h.ledger_service_();
+  reboot(1);
+  h.ledger_service_();
+  CHECK(ultra_ledger().find(uid2) != nullptr, "F6: the periodic save after a failed one writes it again");
+  std::printf("  ledger store: a failed flush written again (forced and periodic)\n");
+}
 }  // namespace ledger_store
 
 }  // namespace esphome::dig2analog_ultra
@@ -3544,6 +3578,7 @@ int main() {
   receiver_entities::test_receiver_entities();
   update_retry::test_auto_retry();
   ledger_store::test_ledger_resize();
+  ledger_store::test_ledger_flush_failure();
   port_power::test_port();
   port_power::test_port_prepare();
   hub_port::test_hub_port();

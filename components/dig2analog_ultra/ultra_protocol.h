@@ -184,7 +184,9 @@ enum {
     ULTRA_PAGE_LIFETIME = 0x0C,        /* 0.2.5: the board's lifetime record, its odometer (ULTRA_LT_*) */
     ULTRA_PAGE_DIAG = 0x0D,            /* 0.2.5: diagnostics in two parts (POLL argument 0: 0 = the running board, 1 =
                                           the fault memory and the calibration trend; 2-255: UNSUPPORTED) (ULTRA_DG_*) */
-    ULTRA_PAGE_HW = 0x80,              /* 0x0E-0x7F: future official pages; 0x80-0xFD: hardware-specific */
+    ULTRA_PAGE_LIFE_SYNC = 0x0E,       /* 0.2.6: the hub's lifetime counters for the board to merge (ULTRA_LS_*; the
+                                          answer: the counters after it and the result) (ULTRA_FEAT_LIFE_SYNC) */
+    ULTRA_PAGE_HW = 0x80,              /* 0x0F-0x7F: future official pages; 0x80-0xFD: hardware-specific */
     ULTRA_PAGE_BUSY = 0xFE, ULTRA_PAGE_UNSUPPORTED = 0xFF,
 };
 /* IDENTITY page DATA: MCU UID (12) | firmware version word (4, ultra_update.h; 0 = unknown) | bootloader version (1,
@@ -408,6 +410,42 @@ enum {
 #define ULTRA_LT_WATCHDOG         18u    /* u8: watchdog resets (saturating) */
 #define ULTRA_LT_UPDATES          19u    /* u16: firmware updates (starts with a new app version) */
 #define ULTRA_LT_RECORDS          21u    /* u24: the record's writes (its flash wear) */
+/* LIFE_SYNC page (0x0E, 0.2.6; ULTRA_FEAT_LIFE_SYNC): a hub that keeps each board's lifetime counters (its ledger,
+ * by the board's full UID, IDENTITY 0..11) sends them back after the board's power-up, so what the board couldn't
+ * store before a power cut isn't lost. The board merges once per power-up, and only when the POLL's UID16 and RECORDS
+ * low 8 bits are its own (the record the hub reconciled against: a board that wrote since, or another board, merges
+ * nothing). Each counter is raised by the hub's step d ahead (in the wire's units) when 0 < d <= its step, else kept:
+ * nothing is ever lowered; a counter ahead by more than its step is ignored (result CAPPED), the others still merge.
+ * The steps (the QuinLED Diff-Power ultra receiver): powered time 30 days; lit time the powered step + 0.1 h;
+ * power-ups, trips and dips one per 10 s of the powered step + 64; the energy 1 kW over the powered step + 1 h. They
+ * limit what a wrong ledger can do; the ledger's correctness is the hub's. A merged counter counts as stored: it
+ * never makes the board write; it is stored with the board's own next lifetime write, and the board's write allowance
+ * counts only its own powered time. Hub: once per board power-up, when the ledger is ahead; then the notice (IDENTIFY
+ * 7) if the line is to be switched off, and no POLL until the cut. A board without the feature answers
+ * ULTRA_PAGE_UNSUPPORTED. POLL arguments ("POLL argument 0" = slot byte 7): */
+#define ULTRA_LS_UID16            0u     /* u16: the board's UID16 (as in its answers) */
+#define ULTRA_LS_LIFETIME         2u     /* 16 bytes: LIFETIME page bytes 0..15, the same fields and layout (powered,
+                                            lit, power-ups, overload trips, short trips, supply dips) */
+#define ULTRA_LS_TOTAL_WH         18u    /* u32: the lifetime energy, Wh (as ENERGY 4) */
+#define ULTRA_LS_RECORDS          22u    /* u8: the low 8 bits of the board's RECORDS (LIFETIME 21) the ledger was
+                                            reconciled against */
+/* ... the answer's DATA: bytes 0..15 as LIFETIME's (after the merge), then: */
+#define ULTRA_LS_A_TOTAL_WH       16u    /* u32: the lifetime energy, Wh, after the merge */
+#define ULTRA_LS_A_RESULT         20u    /* u8: ULTRA_LS_R_* */
+#define ULTRA_LS_A_APPLIED        21u    /* u8: the counters raised, ULTRA_LS_F_* */
+#define ULTRA_LS_A_RECORDS        22u    /* u16: RECORDS, its low 16 bits */
+#define ULTRA_LS_R_APPLIED        0u     /* merged (every counter that was ahead) */
+#define ULTRA_LS_R_NOOP           1u     /* nothing was ahead (doesn't use up the power-up's merge) */
+#define ULTRA_LS_R_UID            2u     /* UID16 not the board's: nothing merged */
+#define ULTRA_LS_R_RECORDS        3u     /* RECORDS low 8 bits not the board's: nothing merged */
+#define ULTRA_LS_R_ONCE           4u     /* already merged this power-up: nothing merged */
+#define ULTRA_LS_R_CAPPED         5u     /* a counter ahead by more than its step: ignored (the others: APPLIED's) */
+#define ULTRA_LS_F_POWERED        0x01u
+#define ULTRA_LS_F_LIT            0x02u
+#define ULTRA_LS_F_UPS            0x04u
+#define ULTRA_LS_F_TRIPS          0x08u  /* overload or short */
+#define ULTRA_LS_F_DIPS           0x10u
+#define ULTRA_LS_F_WH             0x20u
 /* DIAG page DATA (0x0D, 0.2.5): what service looks at first (ULTRA_FEAT_DIAG). POLL argument 0, the running board: */
 #define ULTRA_DG_RESET            0u     /* u8: this start's reset cause, ULTRA_ST_RST_* (as STATUS 7) */
 #define ULTRA_DG_BC_CAUSE         1u     /* u8: the last run's breadcrumbs (kept by a watchdog, software or pin reset):
@@ -429,7 +467,9 @@ enum {
 #define ULTRA_DG_FP_SETTINGS      0x01u
 #define ULTRA_DG_FP_CALIBRATION   0x02u
 #define ULTRA_DG_FP_SCENE         0x04u
-#define ULTRA_DG_FP_LIFETIME      0x08u  /* a regular write is due (it waits for the outputs to go dark) */
+#define ULTRA_DG_FP_LIFETIME      0x08u  /* a write is due, waiting for the flash's admission and the write budget (a
+                                            regular one also for the outputs to go dark; 0.2.6: also a supply dip's
+                                            write that couldn't be made then, which doesn't wait for dark) */
 #define ULTRA_DG_FP_EFFECTS       0x10u  /* the power-on effects */
 #define ULTRA_DG_FP_EXHAUSTED     0x80u  /* (0.2.6) not a record: the lifetime record's flash-wear allowance is used up
                                             (the receiver: 32,768 writes + one per 3 h powered); it is written again
@@ -478,7 +518,8 @@ enum {
 #define ULTRA_FEAT_RETRY          0x00080000u  /* CONFIG 24: the trips' retry policy (0.2.5) */
 #define ULTRA_FEAT_LOSS_SCENE     0x00100000u  /* CONFIG 8 value 3: signal loss fades to the power-on scene (0.2.5) */
 #define ULTRA_FEAT_STANDBY        0x00200000u  /* IDENTIFY 7: the planned power-off notice (0.2.6) */
-/*      0x00400000-0x00800000     future official features (e.g. broadcast slots, an EXT extension);
+#define ULTRA_FEAT_LIFE_SYNC      0x00400000u  /* LIFE_SYNC page: the hub's lifetime counters merged (0.2.6) */
+/*      0x00800000                future official features (e.g. broadcast slots, an EXT extension);
  *      0x01000000-0x80000000     hardware-specific */
 
 /* SET flags (low nibble of byte 1; the other slot types send FLAGS 0) */

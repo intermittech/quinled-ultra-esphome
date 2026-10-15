@@ -48,7 +48,7 @@ void UltraDiagnostics::update() {
 }
 
 void UltraDiagnostics::dump_config() {
-  ESP_LOGCONFIG(TAG, "QuinLED dig2analog Ultra diagnostics (GPIO%u):", this->hub_->get_pin());
+  ESP_LOGCONFIG(TAG, "QuinLED Ultra diagnostics (GPIO%u):", this->hub_->get_pin());
   LOG_SENSOR("  ", "Queue peak", this->queue_peak_);
   LOG_SENSOR("  ", "Memory peak", this->memory_peak_);
   LOG_SENSOR("  ", "Frame build time", this->build_time_);

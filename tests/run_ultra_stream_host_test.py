@@ -1,6 +1,6 @@
 """Build and run tests/ultra_stream_host_test.cpp with the zig C/C++ compiler (pip install ziglang).
 
-With the QuinLED dig2analog-ultra-5ch firmware next to this repo (quinled-ultra-firmware, or
+With the QuinLED Dig2Analog-Ultra-5ch firmware next to this repo (quinled-ultra-firmware, or
 ULTRA_FIRMWARE=<firmware dir>), the board's light engine is compiled in and the glide test runs on it too. Without
 it that part is skipped; with ULTRA_REQUIRE_DEPS=1 (CI) a missing firmware is a failure.
 """

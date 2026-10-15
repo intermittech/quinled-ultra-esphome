@@ -1,13 +1,13 @@
 # quinled-ultra-esphome
 
-ESPHome external components for **QuinLED Ultra** boards, such as the **QuinLED dig2analog-ultra-5ch**, in
-**Ultra mode**. The board works as a co-processor: ESPHome sends **what** should happen (a colour with a transition
-length, an effect, a setting), and the board computes **how**, every millisecond, in 16 bit, in step with every
-other board on the line.
+ESPHome external components for boards on the **QuinLED Ultra protocol**, such as the **QuinLED Dig2Analog-Ultra-5ch**
+and the **QuinLED Diff-Power Ultra receivers**, in **Ultra mode**. The board works as a co-processor: ESPHome sends
+**what** should happen (a colour with a transition length, an effect, a setting), and the board computes **how**,
+every millisecond, in 16 bit, in step with every other board on the line.
 
 | Board | | |
 |---|---|---|
-| QuinLED dig2analog-ultra-5ch | Ultra mode: `dig2analog_ultra` (this repository) | In development |
+| QuinLED Dig2Analog-Ultra-5ch | Ultra mode: `dig2analog_ultra` (this repository) | In development |
 
 | Component | |
 |---|---|
@@ -57,7 +57,7 @@ light:
 
 ## What Ultra mode adds over WS2805 / WS2915
 
-| | WS2805 / WS2915 boards ([esphome-ws2915-ws2805](https://github.com/intermittech/esphome-ws2915-ws2805)) | QuinLED dig2analog-ultra-5ch in Ultra mode |
+| | WS2805 / WS2915 boards ([esphome-ws2915-ws2805](https://github.com/intermittech/esphome-ws2915-ws2805)) | QuinLED Dig2Analog-Ultra-5ch in Ultra mode |
 |---|---|---|
 | Resolution | 8 bit (WS2805) or 16 bit (WS2915) frames | 16 bit with an exact gamma curve on the board, no 8-bit stage |
 | PWM | the chip's own: ~4 kHz (WS2805), ~2 kHz (WS2915) | 2.2-100 kHz, the channels staggered, spread spectrum |
@@ -66,11 +66,11 @@ light:
 | Also | | power-on scene and effect, dim to warm, board current sense and calibration (on the board: protection, limits, automatic dimming), firmware updates over the data line |
 
 **Reporting back** (voltage, current, power, energy, temperature, power events and why a light is dim or off, to
-ESPHome and Home Assistant) is for **QuinLED Diff-Power ultra receivers only**: the line's `telemetry:` (wiki: Ultra
-Mode, Diff-Power telemetry). The QuinLED dig2analog-ultra-5ch's data line is one-way: it measures for itself and never
+ESPHome and Home Assistant) is for **QuinLED Diff-Power Ultra receivers only**: the line's `telemetry:` (wiki: Ultra
+Mode, Diff-Power telemetry). The QuinLED Dig2Analog-Ultra-5ch's data line is one-way: it measures for itself and never
 reports back.
 
-The QuinLED dig2analog-ultra-5ch can also run in WS2805 / WS2915 mode with the
+The QuinLED Dig2Analog-Ultra-5ch can also run in WS2805 / WS2915 mode with the
 [`ws2915`](https://github.com/intermittech/esphome-ws2915-ws2805) component (then it already has its own PWM).
 
 ## Documentation
@@ -90,12 +90,12 @@ Ready-made configurations are in [`examples/`](examples).
 
 **Related:**
 - [quinled-ultra-firmware](https://github.com/intermittech/quinled-ultra-firmware): the board firmware.
-- [quinled-ultra-protocol](https://github.com/intermittech/quinled-ultra-protocol): the protocol
+- [quinled-ultra-protocol](https://github.com/intermittech/quinled-ultra-protocol): the QuinLED Ultra protocol
   (`components/dig2analog_ultra/ultra_protocol.h` is its reference header, unchanged).
 
 ## Status
 
-Compiles and passes its tests for the ESP32 classic (ESP-IDF). The QuinLED dig2analog-ultra-5ch is still in
+Compiles and passes its tests for the ESP32 classic (ESP-IDF). The QuinLED Dig2Analog-Ultra-5ch is still in
 development; see the [bench plan](https://github.com/intermittech/quinled-ultra-esphome/wiki/Bench-Plan).
 
 ## License

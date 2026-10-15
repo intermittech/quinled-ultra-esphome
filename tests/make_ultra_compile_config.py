@@ -433,6 +433,13 @@ light:
       - id: hall_strip
         from: 0
         to: 9
+  - platform: partition              # (a partition of that partition: still the hall strip's pixels)
+    id: hall_door_top
+    name: Hall door top
+    segments:
+      - id: hall_door
+        from: 0
+        to: 4
   - platform: esp32_rmt_led_strip
     id: garden_strip
     name: Garden strip

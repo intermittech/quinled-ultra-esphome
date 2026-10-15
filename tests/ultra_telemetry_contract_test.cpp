@@ -36,6 +36,7 @@
 //    every output every ms, through the session, the quiet second and the answer on its status LED (feedback channel
 //    red and all; firmware 0.6.9).
 
+#include "../components/dig2analog_ultra/ultra_ledger.h"
 #include "../components/dig2analog_ultra/ultra_telemetry.h"
 #include "../components/dig2analog_ultra/update_session.h"
 #include "ultra_telemetry_receiver.h"
@@ -270,6 +271,17 @@ static void verify_page(int tp, const ReceiverData &d, const ucrx_truth_t &t, co
             d.trend[0], d.trend_lit_h, d.trend_tests);
       break;
     }
+    case TP_SYNC:   // (0.2.6) the counters after the merge, its result, RECORDS
+      CHECK(d.lt_powered == ((t.lt_on_s / 360u) & 0xFFFFFFu) && d.lt_lit == ((t.lt_lit_s / 360u) & 0xFFFFFFu) &&
+                d.lt_power_ups == (t.lt_ups & 0xFFFFFFu) && d.lt_dips == (t.lt_dips & 0xFFFFFFu) &&
+                d.lt_overload_trips == t.lt_trips[0] && d.lt_short_trips == t.lt_trips[1] &&
+                d.total_wh == t.total_wh && d.ls_result <= ULTRA_LS_R_CAPPED &&
+                d.ls_records16 == static_cast<uint16_t>(t.lt_writes),
+            "%s: LIFE_SYNC on %u (%u s), lit %u (%u s), %u Wh (%u), result %u, applied %02X, records %u (%u)", w,
+            (unsigned) d.lt_powered, (unsigned) t.lt_on_s, (unsigned) d.lt_lit, (unsigned) t.lt_lit_s,
+            (unsigned) d.total_wh, (unsigned) t.total_wh, d.ls_result, d.ls_applied, d.ls_records16,
+            (unsigned) t.lt_writes);
+      break;
     default:
       break;
   }
@@ -387,6 +399,10 @@ struct Bench {
   uint16_t read_cnt[3]{}, read_dips{0};
   uint32_t acks{0}, acks_across{0}, acks_wrong{0};
   float last_energy{NAN};
+  // the hub's lifetime ledger (ultra_ledger.h): the position's Energy never back, across every restart
+  LifetimeLedger led;
+  LedgerKeeper keeper;
+  double last_position{-1};
 
   explicit Bench(const char *nm) : name(nm) {}
 
@@ -404,6 +420,8 @@ struct Bench {
     this->fakes.assign(receivers, Fake{});
     for (uint16_t i = 0; i < receivers; i++)
       this->fakes[i].init(i, ucrx_hub_ms(), FAKE_FEATURES);
+    this->led.init(receivers + 4u, receivers);
+    this->keeper.attach(&this->led, 5, receivers, ucrx_hub_ms());
     this->p.locked(ucrx_hub_ms());   // (the hub's preamble: the soak's frames from the power-up on)
   }
 
@@ -616,9 +634,13 @@ struct Bench {
     // what the poller made of it
     this->updates = this->p.take_updates(this->k);
     this->upd_all |= this->updates;
-    for (uint16_t b = 0; b < this->n; b++) {
-      if (b != this->k)
-        (void) this->p.take_updates(b);
+    for (uint16_t b = 0; b < this->n; b++)   // (as UltraHub::rw_publish_: every receiver's news to the ledger)
+      this->keeper.on_updates(this->p, b, b == this->k ? this->updates : this->p.take_updates(b), ucrx_hub_ms());
+    const double pos = this->keeper.energy_wh(this->k);
+    if (pos >= 0) {
+      CHECK(pos >= this->last_position, "%s: window %u: the position's Energy %.3f Wh after %.3f", this->name,
+            (unsigned) this->windows, pos, this->last_position);
+      this->last_position = pos;
     }
     char w[96];
     std::snprintf(w, sizeof(w), "%s: window %u (%s)", this->name, (unsigned) this->windows,
@@ -1128,6 +1150,7 @@ static void sc_restart() {
   CHECK(read, "restart: the short read");
   const uint32_t up_before = b.d().uptime_s;
   const float e_hub = telemetry_value(b.d(), TV_ENERGY);
+  const double pos_before = b.keeper.energy_wh(0);
   ucrx_truth_t fw;
   ucrx_truth(&fw);
   const uint32_t e_fw = fw.total_wh, t0 = ucrx_hub_ms();
@@ -1176,16 +1199,18 @@ static void sc_restart() {
   CHECK(b.t.latched == 0 && b.t.short_trips == 1,
         "restart: the new boot's short acknowledged in the end (latched %02X)", b.t.latched);
   const float e_after = telemetry_value(d, TV_ENERGY);
-  std::printf("  lifetime energy across the watchdog restart: the hub showed %.0f Wh, the board had %u Wh, after it "
-              "%.0f Wh%s\n",
-              e_hub, (unsigned) e_fw, e_after,
-              e_after < e_hub ? " (NOTE: lower: the Wh since its last lifetime write are lost on the board, the "
-                                "total_increasing sensor goes back)"
-                              : "");
+  // the board loses what it hadn't stored (its lifetime goes back); the position's Energy (the ledger) doesn't
+  CHECK(pos_before > 0 && b.keeper.energy_wh(0) >= pos_before,
+        "restart: the position's Energy %.3f Wh after the watchdog restart (%.3f before)", b.keeper.energy_wh(0),
+        pos_before);
+  std::printf("  lifetime energy across the watchdog restart: the board said %.3f Wh (stored %u), after it %.3f; the "
+              "position's Energy (the ledger) %.3f, after it %.3f\n",
+              e_hub, (unsigned) e_fw, e_after, pos_before, b.keeper.energy_wh(0));
 
   // the hub's own power cycle (a wall switch): the supply falls (the dip's lifetime write), the hub stops, powers up
   b.run(65000);
   const float e1 = telemetry_value(b.d(), TV_ENERGY);
+  const double pos1 = b.keeper.energy_wh(0);
   const uint32_t restarts0 = b.p.stats().restarts;
   ucrx_supply_mv(3000);
   ucrx_run_ms(30);
@@ -1207,10 +1232,14 @@ static void sc_restart() {
             "pin, power-on" && b.d().short_trips == 0 && telemetry_power_events_text(b.d()) == "no events",
         "restart: after the power cycle: restarts %u, reset '%s', events '%s'", (unsigned) b.p.stats().restarts,
         telemetry_reset_text(b.d().reset_cause).c_str(), telemetry_power_events_text(b.d()).c_str());
-  CHECK(telemetry_value(b.d(), TV_ENERGY) >= e1, "restart: the lifetime energy kept through the power cycle (%.0f Wh, "
-        "%.0f before)", telemetry_value(b.d(), TV_ENERGY), e1);
-  std::printf("  power cycle (the dip's lifetime write first): lifetime %.0f Wh before, %.0f Wh after\n", e1,
-              telemetry_value(b.d(), TV_ENERGY));
+  // the board keeps its whole Wh (the dip's write), not its fraction; the hub's ledger keeps both
+  CHECK(std::floor(telemetry_value(b.d(), TV_ENERGY)) >= std::floor(e1) && pos1 > 0 && b.keeper.energy_wh(0) >= pos1,
+        "restart: the lifetime energy kept through the power cycle: the board %.3f Wh (%.3f before), the position "
+        "%.3f Wh (%.3f before)",
+        telemetry_value(b.d(), TV_ENERGY), e1, b.keeper.energy_wh(0), pos1);
+  std::printf("  power cycle (the dip's lifetime write first): the board %.3f Wh before, %.3f after; the position's "
+              "Energy (the ledger) %.3f, %.3f\n",
+              e1, telemetry_value(b.d(), TV_ENERGY), pos1, b.keeper.energy_wh(0));
   CHECK(b.acks_wrong == 0, "restart: %u acknowledges not with the counts read in that boot", (unsigned) b.acks_wrong);
   b.check_retried();
   b.summary();
@@ -1218,6 +1247,54 @@ static void sc_restart() {
 
 /// (0.2.5) LIFETIME and DIAG against the firmware's record; the retry policy: no retries, "retries used up", a new
 /// command switches it on again; the short in LIFETIME's count and the fault memory.
+/// (0.2.6) LIFE_SYNC with the receiver's own firmware: lit for 7 min, then a cut without a lifetime write (a watchdog
+/// restart: what it hadn't stored is gone): after its power-up the hub's ledger gives the powered / lit time and the
+/// whole Wh back in one POLL (applied, merged into its RAM record), never twice; the position's Energy never back.
+static void sc_life_sync() {
+  std::printf("life sync: the hub's ledger back to the receiver after a cut that lost what it hadn't stored\n");
+  Bench b("lifesync");
+  b.power_up(0, RESET_POWER_PIN);
+  TelemetryIntervals iv = intervals(1000, 5000, 10000);
+  iv.lifetime_ms = 10000;
+  b.start(1, 0, ULTRA_RW_RATE_1M, iv);
+  lights_on(65535);
+  b.run(8000);
+  if (!(b.d().features & ULTRA_FEAT_LIFE_SYNC)) {
+    std::printf("  a firmware without LIFE_SYNC: skipped\n");
+    b.summary();
+    return;
+  }
+  b.run(420000);   // (0.1 h and more of powered and lit time, and Wh, not stored yet)
+  const LifeCounters led = *b.keeper.counters(0);
+  ucrx_truth_t before;
+  ucrx_truth(&before);
+  b.power_up(1, RESET_WATCHDOG);   // (no write: the record as last stored)
+  ucrx_truth_t cut;
+  ucrx_truth(&cut);
+  CHECK(cut.lt_lit_s / 360u < led.lit && cut.lt_on_s / 360u < led.powered && cut.total_wh < led.mwh / 1000,
+        "life sync: the cut lost what it hadn't stored: lit %u (ledger %u), powered %u (%u), %u Wh (%.3f)",
+        (unsigned) (cut.lt_lit_s / 360u), (unsigned) led.lit, (unsigned) (cut.lt_on_s / 360u), (unsigned) led.powered,
+        (unsigned) cut.total_wh, led.mwh / 1000.0);
+  lights_on(65535);
+  b.run(20000);
+  ucrx_truth_t after;
+  ucrx_truth(&after);
+  CHECK(b.reads[TP_SYNC] == 1 && b.keeper.last_result(0) == ULTRA_LS_R_APPLIED && !b.keeper.attention(0) &&
+            after.lt_lit_s / 360u >= led.lit && after.lt_on_s / 360u >= led.powered &&
+            after.total_wh >= led.mwh / 1000 - 1 && after.lt_writes == cut.lt_writes,
+        "life sync: one POLL (%u), applied (%u): lit %u, powered %u, %u Wh back; no write for it (records %u -> %u)",
+        (unsigned) b.reads[TP_SYNC], b.keeper.last_result(0), (unsigned) (after.lt_lit_s / 360u),
+        (unsigned) (after.lt_on_s / 360u), (unsigned) after.total_wh, (unsigned) cut.lt_writes,
+        (unsigned) after.lt_writes);
+  b.run(30000);
+  CHECK(b.reads[TP_SYNC] == 1, "life sync: once per power-up (%u)", (unsigned) b.reads[TP_SYNC]);
+  std::printf("  the cut: lit %u -> %u (0.1 h), %u -> %u Wh; synced back: lit %u, %u Wh; position %.3f Wh\n",
+              (unsigned) (before.lt_lit_s / 360u), (unsigned) (cut.lt_lit_s / 360u), (unsigned) before.total_wh,
+              (unsigned) cut.total_wh, (unsigned) (after.lt_lit_s / 360u), (unsigned) after.total_wh,
+              b.keeper.energy_wh(0));
+  b.summary();
+}
+
 static void sc_retry() {
   std::printf("retry: the retry policy, LIFETIME, DIAG (0.2.5)\n");
   Bench b("retry");
@@ -1357,6 +1434,7 @@ int main() {
   sc_relay();
   sc_lost();
   sc_restart();
+  sc_life_sync();
   sc_retry();
   sc_update_repeat();
   const int soak = ucrx_soak_failures();

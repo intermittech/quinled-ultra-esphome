@@ -5,6 +5,7 @@
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 
+#include <algorithm>
 #include <string>
 
 namespace esphome::diffpower {
@@ -13,7 +14,7 @@ static const char *const TAG = "diffpower";
 static constexpr uint32_t DARK_CHECK_MS = 60000;   // the dark window, once a minute (and after a mode change)
 static constexpr uint32_t MINUTE_MS = 60000;       // the hours in standby: published once a minute
 static constexpr uint32_t SAVE_STANDBY_S = 600;    // ... stored every 10 min of standby (cycles, drops: each change)
-static constexpr uint32_t SHUTDOWN_MAX_MS = 1100;  // the shutdown's notices at most (notice_max_ms + a margin)
+static constexpr uint32_t SHUTDOWN_MARGIN_MS = 100;   // the shutdown's notices: the longest notice_max_ms + this
 // the lights' state again after the port is powered: at once, then twice more (boards still booting)
 static const uint32_t RESEND_MS[] = {300, 1000};
 
@@ -90,6 +91,13 @@ void DiffPowerPort::loop() {
   for (uint16_t i = 0; i < this->loads_.size(); i++)
     this->core_.set_lit(i, this->loads_[i].lit(now), now);
   this->update_dark_(now);
+  if (this->core_.preparing()) {   // a planned power-off next: its hubs' last reads first
+    bool ready = true;
+    for (auto &cb : this->prepare_cb_)
+      ready &= cb(this->prepare_first_);
+    this->prepare_first_ = false;
+    this->core_.set_notice_ready(ready);
+  }
   this->apply_(this->core_.update(now), now);
   if (now - this->minute_ms_ >= MINUTE_MS) {   // the hours in standby
     this->minute_ms_ = now;
@@ -109,6 +117,8 @@ void DiffPowerPort::apply_(uint8_t ev, uint32_t now) {
     if (this->notice_cb_.size() == 0)
       this->core_.notice_sent(now);   // (nobody to tell: plain lights)
   }
+  if (ev & EV_PREPARE)
+    this->prepare_first_ = true;
   if (ev & EV_ENABLE)
     this->enable_pin_->digital_write(this->core_.enable());
   if (ev & EV_LOST) {
@@ -185,9 +195,12 @@ void DiffPowerPort::shutdown_all() {
     return;
   shut_down_ = true;
   const uint32_t t0 = millis();
-  for (auto *p : ports_)
+  uint32_t limit = 0;
+  for (auto *p : ports_) {
     p->apply_(p->core_.shutdown(t0), t0);
-  for (bool busy = true; busy && millis() - t0 < SHUTDOWN_MAX_MS;) {
+    limit = std::max(limit, p->core_.config().notice_max_ms + SHUTDOWN_MARGIN_MS);
+  }
+  for (bool busy = true; busy && millis() - t0 < limit;) {
     busy = false;
     for (auto *p : ports_) {
       if (p->core_.state() != PS_NOTICE)

@@ -107,7 +107,7 @@ static PrefsStub prefs_stub;
 static PrefsStub *const global_preferences = &prefs_stub;
 static constexpr uint32_t MINUTE_MS = 60000;
 static constexpr uint32_t SAVE_STANDBY_S = 600;
-static constexpr uint32_t SHUTDOWN_MAX_MS = 1100;
+static constexpr uint32_t SHUTDOWN_MARGIN_MS = 100;   // (diffpower.cpp: the longest notice_max_ms + this)
 static const uint32_t RESEND_MS[] = {300, 1000};
 
 /// a light of the line, as its port sees it (UltraLight: its turn-off period, lit)
@@ -145,6 +145,12 @@ struct DiffPowerPort {
   void add_on_ready_callback(std::function<void()> &&cb) { this->ready_cb_.f.push_back(std::move(cb)); }
   void add_on_notice_callback(std::function<void(uint8_t)> &&cb) { this->notice_cb_.f.push_back(std::move(cb)); }
   void add_on_pump_callback(std::function<void()> &&cb) { this->pump_cb_.f.push_back(std::move(cb)); }
+  void add_on_prepare_callback(std::function<bool(bool)> &&cb) {
+    this->prepare_cb_.push_back(std::move(cb));
+    PortConfig c = this->core_.config();
+    c.prepare_max_ms = PREPARE_MAX_MS;
+    this->core_.configure(c);
+  }
   void notice_sent() { this->core_.notice_sent(millis()); }
   void power_cycle() { this->apply_(this->core_.power_cycle(millis()), millis()); }
   uint32_t power_cycle_ms() const { return this->core_.power_cycle_ms(); }
@@ -160,6 +166,9 @@ struct DiffPowerPort {
   std::vector<LoadRef> loads_;
   Callbacks<> ready_cb_, pump_cb_;
   Callbacks<uint8_t> notice_cb_;
+  std::vector<std::function<bool(bool)>> prepare_cb_;
+  bool prepare_first_{false};
+  static constexpr uint32_t PREPARE_MAX_MS = 3000;
   uint32_t minute_ms_{0}, saved_standby_s_{0}, saved_cycles_{0}, saved_drops_{0};
   static std::vector<DiffPowerPort *> ports_;
   static bool shut_down_;
@@ -265,6 +274,10 @@ struct UltraHub {
   volatile int64_t rw_released_us_{0};
   TelemetryPoller poller_;
   PortMonitor port_monitor_;
+  LedgerKeeper keeper_;   // (not attached: nothing to prepare; tests/ultra_telemetry_test.cpp runs it)
+  const char *tel_name_{"Port"};
+  void ledger_service_() {}
+  static void ledger_save_(bool) {}
   std::vector<uint8_t> rw_slots_, rw_rx_;
   bool rw_next_{false}, tx_rw_{false};
   uint32_t rw_window_us_{0};

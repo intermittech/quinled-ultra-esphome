@@ -32,6 +32,12 @@
 
 namespace esphome::dig2analog_ultra {
 
+// LIFE_SYNC (protocol 0.2.6, ULTRA_LS_*): the hub gives a board its ledger back (ultra_ledger.h). The receiver's steps
+// per merge (the header's text): a counter ahead by more is ignored, so the hub sends at most this much (powered:
+// 0.1 h; lit: what powered got + 1; counts: Δpowered_s / 10 + 64; Wh: 1 kW over Δpowered + 1 h)
+static constexpr uint32_t LS_STEP_POWERED = 7200, LS_STEP_EVENTS = 64, LS_STEP_EVENTS_PER_01H = 36,
+                          LS_STEP_WH_PER_01H = 100, LS_STEP_WH = 1000;
+
 /// The pages the hub reads; when several are equally overdue, the earlier one goes first.
 enum TelemetryPage : uint8_t {
   TP_IDENTITY = 0,  // at the start, after a restart or a new board (UID16)
@@ -44,12 +50,13 @@ enum TelemetryPage : uint8_t {
   TP_LIFETIME,      // 0.2.5: the odometer (feature LIFETIME)
   TP_DIAG,          // 0.2.5: DIAG part 0, the running board (feature DIAG)
   TP_FAULTS,        // 0.2.5: DIAG part 1, the fault memory and the calibration trend
+  TP_SYNC,          // 0.2.6: LIFE_SYNC, only when the ledger asks (TelemetryPoller::request_sync)
   TP_COUNT,
 };
 static constexpr uint8_t TP_PAGE_ID[TP_COUNT] = {ULTRA_PAGE_IDENTITY, ULTRA_PAGE_POWER,    ULTRA_PAGE_STATUS,
                                                  ULTRA_PAGE_OUTPUTS,  ULTRA_PAGE_SUPPLY,   ULTRA_PAGE_ENERGY,
                                                  ULTRA_PAGE_HEALTH,   ULTRA_PAGE_LIFETIME, ULTRA_PAGE_DIAG,
-                                                 ULTRA_PAGE_DIAG};
+                                                 ULTRA_PAGE_DIAG,     ULTRA_PAGE_LIFE_SYNC};
 /// the IDENTITY feature a page needs (0: every receiver, or tried)
 static constexpr uint32_t TP_FEATURE[TP_COUNT] = {0,
                                                   ULTRA_FEAT_POWER_EVENTS,
@@ -60,9 +67,10 @@ static constexpr uint32_t TP_FEATURE[TP_COUNT] = {0,
                                                   ULTRA_FEAT_HEALTH,
                                                   ULTRA_FEAT_LIFETIME,
                                                   ULTRA_FEAT_DIAG,
-                                                  ULTRA_FEAT_DIAG};
+                                                  ULTRA_FEAT_DIAG,
+                                                  ULTRA_FEAT_LIFE_SYNC};
 /// the POLL's argument byte 0 (DIAG: its part)
-static constexpr uint8_t TP_PART[TP_COUNT] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+static constexpr uint8_t TP_PART[TP_COUNT] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0};
 /// the features of a 0.2.5 receiver (its ENERGY bytes 15-18 and HEALTH's hot flag are set; before: 0)
 static constexpr uint32_t FEATURES_025 = ULTRA_FEAT_LIFETIME | ULTRA_FEAT_DIAG | ULTRA_FEAT_RETRY | ULTRA_FEAT_LOSS_SCENE;
 
@@ -125,8 +133,8 @@ struct ReceiverData {
   // ENERGY
   bool have_energy{false};
   uint32_t boot_mwh{0}, total_wh{0}, power_mw{0}, saved_age_s{0xFFFFFF};
-  double energy_wh{0};     // the hub's total for this receiver (TelemetryPoller: only grows; persisted by its entity):
-                           // the Energy sensor (total_increasing)
+  double energy_wh{0};     // the board's lifetime energy, exact (TOTAL_WH + the mWh of this power-up's last Wh); the
+                           // Energy sensor shows its position's (ultra_ledger.h: never down)
   uint16_t vb_10mv{0xFFFF};  // (0.2.5) the LED supply after the buck; 0xFFFF = not measured
   uint16_t peak_ma{0};       // (0.2.5) the input current's highest ~100 ms average since the ENERGY answer before
   // LIFETIME (0.2.5): the odometer, kept across power cuts
@@ -136,6 +144,10 @@ struct ReceiverData {
   uint16_t lt_overload_trips{0}, lt_short_trips{0}, lt_updates{0};
   uint8_t lt_temp_peak{0}, lt_current_peak{0}, lt_watchdog{0};   // 0.5 C, 0.1 A
   uint32_t lt_records{0};
+  // LIFE_SYNC (0.2.6): the last sync's answer (its LIFETIME bytes and Wh go to the fields above)
+  bool have_sync{false};
+  uint8_t ls_result{0}, ls_applied{0};
+  uint16_t ls_records16{0};
   // DIAG part 0 (0.2.5): the running board
   bool have_diag{false};
   uint8_t dg_reset{0}, bc_cause{0xFF};   // this start's reset cause; the run before's exception (0xFF: none kept)
@@ -250,6 +262,7 @@ inline void decode_receiver_page(ReceiverData &d, uint8_t page, const uint8_t *p
     case ULTRA_PAGE_ENERGY:
       d.boot_mwh = ultra_get32(p + ULTRA_EN_BOOT_MWH);
       d.total_wh = ultra_get32(p + ULTRA_EN_TOTAL_WH);
+      d.energy_wh = d.total_wh + (ultra_get32(p + ULTRA_EN_BOOT_MWH) % 1000u) / 1000.0;
       d.power_mw = ultra_get32(p + ULTRA_EN_POWER_MW);
       d.saved_age_s = ultra_get24(p + ULTRA_EN_SAVED_AGE);
       d.vb_10mv = static_cast<uint16_t>(ultra_get16(p + ULTRA_EN_VB));
@@ -302,6 +315,19 @@ inline void decode_receiver_page(ReceiverData &d, uint8_t page, const uint8_t *p
         d.trend_tests = p[ULTRA_DG_TREND_TESTS];
         d.have_faults = true;
       }
+      break;
+    case ULTRA_PAGE_LIFE_SYNC:   // (0.2.6) LIFETIME 0-15 and the Wh after the merge, its result
+      d.lt_powered = ultra_get24(p + ULTRA_LT_POWERED);
+      d.lt_lit = ultra_get24(p + ULTRA_LT_LIT);
+      d.lt_power_ups = ultra_get24(p + ULTRA_LT_POWER_UPS);
+      d.lt_overload_trips = static_cast<uint16_t>(ultra_get16(p + ULTRA_LT_OVERLOAD_TRIPS));
+      d.lt_short_trips = static_cast<uint16_t>(ultra_get16(p + ULTRA_LT_SHORT_TRIPS));
+      d.lt_dips = ultra_get24(p + ULTRA_LT_DIPS);
+      d.total_wh = ultra_get32(p + ULTRA_LS_A_TOTAL_WH);
+      d.ls_result = p[ULTRA_LS_A_RESULT];
+      d.ls_applied = p[ULTRA_LS_A_APPLIED];
+      d.ls_records16 = static_cast<uint16_t>(ultra_get16(p + ULTRA_LS_A_RECORDS));
+      d.have_sync = true;
       break;
     default:
       break;
@@ -691,11 +717,20 @@ class TelemetryPoller {
       r.ack_due = false;
     }
   }
-  /// Energy: the hub's total for receiver i (mWh), and the stored one at the hub's start (its entity's preferences)
-  uint64_t energy_mwh(uint16_t i) const { return i < this->rx_.size() ? this->rx_[i].energy_mwh : 0; }
-  void seed_energy(uint16_t i, uint64_t mwh) {
-    if (i < this->rx_.size() && mwh > this->rx_[i].energy_mwh)
-      this->rx_[i].energy_mwh = mwh;
+  /// The ledger's sync for receiver i (LIFE_SYNC, its 23 argument bytes): asked next (until it answers)
+  void request_sync(uint16_t i, const uint8_t *args, uint32_t now_ms) {
+    if (i >= this->rx_.size())
+      return;
+    Receiver &r = this->rx_[i];
+    std::memcpy(r.sync_args, args, sizeof(r.sync_args));
+    r.sync_due = true;
+    r.next[TP_SYNC] = now_ms - 60000;   // (before every other page)
+  }
+  bool sync_pending(uint16_t i) const { return i < this->rx_.size() && this->rx_[i].sync_due; }
+  /// A page of receiver i due now (the ledger's reads)
+  void read_now(uint16_t i, uint8_t tp, uint32_t now_ms) {
+    if (i < this->rx_.size() && tp < TP_COUNT)
+      this->rx_[i].next[tp] = now_ms;
   }
 
   /// An RW frame should go out now: the chain is locked, the spacing allows one, and a receiver it can hear has a
@@ -760,8 +795,12 @@ class TelemetryPoller {
         uint8_t tp = this->pick_(r, now_ms, &overdue);
         if (tp >= TP_COUNT)
           tp = TP_STATUS;
-        uint8_t arg[9]{TP_PART[tp]};
+        uint8_t arg[23]{TP_PART[tp]};
         uint32_t nargs = TP_PART[tp] != 0 ? 1 : 0;
+        if (tp == TP_SYNC) {   // the ledger's counters (its arguments as asked)
+          std::memcpy(arg, r.sync_args, sizeof(r.sync_args));
+          nargs = sizeof(r.sync_args);
+        }
         if (tp == TP_POWER && r.ack_due && (!r.d.have_status || now_ms - r.status_ms > ACK_FRESH_MS))
           tp = TP_STATUS;   // its STATUS first (a restart drops the acknowledge), the acknowledge in the next window
         if (tp == TP_POWER && r.ack_due) {   // acknowledge exactly the counts as last read (the dips: SUPPLY's)
@@ -890,11 +929,9 @@ class TelemetryPoller {
     bool outputs{false};       // OUTPUTS is read too (a receiver with several lights: their power, why they're dim)
     uint32_t polls{0}, missed{0};   // POLLs that asked it for an answer, and the ones without one
     uint32_t updated{0};
-    // Energy: the hub's total (mWh), the receiver's count since its power-up at its last ENERGY answer
-    uint64_t energy_mwh{0};
-    uint32_t energy_boot{0};
-    bool energy_seen{false};     // an ENERGY answer since the hub started
-    bool energy_rebase{false};   // another board at its position: its count is the base, nothing added
+    // LIFE_SYNC: asked by the ledger (its arguments), until it answers
+    bool sync_due{false};
+    uint8_t sync_args[23]{};
   };
   struct Asked {
     uint16_t rx;
@@ -934,6 +971,8 @@ class TelemetryPoller {
     if (!r.d.have_identity)   // the optional pages once IDENTITY says which the board has
       return false;
     if (tp == TP_OUTPUTS && !r.outputs)
+      return false;
+    if (tp == TP_SYNC && !r.sync_due)
       return false;
     return TP_FEATURE[tp] == 0 || (r.d.features & TP_FEATURE[tp]) != 0;
   }
@@ -978,7 +1017,7 @@ class TelemetryPoller {
       r.d = ReceiverData{};
       r.unsupported = 0;
       r.updated |= (1u << TP_COUNT) - 1;   // every value unknown again
-      r.energy_rebase = true;   // (Energy goes on from the hub's total: another board's count is no news)
+      r.sync_due = false;   // (the ledger asks again for the board that's there)
     }
     r.need_identity = true;
     r.next[TP_IDENTITY] = now_ms;
@@ -1072,8 +1111,8 @@ class TelemetryPoller {
         }
         break;
       }
-      case TP_ENERGY:
-        this->energy_(r);
+      case TP_SYNC:
+        r.sync_due = false;
         break;
       case TP_POWER:
         if (d.pw_latched != 0) {
@@ -1089,30 +1128,6 @@ class TelemetryPoller {
       default:
         break;
     }
-  }
-
-  /// Energy never goes back (Home Assistant takes a lower total_increasing value for a reset: it would count the whole
-  /// total again). The hub adds the receiver's mWh since its power-up as it grows; a count that went back (a restart, a
-  /// wake: what the board hadn't stored is lost there) started again from 0, so all of it is new, and the total never
-  /// drops. (A power-off is never a reason by itself: a supply that stayed on would count its session twice.) The
-  /// first answer since the hub started: at least the receiver's own stored lifetime (what it used while the hub was
-  /// off); another board at its position: its count only the base.
-  static void energy_(Receiver &r) {
-    ReceiverData &d = r.d;
-    if (!r.energy_seen) {
-      const uint64_t lifetime = static_cast<uint64_t>(d.total_wh) * 1000u;
-      r.energy_mwh = lifetime > r.energy_mwh ? lifetime : r.energy_mwh;
-      r.energy_seen = true;
-    } else if (r.energy_rebase) {
-      // (nothing added: another board's count)
-    } else if (d.boot_mwh < r.energy_boot) {
-      r.energy_mwh += d.boot_mwh;
-    } else {
-      r.energy_mwh += d.boot_mwh - r.energy_boot;
-    }
-    r.energy_rebase = false;
-    r.energy_boot = d.boot_mwh;
-    d.energy_wh = static_cast<double>(r.energy_mwh) / 1000.0;
   }
 
   std::vector<Receiver> rx_;

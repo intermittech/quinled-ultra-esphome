@@ -1,4 +1,4 @@
-"""The line's `telemetry:` (QuinLED Diff-Power ultra receivers report back): its schema, the entities of each receiver
+"""The line's `telemetry:` (QuinLED Diff-Power Ultra receivers report back): its schema, the entities of each receiver
 (a Home Assistant device of its own, `device_id`), the port's summary, and the lights' estimates. Used by __init__.py
 and light.py; the logic is ultra_telemetry.h, the entities ultra_receiver.h."""
 
@@ -390,6 +390,7 @@ async def telemetry_to_code(hub, config):
             *[int(iv[k].total_milliseconds) for k in POLL_PAGES],
         )
     )
+    cg.add(hub.set_telemetry_name(tel[CONF_NAME]))
     if CONF_DIRECTION_PIN in tel:
         cg.add(hub.set_telemetry_direction_pin(await cg.gpio_pin_expression(tel[CONF_DIRECTION_PIN])))
     if CONF_RECEIVER_ENABLE_PIN in tel:

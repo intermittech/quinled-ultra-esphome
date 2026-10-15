@@ -40,21 +40,14 @@ class UltraReceiver final : public Component {
   void set_problem(binary_sensor::BinarySensor *s) { this->problem_ = s; }
   void setup() override;
   void dump_config() override;
-  /// OTA / a reboot: its Energy total stored
-  void on_shutdown() override { this->save_energy_(true); }
   float get_setup_priority() const override { return setup_priority::DATA; }
 
  protected:
   void update_(uint32_t updates);
   void value_(uint8_t which, float v);
   void text_(uint8_t which, const std::string &s);
-  /// the hub's Energy total stored (at most hourly, and at a reboot): it never goes back after the ESP32 restarts
-  void save_energy_(bool now);
   UltraHub *hub_{nullptr};
   uint16_t board_{0};
-  ESPPreferenceObject energy_pref_;
-  uint64_t energy_saved_{0};
-  uint32_t energy_saved_ms_{0};
   sensor::Sensor *values_[VALUE_COUNT]{};
   text_sensor::TextSensor *texts_[TEXT_COUNT]{};
   binary_sensor::BinarySensor *problem_{nullptr};

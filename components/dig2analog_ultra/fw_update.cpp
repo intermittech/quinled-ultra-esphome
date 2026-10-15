@@ -69,7 +69,7 @@ void UltraFirmwareUpdate::setup() {
   this->pref_ = this->make_entity_preference<uint32_t>();
   if (!this->pref_.load(&this->installed_))
     this->installed_ = 0;
-  this->update_info_.title = "QuinLED dig2analog-ultra-5ch";
+  this->update_info_.title = "QuinLED Dig2Analog-Ultra-5ch";
   this->update_info_.current_version = this->installed_text_();
   this->publish_state();
   this->set_status_("idle");
@@ -217,7 +217,7 @@ void UltraFirmwareUpdate::check_task_(void *arg) {
     const bool parsed = json::parse_json(body.data(), body.size(), [&m](JsonObject root) -> bool {
       if (!root["version"].is<const char *>() || !root["channel"].is<const char *>() || !root["images"].is<JsonArray>())
         return false;
-      m.name = root["name"] | "QuinLED dig2analog-ultra-5ch";
+      m.name = root["name"] | "QuinLED Dig2Analog-Ultra-5ch";
       m.channel = root["channel"].as<std::string>();
       m.version = root["version"].as<std::string>();
       m.release_url = root["release_url"] | "";

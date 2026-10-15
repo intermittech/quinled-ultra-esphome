@@ -30,6 +30,7 @@
 
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
 #include "esphome/components/uart/uart_component.h"
+#include "ultra_ledger.h"
 #include "ultra_telemetry.h"
 #endif
 
@@ -58,6 +59,8 @@ class UltraHub final : public Component {
   void setup() override;
   void loop() override;
   void dump_config() override;
+  /// OTA / a reboot: the receivers' lifetime ledger stored
+  void on_shutdown() override;
   float get_setup_priority() const override { return setup_priority::HARDWARE; }
 
   // Configuration (codegen)
@@ -310,8 +313,12 @@ class UltraHub final : public Component {
   const PortMonitor &port_monitor() const { return this->port_monitor_; }
   bool has_telemetry() const { return this->rw_uart_ != nullptr; }
   const TelemetryPoller &telemetry() const { return this->poller_; }
-  /// a receiver's stored Energy total (mWh), at the start: it goes on from there
-  void seed_energy(uint16_t receiver, uint64_t mwh) { this->poller_.seed_energy(receiver, mwh); }
+  /// the port's name (its telemetry `name:`): the logs say which receiver
+  void set_telemetry_name(const char *name) { this->tel_name_ = name; }
+  /// A position's Energy (Wh: its boards' lifetime energy through the ledger, never down; < 0: not known yet)
+  double position_energy_wh(uint16_t receiver) const { return this->keeper_.energy_wh(receiver); }
+  /// The lifetime counters the ledger keeps for the board at a position (nullptr: not known yet)
+  const LifeCounters *ledger_counters(uint16_t receiver) const { return this->keeper_.counters(receiver); }
   /// Its line's power just came back (a port's wake): not heard yet, not missed enough to count as gone (its status:
   /// Waking, no problem)
   bool rx_settling(uint16_t receiver) const;
@@ -372,6 +379,10 @@ class UltraHub final : public Component {
   volatile int64_t rw_released_us_{0};
   TelemetryPoller poller_;
   PortMonitor port_monitor_;              // the port's load and cable, after each window
+  LedgerKeeper keeper_;                   // this line's receivers in the lifetime ledger (ultra_ledger.h)
+  const char *tel_name_{"Port"};
+  void ledger_service_();                 // (the ESP32's one ledger: loaded at the first loop, stored as it changes)
+  static void ledger_save_(bool now);
   std::vector<uint8_t> rw_slots_;         // the POLL slots of the next RW frame
   std::vector<uint8_t> rw_rx_;            // the window's UART bytes
   bool rw_next_{false};                   // transmit_(): this frame is an RW frame

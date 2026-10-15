@@ -414,7 +414,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_FEEDBACK_CHANNEL, default="red"): cv.enum(FEEDBACK, lower=True),
             cv.Optional(CONF_POWER_LIMIT): _validate_power_limit,
             cv.Optional(CONF_CURRENT_CALIBRATION): CURRENT_CALIBRATION_SCHEMA,
-            # QuinLED Diff-Power ultra receivers report back (receiver_schema.py): their power, energy, status,
+            # QuinLED Diff-Power Ultra receivers report back (receiver_schema.py): their power, energy, status,
             # problems and diagnostics, each receiver a Home Assistant device of its own. Off unless configured.
             cv.Optional(CONF_TELEMETRY): TELEMETRY_SCHEMA,
             # Protocol mode the boards start in after power-up; stored on the boards (the only setting that is),

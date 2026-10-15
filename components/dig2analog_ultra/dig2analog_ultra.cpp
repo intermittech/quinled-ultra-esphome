@@ -600,6 +600,28 @@ void UltraHub::rw_publish_() {
       this->rx_note_[i] = note;
     if ((u & (1u << TP_POWER)) && d.pw_latched != 0)
       ESP_LOGW(TAG, "Receiver %u on GPIO%u power events: %s", i, this->pin_, telemetry_power_events_text(d).c_str());
+    // the lifetime ledger: its counters merged, a sync when it is ahead, the position's Energy
+    const uint8_t lev = this->keeper_.on_updates(this->poller_, i, u, millis());
+    if (lev & (LedgerKeeper::EV_NEW_BOARD | LedgerKeeper::EV_RESTORE)) {
+      char uid[25];
+      for (int k = 0; k < 12; k++)
+        snprintf(uid + 2 * k, 3, "%02X", d.uid[k]);
+      if (lev & LedgerKeeper::EV_NEW_BOARD) {
+        ESP_LOGI(TAG, "New board at %s \xC2\xB7 Receiver %u (UID %s): its Energy goes on from the position's", this->tel_name_,
+                 i + 1, uid);
+      }
+      if (lev & LedgerKeeper::EV_RESTORE) {
+        ESP_LOGI(TAG, "%s \xC2\xB7 Receiver %u (UID %s): its lifetime record went back (erased?): restored from the hub "
+                 "over its next power-ups", this->tel_name_, i + 1, uid);
+      }
+    }
+    if (lev & LedgerKeeper::EV_ATTENTION) {
+      ESP_LOGW(TAG, "%s \xC2\xB7 Receiver %u: its lifetime sync was refused twice: needs attention (the hub shows its "
+               "own counts)", this->tel_name_, i + 1);
+    }
+    if (lev & LedgerKeeper::EV_SYNCED) {
+      ESP_LOGD(TAG, "%s \xC2\xB7 Receiver %u: its lifetime counters synced from the hub", this->tel_name_, i + 1);
+    }
     this->rw_callback_.call(i, u);
   }
   this->rw_window_callback_.call();
@@ -848,6 +870,8 @@ void UltraHub::setup() {
 #endif
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   if (this->rw_uart_ != nullptr) {
+    this->keeper_.attach(&ultra_ledger(), static_cast<uint8_t>(this->pin_), this->poller_.receivers());
+    ledger_receivers() += this->poller_.receivers();
     this->rw_slots_.assign(static_cast<size_t>(ULTRA_SLOT_BYTES) * this->num_boards_, 0);
     this->rw_extra_us_ = this->poller_.max_window_us() + ULTRA_RW_HOLDOFF_US;
     if (this->rw_dir_pin_ != nullptr) {
@@ -948,6 +972,78 @@ bool UltraHub::setup_rmt_() {
   return true;
 }
 
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+// The ESP32's one lifetime ledger (every line's receivers: a board moved between lines keeps its entry). Two stored
+// copies alternate: the newer valid one loads (a cut while one is written keeps the other). Stored at most every
+// 15 min while it changes by a wire unit, at a planned power-off (the notice) and at a reboot.
+namespace {
+ESPPreferenceObject g_ledger_pref[2];
+std::vector<uint8_t> g_ledger_blob;
+uint32_t g_ledger_generation = 0, g_ledger_saved_ms = 0, g_ledger_day_ms = 0;
+bool g_ledger_loaded = false;
+}  // namespace
+
+void UltraHub::ledger_service_() {
+  LifetimeLedger &l = ultra_ledger();
+  const uint32_t now = millis();
+  if (!g_ledger_loaded) {   // the first loop: every line has its receivers counted
+    g_ledger_loaded = true;
+    // (blocks of 32: a receiver more or less keeps the stored size, so the ledger loads)
+    const size_t n = ledger_receivers(), pos = (n + 31) / 32 * 32, room = (n + std::max<size_t>(4, n / 2) + 31) / 32 * 32;
+    l.init(room, pos);
+    g_ledger_blob.assign(l.blob_size(), 0);
+    uint32_t newest = 0;
+    bool any = false;
+    for (int k = 0; k < 2; k++) {
+      g_ledger_pref[k] = global_preferences->make_preference(g_ledger_blob.size(), fnv1_hash(k == 0 ? "ultra_ledger_a" : "ultra_ledger_b"),
+                                                             true);
+      std::vector<uint8_t> b(g_ledger_blob.size());
+      LifetimeLedger probe;
+      probe.init(room, pos);
+      uint32_t gen = 0;
+      if (g_ledger_pref[k].load(b.data(), b.size()) && probe.load(b.data(), b.size(), &gen) &&
+          (!any || static_cast<int32_t>(gen - newest) > 0)) {
+        l.load(b.data(), b.size(), &gen);
+        newest = gen;
+        any = true;
+      }
+    }
+    g_ledger_generation = newest;
+    g_ledger_saved_ms = g_ledger_day_ms = now;
+    ESP_LOGD(TAG, "Lifetime ledger: %u board(s) room, %s", static_cast<unsigned>(l.capacity()),
+             any ? "loaded" : "new");
+    return;
+  }
+  if (now - g_ledger_day_ms >= LEDGER_DAY_MS) {   // the ledger's days: the hub's time on
+    g_ledger_day_ms += LEDGER_DAY_MS;
+    l.set_day(l.day() + 1);
+  }
+  if (l.dirty() && now - g_ledger_saved_ms >= LEDGER_SAVE_MS)
+    ledger_save_(false);
+}
+
+void UltraHub::ledger_save_(bool now) {
+  LifetimeLedger &l = ultra_ledger();
+  if (!g_ledger_loaded || (!l.dirty() && !now))
+    return;
+  if (l.dirty()) {
+    g_ledger_generation++;
+    l.save(g_ledger_blob.data(), g_ledger_generation);
+    g_ledger_pref[g_ledger_generation & 1].save(g_ledger_blob.data(), g_ledger_blob.size());
+    l.clear_dirty();
+  }
+  g_ledger_saved_ms = millis();
+  if (now)
+    global_preferences->sync();   // (a planned power-off, a reboot: on the flash now)
+}
+#endif
+
+void UltraHub::on_shutdown() {
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  ledger_save_(true);
+#endif
+}
+
 #ifdef USE_DIFFPOWER
 // The port powers this line while a light here is lit (or within its turn-off period) and while a calibration or an
 // update holds it; once powered, everything again (the boards booted dark); before it drops, the notice.
@@ -980,6 +1076,11 @@ void UltraHub::attach_port_() {
   });
   this->port_->add_on_notice_callback([this](uint8_t copy) { this->send_power_off_notice(copy); });
   this->port_->add_on_pump_callback([this]() { this->pump_notice_(); });
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  if (this->rw_uart_ != nullptr)   // before a planned power-off: the receivers' counters read once more, a sync
+    this->port_->add_on_prepare_callback(
+        [this](bool first) { return this->keeper_.prepare(this->poller_, millis(), first); });
+#endif
 }
 
 void UltraHub::send_power_off_notice(uint8_t copy) {
@@ -988,6 +1089,9 @@ void UltraHub::send_power_off_notice(uint8_t copy) {
   if (copy == 0) {
     this->notices_++;
     ESP_LOGD(TAG, "GPIO%u: the planned power-off notice to %u board(s)", this->pin_, this->num_boards_);
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+    ledger_save_(true);   // (the planned cut: the ledger as it is now)
+#endif
   }
   this->wake_();
 }
@@ -1030,6 +1134,9 @@ void UltraHub::loop() {
   if (this->port_ != nullptr && !this->port_attached_)
     this->attach_port_();
   this->service_notice_();
+#endif
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  this->ledger_service_();
 #endif
   this->service_calibration_();
 #ifdef USE_POWER_SUPPLY
@@ -1287,7 +1394,7 @@ void UltraHub::dump_config() {
   const uint32_t bits = static_cast<uint32_t>(ULTRA_HDR_BITS + ULTRA_SLOT_BITS * this->num_boards_);
   const uint32_t frame_us = static_cast<uint32_t>((static_cast<uint64_t>(bits) * worst) / 1000) + this->reset_ns_ / 1000;
   ESP_LOGCONFIG(TAG,
-                "QuinLED dig2analog Ultra line:\n"
+                "QuinLED Ultra protocol line:\n"
                 "  Boards: %u\n"
                 "  Pin: GPIO%u%s\n"
                 "  %s: %" PRIu32 "%s\n"

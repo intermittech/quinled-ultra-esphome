@@ -123,6 +123,14 @@ class DiffPowerPort final : public Component {
   void add_on_notice_callback(std::function<void(uint8_t)> &&cb) { this->notice_cb_.add(std::move(cb)); }
   /// At the shutdown (the loop doesn't run any more): send what is queued now if the line is free (no waiting)
   void add_on_pump_callback(std::function<void()> &&cb) { this->pump_cb_.add(std::move(cb)); }
+  /// Before a planned power-off: a hub's last reads (true: ready for the notice; first: the first call of this one).
+  /// The notice waits for all of them, 3 s at most.
+  void add_on_prepare_callback(std::function<bool(bool)> &&cb) {
+    this->prepare_cb_.push_back(std::move(cb));
+    PortConfig c = this->core_.config();
+    c.prepare_max_ms = PREPARE_MAX_MS;
+    this->core_.configure(c);
+  }
   void notice_sent() { this->core_.notice_sent(millis()); }
   /// A deliberate power cycle (firmware recovery): off now, then a wake; power_cycle_ms() until powered again
   void power_cycle() { this->apply_(this->core_.power_cycle(millis()), millis()); }
@@ -156,6 +164,9 @@ class DiffPowerPort final : public Component {
   CallbackManager<void()> ready_cb_;
   CallbackManager<void(uint8_t)> notice_cb_;
   CallbackManager<void()> pump_cb_;
+  std::vector<std::function<bool(bool)>> prepare_cb_;
+  bool prepare_first_{false};
+  static constexpr uint32_t PREPARE_MAX_MS = 3000;
 #ifdef USE_DIFFPOWER_SUN
   sun::Sun *sun_{nullptr};
 #endif

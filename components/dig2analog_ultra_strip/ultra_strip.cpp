@@ -273,7 +273,7 @@ void UltraStrip::transition_done_(UltraStripTransition *t, bool finished) {
 void UltraStrip::dump_config() {
   static const char *const GLIDE[] = {"off", "always", "auto (small steps glide, jumps up at once, down 50 ms)"};
   ESP_LOGCONFIG(TAG,
-                "QuinLED dig2analog Ultra strip:\n"
+                "QuinLED Ultra strip:\n"
                 "  Pixels: %u (dig2analog_ultra lights)\n"
                 "  Colour: %s\n"
                 "  Effect glide: %s\n"

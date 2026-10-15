@@ -14,6 +14,7 @@
 #include "../components/dig2analog_ultra/fw_manifest.h"
 #include "../components/dig2analog_ultra/update_retry.h"
 #include "../components/dig2analog_ultra/update_session.h"
+#include "../components/dig2analog_ultra/ultra_ledger.h"
 #include "../components/dig2analog_ultra/ultra_telemetry.h"
 #include "../components/diffpower/diffpower_core.h"
 
@@ -1169,6 +1170,9 @@ struct UltraHub {
   volatile int64_t rw_released_us_{0};
   TelemetryPoller poller_;
   PortMonitor port_monitor_;
+  LedgerKeeper keeper_;   // (not attached here: tests/ultra_telemetry_test.cpp runs it)
+  const char *tel_name_{"Port"};
+  void ledger_service_() {}
   std::vector<uint8_t> rw_slots_, rw_rx_;
   bool rw_next_{false}, tx_rw_{false};
   uint32_t rw_window_us_{0};
@@ -1693,8 +1697,16 @@ struct BinarySensor {
 struct UltraHub {
   TelemetryPoller p;
   PortMonitor m;
+  LifetimeLedger led;
+  LedgerKeeper keeper;
+  UltraHub() {
+    this->led.init(4, 2);
+    this->keeper.attach(&this->led, 5, 2);
+  }
   bool standby{false};    // its Diff-Power port in standby
   bool settling{false};   // ... just woken: the receivers not heard yet
+  double position_energy_wh(uint16_t receiver) const { return this->keeper.energy_wh(receiver); }
+  const LifeCounters *ledger_counters(uint16_t receiver) const { return this->keeper.counters(receiver); }
   const TelemetryPoller &telemetry() const { return this->p; }
   const PortMonitor &port_monitor() const { return this->m; }
   bool port_standby() const { return this->standby; }
@@ -1715,20 +1727,8 @@ struct UltraReceiver {   // as ultra_receiver.h
   void update_(uint32_t updates);
   void value_(uint8_t which, float v);
   void text_(uint8_t which, const std::string &s);
-  void save_energy_(bool now);
   UltraHub *hub_{nullptr};
   uint16_t board_{0};
-  struct {
-    uint64_t v{0};
-    int saves{0};
-    bool save(const uint64_t *p) {
-      this->v = *p;
-      this->saves++;
-      return true;
-    }
-  } energy_pref_;
-  uint64_t energy_saved_{0};
-  uint32_t energy_saved_ms_{0};
   sensor::Sensor *values_[VALUE_COUNT]{};
   text_sensor::TextSensor *texts_[TEXT_COUNT]{};
   binary_sensor::BinarySensor *problem_{nullptr};
@@ -1771,6 +1771,8 @@ static void answer(const uint8_t *s, uint16_t uid, const ReceiverData &model, ui
     d[ULTRA_ST_MEASURED] = ULTRA_ST_M_VBUS | ULTRA_ST_M_CURRENT;
     d[ULTRA_ST_RESET] = ULTRA_ST_RST_POWER;
   } else if (page == ULTRA_PAGE_IDENTITY) {
+    for (int k = 0; k < 12; k++)
+      d[k] = static_cast<uint8_t>(uid + 7 * k);
     ultra_put32(d + ULTRA_ID_FW_VERSION, 0x000608FF);
     ultra_put32(d + ULTRA_ID_FEATURES, model.features);
   } else if (page == ULTRA_PAGE_ENERGY) {
@@ -1781,6 +1783,7 @@ static void answer(const uint8_t *s, uint16_t uid, const ReceiverData &model, ui
       ultra_put16(d + ULTRA_EN_PEAK_MA, model.peak_ma);
     }
   } else if (page == ULTRA_PAGE_LIFETIME) {
+    ultra_put24(d + ULTRA_LT_POWERED, model.lt_powered);
     ultra_put24(d + ULTRA_LT_LIT, model.lt_lit);
     ultra_put24(d + ULTRA_LT_POWER_UPS, model.lt_power_ups);
     ultra_put16(d + ULTRA_LT_SHORT_TRIPS, model.lt_short_trips);
@@ -1866,6 +1869,7 @@ static void test_receiver_entities() {
   model[1].features |= ULTRA_FEAT_LIFETIME | ULTRA_FEAT_DIAG;
   model[1].vb_10mv = 2400;
   model[1].peak_ma = 900;
+  model[1].lt_powered = 23456;
   model[1].lt_lit = 12345;
   model[1].lt_power_ups = 41;
   model[1].lt_short_trips = 3;
@@ -1889,10 +1893,11 @@ static void test_receiver_entities() {
     now_ms += 10;
     hub.p.finish(now_ms, uart.data(), uart.size());
     hub.m.update(now_ms, hub.p);
-    for (uint16_t k = 0; k < 2; k++) {   // as UltraHub::rw_publish_: the port's load, the callbacks, the window's
+    for (uint16_t k = 0; k < 2; k++) {   // as UltraHub::rw_publish_: the port's load, the ledger, the callbacks
       const uint32_t u = hub.p.take_updates(k);
       if (u == 0)
         continue;
+      hub.keeper.on_updates(hub.p, k, u, now_ms);
       rx[k].update_(u);
       if (k == 1)
         light.update_(u);
@@ -1940,14 +1945,19 @@ static void test_receiver_entities() {
                 std::string::npos &&
             texts[0][UltraReceiver::STATUS_DETAIL].state.find("Lifetime record held") == std::string::npos,
         "the record held: '%s'", texts[1][UltraReceiver::STATUS_DETAIL].state.c_str());
-  // its Energy total stored at most hourly, and at a reboot (on_shutdown)
-  CHECK(vals[0][UltraReceiver::ENERGY].state == 1234.0f && rx[0].energy_pref_.saves == 0,
-        "Energy %.1f Wh, not stored within the hour", vals[0][UltraReceiver::ENERGY].state);
-  rx[0].save_energy_(true);
-  CHECK(rx[0].energy_pref_.saves == 1 && rx[0].energy_pref_.v == 1234000, "stored at a reboot: %u mWh",
-        static_cast<unsigned>(rx[0].energy_pref_.v));
-  rx[0].save_energy_(true);
-  CHECK(rx[0].energy_pref_.saves == 1, "unchanged: not again");
+  // (0.2.6) the lifetime counts and Energy through the hub's ledger: a lower LIFETIME (its record held, a reload)
+  // doesn't lower them
+  model[1].lt_lit = 12000;
+  model[1].lt_power_ups = 40;
+  run(8000);
+  CHECK(std::fabs(vals[1][UltraReceiver::LIT_HOURS].state - 1234.5f) < 1e-2f &&
+            vals[1][UltraReceiver::POWER_UPS].state == 41.0f && vals[0][UltraReceiver::ENERGY].state == 1234.0f &&
+            hub.keeper.counters(1) != nullptr && hub.keeper.counters(1)->lit == 12345,
+        "the ledger's counts shown: lit %.1f h, %.0f power-ups (the board now says 1200.0 / 40), Energy %.1f Wh",
+        vals[1][UltraReceiver::LIT_HOURS].state, vals[1][UltraReceiver::POWER_UPS].state,
+        vals[0][UltraReceiver::ENERGY].state);
+  model[1].lt_lit = 12345;
+  model[1].lt_power_ups = 41;
   CHECK(vals[0][UltraReceiver::UPTIME].publishes == 1 && vals[0][UltraReceiver::POWER].publishes <= 3,
         "the uptime at most once a minute, unchanged values not again (%d, %d)",
         vals[0][UltraReceiver::UPTIME].publishes, vals[0][UltraReceiver::POWER].publishes);
@@ -2151,7 +2161,7 @@ static const char *const TAG = "diffpower";
 static const uint32_t RESEND_MS[] = {300, 1000};
 static constexpr uint32_t MINUTE_MS = 60000;
 static constexpr uint32_t SAVE_STANDBY_S = 600;
-static constexpr uint32_t SHUTDOWN_MAX_MS = 1100;
+static constexpr uint32_t SHUTDOWN_MARGIN_MS = 100;
 // the shutdown's stand-ins: delay() lets the time pass, the watchdog; the preferences (a store by key, its sync)
 static void delay(uint32_t ms) { now_ms += ms; }
 struct AppStub {
@@ -2236,6 +2246,12 @@ struct DiffPowerPort {
   }
   void add_on_notice_callback(std::function<void(uint8_t)> &&cb) { this->notice_cb_.f.push_back(std::move(cb)); }
   void add_on_pump_callback(std::function<void()> &&cb) { this->pump_cb_.f.push_back(std::move(cb)); }
+  void add_on_prepare_callback(std::function<bool(bool)> &&cb) {
+    this->prepare_cb_.push_back(std::move(cb));
+    PortConfig c = this->core_.config();
+    c.prepare_max_ms = PREPARE_MAX_MS;
+    this->core_.configure(c);
+  }
   void notice_sent() { this->core_.notice_sent(millis()); }
   bool has_sun() const { return this->sun; }
   void set_mode(uint8_t mode) { this->core_.set_mode(static_cast<PowerMode>(mode)); }
@@ -2270,6 +2286,9 @@ struct DiffPowerPort {
   std::vector<LoadRef> loads_;
   Callbacks ready_cb_, pump_cb_;
   NoticeCallbacks notice_cb_;
+  std::vector<std::function<bool(bool)>> prepare_cb_;
+  bool prepare_first_{false};
+  static constexpr uint32_t PREPARE_MAX_MS = 3000;
   uint32_t saved_standby_s_{0}, saved_cycles_{0}, saved_drops_{0}, minute_ms_{0};
   TextSensor *status_{nullptr};
   BinarySensor *problem_{nullptr};
@@ -2499,6 +2518,27 @@ static void test_port() {
     CHECK(ok && now_ms - start < 1100, "4 slow transmitters: every port 3 well spaced copies (%u ms in all)",
           now_ms - start);
   }
+  // portmgr-recheck-gpt N6: a long notice (1.5 s, the core's cap raised with it) through the shutdown: not cut short
+  {
+    now_ms = 250000;
+    Pin en, det;
+    det.level = true;
+    DiffPowerPort l;
+    PortConfig lc;
+    lc.notice_ms = 1500;
+    l.core_.configure(lc);
+    l.enable_pin_ = &en;
+    l.detect_pin_ = &det;
+    HubModel hl;
+    hl.attach(l, en);
+    l.wake(120000);
+    run({&l}, 3000, {&hl});
+    DiffPowerPort::ports_ = {&l};
+    DiffPowerPort::shut_down_ = false;
+    DiffPowerPort::shutdown_all();
+    CHECK(hl.out.size() == 3 && !en.level && en.changed_at - hl.asked[0] >= 1500,
+          "a 1.5 s notice at the shutdown: the enable low %u ms after it began", en.changed_at - hl.asked[0]);
+  }
   // portmgr-gpt 13: nine minutes in standby, then a reboot: that time saved
   {
     now_ms = 300000;
@@ -2594,6 +2634,104 @@ static void test_port() {
   now_ms = 0;
   std::printf("  Diff-Power port: wake, a plain light sent again, the notice, the shutdown hook (2 + 1 ports, during a "
               "notice, slow transmitters, standby time), the counters per id, the select\n");
+}
+
+/// Before a planned power-off its hubs' last reads (an Ultra hub: the receivers' lifetime counters, a sync; review-r8
+/// fable-sync §4, §5 17): the port stays on (polls allowed) until every hub is ready, 3 s at most; then the notice, and
+/// from its first copy to the cut the port isn't ready (no POLL). Wanted again meanwhile: no power-off.
+static void test_port_prepare() {
+  now_ms = 1000;
+  Pin enable, detect;
+  detect.level = true;
+  LightState strip;
+  DiffPowerPort p;
+  PortConfig cfg;
+  cfg.standby_after_ms = 60000;
+  p.core_.configure(cfg);
+  p.enable_pin_ = &enable;
+  p.detect_pin_ = &detect;
+  p.add_light(&strip, 0);
+  HubModel hub;
+  hub.attach(p, enable);
+  struct Call {
+    uint32_t ms;
+    bool first, ready;
+  };
+  std::vector<Call> calls;
+  uint32_t ready_at = 0;   // (0: never)
+  p.add_on_prepare_callback([&](bool first) {
+    calls.push_back(Call{now_ms, first, p.core_.ready()});
+    return ready_at != 0 && now_ms >= ready_at;
+  });
+  strip.remote_values.on = strip.current_values.on = true;
+  run({&p}, 3000, {&hub});
+  // off: after the turn-off period its hub reads for 400 ms, then the notice
+  strip.remote_values.on = strip.current_values.on = false;
+  const uint32_t off = now_ms;
+  run({&p}, 119000, {&hub});
+  CHECK(calls.empty() && enable.level, "the turn-off period: no prepare yet");
+  for (uint32_t end = now_ms + 5000; calls.empty() && static_cast<int32_t>(now_ms - end) < 0;)
+    run({&p}, 10, {&hub});
+  ready_at = calls.empty() ? 0 : calls[0].ms + 400;
+  // (no POLL from the notice to the cut: the port not ready at any step from the first copy to the enable low)
+  bool quiet = true;
+  for (uint32_t end = now_ms + 3000; static_cast<int32_t>(now_ms - end) < 0;) {
+    run({&p}, 10, {&hub});
+    if (!hub.asked.empty() && enable.level)
+      quiet = quiet && !p.core_.ready();
+  }
+  bool all_ready = true;
+  for (const auto &c : calls)
+    all_ready = all_ready && c.ready;
+  CHECK(!calls.empty() && calls[0].first && calls[0].ms - off >= 120000 && calls.size() > 1 && !calls[1].first &&
+            all_ready && hub.asked.size() == 3 && hub.asked[0] >= ready_at && hub.asked[0] - ready_at <= 20 &&
+            hub.well_spaced(),
+        "prepare: first once, the port ready (polls) throughout (%d), the notice when the hub is ready (%u ms after "
+        "it, %u copies)",
+        all_ready, hub.asked.empty() ? 0u : hub.asked[0] - ready_at, static_cast<unsigned>(hub.asked.size()));
+  CHECK(quiet && !hub.asked.empty() && calls.back().ms <= hub.asked[0],
+        "from the notice to the cut: not ready (no POLL: %d), no prepare call after it", quiet);
+  // a hub never ready: the notice 3 s after the prepare began
+  strip.remote_values.on = strip.current_values.on = true;
+  run({&p}, 3000, {&hub});
+  strip.remote_values.on = strip.current_values.on = false;
+  calls.clear();
+  hub.asked.clear();
+  hub.out.clear();
+  hub.index.clear();
+  hub.enabled.clear();
+  hub.at_shutdown.clear();
+  ready_at = 0;
+  run({&p}, 126000, {&hub});
+  CHECK(!calls.empty() && calls[0].first && hub.asked.size() == 3 && hub.asked[0] - calls[0].ms >= 2980 &&
+            hub.asked[0] - calls[0].ms <= 3020 && hub.well_spaced(),
+        "a hub never ready: the notice %u ms after the prepare began", hub.asked.empty() ? 0u : hub.asked[0] - calls[0].ms);
+  // wanted again during the prepare: no power-off; the next one prepares again (first again)
+  strip.remote_values.on = strip.current_values.on = true;
+  run({&p}, 3000, {&hub});
+  strip.remote_values.on = strip.current_values.on = false;
+  calls.clear();
+  hub.asked.clear();
+  hub.out.clear();
+  hub.index.clear();
+  hub.enabled.clear();
+  hub.at_shutdown.clear();
+  run({&p}, 120200, {&hub});
+  const size_t before = calls.size();
+  strip.remote_values.on = strip.current_values.on = true;
+  run({&p}, 5000, {&hub});
+  const bool on = enable.level && hub.asked.empty() && p.core_.ready();
+  strip.remote_values.on = strip.current_values.on = false;
+  ready_at = now_ms + 120100;
+  run({&p}, 123000, {&hub});
+  size_t firsts = 0;
+  for (const auto &c : calls)
+    firsts += c.first ? 1 : 0;
+  CHECK(before > 0 && on && firsts == 2 && hub.asked.size() == 3 && hub.well_spaced(),
+        "wanted again during the prepare: stays on (%d); the next power-off prepares again (%u firsts, %u copies)", on,
+        static_cast<unsigned>(firsts), static_cast<unsigned>(hub.asked.size()));
+  now_ms = 0;
+  std::printf("  Diff-Power port: the hubs' last reads before the notice (ready / 3 s / wanted again), no POLL after it\n");
 }
 
 #undef USE_TEXT_SENSOR
@@ -3140,6 +3278,7 @@ int main() {
   receiver_entities::test_receiver_entities();
   update_retry::test_auto_retry();
   port_power::test_port();
+  port_power::test_port_prepare();
   hub_port::test_hub_port();
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "ALL ULTRA LIFECYCLE TESTS PASSED", failures);
   return failures ? 1 : 0;

@@ -689,6 +689,51 @@ static void test_power_cycle() {
   CHECK(t.ready == 1, "from standby: a wake after the off time");
 }
 
+// ------------------------------------------------------------------- review-r8/portmgr-recheck-gpt regressions
+static void test_prewake_at_expiry() {
+  std::printf("a pre-wake right after the one before ran out (before the next update): kept\n");
+  PortCore p;
+  p.set_detect(true, 0);
+  p.prewake(0, 120000);
+  p.update(0);
+  p.update(119999);
+  p.prewake(120001, 120000);   // (the old one ran out at 120000; no update since)
+  p.update(120001);
+  CHECK(p.want_power(120001) && p.want_power(240000) && !p.want_power(240002),
+        "the new pre-wake holds until 240001 (wanted at 120001 %d, 240000 %d, 240002 %d)", p.want_power(120001),
+        p.want_power(240000), p.want_power(240002));
+  // negative control: a pre-wake still running is extended only by a longer one
+  PortCore q;
+  q.set_detect(true, 0);
+  q.prewake(0, 300000);
+  q.update(0);
+  q.prewake(100000, 120000);   // (ends at 220000: shorter than what's left)
+  q.update(250000);
+  CHECK(q.want_power(299999) && !q.want_power(300001), "a shorter pre-wake meanwhile: the first one's end");
+}
+
+static void test_long_notice() {
+  std::printf("a long notice: never cut short by the cap\n");
+  PortCore p;
+  PortConfig c;
+  c.notice_ms = 1500;   // (the YAML allows 1 s at most; the core keeps its cap at least the notice anyway)
+  p.configure(c);
+  CHECK(p.config().notice_max_ms == 1500, "the cap raised to the notice (%u)", p.config().notice_max_ms);
+  p.set_detect(true, 0);
+  p.prewake(0, 1);
+  uint32_t n0 = 0, low = 0;
+  for (uint32_t t = 0; t < 200000 && low == 0; t += 10) {
+    const uint8_t ev = p.update(t);
+    if (ev & EV_NOTICE) {
+      n0 = n0 == 0 ? t : n0;
+      p.notice_sent(t);
+    }
+    if ((ev & EV_ENABLE) && !p.enable())
+      low = t;
+  }
+  CHECK(n0 != 0 && low - n0 == 1500, "copies on time: the enable low at 1500 ms (%u)", low - n0);
+}
+
 int main() {
   std::printf("diffpower test (the port power manager's core)\n");
   test_cycle();
@@ -709,6 +754,8 @@ int main() {
   test_dark_offsets();
   test_shutdown_during_notice();
   test_power_cycle();
+  test_prewake_at_expiry();
+  test_long_notice();
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "ALL DIFFPOWER TESTS PASSED", failures);
   return failures ? 1 : 0;
 }

@@ -61,6 +61,9 @@ jobs:
       - name: Diff-Power test (the port power manager's core)
         working-directory: quinled-ultra-esphome
         run: python tests/run_diffpower_test.py
+      - name: Diff-Power config test (partitions at any depth, wake targets)
+        working-directory: quinled-ultra-esphome
+        run: python tests/diffpower_config_test.py
       - name: Update retry test (auto_retry with the sender through the board firmware's bootloader)
         working-directory: quinled-ultra-esphome
         run: python tests/run_ultra_update_retry_test.py

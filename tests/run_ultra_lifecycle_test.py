@@ -72,7 +72,6 @@ PIECES = {
     "receiver_methods.inc": (
         "ultra_receiver.cpp",
         ["void UltraReceiver::value_(", "void UltraReceiver::text_(", "void UltraReceiver::update_(",
-         "void UltraReceiver::save_energy_(",
          "void UltraTelemetryPort::update_(", "void UltraLightTelemetry::update_("],
     ),
 }

@@ -59,6 +59,7 @@ enum PortEvent : uint8_t {
   EV_READY = 8,      // the wake is over: send everything (the boards just booted; data sent before is lost)
   EV_LOST = 16,      // the power cut while ON (detect lost, or a dropout)
   EV_COUNTERS = 32,  // standby cycles / detect drops changed (persist)
+  EV_PREPARE = 64,   // a planned power-off is next: its hubs' last reads first (set_notice_ready(), prepare_max_ms)
 };
 
 static constexpr uint32_t MAX_HOLD_MS = 86400000;   // turn-off periods and pre-wakes: 24 h at most
@@ -69,7 +70,9 @@ struct PortConfig {
   uint32_t notice_ms{200};            // NOTICE -> the enable drops (on time: copies at 0 / 50 / 100, low at 200)
   uint32_t notice_spacing_ms{50};     // between the notice's copies (from the last one out)
   uint8_t notice_copies{3};
-  uint32_t notice_max_ms{1000};       // NOTICE at most this long (copies the hub can't send are given up)
+  uint32_t prepare_max_ms{0};         // before the notice: its hubs' last reads, at most this long (0: none)
+  uint32_t notice_max_ms{1000};       // NOTICE at most this long (copies the hub can't send are given up; never
+                                      // shorter than notice_ms; the receiver forgets a notice after 2 s)
   uint32_t min_off_ms{1000};          // the enable stays low this long after a planned power-off
   uint32_t cycle_off_ms{1500};        // ... after a power cycle (firmware recovery)
   uint32_t min_on_ms{120000};         // ON at least this long; the floor of turn-off periods and pre-wakes
@@ -128,7 +131,11 @@ inline bool dark_window(double unix_s, double lat_deg, double lon_deg, uint32_t 
 
 class PortCore {
  public:
-  void configure(const PortConfig &c) { this->cfg_ = c; }
+  void configure(const PortConfig &c) {
+    this->cfg_ = c;
+    if (this->cfg_.notice_max_ms < this->cfg_.notice_ms)
+      this->cfg_.notice_max_ms = this->cfg_.notice_ms;   // (the cap never cuts a notice short)
+  }
   const PortConfig &config() const { return this->cfg_; }
 
   /// A light (or another load) on the port; hold_ms: its turn-off period (0: the port's). Returns its index.
@@ -160,8 +167,10 @@ class PortCore {
   void prewake(uint32_t now_ms, uint32_t timeout_ms) {
     timeout_ms = timeout_ms < this->cfg_.min_on_ms ? this->cfg_.min_on_ms : timeout_ms;
     timeout_ms = timeout_ms > MAX_HOLD_MS ? MAX_HOLD_MS : timeout_ms;
-    // (a start and a length, compared as elapsed time: right even with updates days apart)
-    if (!this->prewake_ || timeout_ms > this->prewake_ms_ - (now_ms - this->prewake_from_)) {
+    // (a start and a length, compared as elapsed time: right even with updates days apart; one that ran out before
+    // this update came is over, whatever its length)
+    const uint32_t elapsed = now_ms - this->prewake_from_;
+    if (!this->prewake_ || elapsed >= this->prewake_ms_ || timeout_ms > this->prewake_ms_ - elapsed) {
       this->prewake_from_ = now_ms;
       this->prewake_ms_ = timeout_ms;
     }
@@ -259,6 +268,7 @@ class PortCore {
         break;
       case PS_ON:
         if (!this->raw_ || this->raw_lost_) {   // the 55 V cut (a dropout, or the board gone): the boards lost power
+          this->preparing_ = false;
           this->drops_++;
           ev |= EV_LOST | EV_COUNTERS;
           if (!this->board_) {
@@ -270,8 +280,20 @@ class PortCore {
             this->rewake_ = true;
           }
         } else if (!want && now_ms - this->on_ms_ >= this->cfg_.min_on_ms) {
-          this->notice_(now_ms);
-          ev |= this->copy_(now_ms);
+          // (its hubs read the receivers' counters once more first: prepare_max_ms at most)
+          if (this->cfg_.prepare_max_ms == 0 ||
+              (this->preparing_ && (this->notice_ready_ || now_ms - this->prep_ms_ >= this->cfg_.prepare_max_ms))) {
+            this->preparing_ = false;
+            this->notice_(now_ms);
+            ev |= this->copy_(now_ms);
+          } else if (!this->preparing_) {
+            this->preparing_ = true;
+            this->prep_ms_ = now_ms;
+            this->notice_ready_ = false;
+            ev |= EV_PREPARE;
+          }
+        } else {
+          this->preparing_ = false;   // (wanted again: no power-off)
         }
         break;
       case PS_NOTICE: {
@@ -320,6 +342,10 @@ class PortCore {
       ev |= EV_ENABLE;
     return ev;
   }
+
+  /// Before a planned power-off (EV_PREPARE): its hubs are ready for the notice (their last reads done)
+  void set_notice_ready(bool ready) { this->notice_ready_ = ready; }
+  bool preparing() const { return this->preparing_; }
 
   /// The notice's copy EV_NOTICE asked for went out (the Ultra hub: the frame with it handed to the transmitter; a
   /// port without one: at once). The next one is due notice_spacing_ms from now.
@@ -484,6 +510,8 @@ class PortCore {
   uint32_t on_ms_{0}, notice_ms_{0}, last_out_ms_{0}, off_ms_{0}, off_hold_ms_{0};
   uint8_t delivered_{0};
   bool pending_{false}, wake_pending_{false}, shutting_down_{false}, rewake_{false};
+  bool preparing_{false}, notice_ready_{false};
+  uint32_t prep_ms_{0};
   bool problem_{false};
   uint32_t standby_cycles_{0}, drops_{0}, standby_s_{0}, standby_ms_{0}, acc_ms_{0}, wakes_{0};
 };

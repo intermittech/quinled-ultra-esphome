@@ -2,14 +2,17 @@
 // chain of Diff-Power ultra receivers: the RW frames' POLL plans, the answers in a hub UART's byte stream with junk,
 // missing and late answers, a receiver that never answers, restarts and swapped boards, the POWER acknowledge,
 // BUSY / UNSUPPORTED pages, more than 16 receivers, the sensor values / texts, and protocol 0.2.5 (LIFETIME, DIAG's
-// two parts, STATUS's reason, ENERGY's LED supply and peak, HEALTH's flags). The receiver firmware's own answer path:
-// tests/ultra_telemetry_contract_test.cpp.
+// two parts, STATUS's reason, ENERGY's LED supply and peak, HEALTH's flags), and (0.2.6) the lifetime ledger and its
+// LIFE_SYNC (components/dig2analog_ultra/ultra_ledger.h; review-r8/fable-sync §5 13-17, a replaced / moved board, a
+// replaced controller). The receiver firmware's own answer path: tests/ultra_telemetry_contract_test.cpp.
 //
 // Build and run: python tests/run_ultra_telemetry_test.py
 
+#include "../components/dig2analog_ultra/ultra_ledger.h"
 #include "../components/dig2analog_ultra/ultra_telemetry.h"
 
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <random>
 #include <set>
@@ -61,6 +64,15 @@ struct Model {
   uint16_t vb{0xFFFF}, peak{0};   // ENERGY 15 / 17 (0 before 0.2.5)
   uint32_t lit_01h{12345}, power_ups{41}, lt_dips{2};
   uint16_t lt_overloads{1}, lt_shorts{3};
+  uint32_t powered_01h{24690}, records{77};   // LIFETIME 0 / 21
+  // LIFE_SYNC (0.2.6, feature bit 22): one applied merge per power-up; the caps (review-r8/fable-sync §3)
+  bool merged{false};
+  uint32_t syncs{0};
+  uint8_t sync_result{0xFF}, sync_mask{0};
+  std::vector<uint8_t> results;
+  // (the tests: what changes on the board between the hub's read and its sync; a forced result)
+  int records_bump_on_sync{0}, wh_bump_on_sync{0}, powered_bump_on_sync{0};
+  uint8_t force_result{0xFF};
   uint8_t bc_cause{0xFF};
   uint16_t supply_z{95};
   uint8_t fm_trip{0}, fm_rst{0};
@@ -92,6 +104,95 @@ struct Model {
     this->limits = this->overloads = this->shorts = this->dips = 0;
     this->latched = 0;
     this->boot_mwh = 0;
+    this->merged = false;
+  }
+  /// used energy: its count since power-up and (whole Wh) its lifetime
+  void use(uint32_t mwh) {
+    const uint32_t before = this->boot_mwh / 1000;
+    this->boot_mwh += mwh;
+    this->total_wh += this->boot_mwh / 1000 - before;
+  }
+  /// a cut and a power-up: what it hadn't stored lost (lost_wh), a power-up more
+  void power_up(uint32_t lost_wh = 0) {
+    this->restart();
+    this->reset = ULTRA_ST_RST_POWER;
+    this->total_wh -= lost_wh;
+    this->power_ups++;
+  }
+  /// LIFE_SYNC: the hub's ledger merged where it is ahead (in wire units), the caps, once per power-up
+  void life_sync(const uint8_t *arg, uint8_t *d) {
+    this->syncs++;
+    if (this->records_bump_on_sync > 0) {   // (its record written since the hub's read)
+      this->records_bump_on_sync--;
+      this->records++;
+    }
+    if (this->wh_bump_on_sync > 0) {
+      this->wh_bump_on_sync--;
+      this->total_wh++;
+    }
+    if (this->powered_bump_on_sync > 0) {
+      this->powered_bump_on_sync--;
+      this->powered_01h++;
+    }
+    uint8_t result = ULTRA_LS_R_APPLIED, mask = 0;
+    const uint8_t *l = arg + ULTRA_LS_LIFETIME;
+    const uint32_t a_pow = ultra_get24(l + ULTRA_LT_POWERED), a_lit = ultra_get24(l + ULTRA_LT_LIT),
+                   a_ups = ultra_get24(l + ULTRA_LT_POWER_UPS), a_dips = ultra_get24(l + ULTRA_LT_DIPS);
+    const uint16_t a_ovl = ultra_get16(l + ULTRA_LT_OVERLOAD_TRIPS), a_sh = ultra_get16(l + ULTRA_LT_SHORT_TRIPS);
+    const uint32_t a_wh = ultra_get32(arg + ULTRA_LS_TOTAL_WH);
+    auto dd = [](uint32_t a, uint32_t own) { return a > own && a - own < 0x800000u ? a - own : 0u; };
+    const uint32_t d_pow = dd(a_pow, this->powered_01h), d_lit = dd(a_lit, this->lit_01h), d_ups = dd(a_ups, this->power_ups),
+                   d_dips = dd(a_dips, this->lt_dips), d_ovl = dd(a_ovl, this->lt_overloads), d_sh = dd(a_sh, this->lt_shorts),
+                   d_wh = dd(a_wh, this->total_wh);
+    if (this->force_result != 0xFF) {
+      result = this->force_result;
+    } else if (ultra_get16(arg + ULTRA_LS_UID16) != this->uid16()) {
+      result = ULTRA_LS_R_UID;
+    } else if (arg[ULTRA_LS_RECORDS] != (this->records & 0xFF)) {
+      result = ULTRA_LS_R_RECORDS;
+    } else if (!(d_pow | d_lit | d_ups | d_dips | d_ovl | d_sh | d_wh)) {
+      result = ULTRA_LS_R_NOOP;   // (doesn't use up the merge)
+    } else if (this->merged) {
+      result = ULTRA_LS_R_ONCE;
+    } else {
+      const uint32_t p_ok = d_pow <= 7200 ? d_pow : 0;   // 30 days
+      const uint32_t ev_cap = p_ok * 36 + 64;            // (Δpowered_s / 10 + 64)
+      auto take = [&](uint32_t dv, uint32_t cap, uint32_t bit, auto &field) {
+        if (dv == 0)
+          return;
+        if (dv > cap) {
+          result = ULTRA_LS_R_CAPPED;
+          return;
+        }
+        field += dv;
+        mask |= bit;
+      };
+      take(d_pow, 7200, ULTRA_LS_F_POWERED, this->powered_01h);
+      take(d_lit, p_ok + 1, ULTRA_LS_F_LIT, this->lit_01h);
+      take(d_ups, ev_cap, ULTRA_LS_F_UPS, this->power_ups);
+      take(d_ovl, ev_cap, ULTRA_LS_F_TRIPS, this->lt_overloads);
+      take(d_sh, ev_cap, ULTRA_LS_F_TRIPS, this->lt_shorts);
+      take(d_dips, ev_cap, ULTRA_LS_F_DIPS, this->lt_dips);
+      take(d_wh, p_ok * 100 + 1000, ULTRA_LS_F_WH, this->total_wh);   // (energy.c: 1 kW over Δpowered + 1 h)
+      if (mask != 0)
+        this->merged = true;
+    }
+    this->sync_result = result;
+    this->sync_mask = mask;
+    this->results.push_back(result);
+    this->lifetime(d);
+    ultra_put32(d + ULTRA_LS_A_TOTAL_WH, this->total_wh);
+    d[ULTRA_LS_A_RESULT] = result;
+    d[ULTRA_LS_A_APPLIED] = mask;
+    ultra_put16(d + ULTRA_LS_A_RECORDS, static_cast<uint16_t>(this->records));
+  }
+  void lifetime(uint8_t *d) const {
+    ultra_put24(d + ULTRA_LT_POWERED, this->powered_01h);
+    ultra_put24(d + ULTRA_LT_LIT, this->lit_01h);
+    ultra_put24(d + ULTRA_LT_POWER_UPS, this->power_ups);
+    ultra_put16(d + ULTRA_LT_OVERLOAD_TRIPS, this->lt_overloads);
+    ultra_put16(d + ULTRA_LT_SHORT_TRIPS, this->lt_shorts);
+    ultra_put24(d + ULTRA_LT_DIPS, this->lt_dips);
   }
   /// the answer to a POLL slot with index i
   void answer(const uint8_t *poll, uint8_t *a) {
@@ -186,12 +287,15 @@ struct Model {
           out_page = ULTRA_PAGE_UNSUPPORTED;
           break;
         }
-        ultra_put24(d + ULTRA_LT_POWERED, this->lit_01h * 2);
-        ultra_put24(d + ULTRA_LT_LIT, this->lit_01h);
-        ultra_put24(d + ULTRA_LT_POWER_UPS, this->power_ups);
-        ultra_put16(d + ULTRA_LT_OVERLOAD_TRIPS, this->lt_overloads);
-        ultra_put16(d + ULTRA_LT_SHORT_TRIPS, this->lt_shorts);
-        ultra_put24(d + ULTRA_LT_DIPS, this->lt_dips);
+        this->lifetime(d);
+        ultra_put24(d + ULTRA_LT_RECORDS, this->records);
+        break;
+      case ULTRA_PAGE_LIFE_SYNC:
+        if (!(this->features & ULTRA_FEAT_LIFE_SYNC)) {
+          out_page = ULTRA_PAGE_UNSUPPORTED;
+          break;
+        }
+        this->life_sync(arg, d);
         break;
       case ULTRA_PAGE_DIAG:
         this->diag_parts[arg[0] < 2 ? arg[0] : 2]++;
@@ -405,9 +509,9 @@ static void test_basic() {
               std::fabs(telemetry_value(d, TV_INPUT_CURRENT) - 1.5f) < 1e-4f &&
               std::fabs(telemetry_value(d, TV_INPUT_POWER) - 36.0f) < 1e-3f &&
               std::fabs(telemetry_value(d, TV_MCU_TEMPERATURE) - 41.2f) < 1e-3f &&
-              telemetry_value(d, TV_ENERGY) == 1234.0f && telemetry_value(d, TV_UPTIME) <= m.uptime &&
+              std::fabs(telemetry_value(d, TV_ENERGY) - 1234.567f) < 1e-3f && telemetry_value(d, TV_UPTIME) <= m.uptime &&
               telemetry_value(d, TV_UPTIME) + 4 >= m.uptime,
-          "receiver %u: V %.2f I %.3f P %.2f T %.1f E %.0f up %.0f", i, telemetry_value(d, TV_SUPPLY_VOLTAGE),
+          "receiver %u: V %.2f I %.3f P %.2f T %.1f E %.3f up %.0f", i, telemetry_value(d, TV_SUPPLY_VOLTAGE),
           telemetry_value(d, TV_INPUT_CURRENT), telemetry_value(d, TV_INPUT_POWER),
           telemetry_value(d, TV_MCU_TEMPERATURE), telemetry_value(d, TV_ENERGY), telemetry_value(d, TV_UPTIME));
     CHECK(telemetry_firmware_text(d) == "0.6.8" && telemetry_reset_text(d.reset_cause) == "power-on" &&
@@ -969,74 +1073,502 @@ static void test_025() {
         "a board without the peak counts with its average: %.2f A", pm.peak_a());
 }
 
-/// Energy never goes back (Home Assistant would count a lower total_increasing value as a reset: the whole total again):
-/// the hub's total grows by the receiver's mWh since its power-up; a wake that brings back an older stored lifetime, a
-/// restart, the ESP32's restart (its stored total), another board at the position: never lower, nothing twice.
-static void test_energy() {
+// ------------------------------------------------------------------------------------ the lifetime ledger (0.2.6)
+/// A hub's ledger side of one line: its poller and its keeper on an ESP32's ledger.
+struct LedgerHub {
+  TelemetryPoller p;
+  LedgerKeeper k;
+  uint8_t events{0};
+  uint32_t new_boards{0}, restores{0}, attentions{0};
+};
+
+/// Home Assistant's view: each position's Energy as it got it (the same entities across the controller's restarts)
+struct HaView {
+  std::vector<double> last;
+  double worst_back{0};   // the largest step back (Wh)
+};
+
+static TelemetryIntervals ledger_iv() {
   TelemetryIntervals iv;
+  iv.status_ms = 1000;
   iv.energy_ms = 2000;
+  iv.lifetime_ms = 4000;
+  return iv;
+}
+
+static void ledger_board(Model &m) {
+  m.set025();
+  m.features |= ULTRA_FEAT_LIFE_SYNC;
+}
+
+/// the hub starts now (the ESP32's boot; its boards keep their uptime)
+static void start_hub(LedgerHub &h, Chain &c, LifetimeLedger &l, uint8_t pin = 5) {
+  h = LedgerHub{};
+  h.p = started(c, static_cast<uint16_t>(c.rx.size()), ULTRA_RW_RATE_1M, ledger_iv());
+  h.k.attach(&l, pin, static_cast<uint16_t>(c.rx.size()), c.now_ms);
+}
+
+/// the line runs for ms: each window's news to the keeper, the positions' Energy to Home Assistant
+static void drive(Chain &c, LedgerHub &h, HaView &ha, uint32_t ms) {
+  const uint32_t end = c.now_ms + ms;
+  while (static_cast<int32_t>(c.now_ms - end) < 0) {
+    const uint32_t before = c.now_ms / 1000;
+    if (h.p.due(c.now_ms)) {
+      c.window(h.p);
+      for (uint16_t i = 0; i < h.p.receivers(); i++) {
+        const uint8_t ev = h.k.on_updates(h.p, i, h.p.take_updates(i), c.now_ms);
+        h.events |= ev;
+        h.new_boards += (ev & LedgerKeeper::EV_NEW_BOARD) ? 1 : 0;
+        h.restores += (ev & LedgerKeeper::EV_RESTORE) ? 1 : 0;
+        h.attentions += (ev & LedgerKeeper::EV_ATTENTION) ? 1 : 0;
+        const double wh = h.k.energy_wh(i);
+        if (wh >= 0) {
+          if (ha.last.size() <= i)
+            ha.last.resize(i + 1, -1.0);
+          if (ha.last[i] >= 0 && ha.last[i] - wh > ha.worst_back)
+            ha.worst_back = ha.last[i] - wh;
+          ha.last[i] = wh;
+        }
+      }
+    } else {
+      c.now_ms += 5;
+    }
+    for (uint32_t s = before; s < c.now_ms / 1000; s++) {
+      for (auto &m : c.rx)
+        m.uptime++;
+    }
+  }
+}
+
+static uint64_t ledger_mwh(const LedgerHub &h, uint16_t i) {
+  const LifeCounters *lc = h.k.counters(i);
+  return lc != nullptr ? lc->mwh : 0;
+}
+static unsigned long long ull(uint64_t v) { return static_cast<unsigned long long>(v); }
+static bool near(double a, double b) { return std::fabs(a - b) < 1e-6; }
+
+/// §5 13 / 16: first contact adopts; the ledger merges every reading, never down; after a power-up the ledger given
+/// back once (applied); mWh carried across Wh boundaries and across the cuts that drop a board's fraction (only whole
+/// missing Wh go back); the answer paths: a record written since (re-read, applied), no-op, once, refused twice
+/// (needs attention, the ledger shown), capped (the rest at the next power-up).
+static void test_ledger_sync() {
   Chain c(1);
-  TelemetryPoller p = started(c, 1, ULTRA_RW_RATE_1M, iv);
-  std::vector<float> seen;
-  auto run = [&](TelemetryPoller &q, uint32_t ms) {
-    c.run(q, ms);
-    seen.push_back(telemetry_value(q.data(0), TV_ENERGY));
-  };
-  run(p, 8000);
-  CHECK(std::fabs(seen.back() - 1234.0f) < 1e-3f, "first answer: the receiver's lifetime (%.3f Wh)", seen.back());
-  c.rx[0].boot_mwh += 2500;   // 2.5 Wh used
-  c.rx[0].total_wh += 2;
-  run(p, 8000);
-  CHECK(std::fabs(seen.back() - 1236.5f) < 1e-3f, "+2.5 Wh (its count since power-up, in mWh): %.3f", seen.back());
-  // a wake: the board lost what it hadn't stored (lifetime 1230 again), a new power-up
-  c.rx[0].restart();
-  c.rx[0].total_wh = 1230;
-  c.rx[0].boot_mwh = 300;
-  run(p, 8000);
-  CHECK(std::fabs(seen.back() - 1236.8f) < 1e-3f, "a wake with an older stored lifetime: +0.3 Wh, not back (%.3f)",
-        seen.back());
-  c.rx[0].boot_mwh = 1300;
-  run(p, 8000);
-  CHECK(std::fabs(seen.back() - 1237.8f) < 1e-3f, "then +1.0 Wh (%.3f)", seen.back());
-  // a power-off that didn't cut it (a supply kept on): its count goes on: only the new mWh, never its session again
-  p.unpowered();
-  p.locked(c.now_ms);   // (powered again: the preamble locks the chain)
-  c.rx[0].boot_mwh = 1400;
-  run(p, 8000);
-  CHECK(std::fabs(seen.back() - 1237.9f) < 1e-3f, "a power-off without a cut: +0.1 Wh, not its session twice (%.3f)",
-        seen.back());
-  // the ESP32 restarts: its stored total seeds the new poller; the receiver's lifetime is lower
-  const uint64_t stored = p.energy_mwh(0);
-  TelemetryPoller q = started(c, 1, ULTRA_RW_RATE_1M, iv);
-  q.seed_energy(0, stored);
-  run(q, 8000);
-  CHECK(std::fabs(seen.back() - 1237.9f) < 1e-3f, "after the ESP32's restart: the stored total (%.3f)", seen.back());
-  c.rx[0].boot_mwh += 200;
-  run(q, 8000);
-  CHECK(std::fabs(seen.back() - 1238.1f) < 1e-3f, "and on from there (%.3f)", seen.back());
-  // ... and with the receiver ahead (it stored more while the hub was off): its lifetime
-  TelemetryPoller r = started(c, 1, ULTRA_RW_RATE_1M, iv);
-  r.seed_energy(0, 1000000);
-  c.rx[0].total_wh = 1500;
-  run(r, 8000);
-  CHECK(std::fabs(seen.back() - 1500.0f) < 1e-3f, "the receiver's lifetime ahead of the stored total (%.3f)", seen.back());
-  // another board at the position (a new UID), its own large count: the base, nothing added for it
-  for (auto &b : c.rx[0].uid)
-    b ^= 0x5A;
-  c.rx[0].boot_mwh = 900000;
-  c.rx[0].total_wh = 50;
-  run(r, 8000);
-  const float before = seen.back();
-  c.rx[0].boot_mwh += 100;
-  run(r, 8000);
-  CHECK(std::fabs(before - 1500.0f) < 1e-3f && std::fabs(seen.back() - 1500.1f) < 1e-3f,
-        "another board: nothing added for its count (%.3f), then its use (%.3f)", before, seen.back());
-  bool never_back = true;
-  for (size_t i = 1; i < seen.size(); i++)
-    never_back = never_back && (seen[i] >= seen[i - 1] || i == 7);   // (7: a new poller seeded higher, not lower)
-  CHECK(never_back, "Energy never went back");
-  // negative control: the old rule (the receiver's lifetime, at most up) would have shown 1230 after the restart
-  std::printf("  Energy: never back after a wake, a restart, the ESP32's restart, another board\n");
+  Model &m = c.rx[0];
+  ledger_board(m);
+  LifetimeLedger led;
+  led.init(8, 4);
+  LedgerHub h;
+  HaView ha;
+  start_hub(h, c, led);
+  drive(c, h, ha, 10000);
+  const LifeCounters *lc = h.k.counters(0);
+  CHECK(lc != nullptr && lc->lit == 12345 && lc->powered == 24690 && lc->ups == 41 && lc->mwh == 1234567 &&
+            m.syncs == 0,
+        "first contact: its counters adopted (lit %u, ups %u, %llu mWh), no sync (%u)", lc ? lc->lit : 0,
+        lc ? lc->ups : 0, ull(ledger_mwh(h, 0)), m.syncs);
+  CHECK(near(h.k.energy_wh(0), 1234.567), "the position's Energy: the board's lifetime (%.3f Wh)", h.k.energy_wh(0));
+  // 16: mWh across a Wh boundary
+  m.use(300);
+  drive(c, h, ha, 5000);
+  m.use(300);
+  drive(c, h, ha, 5000);
+  CHECK(ledger_mwh(h, 0) == 1235167 && m.total_wh == 1235, "+0.6 Wh across a Wh boundary: %llu mWh",
+        ull(ledger_mwh(h, 0)));
+  // a cut: it lost its fraction (stored 1235 Wh) and 0.3 h lit / 0.4 h powered it hadn't stored; a power-up more
+  m.power_up();
+  m.lit_01h -= 3;
+  m.powered_01h -= 4;
+  drive(c, h, ha, 15000);
+  CHECK(m.syncs == 1 && m.sync_result == ULTRA_LS_R_APPLIED && m.lit_01h == 12345 && m.powered_01h == 24690 &&
+            m.total_wh == 1235 && h.k.counters(0)->ups == 42,
+        "after its power-up one sync: lit / powered back (%u / %u), its Wh not (%u: only its fraction was lost), its "
+        "own power-up count adopted (%u)",
+        m.lit_01h, m.powered_01h, m.total_wh, h.k.counters(0)->ups);
+  CHECK(ledger_mwh(h, 0) == 1235167, "the fraction it dropped stays in the ledger (%llu mWh)", ull(ledger_mwh(h, 0)));
+  m.use(900);
+  drive(c, h, ha, 30000);
+  CHECK(ledger_mwh(h, 0) == 1236067 && m.syncs == 1, "on across the boundary in the hub (%llu mWh), one sync (%u)",
+        ull(ledger_mwh(h, 0)), m.syncs);
+  m.use(2400);
+  drive(c, h, ha, 5000);
+  m.power_up(2);   // (stored 1236 of its 1238 Wh)
+  drive(c, h, ha, 15000);
+  CHECK(m.syncs == 2 && m.sync_result == ULTRA_LS_R_APPLIED && m.total_wh == 1238 && ledger_mwh(h, 0) == 1238467,
+        "2 Wh lost at a cut: given back (%u Wh), the fraction stays in the ledger (%llu mWh)", m.total_wh,
+        ull(ledger_mwh(h, 0)));
+  // a record written between the read and the sync: refused (RECORDS), read again, applied
+  m.records_bump_on_sync = 1;
+  m.power_up(1);
+  drive(c, h, ha, 15000);
+  CHECK(m.syncs == 4 && m.results.size() == 4 && m.results[2] == ULTRA_LS_R_RECORDS && m.results[3] == ULTRA_LS_R_APPLIED &&
+            m.total_wh == 1238 && !h.k.attention(0),
+        "its record written since the read: refused, read again, applied (%u syncs, %u Wh)", m.syncs, m.total_wh);
+  // no-op: it caught up before the sync came (nothing merged: its one merge not used)
+  m.wh_bump_on_sync = 1;
+  m.power_up(1);
+  drive(c, h, ha, 15000);
+  CHECK(m.syncs == 5 && m.sync_result == ULTRA_LS_R_NOOP && !m.merged && !h.k.attention(0) && m.total_wh == 1238,
+        "caught up before the sync: no-op, nothing merged, done (%u syncs)", m.syncs);
+  // once: it took one this power-up already (another hub): done, the rest at its next power-up
+  m.force_result = ULTRA_LS_R_ONCE;
+  m.power_up(1);
+  drive(c, h, ha, 15000);
+  CHECK(m.syncs == 6 && m.sync_result == ULTRA_LS_R_ONCE && !h.k.attention(0) && m.total_wh == 1237,
+        "already merged this power-up: done, no retry (%u syncs)", m.syncs);
+  m.force_result = 0xFF;
+  m.power_up();
+  drive(c, h, ha, 15000);
+  CHECK(m.syncs == 7 && m.sync_result == ULTRA_LS_R_APPLIED && m.total_wh == 1238, "its next power-up: applied (%u Wh)",
+        m.total_wh);
+  // refused twice (another board's UID16): needs attention, the ledger shown; the next applied clears it
+  m.force_result = ULTRA_LS_R_UID;
+  m.power_up(1);
+  drive(c, h, ha, 15000);
+  CHECK(m.syncs == 9 && h.k.attention(0) && h.attentions == 1 && h.k.counters(0)->mwh > m.total_wh * 1000ull + 999,
+        "refused twice: needs attention (%u syncs), the ledger shown (%llu mWh, the board %u Wh)", m.syncs,
+        ull(ledger_mwh(h, 0)), m.total_wh);
+  m.force_result = 0xFF;
+  m.power_up();
+  drive(c, h, ha, 15000);
+  CHECK(m.syncs == 10 && m.sync_result == ULTRA_LS_R_APPLIED && !h.k.attention(0) && m.total_wh == 1238,
+        "the next power-up: applied, attention cleared");
+  // capped: its powered grew 0.1 h between the read and the sync, so lit is over its cap: the rest next power-up
+  m.power_up();
+  m.powered_01h -= 5;
+  m.lit_01h -= 6;
+  m.powered_bump_on_sync = 1;
+  drive(c, h, ha, 15000);
+  CHECK(m.syncs == 11 && m.sync_result == ULTRA_LS_R_CAPPED && (m.sync_mask & ULTRA_LS_F_POWERED) && !(m.sync_mask & ULTRA_LS_F_LIT) &&
+            m.powered_01h == 24690 && m.lit_01h == 12339 && !h.k.attention(0),
+        "capped (lit over its cap): powered merged, lit not (%u), done (mask %02X)", m.lit_01h, m.sync_mask);
+  m.power_up();
+  drive(c, h, ha, 15000);
+  CHECK(m.syncs == 12 && m.sync_result == ULTRA_LS_R_APPLIED && m.lit_01h == 12340,
+        "its next power-up: lit +1 (its cap without powered behind: %u)", m.lit_01h);
+  CHECK(ha.worst_back == 0, "Energy never went back (%.3f Wh)", ha.worst_back);
+  std::printf("  ledger: adopt, merge, one sync per power-up, the mWh carried, every answer path\n");
+}
+
+/// §5 16: the Wh a sync gives back count the board's own fraction: 1.967 Wh lost at a cut, 0.9 Wh into its new
+/// power-up when the hub reads it: 1 whole Wh back (the board never above the ledger; 0.967 stays with the hub).
+static void test_ledger_fraction() {
+  Chain c(1);
+  Model &m = c.rx[0];
+  ledger_board(m);
+  m.total_wh = 1238;
+  m.boot_mwh = 467;
+  LifetimeLedger led;
+  led.init(4, 2);
+  LedgerHub h;
+  HaView ha;
+  start_hub(h, c, led);
+  drive(c, h, ha, 10000);
+  m.use(1500);
+  drive(c, h, ha, 5000);
+  m.power_up(1);   // (stored 1238 of its 1239.967)
+  m.use(900);
+  drive(c, h, ha, 15000);
+  const uint64_t board = m.total_wh * 1000ull + m.boot_mwh % 1000;
+  CHECK(m.syncs == 1 && m.sync_result == ULTRA_LS_R_APPLIED && m.total_wh == 1239 && ledger_mwh(h, 0) == 1240867 &&
+            board <= ledger_mwh(h, 0) && ha.worst_back == 0,
+        "its fraction counted: %u Wh back to %u (the board %llu mWh, the ledger %llu)", m.total_wh - 1238, m.total_wh,
+        ull(board), ull(ledger_mwh(h, 0)));
+}
+
+/// §5 14 and the replacement cases: a receiver ahead (adopted per counter); a replaced board at a position (a new
+/// entry, the position's Energy goes on, the old entry kept); a board moved to another line's position (its entry
+/// follows it, the counters go on); a new controller adopts the boards' lifetime.
+static void test_ledger_boards() {
+  Chain c(2);
+  for (auto &m : c.rx)
+    ledger_board(m);
+  c.rx[1].total_wh = 500;
+  c.rx[1].lit_01h = 600;
+  c.rx[1].powered_01h = 900;
+  LifetimeLedger led;
+  led.init(4, 4);
+  LedgerHub h;
+  HaView ha;
+  start_hub(h, c, led);
+  drive(c, h, ha, 10000);
+  // a receiver ahead (it ran on another controller): every counter it is ahead in adopted, no sync
+  c.rx[0].lit_01h += 100;
+  c.rx[0].power_ups += 2;
+  c.rx[0].total_wh += 50;
+  drive(c, h, ha, 10000);
+  CHECK(h.k.counters(0)->lit == 12445 && h.k.counters(0)->ups == 43 && ledger_mwh(h, 0) == 1284567 &&
+            c.rx[0].syncs == 0,
+        "a receiver ahead: adopted (lit %u, ups %u, %llu mWh), no sync", h.k.counters(0)->lit, h.k.counters(0)->ups,
+        ull(ledger_mwh(h, 0)));
+  // R1: position 1's board replaced by a used one (50 kWh): a new entry, the position goes on, the old one kept
+  uint8_t old_uid[12];
+  std::memcpy(old_uid, c.rx[1].uid, 12);
+  const double before = h.k.energy_wh(1);
+  Model b;
+  ledger_board(b);
+  for (int k = 0; k < 12; k++)
+    b.uid[k] = static_cast<uint8_t>(0xC0 + k);
+  b.total_wh = 50000;
+  b.boot_mwh = 0;
+  b.uptime = 0;
+  b.lit_01h = 99999;
+  b.powered_01h = 199999;
+  c.rx[1] = b;
+  drive(c, h, ha, 15000);
+  CHECK(h.new_boards == 1 && near(h.k.energy_wh(1), before) && led.find(old_uid) != nullptr &&
+            led.find(b.uid) != nullptr && h.k.counters(1)->lit == 99999 && c.rx[1].syncs == 0,
+        "a replaced board: logged once (%u), the position goes on (%.3f, was %.3f), the old entry kept, the new one "
+        "adopted, no sync",
+        h.new_boards, h.k.energy_wh(1), before);
+  c.rx[1].use(1500);
+  drive(c, h, ha, 5000);
+  CHECK(near(h.k.energy_wh(1), before + 1.5), "then its use (%.3f)", h.k.energy_wh(1));
+  // R2: board 0 moved to another line's position 0 (a new board in its place): its entry follows it
+  Chain c2(1);
+  c2.now_ms = c.now_ms;
+  c2.rx[0] = c.rx[0];
+  c2.rx[0].power_up(1);   // (it lost 1 Wh and 0.2 h at the move)
+  c2.rx[0].lit_01h -= 2;
+  c2.rx[0].powered_01h -= 2;
+  const LifeCounters moved = *h.k.counters(0);
+  Model n;
+  ledger_board(n);
+  for (int k = 0; k < 12; k++)
+    n.uid[k] = static_cast<uint8_t>(0xE0 + k);
+  n.uptime = 0;
+  c.rx[0] = n;
+  LedgerHub h2;
+  HaView ha2;
+  start_hub(h2, c2, led, 6);
+  h2.k.attach(&led, 6, 1, 0);   // (the same ESP32: its hub started at 0)
+  drive(c2, h2, ha2, 15000);
+  drive(c, h, ha, 15000);
+  CHECK(h2.k.counters(0) != nullptr && h2.k.counters(0)->lit == moved.lit && c2.rx[0].lit_01h == moved.lit &&
+            c2.rx[0].syncs == 1 && near(h2.k.energy_wh(0), moved.mwh / 1000.0),
+        "a moved board: its entry follows it (lit %u, synced back: %u), the new position starts at its ledger "
+        "(%.3f)",
+        h2.k.counters(0) ? h2.k.counters(0)->lit : 0, c2.rx[0].lit_01h, h2.k.energy_wh(0));
+  CHECK(h.new_boards == 2 && h.k.energy_wh(0) >= ha.last[0] - 1e-9, "its old position: a new board, on from there");
+  CHECK(ha.worst_back == 0, "Energy never went back on one controller (%.3f Wh)", ha.worst_back);
+  // R3: the controller replaced (an empty ledger, the same entities): each board's lifetime at first contact; where
+  // the old one had re-based a replaced board, the value jumps (Home Assistant: a rise counts, a drop of 10 % or
+  // more is a new meter cycle: the wiki says how to fix the statistic)
+  LifetimeLedger fresh;
+  fresh.init(4, 4);
+  LedgerHub h3;
+  HaView ha3 = ha;
+  start_hub(h3, c, fresh);
+  drive(c, h3, ha3, 15000);
+  CHECK(near(h3.k.energy_wh(0), 1234.567) && near(h3.k.energy_wh(1), 50001.5) && c.rx[1].syncs == 0 &&
+            c.rx[0].syncs == 0,
+        "a new controller: the boards' lifetimes (%.3f / %.3f; the old one showed %.3f / %.3f), no sync",
+        h3.k.energy_wh(0), h3.k.energy_wh(1), ha.last[0], ha.last[1]);
+  std::printf("  ledger: a receiver ahead, a replaced board, a moved board, a new controller\n");
+}
+
+/// §5 14: a board whose record went back (erased): logged once, the ledger given back over a few power-ups (each
+/// counter at most the receiver's cap per merge); its position never back.
+static void test_ledger_erased() {
+  Chain c(1);
+  Model &m = c.rx[0];
+  ledger_board(m);
+  LifetimeLedger led;
+  led.init(4, 2);
+  LedgerHub h;
+  HaView ha;
+  start_hub(h, c, led);
+  drive(c, h, ha, 10000);
+  m.power_up();
+  m.records = 2;
+  m.powered_01h = 20;
+  m.lit_01h = 10;
+  m.power_ups = 1;
+  m.lt_dips = m.lt_overloads = m.lt_shorts = 0;
+  m.total_wh = 3;
+  drive(c, h, ha, 15000);
+  CHECK(h.restores == 1 && m.syncs == 1 && m.powered_01h == 7220 && m.lit_01h == 7211 && m.total_wh == 1234 &&
+            m.lt_dips == 2 && m.lt_shorts == 3,
+        "erased: logged (%u), the first power-up back by the caps' steps (powered %u, lit %u, %u Wh)", h.restores,
+        m.powered_01h, m.lit_01h, m.total_wh);
+  for (int k = 0; k < 4; k++) {
+    m.power_up();
+    drive(c, h, ha, 15000);
+  }
+  CHECK(m.syncs == 4 && m.powered_01h == 24690 && m.lit_01h == 12345 && h.restores == 1 && ha.worst_back == 0,
+        "whole again after 4 power-ups (%u syncs: powered %u, lit %u), logged once, Energy never back", m.syncs,
+        m.powered_01h, m.lit_01h);
+  std::printf("  ledger: an erased board restored over 4 power-ups\n");
+}
+
+/// §5 15 and GPT's N1-N3: the ESP32 restarts (a stored ledger older than what was shown): the board's lifetime, its
+/// power-up's count not again; used while the ESP32 was off: counted; a used board fitted while it was off: the
+/// position goes on; a reading of a new power-up before the STATUS that shows it; a power-off without a cut; the
+/// 32-bit count wrapping.
+static void test_ledger_restart() {
+  Chain c(1);
+  Model &m = c.rx[0];
+  ledger_board(m);
+  LifetimeLedger led;
+  led.init(8, 4);
+  LedgerHub h;
+  HaView ha;
+  start_hub(h, c, led);
+  drive(c, h, ha, 10000);
+  m.use(150000);
+  drive(c, h, ha, 5000);
+  std::vector<uint8_t> blob(led.blob_size());
+  led.save(blob.data(), 1);   // (the 15 min save)
+  const uint64_t saved = ledger_mwh(h, 0);
+  m.use(10000);               // 10 Wh more shown; then the ESP32 crashes before its next save
+  drive(c, h, ha, 5000);
+  const double shown = h.k.energy_wh(0);
+  LifetimeLedger led2;
+  led2.init(8, 4);
+  uint32_t gen = 0;
+  CHECK(led2.load(blob.data(), blob.size(), &gen) && gen == 1, "the stored ledger loads");
+  start_hub(h, c, led2);
+  drive(c, h, ha, 10000);
+  CHECK(near(h.k.energy_wh(0), shown) && near(shown, 1394.567) && ha.worst_back == 0,
+        "N1: the ESP32 restarted (stored %.3f): %.3f Wh as shown before (%.3f), its power-up's count not again",
+        saved / 1000.0, h.k.energy_wh(0), shown);
+  m.use(700);
+  drive(c, h, ha, 5000);
+  CHECK(near(h.k.energy_wh(0), shown + 0.7), "then on (%.3f)", h.k.energy_wh(0));
+  // N2: used while the ESP32 was off (a clean shutdown stored the ledger)
+  led2.save(blob.data(), 2);
+  m.use(20000);
+  m.uptime += 3600;
+  c.now_ms += 3600000;
+  LifetimeLedger led3;
+  led3.init(8, 4);
+  led3.load(blob.data(), blob.size(), &gen);
+  start_hub(h, c, led3);
+  drive(c, h, ha, 10000);
+  CHECK(near(h.k.energy_wh(0), shown + 20.7) && ha.worst_back == 0, "N2: used while the ESP32 was off: counted (%.3f)",
+        h.k.energy_wh(0));
+  // a reading of a new power-up before the STATUS that shows it: its use once
+  const double e0 = h.k.energy_wh(0);
+  m.power_up();
+  m.use(300);
+  h.p.read_now(0, TP_ENERGY, c.now_ms - 20000);
+  drive(c, h, ha, 10000);
+  CHECK(near(h.k.energy_wh(0), e0 + 0.3), "a new power-up's reading before its STATUS: +0.3 Wh, once (%.3f)",
+        h.k.energy_wh(0) - e0);
+  m.use(200);
+  drive(c, h, ha, 5000);
+  CHECK(near(h.k.energy_wh(0), e0 + 0.5), "then +0.2 (%.3f)", h.k.energy_wh(0) - e0);
+  // a power-off that didn't cut it (a supply kept on): its count goes on, only the new mWh
+  h.p.unpowered();
+  h.p.locked(c.now_ms);
+  m.use(100);
+  drive(c, h, ha, 10000);
+  CHECK(near(h.k.energy_wh(0), e0 + 0.6), "a power-off without a cut: +0.1 Wh, not its power-up's count again (%.3f)",
+        h.k.energy_wh(0) - e0);
+  // N3: a used board fitted while the ESP32 was off (shut down cleanly): the position goes on, not +50 kWh
+  led3.save(blob.data(), 3);
+  const double last = ha.last[0];
+  Model b;
+  ledger_board(b);
+  for (int k = 0; k < 12; k++)
+    b.uid[k] = static_cast<uint8_t>(0x90 + k);
+  b.total_wh = 50000;
+  b.boot_mwh = 0;
+  b.uptime = 30;
+  c.rx[0] = b;
+  c.now_ms += 60000;
+  LifetimeLedger led4;
+  led4.init(8, 4);
+  led4.load(blob.data(), blob.size(), &gen);
+  start_hub(h, c, led4);
+  drive(c, h, ha, 10000);
+  CHECK(h.new_boards == 1 && near(h.k.energy_wh(0), last) && ha.worst_back == 0,
+        "N3: a used board fitted while the ESP32 was off: the position goes on (%.3f, was %.3f)", h.k.energy_wh(0), last);
+  // ... after a crash instead (the last save older): back by what was shown since that save at most
+  led4.save(blob.data(), 4);
+  const double at_save = h.k.energy_wh(0);
+  c.rx[0].use(5000);
+  drive(c, h, ha, 5000);
+  Model b2 = b;
+  for (int k = 0; k < 12; k++)
+    b2.uid[k] = static_cast<uint8_t>(0xA0 + k);
+  c.rx[0] = b2;
+  LifetimeLedger led5;
+  led5.init(8, 4);
+  led5.load(blob.data(), blob.size(), &gen);
+  start_hub(h, c, led5);
+  drive(c, h, ha, 10000);
+  CHECK(near(h.k.energy_wh(0), at_save) && near(ha.worst_back, 5.0),
+        "a crash, then a board fitted while off: back to the last save (%.3f): the 5 Wh shown since (%.3f): the bound",
+        h.k.energy_wh(0), ha.worst_back);
+  // the 32-bit count wraps within a power-up (4295 kWh): on, nothing lost
+  Chain w(1);
+  ledger_board(w.rx[0]);
+  w.rx[0].boot_mwh = 0xFFFFF000u;
+  w.rx[0].total_wh = 4400000;
+  LifetimeLedger lw;
+  lw.init(2, 1);
+  LedgerHub hw;
+  HaView haw;
+  start_hub(hw, w, lw);
+  drive(w, hw, haw, 10000);
+  const uint64_t w0 = ledger_mwh(hw, 0);
+  w.rx[0].boot_mwh += 0x2000;   // (wraps: 0x1000)
+  w.rx[0].total_wh += 8;
+  drive(w, hw, haw, 10000);
+  CHECK(ledger_mwh(hw, 0) == w0 + 0x2000 && haw.worst_back == 0, "its count wrapped: +%llu mWh",
+        ull(ledger_mwh(hw, 0) - w0));
+  std::printf("  ledger: the ESP32's restarts (N1-N3), a reading before its STATUS, no cut, the count's wrap\n");
+}
+
+/// §5 17: a board without LIFE_SYNC (0.2.5) never gets 0x0E (the ledger only, shown); without LIFETIME (0.2.4): its
+/// Energy through the ledger still. The stored form: two copies, a broken one refused; an old entry ages out.
+static void test_ledger_misc() {
+  Chain c(2);
+  c.rx[0].set025();                 // LIFETIME, no LIFE_SYNC
+  LifetimeLedger led;
+  led.init(4, 2);
+  LedgerHub h;
+  HaView ha;
+  start_hub(h, c, led);
+  drive(c, h, ha, 10000);
+  c.rx[0].power_up(2);
+  c.rx[0].lit_01h -= 5;
+  c.rx[1].power_up(2);
+  drive(c, h, ha, 15000);
+  CHECK(c.rx[0].asked[ULTRA_PAGE_LIFE_SYNC] == 0 && c.rx[1].asked[ULTRA_PAGE_LIFE_SYNC] == 0 && !h.k.sync_sent(0) &&
+            !h.p.sync_pending(0) && h.k.counters(0)->lit == 12345 &&
+            ledger_mwh(h, 0) == 1234567 && ledger_mwh(h, 1) == 1234567 && ha.worst_back == 0,
+        "no LIFE_SYNC (bit 22): no 0x0E (%u / %u), the ledger shown (lit %u, %llu mWh)",
+        c.rx[0].asked[ULTRA_PAGE_LIFE_SYNC], c.rx[1].asked[ULTRA_PAGE_LIFE_SYNC], h.k.counters(0)->lit, ull(ledger_mwh(h, 0)));
+  // the stored form: a copy refused when broken, its generation; another size refused
+  std::vector<uint8_t> a(led.blob_size()), b(led.blob_size());
+  led.save(a.data(), 7);
+  led.save(b.data(), 8);
+  b[40] ^= 1;
+  LifetimeLedger l2;
+  l2.init(4, 2);
+  uint32_t gen = 0;
+  const bool b_ok = l2.load(b.data(), b.size(), &gen);
+  const bool a_ok = l2.load(a.data(), a.size(), &gen);
+  a[0] ^= 1;
+  LifetimeLedger l3;
+  l3.init(4, 2);
+  uint32_t g3 = 0;
+  CHECK(!b_ok && a_ok && gen == 7 && !l3.load(a.data(), a.size(), &g3) && !l3.load(a.data(), a.size() - 2, &g3) &&
+            l2.find(c.rx[0].uid) != nullptr && l2.find(c.rx[0].uid)->c.lit == 12345,
+        "the stored copies: a broken one refused, the other loads (generation %u)", gen);
+  // age-out: a board not seen for 90 hub days that no position holds goes; one a position holds stays
+  Model gone;
+  for (int k = 0; k < 12; k++)
+    gone.uid[k] = static_cast<uint8_t>(0x10 + k);
+  bool created = false;
+  led.touch(gone.uid, &created);
+  led.set_day(led.day() + LEDGER_AGE_DAYS - 1);
+  const bool kept = led.find(gone.uid) != nullptr;
+  led.set_day(led.day() + 1);
+  CHECK(created && kept && led.find(gone.uid) == nullptr && led.find(c.rx[0].uid) != nullptr,
+        "a board not seen for %u days goes, the ones the positions hold stay", LEDGER_AGE_DAYS);
+  std::printf("  ledger: no 0x0E without bit 22, the stored copies, the age-out\n");
 }
 
 /// (0.2.6) DIAG 20 bit 7: the receiver's lifetime record held: a note after the Status detail, no problem
@@ -1081,7 +1613,12 @@ int main() {
   test_long_chain();
   test_unpowered();
   test_wraps();
-  test_energy();
+  test_ledger_sync();
+  test_ledger_fraction();
+  test_ledger_boards();
+  test_ledger_erased();
+  test_ledger_restart();
+  test_ledger_misc();
   test_record_held();
   test_status();
   test_port();

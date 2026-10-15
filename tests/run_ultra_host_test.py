@@ -1,6 +1,6 @@
 """Build and run tests/ultra_host_test.cpp with the zig C/C++ compiler (pip install ziglang).
 
-With the QuinLED dig2analog-ultra-5ch firmware next to this repo (quinled-ultra-firmware, or
+With the QuinLED Dig2Analog-Ultra-5ch firmware next to this repo (quinled-ultra-firmware, or
 ULTRA_FIRMWARE=<firmware dir>), the board's light engine is compiled in and the chain test runs too; the protocol
 header copy must equal the firmware's master and a quinled-ultra-protocol checkout next to this repo (the tag CI pins).
 Without them the parts that need them are skipped; with ULTRA_REQUIRE_DEPS=1 (CI) a missing one is a failure.

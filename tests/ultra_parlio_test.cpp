@@ -25,6 +25,7 @@
 // Build: python tests/run_ultra_parlio_test.py (also its negative controls and the render benchmark)
 
 #include "../components/dig2analog_ultra/ultra_core.h"
+#include "../components/dig2analog_ultra/ultra_ledger.h"
 #include "../components/dig2analog_ultra/ultra_parlio.h"
 #include "../components/dig2analog_ultra/ultra_telemetry.h"
 #include "../components/dig2analog_ultra/update_session.h"

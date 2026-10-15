@@ -15,21 +15,12 @@ static constexpr uint32_t ALL_NEW = TU_AVAILABILITY | TU_RESTART;
 static constexpr uint32_t PG_STATUS = 1u << TP_STATUS, PG_POWER = 1u << TP_POWER, PG_ENERGY = 1u << TP_ENERGY,
                           PG_SUPPLY = 1u << TP_SUPPLY, PG_OUTPUTS = 1u << TP_OUTPUTS, PG_HEALTH = 1u << TP_HEALTH,
                           PG_IDENTITY = 1u << TP_IDENTITY, PG_LIFETIME = 1u << TP_LIFETIME, PG_DIAG = 1u << TP_DIAG,
-                          PG_FAULTS = 1u << TP_FAULTS;
-static constexpr uint32_t ENERGY_SAVE_MS = 3600000;   // the Energy total stored at most hourly (and at a reboot)
+                          PG_FAULTS = 1u << TP_FAULTS, PG_SYNC = 1u << TP_SYNC;
 static constexpr uint32_t SLOW_MS = 60000;
 
 // ------------------------------------------------------------------------------------------------------- receiver
 
 void UltraReceiver::setup() {
-  // its Energy total across the ESP32's restarts (this line, this position)
-  this->energy_pref_ = global_preferences->make_preference<uint64_t>(
-      fnv1_hash("dig2analog_ultra.energy:" + std::to_string(this->hub_->get_pin()) + ":" + std::to_string(this->board_)));
-  uint64_t mwh;
-  if (this->energy_pref_.load(&mwh)) {
-    this->hub_->seed_energy(this->board_, mwh);
-    this->energy_saved_ = mwh;
-  }
   this->hub_->add_on_telemetry_callback([this](uint16_t receiver, uint32_t updates) {
     if (receiver == this->board_)
       this->update_(updates);
@@ -57,12 +48,31 @@ void UltraReceiver::update_(uint32_t updates) {
   const ReceiverData &d = p.data(this->board_);
   const bool all = (updates & ALL_NEW) != 0;
   auto from = [&](uint32_t pages) { return all || (updates & pages) != 0; };
-  // its Diff-Power port not on: no power (Power and Current 0), nothing else known; Energy keeps its total
+  // its Diff-Power port not on: no power (Power and Current 0), nothing else known; Energy keeps its total.
+  // The lifetime counts: the ledger's (the highest seen: also while the board's record is held, DIAG EXHAUSTED)
   const bool standby = this->hub_->port_standby();
+  const LifeCounters *lc = d.have_identity && (d.features & ULTRA_FEAT_LIFETIME) ? this->hub_->ledger_counters(this->board_)
+                                                                                 : nullptr;
   auto v = [&](TelemetryValue tv) {
     if (standby)
       return tv == TV_INPUT_POWER || tv == TV_INPUT_CURRENT ? 0.0f : NAN;
-    return answering ? telemetry_value(d, tv) : NAN;
+    if (!answering)
+      return NAN;
+    if (lc != nullptr && d.have_lifetime) {
+      switch (tv) {
+        case TV_LIT_HOURS:
+          return lc->lit * 0.1f;
+        case TV_POWER_UPS:
+          return static_cast<float>(lc->ups);
+        case TV_TRIPS:
+          return static_cast<float>(lc->ovl + lc->shorts);
+        case TV_DIPS:
+          return static_cast<float>(lc->dips);
+        default:
+          break;
+      }
+    }
+    return telemetry_value(d, tv);
   };
 
   // the status: worst first, with its plain line and the Problem (just woken, not heard yet: Waking)
@@ -77,16 +87,20 @@ void UltraReceiver::update_(uint32_t updates) {
 
   if (from(PG_STATUS | PG_ENERGY))
     this->value_(POWER, v(TV_INPUT_POWER));
+  if (from(PG_ENERGY | PG_SYNC | PG_STATUS)) {
+    // the position's Energy: through the ledger, never down (a replaced board, a restart, the ESP32's restart); its
+    // ENERGY readings go in with the STATUS after them (it dates a restart). Unavailable while it doesn't answer
+    // (kept in standby), as its other values
+    const double wh = this->hub_->position_energy_wh(this->board_);
+    this->value_(ENERGY, wh >= 0 && (answering || standby) ? static_cast<float>(wh) : NAN);
+  }
   if (from(PG_ENERGY)) {
-    if (!standby)
-      this->value_(ENERGY, v(TV_ENERGY));
-    this->save_energy_(false);
     this->value_(LED_SUPPLY, v(TV_LED_SUPPLY));       // (0.2.5) after the buck
     this->value_(CURRENT_PEAK, v(TV_CURRENT_PEAK));   // (0.2.5) since the ENERGY read before
   }
   if (from(PG_DIAG))
     this->value_(SUPPLY_IMPEDANCE, v(TV_SUPPLY_IMPEDANCE));
-  if (from(PG_LIFETIME)) {
+  if (from(PG_LIFETIME | PG_SYNC)) {
     this->value_(LIT_HOURS, v(TV_LIT_HOURS));
     this->value_(POWER_UPS, v(TV_POWER_UPS));
   }
@@ -101,11 +115,11 @@ void UltraReceiver::update_(uint32_t updates) {
     this->value_(CABLE_RESISTANCE, std::isnan(r) ? NAN : r * 1000.0f);
   }
   // trips and dips: the lifetime counts on a board with LIFETIME (0.2.5), else since its power-up
-  if (from(PG_POWER | PG_LIFETIME)) {
+  if (from(PG_POWER | PG_LIFETIME | PG_SYNC)) {
     this->value_(TRIPS, v(TV_TRIPS));
     this->value_(LIMIT_EVENTS, v(TV_LIMIT_EVENTS));
   }
-  if (from(PG_SUPPLY | PG_LIFETIME))
+  if (from(PG_SUPPLY | PG_LIFETIME | PG_SYNC))
     this->value_(SUPPLY_DIPS, v(TV_DIPS));
   if (all || !this->slow_sent_ || millis() - this->slow_ms_ >= SLOW_MS) {   // at most once a minute
     this->slow_ms_ = millis();
@@ -135,17 +149,8 @@ void UltraReceiver::update_(uint32_t updates) {
   }
 }
 
-void UltraReceiver::save_energy_(bool now) {
-  const uint64_t mwh = this->hub_->telemetry().energy_mwh(this->board_);
-  if (mwh == this->energy_saved_ || (!now && millis() - this->energy_saved_ms_ < ENERGY_SAVE_MS))
-    return;
-  this->energy_pref_.save(&mwh);
-  this->energy_saved_ = mwh;
-  this->energy_saved_ms_ = millis();
-}
-
 void UltraReceiver::dump_config() {
-  ESP_LOGCONFIG(TAG, "QuinLED Diff-Power ultra receiver %u (GPIO%u):", this->board_ + 1, this->hub_->get_pin());
+  ESP_LOGCONFIG(TAG, "QuinLED Diff-Power Ultra receiver %u (GPIO%u):", this->board_ + 1, this->hub_->get_pin());
   LOG_SENSOR("  ", "Power", this->values_[POWER]);
   LOG_SENSOR("  ", "Energy", this->values_[ENERGY]);
   LOG_TEXT_SENSOR("  ", "Status", this->texts_[STATUS]);

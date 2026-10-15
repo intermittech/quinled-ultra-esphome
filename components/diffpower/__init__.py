@@ -201,10 +201,11 @@ PORT_SCHEMA = cv.All(
                 cv.positive_time_period_milliseconds, cv.Range(max=cv.TimePeriod(seconds=10))
             ),
             # the planned power-off: the notice (3 copies at 0 / 50 / 100 ms), the enable low after notice_time, then
-            # low for at least min_off_time (the bus falls below the receivers' UVLO) before any wake
+            # low for at least min_off_time (the bus falls below the receivers' UVLO) before any wake. 1 s at most: a
+            # receiver forgets the notice 2 s after it, and the port gives up on copies it can't send after 1 s
             cv.Optional(CONF_NOTICE_TIME, default="200ms"): cv.All(
                 cv.positive_time_period_milliseconds, cv.Range(min=cv.TimePeriod(milliseconds=150),
-                                                               max=cv.TimePeriod(seconds=2))
+                                                               max=cv.TimePeriod(seconds=1))
             ),
             cv.Optional(CONF_MIN_OFF_TIME, default="1s"): cv.All(
                 cv.positive_time_period_milliseconds,
@@ -248,23 +249,37 @@ def _partition_sources(conf):
     return out
 
 
-def _related_lights(full, entries):
-    """Lights that light the same pixels as the port's: the partitions of a listed strip, the strips under a listed
-    partition (a partition writes its strip's buffer without turning the strip's light on). id -> turn-off period."""
-    listed = {str(e[CONF_ID].id): e for e in entries}
+def _related_lights(full, entries, default_ms=0):
+    """Lights that light the same pixels as the port's (a partition writes its strip's buffer without turning the
+    strip's light on), at any depth: from each listed light down through partitions to the physical strips, then up
+    through every partition over any of those (nested ones too; a cycle stops). id -> turn-off period in ms: the
+    longest of the listed lights it shares pixels with (default_ms: the port's, for a light without its own)."""
+    under = {pid: _partition_sources(conf) for pid, conf in _light_confs(full).items()
+             if conf.get("platform") == "partition"}
+    over = {}
+    for pid, sources in under.items():
+        for src in sources:
+            over.setdefault(src, set()).add(pid)
+    listed = {}
+    for e in entries:
+        hold = e.get(CONF_STANDBY_AFTER)
+        listed[str(e[CONF_ID].id)] = int(hold.total_milliseconds) if hold else default_ms
     extra = {}
-    for pid, conf in _light_confs(full).items():
-        if conf.get("platform") != "partition":
-            continue
-        sources = _partition_sources(conf)
-        if pid in listed:
-            for src in sources:
-                if src not in listed:
-                    extra.setdefault(src, listed[pid].get(CONF_STANDBY_AFTER))
-        else:
-            holds = [listed[s].get(CONF_STANDBY_AFTER) for s in sources if s in listed]
-            if holds:
-                extra.setdefault(pid, max(holds, key=lambda h: h.total_milliseconds if h else 0))
+    for lid, hold in listed.items():
+        down, stack = set(), [lid]
+        while stack:
+            x = stack.pop()
+            if x not in down:
+                down.add(x)
+                stack.extend(under.get(x, ()))
+        group, stack = set(down), list(down)
+        while stack:
+            for p in over.get(stack.pop(), ()):
+                if p not in group:
+                    group.add(p)
+                    stack.append(p)
+        for other in group - set(listed):
+            extra[other] = max(extra.get(other, 0), hold)
     return extra
 
 
@@ -273,7 +288,7 @@ def _port_lights(full):
     lights = set()
     for port in full.get("diffpower", []):
         lights |= {str(e[CONF_ID].id) for e in port.get(CONF_LIGHTS, [])}
-        lights |= set(_related_lights(full, port.get(CONF_LIGHTS, [])))
+        lights |= set(_related_lights(full, port.get(CONF_LIGHTS, [])))   # (any depth)
     hubs = {str(h[CONF_ID].id) for h in full.get("dig2analog_ultra", []) if h.get("port") is not None}
     for lid, conf in _light_confs(full).items():
         hub = conf.get("dig2analog_ultra_id")
@@ -334,14 +349,11 @@ async def to_code(config):
     for entry in config[CONF_LIGHTS]:
         hold = int(entry[CONF_STANDBY_AFTER].total_milliseconds) if CONF_STANDBY_AFTER in entry else 0
         cg.add(var.add_light(await cg.get_variable(entry[CONF_ID]), hold))
-    # the partitions of its strips and the strips under its partitions: the same pixels
-    for lid, hold in _related_lights(CORE.config, config[CONF_LIGHTS]).items():
-        light_conf = _light_confs(CORE.config)[lid]
-        cg.add(
-            var.add_light(
-                await cg.get_variable(light_conf[CONF_ID]), int(hold.total_milliseconds) if hold else 0
-            )
-        )
+    # the partitions of its strips and the strips under its partitions, at any depth: the same pixels
+    default_ms = int(config[CONF_STANDBY_AFTER].total_milliseconds)
+    confs = _light_confs(CORE.config)
+    for lid, hold in sorted(_related_lights(CORE.config, config[CONF_LIGHTS], default_ms).items()):
+        cg.add(var.add_light(await cg.get_variable(confs[lid][CONF_ID]), 0 if hold == default_ms else hold))
     if conf := config.get(CONF_STATUS):
         cg.add(var.set_status_sensor(await text_sensor.new_text_sensor(conf)))
     if conf := config.get(CONF_PROBLEM):

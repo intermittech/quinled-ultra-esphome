@@ -84,6 +84,7 @@ jobs:
           - ultra/ultra-p4-telemetry.yaml
           - ultra/ultra-diffpower.yaml
           - ultra/ultra-p4-parlio.yaml
+          - ultra/ultra-p4-parlio-lights.yaml
           - examples-local/quinled-dig2analog-ultra-rgbcct.yaml
           - examples-local/quinled-dig2analog-ultra-downlights.yaml
           - examples-local/quinled-dig2analog-ultra-candle-niche.yaml

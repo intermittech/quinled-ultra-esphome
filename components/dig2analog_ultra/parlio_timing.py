@@ -7,6 +7,9 @@ on it (their timing on that grid, so their frames' TIME is the stream's). ultra_
 - The rounded times must stay inside the protocol's Physical Layer limits.
 - A frame starts on a group (8 bits); the quiet after it (the reset) is rounded up to whole groups.
 - The stream is cut into chunks of whole groups (two DMA buffers), each a multiple of 128 bytes (DMA / cache lines).
+- A chunk must be handed to the DMA a margin before the one playing ends: the DMA's look-ahead (its last descriptors,
+  up to 4095 bytes each, two of them) and the timer's latency. A chunk is long enough to leave the render its time
+  after that (buffer_time auto: at least 1 ms).
 """
 
 PARLIO_CLOCK_HZ = 160_000_000
@@ -16,6 +19,10 @@ T1H_LIMITS = (580, 2000)
 TL_LIMITS = (450, 10000)
 RESET_MIN_NS = 280_000
 BUFFER_ALIGN = 128
+DMA_NODE_BYTES = 4095        # the driver's largest DMA descriptor (PARLIO_DMA_DESCRIPTOR_BUFFER_MAX_SIZE)
+HANDOVER_SLACK_NS = 50_000   # the timer's interrupt and the driver's own work around a handover
+RENDER_BUDGET_NS = 400_000   # what a chunk leaves the render task after the margin, at least
+AUTO_BUFFER_NS = 1_000_000
 
 
 def rate_ok(rate_hz: int) -> bool:
@@ -32,9 +39,16 @@ def lane_samples(timing: tuple, sample_ns: int) -> tuple:
     return tuple(to_samples(t, sample_ns) for t in timing)
 
 
-def layout(rate_hz: int, lane_count: int, lanes: dict, buffer_ns: int) -> dict:
-    """lanes: {lane: (bit0_high, bit0_low, bit1_high, bit1_low, reset) in ns}. The bus' layout and each lane's timing
-    on it; 'errors': what breaks the Physical Layer (empty when it fits)."""
+def margin_ns(rate_hz: int, width: int) -> int:
+    """How long before the playing chunk ends the next one must be with the DMA: two descriptors' worth of samples."""
+    bytes_per_s = rate_hz * width // 8
+    return 2 * DMA_NODE_BYTES * 1_000_000_000 // bytes_per_s + HANDOVER_SLACK_NS
+
+
+def layout(rate_hz: int, lane_count: int, lanes: dict, buffer_ns) -> dict:
+    """lanes: {lane: (bit0_high, bit0_low, bit1_high, bit1_low, reset) in ns}; buffer_ns: a chunk's time, None = auto.
+    The bus' layout and each lane's timing on it; 'errors': what breaks the Physical Layer or the handover (empty
+    when it fits)."""
     sample_ns = 1_000_000_000 // rate_hz
     errors = []
     highs, period = {}, 0
@@ -66,10 +80,19 @@ def layout(rate_hz: int, lane_count: int, lanes: dict, buffer_ns: int) -> dict:
     out["grid"] = 1 if same and h == (5, 14) and period == 27 else 2 if same and h == (3, 7) and period == 14 else 0
     group_ns = 8 * period * sample_ns
     group_bytes = 8 * period * width // 8
+    margin = margin_ns(rate_hz, width)
+    least = margin + RENDER_BUDGET_NS
+    if buffer_ns is None:
+        buffer_ns = max(AUTO_BUFFER_NS, least)
+    elif buffer_ns < least:
+        errors.append(f"buffer_time {buffer_ns / 1000:g} us is too short at {rate_hz / 1e6:g} MHz with {width}-bit samples: "
+                      f"a buffer must be with the DMA {margin / 1000:g} us before the one playing ends, and leave the "
+                      f"render {RENDER_BUDGET_NS / 1000:g} us; at least {-(-least // 1000)} us")
     groups = max(1, -(-buffer_ns // group_ns))
     while (groups * group_bytes) % BUFFER_ALIGN:
         groups += 1
-    out.update(group_ns=group_ns, chunk_groups=groups, chunk_bytes=groups * group_bytes, chunk_ns=groups * group_ns)
+    out.update(group_ns=group_ns, chunk_groups=groups, chunk_bytes=groups * group_bytes, chunk_ns=groups * group_ns,
+               margin_ns=margin)
     for lane, (h0, h1) in highs.items():
         reset = lanes[lane][4]
         reset_groups = -(-reset // group_ns)

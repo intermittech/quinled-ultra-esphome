@@ -9,7 +9,9 @@
 //  - ParlioClock: where the stream is (a group's start on the host clock, the chunk the renderer takes frames for);
 //  - ParlioLane: a hub's mailbox (one frame at a time, its start reserved ahead of the renderer) and the renderer's
 //    copy of the frame on the wire;
-//  - ParlioRenderer: one chunk of samples from the lanes' frames, bit-sliced (a byte of every lane per group).
+//  - ParlioRenderer: one chunk of samples from the lanes' frames, bit-sliced (a byte of every lane per group);
+//  - ParlioStream: what the bus does with them: the chunks in turn, the direction pins' releases, and the render
+//    deadline that kills the stream before the DMA could play a buffer twice.
 
 #include <algorithm>
 #include <atomic>
@@ -60,8 +62,8 @@ class ParlioClock {
  public:
   struct State {
     int64_t next_chunk{0};  // the renderer takes the lanes' frames for this chunk next (earlier chunks are fixed)
-    int64_t t0_ns{0};       // the host time of group 0's first sample (ns); a slip moves it
-    uint32_t epoch{0};      // +1 at every slip: frames reserved before it are refused
+    int64_t t0_ns{0};       // the host time of group 0's first sample (ns): chunk k plays from t0 + k x chunk
+    uint32_t epoch{0};      // +1 at every (re)start: frames reserved before it are refused
     bool running{false};
   };
   void configure(uint32_t sample_ns, uint16_t period, uint32_t chunk_groups) {
@@ -110,25 +112,6 @@ class ParlioClock {
   uint32_t sample_ns_{50}, group_samples_{216}, group_ns_{10800}, chunk_groups_{96};
 };
 
-/// Before the renderer takes frames for chunk s.next_chunk: chunk next_chunk - 1 started at switch_ns (measured at the
-/// buffer switch), and this one is handed to the DMA at ready_ns (now + the render's time). The DMA plays the newest
-/// buffer again while no newer one is there, so the stream slips by whole chunks: measured (the switch came later or
-/// earlier than the clock said: a repeat before it, or a slip foreseen that didn't happen) and foreseen (this chunk
-/// comes after next_chunk - 1's end: that one plays again). The clock moves by them, and its epoch changes: frames
-/// reserved before refuse (their TIME would be off by the slip). Returns the chunks it moved (+ later, - earlier).
-inline int64_t parlio_slip(ParlioClock::State &s, uint64_t chunk_ns, int64_t switch_ns, int64_t ready_ns) {
-  const int64_t c = static_cast<int64_t>(chunk_ns);
-  const int64_t expected = s.t0_ns + (s.next_chunk - 1) * c;
-  const int64_t measured = ParlioClock::floor_div_(switch_ns - expected + c / 2, c);
-  const int64_t foreseen = ready_ns > switch_ns ? (ready_ns - switch_ns) / c : 0;
-  const int64_t k = measured + foreseen;
-  if (k != 0) {
-    s.t0_ns += k * c;
-    s.epoch++;
-  }
-  return k;
-}
-
 /// One data line of the bus. The hub posts one frame at a time, at a start it reserved from the stream's clock
 /// (after the lane's last frame and its quiet, and a chunk ahead of the renderer); the renderer copies it when it
 /// reaches the chunk it starts in, and the hub may build the next one.
@@ -158,16 +141,23 @@ class ParlioLane {
   }
   /// the stream runs and the lane has its copy buffer
   bool ready() const { return this->copy_ && this->clock_ != nullptr && this->clock_->read().running; }
-  /// A posted frame still waits for the renderer. A frame it refused (the stream slipped, or its start passed) is
-  /// counted and forgotten: like a frame lost on the wire.
+  /// A posted frame still waits for the renderer. A frame it refused (the stream restarted, or its start passed) is
+  /// counted and forgotten, like a frame lost on the wire; take_refused() tells whether the last one was.
   bool busy() {
     const uint8_t s = this->state_.load(std::memory_order_acquire);
     if (s == REFUSED) {
       this->refused_++;
+      this->last_refused_ = true;
       this->state_.store(FREE, std::memory_order_relaxed);
       return false;
     }
     return s == POSTED;
+  }
+  /// The last posted frame was refused (after busy() returned false): it never went out.
+  bool take_refused() {
+    const bool r = this->last_refused_;
+    this->last_refused_ = false;
+    return r;
   }
   /// The host time (us) the next frame starts at: after the lane's last frame and its quiet, and a chunk beyond the
   /// one the renderer takes frames for next (so a post() within a chunk's time is never late).
@@ -176,6 +166,7 @@ class ParlioLane {
     const int64_t horizon = (c.next_chunk + 1) * static_cast<int64_t>(this->clock_->chunk_groups());
     this->start_ = this->free_ > horizon ? this->free_ : horizon;
     this->epoch_ = c.epoch;
+    this->clock_state_ = c;
     return this->clock_->group_us(c, this->start_);
   }
   /// The frame built for reserve_us()'s start, then quiet_us of low (at least a group); release: the direction pin
@@ -194,9 +185,13 @@ class ParlioLane {
       this->p_quiet_ = 1;
     this->p_release_ = release;
     this->p_epoch_ = this->epoch_;
+    this->last_refused_ = false;
+    this->end_us_ = this->clock_->group_us(this->clock_state_, this->start_ + static_cast<int64_t>(bytes) + this->p_quiet_);
     this->state_.store(POSTED, std::memory_order_release);
     return true;
   }
+  /// When the last posted frame and its quiet are over on the wire (host us; a restart ends them sooner).
+  int64_t end_us() const { return this->end_us_; }
   /// How far ahead of now a frame starts at most: the chunk on the wire, the one rendered after it, the margin chunk,
   /// and a group.
   uint32_t lead_us() const {
@@ -205,22 +200,28 @@ class ParlioLane {
   }
   /// the start group reserve_us() chose (tests, diagnostics)
   int64_t reserved_group() const { return this->start_; }
+  /// frames refused before they went out, and frames a restart cut on the wire (the boards drop those)
   uint32_t refused() const { return this->refused_; }
+  uint32_t lost() const { return this->lost_; }
 
-  // ---- the bus' timer (an interrupt): the RW frame's last bit is out, the hub lets go of the line
-  void release_now() const {
+  // ---- the bus' timer (an interrupt, also with the cache off): the RW frame's last bit is out, the hub lets go
+  ULTRA_ALWAYS_INLINE void release_now() const {
     if (this->release_fn_ != nullptr)
       this->release_fn_(this->release_arg_);
   }
 
  protected:
   friend class ParlioRenderer;
+  friend class ParlioStream;
   ParlioClock *clock_{nullptr};
   uint8_t index_{0};
   // the hub's
   int64_t start_{0};
   uint32_t epoch_{0};
+  ParlioClock::State clock_state_{};   // as reserve_us() read it
+  int64_t end_us_{0};
   uint32_t refused_{0};
+  bool last_refused_{false};
   size_t max_bytes_{0};
   // posted (the hub writes them, then POSTED; the renderer reads them after it)
   std::atomic<uint8_t> state_{FREE};
@@ -235,6 +236,7 @@ class ParlioLane {
   std::unique_ptr<uint8_t[]> copy_;
   int64_t cur_start_{0};       // the frame on the wire (copy_): its first group, its length
   uint32_t cur_bytes_{0};
+  uint32_t lost_{0};           // frames a restart cut
   ReleaseFn release_fn_{nullptr};
   void *release_arg_{nullptr};
 };
@@ -568,6 +570,157 @@ class ParlioRenderer {
   std::unique_ptr<uint8_t[]> dirty_[2];   // per DMA buffer: the groups that carried a frame when last rendered
   Release release_[PARLIO_MAX_LANES]{};
   uint8_t releases_{0};
+};
+
+/// The stream as the bus (ultra_parlio_bus.cpp) drives it, and the tests: the clock, the renderer, the lanes, the
+/// direction pins' releases and the render deadline.
+///  - The DMA plays the newest buffer handed over, again and again while no newer one is there. A buffer played twice
+///    would splice its slots into the frames on the wire: whole slots, valid, for the wrong boards. So the chunk after
+///    the one playing must be handed over a margin before that one ends (its last DMA descriptors), and the timer
+///    checks it: at that deadline a late chunk kills the stream before any repeat (the bus drives the pins to their
+///    idle level: every frame on the wire is cut, and the boards drop a cut frame). The task then restarts it: idle
+///    chunks first, every frame on the wire dropped, every reservation refused (a new epoch).
+///  - No time is taken from an interrupt's timestamp: chunk k plays from t0 + k x chunk, exactly, from a (re)start
+///    until a kill. A direction pin's release is set when its RW frame's chunk is handed over and never moves; a kill
+///    cancels the releases of the frames it cuts.
+/// The task's calls and the timer's (an interrupt that also runs with the cache off) share the releases and the
+/// deadline: the bus calls handed_over(), next_alarm_us() and alarm() under its lock.
+class ParlioStream {
+ public:
+  bool init(const ParlioLaneTiming *timing, uint8_t lanes, uint16_t invert, uint32_t sample_ns, uint8_t width,
+            uint16_t period, uint32_t chunk_groups, uint32_t margin_ns) {
+    this->clock_.configure(sample_ns, period, chunk_groups);
+    for (uint8_t k = 0; k < PARLIO_MAX_LANES; k++)
+      this->lanes_[k].attach(&this->clock_, k);
+    this->margin_ns_ = margin_ns;
+    return this->r_.init(width, period, chunk_groups, timing, lanes, invert);
+  }
+  ParlioClock &clock() { return this->clock_; }
+  ULTRA_ALWAYS_INLINE ParlioLane *lane(uint8_t k) { return &this->lanes_[k < PARLIO_MAX_LANES ? k : 0]; }
+  const ParlioRenderer &renderer() const { return this->r_; }
+  size_t chunk_bytes() const { return this->r_.chunk_bytes(); }
+  uint64_t chunk_ns() const { return this->clock_.chunk_ns(); }
+  /// a DMA buffer at the idle level, before it is first played (also at a restart)
+  void clear(void *buf, uint8_t buffer) { this->r_.clear(buf, buffer); }
+
+  // ---- the task
+  /// The stream (re)starts: chunk `first` (idle) began at t_ns; first + 1 (idle) is handed over as well.
+  void start(int64_t first, int64_t t_ns) {
+    this->st_.t0_ns = t_ns - first * static_cast<int64_t>(this->chunk_ns());
+    this->st_.next_chunk = first + 2;
+    this->st_.epoch++;
+    this->st_.running = true;
+    this->clock_.write(this->st_);
+    for (int64_t &at : this->release_us_)
+      at = 0;
+    this->deadline_us_ = this->deadline_of_(first + 2);
+    this->killed_.store(false, std::memory_order_release);
+  }
+  /// the chunk the next render() renders (a restart's first chunk)
+  int64_t next_chunk() const { return this->st_.next_chunk; }
+  /// At a buffer switch: the chunk after the one that just started, into bufs[chunk & 1]. Returns its index.
+  int64_t render(void *const *bufs) {
+    const int64_t c = this->st_.next_chunk;
+    this->st_.next_chunk = c + 1;
+    this->clock_.write(this->st_);   // hubs reserve from the chunk after it on
+    ParlioLane *ls[PARLIO_MAX_LANES];
+    for (uint8_t k = 0; k < PARLIO_MAX_LANES; k++)
+      ls[k] = &this->lanes_[k];
+    this->r_.render(c, static_cast<uint8_t>(c & 1), bufs[c & 1], ls, &this->clock_, this->st_);
+    // its releases in us, here (no division in the interrupt)
+    this->pending_ = this->r_.releases();
+    for (uint8_t i = 0; i < this->pending_; i++)
+      this->pending_at_[i] = Pending{this->r_.release(i).lane, (this->r_.release(i).at_ns + 999) / 1000};
+    return c;
+  }
+  /// (under the bus' lock) chunk c is with the DMA: its releases armed, the deadline the next chunk's
+  void handed_over(int64_t c) {
+    for (uint8_t i = 0; i < this->pending_; i++)
+      this->release_us_[this->pending_at_[i].lane] = this->pending_at_[i].at_us;
+    this->pending_ = 0;
+    this->deadline_us_ = this->deadline_of_(c + 1);
+  }
+  /// After a kill: the frames on the wire dropped (each lane counts them), the renderer forgets them; the bus then
+  /// clears both buffers, restarts the DMA and calls start() (a new epoch: every reservation refused).
+  void drop_all() {
+    for (ParlioLane &l : this->lanes_) {
+      if (l.cur_bytes_ != 0)
+        l.lost_++;
+      l.cur_bytes_ = 0;
+    }
+    this->pending_ = 0;
+    this->st_.running = false;
+    this->clock_.write(this->st_);
+  }
+  bool killed() const { return this->killed_.load(std::memory_order_acquire); }
+  /// (under the bus' lock) kill at once (the bus found its buffers out of step): the releases cancelled
+  void kill() {
+    for (int64_t &at : this->release_us_)
+      at = 0;
+    this->deadline_us_ = 0;
+    this->kills_++;
+    this->killed_.store(true, std::memory_order_release);
+  }
+  uint32_t kills() const { return this->kills_; }
+  int64_t deadline_us() const { return this->deadline_us_; }
+
+  // ---- the timer (under the bus' lock; an interrupt that also runs with the cache off: inline, no division)
+  /// the next alarm (host us): the earliest release, or the deadline; 0 = none
+  ULTRA_ALWAYS_INLINE int64_t next_alarm_us() const {
+    int64_t first = this->deadline_us_;
+    for (int64_t at : this->release_us_) {
+      if (at != 0 && (first == 0 || at < first))
+        first = at;
+    }
+    return first;
+  }
+  /// At now_us: the lanes whose RW frame ended (the bus releases their direction pins). *kill: the deadline passed
+  /// without the next chunk: the stream is dead (the bus drives the pins to their idle level at once); the releases
+  /// of frames that end after the deadline are cancelled (those frames are cut).
+  ULTRA_ALWAYS_INLINE uint16_t alarm(int64_t now_us, bool *kill) {
+    const bool late = this->deadline_us_ != 0 && now_us >= this->deadline_us_;
+    uint16_t mask = 0;
+    for (uint8_t k = 0; k < PARLIO_MAX_LANES; k++) {
+      const int64_t at = this->release_us_[k];
+      if (at == 0)
+        continue;
+      if (at <= now_us + 1 && (!late || at <= this->deadline_us_)) {
+        mask |= static_cast<uint16_t>(1u << k);
+        this->release_us_[k] = 0;
+      } else if (late) {
+        this->release_us_[k] = 0;
+      }
+    }
+    *kill = late;
+    if (late) {
+      this->deadline_us_ = 0;
+      this->kills_++;
+      this->killed_.store(true, std::memory_order_release);
+    }
+    return mask;
+  }
+
+ protected:
+  /// chunk k must be with the DMA a margin before chunk k - 1 ends (host us, rounded down)
+  int64_t deadline_of_(int64_t k) const {
+    return ParlioClock::floor_div_(this->st_.t0_ns + k * static_cast<int64_t>(this->chunk_ns()) -
+                                       static_cast<int64_t>(this->margin_ns_), 1000);
+  }
+  struct Pending {
+    uint8_t lane;
+    int64_t at_us;
+  };
+  ParlioClock clock_;
+  ParlioClock::State st_{};   // the task's copy (it is the only writer)
+  ParlioLane lanes_[PARLIO_MAX_LANES];
+  ParlioRenderer r_;
+  uint32_t margin_ns_{0};
+  Pending pending_at_[PARLIO_MAX_LANES]{};
+  uint8_t pending_{0};
+  int64_t release_us_[PARLIO_MAX_LANES]{};   // host us, 0 = none
+  int64_t deadline_us_{0};                   // the next chunk not with the DMA by then: kill; 0 = none
+  std::atomic<bool> killed_{false};
+  uint32_t kills_{0};
 };
 
 }  // namespace esphome::dig2analog_ultra

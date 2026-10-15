@@ -1,20 +1,25 @@
 // Host test of the PARLIO lanes (dig2analog_ultra_parlio on an ESP32-P4: ultra_parlio.h) and of the telemetry
-// coordinator for lines sharing a UART. The bus' DMA, render task and timer are modelled the way
-// components/dig2analog_ultra_parlio/ultra_parlio_bus.cpp drives them (chunk after chunk; at each buffer switch the
-// chunk after the one that just started is rendered; a timer drops the direction pins); the hub's own loop(),
-// transmit_() and window code are cut unchanged from dig2analog_ultra.cpp by tests/run_ultra_parlio_test.py.
+// turn-taking for lines sharing a UART. The bus' DMA, render task and timer are modelled the way
+// components/dig2analog_ultra_parlio/ultra_parlio_bus.cpp drives ParlioStream (the DMA plays the newest buffer handed
+// over in time, the same one again when none came, nothing once the timer killed the stream); the hub's own loop(),
+// transmit_(), window, start and update code are cut unchanged from dig2analog_ultra.cpp by
+// tests/run_ultra_parlio_test.py.
 //  1. waveform: every lane, sample for sample, is what the RMT encoder (encode_symbols) sends with the lane's timing
-//     on the sample grid (16 and 8-bit samples, 20 and 10 MHz, an inverted lane, lanes with their own high times);
-//     the lanes independent of each other; the rounding within the Physical Layer;
+//     on the sample grid (16 and 8-bit samples, 20 and 10 MHz, inverted lanes, lanes with their own high times); the
+//     lanes independent of each other; the rounding within the Physical Layer;
 //  2. TIME: every frame's header TIME is its last falling edge on the stream, on every lane;
 //  3. windows: an RW frame's lane stays quiet for its window while the others send; the direction pin drops within
 //     10 us after the RW frame's last bit, never before it;
-//  4. slips: the render late, a chunk played twice: the clock moves with it, the frames reserved before refused, the
-//     frames after it stamped right;
-//  5. 16 lanes on the hub's own code, 4 UARTs shared by 4 lanes each: windows of one UART never overlap, windows of
-//     different UARTs do, every receiver answers with its own data, a silent lane leaves the others answering;
-//  6. RMT lines sharing a UART (the same coordinator);
-//  7. a firmware update session on a lane: every page pause on the wire.
+//  4. a late render: the stream is killed before the DMA could play a buffer twice; every frame with a valid header on
+//     the wire is exactly a frame a hub posted, once, with its real TIME (a repeat would splice valid slots into the
+//     wrong boards' positions); the stream restarts and frames flow again;
+//  5. a late switch interrupt changes nothing; a kill cancels the releases of the frames it cuts, never moves one;
+//  6. 16 lanes on the hub's own code, 4 UARTs shared by 4 lanes each (also through a kill): windows of one UART never
+//     overlap, windows of different UARTs do, every receiver answers with its own data, a silent lane leaves the
+//     others answering; RMT lines sharing a UART; a busy line can't starve the others; a poll that failed to go out
+//     doesn't keep the UART through an update; a group start on a lane with long buffers covers its command cadence;
+//  7. a firmware update session on a lane: every page pause on the wire, expired reservations, refused frames, a
+//     stalled stream with and without an abort, the last frame out before it returns.
 // Build: python tests/run_ultra_parlio_test.py (also its negative controls and the render benchmark)
 
 #include "../components/dig2analog_ultra/ultra_core.h"
@@ -23,14 +28,18 @@
 #include "../components/dig2analog_ultra/update_session.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <functional>
 #include <map>
+#include <new>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -62,8 +71,13 @@ static void set_clock(int64_t us) {
   clock_us = us;
   now_ms = static_cast<uint32_t>(us / 1000);
 }
+/// a fresh object in place (the stream and the hubs hold atomics: not assignable)
+template<typename T> static void renew(T &x) {
+  x.~T();
+  new (&x) T();
+}
 
-// ================================================================================================ the bus, modelled
+// ================================================================================================ the grid
 /// A lane's timing in ns (the hub's YAML) and on the grid.
 struct Grid {
   uint32_t sample_ns;
@@ -83,84 +97,156 @@ static Grid grid(uint32_t sample_ns, const std::vector<std::array<uint32_t, 4>> 
   }
   return g;
 }
+static Grid default_grid(uint8_t lanes, uint32_t sample_ns = 50) {
+  return grid(sample_ns, std::vector<std::array<uint32_t, 4>>(lanes, std::array<uint32_t, 4>{250, 1050, 700, 650}));
+}
+/// as parlio_timing.py margin_ns(): two DMA descriptors' worth of samples and the slack
+static uint32_t margin_ns(uint32_t sample_ns, uint8_t width) {
+  return static_cast<uint32_t>(2ull * 4095 * 8 * sample_ns / width + 50000);
+}
 
-/// The bus as ultra_parlio_bus.cpp drives it: chunk c plays from t0 + c x chunk; at each switch (chunk k starts) the
-/// chunk after it is rendered into the buffer just freed. wire: every sample played, in order.
+// ================================================================================================ the bus, modelled
+/// The bus as ultra_parlio_bus.cpp drives ParlioStream (times in host ns):
+///  - the DMA plays chunk after chunk; at each boundary it takes the newest buffer handed over by the stream's margin
+///    before it (its last descriptors), else it plays the same buffer again (loop transmission) - unless the timer
+///    killed the stream: then the pins are idle;
+///  - at each buffer switch the switch interrupt (isr_ns late) wakes the task, which renders the next chunk and hands
+///    it over task_ns later; late(k) delays it further at the switch to chunk k;
+///  - the timer: at the stream's next alarm (+ timer_ns): the releases, the deadline; after a kill the task restarts
+///    the stream restart_ns later.
+/// wire: the pins, sample by sample (sample s at wire_t0 + s x sample).
 struct Stream {
-  ParlioClock clock;
-  ParlioLane lanes[PARLIO_MAX_LANES];
-  ParlioRenderer r;
-  ParlioClock::State st;
+  ParlioStream s;
   uint8_t width{16};
-  uint16_t period{27};
   uint16_t invert{0};
   uint32_t sample_ns{50};
+  uint32_t margin{0};
   std::vector<uint8_t> buf[2];
   std::vector<uint16_t> wire;
-  std::vector<ParlioRenderer::Release> releases;
-  int64_t t0_ns{0};      // the stream's real start (the wire's sample 0)
-  uint64_t rendered{0};  // chunks rendered
+  int64_t wire_t0{0};
+  int64_t isr_ns{2000}, task_ns{50000}, timer_ns{2000}, restart_ns{300000};
+  std::function<int64_t(int64_t)> late;
+  struct Fired {
+    uint8_t lane;
+    int64_t at;
+  };
+  std::vector<Fired> fired;   // the releases, when the timer dropped a pin
+  int64_t replays{0}, restarts{0};
+  // state
+  int64_t T{0};            // the chunk on the wire started
+  int64_t on_wire{0};      // its index (its buffer: on_wire & 1)
+  int64_t handed{0}, handed_at{0};
+  bool need_render{false}, need_hand{false}, dead{false};
+  int64_t render_at{0}, hand_at{0}, rendered{0}, cut{0}, last_event{0};
 
   bool init(const Grid &g, uint8_t w, uint32_t chunk_groups, uint8_t lanes_used, uint16_t inv, int64_t start_ns) {
     this->sample_ns = g.sample_ns;
-    this->period = g.period;
     this->width = w;
     this->invert = inv;
-    this->clock.configure(g.sample_ns, g.period, chunk_groups);
-    for (uint8_t k = 0; k < PARLIO_MAX_LANES; k++)
-      this->lanes[k].attach(&this->clock, k);
-    if (!this->r.init(w, g.period, chunk_groups, g.lane, lanes_used, inv))
+    this->margin = margin_ns(g.sample_ns, w);
+    if (!this->s.init(g.lane, lanes_used, inv, g.sample_ns, w, g.period, chunk_groups, this->margin))
       return false;
-    for (int i = 0; i < 2; i++) {
-      this->buf[i].assign(this->r.chunk_bytes(), 0xEE);
-      this->r.clear(this->buf[i].data(), static_cast<uint8_t>(i));
-    }
+    for (auto &b : this->buf)
+      b.assign(this->s.chunk_bytes(), 0xEE);
     this->wire.clear();
-    this->releases.clear();
-    this->t0_ns = start_ns;
-    this->st = ParlioClock::State{};
-    this->st.t0_ns = start_ns;
-    this->st.next_chunk = 2;
-    this->st.running = true;
-    this->clock.write(this->st);
-    this->play(0);   // chunk 0 plays (idle), chunk 1 waits (idle)
+    this->fired.clear();
+    this->wire_t0 = start_ns;
+    this->last_event = start_ns;
+    this->start_at(start_ns);
     return true;
   }
-  uint64_t chunk_ns() const { return this->clock.chunk_ns(); }
-  /// the host time a chunk starts (no slips)
-  int64_t chunk_start_ns(int64_t c) const { return this->t0_ns + c * static_cast<int64_t>(this->chunk_ns()); }
-  void play(int64_t c) {
+  int64_t C() const { return static_cast<int64_t>(this->s.chunk_ns()); }
+  size_t chunk_samples() const { return this->s.renderer().chunk_samples(); }
+  int64_t wire_end() const { return this->wire_t0 + static_cast<int64_t>(this->wire.size()) * this->sample_ns; }
+  void start_at(int64_t t) {
+    const int64_t first = this->s.next_chunk();
+    for (int i = 0; i < 2; i++)
+      this->s.clear(this->buf[i].data(), static_cast<uint8_t>(i));
+    this->s.start(first, t);
+    this->T = t;
+    this->on_wire = first;
+    this->handed = first + 1;
+    this->handed_at = t;
+    this->need_render = this->need_hand = this->dead = false;
+  }
+  void append(int64_t c, size_t n) {
     const uint8_t *b = this->buf[c & 1].data();
-    const size_t n = this->r.chunk_samples();
     for (size_t i = 0; i < n; i++)
       this->wire.push_back(this->width == 8 ? b[i] : static_cast<uint16_t>(b[2 * i] | b[2 * i + 1] << 8));
   }
-  /// the render task at a switch: chunk next_chunk - 1 started; ready_ns: when this render hands its chunk over
-  int64_t render(int64_t switch_ns, int64_t ready_ns) {
-    const int64_t moved = parlio_slip(this->st, this->chunk_ns(), switch_ns, ready_ns);
-    const int64_t c = this->st.next_chunk;
-    this->st.next_chunk = c + 1;
-    this->clock.write(this->st);
-    ParlioLane *ls[PARLIO_MAX_LANES];
-    for (uint8_t k = 0; k < PARLIO_MAX_LANES; k++)
-      ls[k] = &this->lanes[k];
-    this->r.render(c, static_cast<uint8_t>(c & 1), this->buf[c & 1].data(), ls, &this->clock, this->st);
-    for (uint8_t i = 0; i < this->r.releases(); i++)
-      this->releases.push_back(this->r.release(i));
-    this->rendered++;
-    return moved;
+  void idle_until(int64_t t) {
+    while (this->wire_end() < t)
+      this->wire.push_back(this->invert);
   }
-  /// the next switch on time: the chunk that waited starts, the one after it is rendered
-  void step() {
-    const int64_t k = this->st.next_chunk - 1;
-    this->play(k);
-    const int64_t sw = this->st.t0_ns + k * static_cast<int64_t>(this->chunk_ns());
-    this->render(sw, sw + 50000);
+  /// every event up to t_ns
+  void run_until(int64_t t_ns) {
+    const int64_t INF = INT64_MAX;
+    for (;;) {
+      const int64_t e_render = !this->dead && this->need_render ? this->render_at : INF;
+      const int64_t e_hand = !this->dead && this->need_hand ? this->hand_at : INF;
+      const int64_t alarm = this->s.next_alarm_us();
+      const int64_t e_alarm = alarm != 0 ? std::max(alarm * 1000 + this->timer_ns, this->last_event) : INF;
+      const int64_t e_end = this->dead ? INF : this->T + this->C();
+      const int64_t e_restart = this->dead ? this->cut + this->restart_ns : INF;
+      const int64_t e = std::min({e_render, e_hand, e_alarm, e_end, e_restart});
+      if (e == INF || e > t_ns)
+        break;
+      this->last_event = e;
+      set_clock(e / 1000);   // (the hubs' release callbacks read it)
+      if (e == e_render) {
+        void *bufs[2] = {this->buf[0].data(), this->buf[1].data()};
+        this->rendered = this->s.render(bufs);
+        this->need_render = false;
+        this->need_hand = true;
+        this->hand_at = e + this->task_ns;
+      } else if (e == e_hand) {
+        this->need_hand = false;
+        if (!this->s.killed()) {   // (the bus: under its lock, after the transmit)
+          this->s.handed_over(this->rendered);
+          this->handed = this->rendered;
+          this->handed_at = e;
+        }
+      } else if (e == e_alarm) {
+        bool kill = false;
+        const uint16_t mask = this->s.alarm(e / 1000, &kill);
+        for (uint8_t k = 0; k < PARLIO_MAX_LANES; k++) {
+          if (mask & (1u << k)) {
+            this->s.lane(k)->release_now();
+            this->fired.push_back(Fired{k, e});
+          }
+        }
+        if (kill && !this->dead) {   // the pins to their idle level now: the chunk on the wire is cut here
+          this->dead = true;
+          this->cut = e;
+          this->append(this->on_wire, static_cast<size_t>((e - this->T) / this->sample_ns));
+        }
+      } else if (e == e_end) {
+        this->append(this->on_wire, this->chunk_samples());
+        // the DMA moves on to the newest buffer, if it came in time; else it plays the same one again
+        if (this->handed > this->on_wire && this->handed_at <= this->T + this->C() - this->margin) {
+          this->on_wire = this->handed;
+          this->need_render = true;
+          const int64_t extra = this->late ? this->late(this->on_wire) : 0;
+          this->render_at = this->T + this->C() + this->isr_ns + extra;
+        } else {
+          this->replays++;
+        }
+        this->T += this->C();
+      } else {   // the task restarts the stream
+        this->idle_until(e);
+        this->s.drop_all();
+        this->restarts++;
+        this->start_at(this->wire_end());
+      }
+    }
   }
+  /// up to the end of the chunk on the wire (or the restart after a kill)
+  void step() { this->run_until(this->dead ? this->cut + this->restart_ns : this->T + this->C()); }
   /// a lane's level at a sample (its idle level 0)
   uint8_t level(uint8_t lane, size_t s) const {
     return static_cast<uint8_t>(((this->wire[s] ^ this->invert) >> lane) & 1u);
   }
+  int64_t time_of(int64_t sample) const { return this->wire_t0 + sample * this->sample_ns; }
 };
 
 /// A test symbol for the RMT encoder (the same fields as rmt_symbol_word_t).
@@ -196,7 +282,63 @@ struct Posted {
   uint32_t quiet;  // groups
   uint32_t time_us;     // its header TIME (Ultra frames), else 0
   int64_t time_full;    // as build_frame returned it
+  bool release{false};
+  bool refused{false};
 };
+
+/// The decoder of one lane's wire, as a board's input sees it: high pulses are bits (>= 472 ns a '1'), a low of 50 us
+/// ends the frame (its last falling edge: t0).
+struct Decoder {
+  struct Frame {
+    int64_t start, t0;   // its first rising and last falling edge (samples)
+    std::vector<uint8_t> bytes;
+  };
+  int64_t rise{-1}, fall{-1}, start{-1};
+  std::vector<uint8_t> bits;
+  std::vector<Frame> frames;
+  void edge(bool up, int64_t s, uint32_t sample_ns) {
+    if (up) {
+      this->rise = s;
+      if (this->bits.empty())
+        this->start = s;
+    } else if (this->rise >= 0) {
+      this->bits.push_back((s - this->rise) * sample_ns >= 472 ? 1 : 0);
+      this->fall = s;
+    }
+  }
+  /// the frame is over once the line stayed low 50 us
+  bool end(int64_t s, uint32_t sample_ns) {
+    if (this->bits.empty() || this->fall < 0 || (s - this->fall) * sample_ns < 50000)
+      return false;
+    std::vector<uint8_t> bytes(this->bits.size() / 8, 0);
+    for (size_t i = 0; i + 8 <= this->bits.size(); i += 8) {
+      for (int j = 0; j < 8; j++)
+        bytes[i / 8] = static_cast<uint8_t>(bytes[i / 8] << 1 | this->bits[i + j]);
+    }
+    this->frames.push_back(Frame{this->start, this->fall, bytes});
+    this->bits.clear();
+    return true;
+  }
+  /// every frame of a lane of the whole wire
+  static Decoder of(const Stream &s, uint8_t lane) {
+    Decoder d;
+    for (size_t i = 1; i < s.wire.size(); i++) {
+      if (((s.wire[i] ^ s.wire[i - 1]) >> lane) & 1u)
+        d.edge(s.level(lane, i), static_cast<int64_t>(i), s.sample_ns);
+      if (!d.bits.empty())
+        d.end(static_cast<int64_t>(i), s.sample_ns);
+    }
+    d.end(static_cast<int64_t>(s.wire.size()) + 2000000, s.sample_ns);
+    return d;
+  }
+};
+
+/// a frame with a valid Ultra header (what the boards act on)
+static bool valid_ultra(const std::vector<uint8_t> &f) {
+  uint32_t t = 0;
+  return f.size() >= ULTRA_HDR_BYTES + ULTRA_SLOT_BYTES && (f.size() - ULTRA_HDR_BYTES) % ULTRA_SLOT_BYTES == 0 &&
+         ultra_parse_header(f.data() + f.size() - ULTRA_HDR_BYTES, &t) == 0;
+}
 
 // ================================================================================================ 1. waveform
 /// Random frames on every lane, posted as a hub posts them (reserve, build, post once the last one was taken), then
@@ -227,15 +369,15 @@ static void test_waveform() {
     }
     const Grid g = grid(c.sample_ns, ns);
     Stream s;
-    const uint32_t chunk_groups = c.sample_ns == 50 ? 96 : 64;
-    CHECK(s.init(g, c.width, chunk_groups, c.lanes, c.invert, 1000000000) && s.r.grid() == c.grid,
-          "%s: the renderer takes the timing (path %u)", c.name, s.r.grid());
+    const uint32_t chunk_groups = c.sample_ns == 50 ? 96 : (c.width == 8 ? 120 : 92);
+    CHECK(s.init(g, c.width, chunk_groups, c.lanes, c.invert, 1000000000) && s.s.renderer().grid() == c.grid,
+          "%s: the renderer takes the timing (path %u)", c.name, s.s.renderer().grid());
     std::mt19937 rng(7 + c.lanes);
     std::vector<std::vector<Posted>> posted(c.lanes);
     std::vector<std::vector<uint8_t>> frame(c.lanes);
     for (int sw = 0; sw < 300; sw++) {
       for (uint8_t l = 0; l < c.lanes; l++) {
-        ParlioLane &lane = s.lanes[l];
+        ParlioLane &lane = *s.s.lane(l);
         if (!lane.ready())
           lane.begin(400, nullptr, nullptr);
         if (lane.busy() || rng() % 3 == 0)
@@ -246,7 +388,7 @@ static void test_waveform() {
           b = static_cast<uint8_t>(rng());
         const uint32_t quiet_us = 300 + rng() % 400;
         if (lane.post(frame[l].data(), frame[l].size(), quiet_us, false)) {
-          const uint32_t q = static_cast<uint32_t>((quiet_us * 1000ULL + s.clock.group_ns() - 1) / s.clock.group_ns());
+          const uint32_t q = static_cast<uint32_t>((quiet_us * 1000ULL + s.s.clock().group_ns() - 1) / s.s.clock().group_ns());
           posted[l].push_back(Posted{lane.reserved_group(), frame[l], q, 0, 0});
         }
       }
@@ -276,14 +418,15 @@ static void test_waveform() {
         std::printf("  lane %u differs at sample %u (group %u): %u, the RMT encoder %u\n", l, static_cast<unsigned>(bad),
                     static_cast<unsigned>(bad / gs), s.level(l, bad), exp[bad]);
       }
-      CHECK(s.lanes[l].refused() == 0, "%s: lane %u refused nothing (%u)", c.name, l, s.lanes[l].refused());
+      CHECK(s.s.lane(l)->refused() == 0, "%s: lane %u refused nothing (%u)", c.name, l, s.s.lane(l)->refused());
     }
-    CHECK(all && apart && frames > 100, "%s: %u frames, every lane sample for sample the RMT encoder's waveform at the "
-          "lane's grid timing, frames apart by their quiet", c.name, static_cast<unsigned>(frames));
+    CHECK(all && apart && frames > 100 && s.replays == 0 && s.restarts == 0, "%s: %u frames, every lane sample for "
+          "sample the RMT encoder's waveform at the lane's grid timing, frames apart by their quiet", c.name,
+          static_cast<unsigned>(frames));
   }
 
   // one lane's waveform doesn't depend on the others: the same frames on lane 2 among silent and among busy lanes
-  const Grid g = grid(50, std::vector<std::array<uint32_t, 4>>(16, std::array<uint32_t, 4>{250, 1050, 700, 650}));
+  const Grid g = default_grid(16);
   std::vector<uint8_t> lane2[2];
   for (int busy = 0; busy < 2; busy++) {
     Stream s;
@@ -292,7 +435,7 @@ static void test_waveform() {
     std::vector<uint8_t> f(200), other[16];
     for (int sw = 0; sw < 60; sw++) {
       for (uint8_t l = 0; l < 16; l++) {
-        ParlioLane &lane = s.lanes[l];
+        ParlioLane &lane = *s.s.lane(l);
         if (!lane.ready())
           lane.begin(400, nullptr, nullptr);
         if (lane.busy())
@@ -350,7 +493,7 @@ static void test_waveform() {
 /// the frame's last bit, the header's CRC, which the scheduler counts before TIME is in it (a '0' or a '1' low: 450 ns
 /// apart at 20 MHz); RMT lines have the same.
 static void test_time() {
-  const Grid g = grid(50, std::vector<std::array<uint32_t, 4>>(16, std::array<uint32_t, 4>{250, 1050, 700, 650}));
+  const Grid g = default_grid(16);
   Stream s;
   s.init(g, 16, 96, 16, 0, 777777123);   // an odd start: the stream's t0 isn't a whole us
   const uint32_t sample_ns = g.sample_ns, gs = 8u * g.period;
@@ -363,12 +506,12 @@ static void test_time() {
     sched[l].set_bit_timing(g.lane[l].h0 * sample_ns, (g.period - g.lane[l].h0) * sample_ns, g.lane[l].h1 * sample_ns,
                             (g.period - g.lane[l].h1) * sample_ns);
     buf[l].assign(sched[l].frame_bytes(), 0);
-    s.lanes[l].begin(buf[l].size(), nullptr, nullptr);
+    s.s.lane(l)->begin(buf[l].size(), nullptr, nullptr);
   }
   for (int sw = 0; sw < 400; sw++) {
-    set_clock(s.chunk_start_ns(s.st.next_chunk - 1) / 1000 + 100);
+    set_clock(s.T / 1000 + 100);
     for (uint8_t l = 0; l < 16; l++) {
-      ParlioLane &lane = s.lanes[l];
+      ParlioLane &lane = *s.s.lane(l);
       if (lane.busy())
         continue;
       if (sw % 7 == static_cast<int>(l % 7)) {   // commands with start times now and then
@@ -399,8 +542,7 @@ static void test_time() {
       if (last >= s.wire.size())
         continue;
       edges &= s.level(l, last - 1) == 1 && s.level(l, last) == 0;   // it is the frame's last falling edge
-      const int64_t edge_ns = s.t0_ns + static_cast<int64_t>(last) * sample_ns;
-      const int64_t err = p.time_full * 1000 - edge_ns;
+      const int64_t err = p.time_full * 1000 - s.time_of(static_cast<int64_t>(last));
       worst = std::max<int64_t>(worst, err < 0 ? -err : err);
       header &= p.time_us == static_cast<uint32_t>(p.time_full);
       frames++;
@@ -415,12 +557,10 @@ static void test_time() {
 
 // ================================================================================================ 3. windows
 /// Lane 6 sends RW frames (its window and hold-off as its quiet, a direction pin), the other lanes keep sending: the
-/// lane is low for its whole window while the others have edges in it; the timer (1 us, an interrupt 1-3 us late)
-/// drops the direction pin within 10 us after the RW frame's last falling edge, never before it.
-static int64_t release_isr_latency_ns(size_t i) { return 1000 + static_cast<int64_t>(i % 3) * 1000; }
-
+/// lane is low for its whole window while the others have edges in it; the timer (an interrupt 2 us late) drops the
+/// direction pin within 10 us after the RW frame's last falling edge, never before it.
 static void test_windows() {
-  const Grid g = grid(50, std::vector<std::array<uint32_t, 4>>(16, std::array<uint32_t, 4>{250, 1050, 700, 650}));
+  const Grid g = default_grid(16);
   Stream s;
   s.init(g, 16, 96, 16, 0, 5000000123);
   const uint32_t gs = 8u * g.period, sample_ns = g.sample_ns;
@@ -431,10 +571,10 @@ static void test_windows() {
   std::mt19937 rng(3);
   int released = 0;
   for (uint8_t l = 0; l < 16; l++)
-    s.lanes[l].begin(300, [](void *arg) { (*static_cast<int *>(arg))++; }, &released);
+    s.s.lane(l)->begin(300, [](void *arg) { (*static_cast<int *>(arg))++; }, &released);
   for (int sw = 0; sw < 300; sw++) {
     for (uint8_t l = 0; l < 16; l++) {
-      ParlioLane &lane = s.lanes[l];
+      ParlioLane &lane = *s.s.lane(l);
       if (lane.busy())
         continue;
       lane.reserve_us();
@@ -452,9 +592,9 @@ static void test_windows() {
   bool quiet = true, others = true, order = true;
   int64_t worst = 0, least = INT64_MAX;
   size_t windows = 0, other_edges = 0;
-  CHECK(s.releases.size() == rw.size(), "a release per RW frame taken (%u / %u)", static_cast<unsigned>(s.releases.size()),
-        static_cast<unsigned>(rw.size()));
-  for (size_t i = 0; i < rw.size() && i < s.releases.size(); i++) {
+  CHECK(s.fired.size() == static_cast<size_t>(released) && s.fired.size() + 1 >= rw.size() && s.fired.size() <= rw.size(),
+        "a release per RW frame on the wire (%u / %u)", static_cast<unsigned>(s.fired.size()), static_cast<unsigned>(rw.size()));
+  for (size_t i = 0; i < rw.size() && i < s.fired.size(); i++) {
     const Posted &p = rw[i];
     const size_t n = p.bytes.size();
     const size_t last = static_cast<size_t>((p.start + static_cast<int64_t>(n)) * gs - g.period +
@@ -469,13 +609,10 @@ static void test_windows() {
       edges += (s.wire[k] ^ s.wire[k - 1]) != 0;
     others &= edges > 1000;
     other_edges += edges;
-    // the timer: an alarm at the release's us, its interrupt 1-3 us later
-    const ParlioRenderer::Release &r = s.releases[i];
-    order &= r.lane == rw_lane;
-    const int64_t fired_ns = (r.at_ns + 999) / 1000 * 1000 + release_isr_latency_ns(i);
-    const int64_t edge_ns = s.t0_ns + static_cast<int64_t>(last) * sample_ns;
-    worst = std::max(worst, fired_ns - edge_ns);
-    least = std::min(least, fired_ns - edge_ns);
+    order &= s.fired[i].lane == rw_lane;
+    const int64_t d = s.fired[i].at - s.time_of(static_cast<int64_t>(last));
+    worst = std::max(worst, d);
+    least = std::min(least, d);
     windows++;
   }
   CHECK(quiet && others && windows > 20, "%u RW windows: lane 6 low for W + hold-off (%u us) after each, the other 15 "
@@ -486,854 +623,215 @@ static void test_windows() {
               "bit\n", static_cast<unsigned>(windows), least / 1000.0, worst / 1000.0);
 }
 
-// ================================================================================================ 4. slips
-/// The render task late: the DMA plays the chunk it has again. parlio_slip foresees it (or measures it at the next
-/// switch): the clock moves by the repeat, frames reserved before are refused (counted, like a frame lost on the
-/// wire), and the frames after it carry the TIME of their real last edge.
-static void test_slips() {
-  // the rule alone
-  {
-    const uint64_t c = 1000000;
-    ParlioClock::State st{};
-    st.t0_ns = 0;
-    st.next_chunk = 5;   // chunk 4 started at 4 ms
-    CHECK(parlio_slip(st, c, 4000000, 4600000) == 0 && st.t0_ns == 0 && st.epoch == 0, "on time: no slip");
-    CHECK(parlio_slip(st, c, 4000000, 5100000) == 1 && st.t0_ns == 1000000 && st.epoch == 1,
-          "handed over after chunk 4's end: foreseen, one chunk later");
-    st.next_chunk = 6;   // the switch to chunk 5 came on time after all (the render was quicker): back
-    CHECK(parlio_slip(st, c, 5000500, 5300000) == -1 && st.t0_ns == 0 && st.epoch == 2, "the slip didn't happen: back");
-    st.next_chunk = 7;   // a repeat nobody foresaw: chunk 6 started 2 chunks late
-    CHECK(parlio_slip(st, c, 8000300, 8200000) == 2 && st.t0_ns == 2000000 && st.epoch == 3, "measured: 2 chunks later");
-  }
-  // end to end: frames on 4 lanes; at switch 120 the task is 1.3 chunks late
-  const Grid g = grid(50, std::vector<std::array<uint32_t, 4>>(4, std::array<uint32_t, 4>{250, 1050, 700, 650}));
-  Stream s;
-  s.init(g, 8, 96, 4, 0, 1000000000);
-  const uint32_t gs = 8u * g.period, groups = 96;
-  const size_t chunk_samples = s.r.chunk_samples();
-  Scheduler sched[4];
-  std::vector<uint8_t> buf[4];
-  struct Out {
-    int64_t start;
-    size_t bytes;
-    int64_t time;
-    uint8_t last;
-    bool refused;
-  };
-  std::vector<Out> out[4];
-  for (uint8_t l = 0; l < 4; l++) {
-    sched[l].init(static_cast<uint16_t>(4 + l * 5), 3 + l, 3);
-    sched[l].set_bit_timing(250, (g.period - 5) * 50, 700, (g.period - 14) * 50);
-    buf[l].assign(sched[l].frame_bytes(), 0);
-    s.lanes[l].begin(buf[l].size(), nullptr, nullptr);
-  }
-  int64_t repeat = -1;   // the chunk played twice
-  for (int sw = 0; sw < 240; sw++) {
-    for (uint8_t l = 0; l < 4; l++) {
-      ParlioLane &lane = s.lanes[l];
-      const uint32_t r0 = lane.refused();
+// ================================================================================================ 4. a late render
+/// Real Ultra frames on 16 lanes posted as hubs post them (8-board frames that start on chunk boundaries and span three
+/// chunks on 4 lanes; 1-30 boards on the others, RW frames with releases on 4), the render task
+/// late now and then: by less than its margin (nothing happens), by more (the timer kills the stream at the deadline,
+/// before the DMA could play its buffer twice). Every frame on the wire with a valid header must be exactly a frame a
+/// hub posted, once, with its TIME its real last edge: a buffer played twice would splice whole, valid slots into the
+/// frames on the wire, for the wrong boards, or replay a frame with a stale TIME. The stream restarts, frames flow.
+/// Returns the frames decoded valid.
+struct LaneRun {
+  Scheduler sched;
+  std::vector<uint8_t> buf;
+  std::vector<Posted> posted;
+};
+static size_t run_lateness(Stream &s, LaneRun *lr, const Grid &g, int switches, std::function<bool(uint8_t)> rw_lane,
+                           const char *what) {
+  const uint32_t window = ultra_rw_window_us(2, ULTRA_RW_RATE_1M) + ULTRA_RW_HOLDOFF_US;
+  for (int sw = 0; sw < switches; sw++) {
+    set_clock(std::max<int64_t>(clock_us, s.T / 1000 + 100));
+    for (uint8_t l = 0; l < 16; l++) {
+      ParlioLane &lane = *s.s.lane(l);
       const bool busy = lane.busy();
-      if (lane.refused() != r0)
-        out[l].back().refused = true;   // the stream slipped before it was taken: it never went out
-      if (busy)
+      if (!busy && lane.take_refused() && !lr[l].posted.empty())
+        lr[l].posted.back().refused = true;   // it never went out (the stream restarted before)
+      if (busy || !lane.ready())
         continue;
+      const uint16_t m = static_cast<uint16_t>(1000 * (sw % 60)), a[CHANNELS] = {1, 2, 3, 4, 5};
+      const uint16_t b[CHANNELS] = {65535, 65535, 65535, 65535, 65535};
+      for (uint16_t board = 0; board < lr[l].sched.num_boards(); board++)
+        lr[l].sched.light_set(board, 0, 0, static_cast<uint16_t>(m + board), a, b, 300, clock_us + 30000);
       const int64_t start = lane.reserve_us();
-      const int64_t t = sched[l].build_frame(start, buf[l].data());
-      if (lane.post(buf[l].data(), buf[l].size(), 300, false))
-        out[l].push_back(Out{lane.reserved_group(), buf[l].size(), t, buf[l].back(), false});
+      const int64_t t = lr[l].sched.build_frame(start, lr[l].buf.data());
+      const bool rw = rw_lane(l);
+      if (lane.post(lr[l].buf.data(), lr[l].buf.size(), rw ? window : 303, rw))
+        lr[l].posted.push_back(Posted{lane.reserved_group(), lr[l].buf, 0, 0, t, rw});
     }
-    const int64_t k = s.st.next_chunk - 1;
-    const int64_t sw_ns = s.t0_ns + static_cast<int64_t>(s.wire.size()) * 50;   // chunk k starts (real time)
-    s.play(k);
-    if (sw == 120) {
-      s.play(k);   // late: chunk k plays again before the next one is handed over
-      repeat = k;
-      const int64_t moved = s.render(sw_ns, sw_ns + static_cast<int64_t>(s.chunk_ns()) * 13 / 10);
-      CHECK(moved == 1, "the late render foresees one chunk played twice (%lld)", static_cast<long long>(moved));
-    } else {
-      const int64_t moved = s.render(sw_ns, sw_ns + 40000);
-      CHECK(moved == 0, "switch %d: no slip measured (%lld)", sw, static_cast<long long>(moved));
-    }
+    s.step();
   }
-  // every frame's TIME against its last edge on the wire: those after the repeat a chunk later on the wire; those it
-  // cut through are lost (the boards drop them: their slots' CRCs), those refused never went out
+  for (int sw = 0; sw < 8; sw++)
+    s.step();
+  // every decoded frame with a valid header: exactly one posted frame, once, its TIME its last edge
+  size_t valid = 0, matched_twice = 0, unmatched = 0, cut = 0;
   int64_t worst = 0;
-  size_t checked = 0, after = 0, refused = 0, cut = 0;
-  bool edges = true;
-  for (uint8_t l = 0; l < 4; l++) {
-    for (const Out &o : out[l]) {
-      if (o.refused) {
-        refused++;
-        continue;
-      }
-      const int64_t cs = o.start / groups, ce = (o.start + static_cast<int64_t>(o.bytes) - 1) / groups;
-      if (cs <= repeat && repeat < ce) {
+  for (uint8_t l = 0; l < 16; l++) {
+    const Decoder d = Decoder::of(s, l);
+    std::vector<int> seen(lr[l].posted.size(), 0);
+    for (const Decoder::Frame &f : d.frames) {
+      if (!valid_ultra(f.bytes)) {
         cut++;
         continue;
       }
-      const size_t shift = cs > repeat ? chunk_samples : 0;
-      const int64_t last_bit = (o.start + static_cast<int64_t>(o.bytes)) * gs - g.period +
-                               ((o.last & 1) ? g.lane[l].h1 : g.lane[l].h0);
-      const size_t last = static_cast<size_t>(last_bit) + shift;
-      if (last >= s.wire.size())
-        continue;   // not played yet
-      edges &= s.level(l, last - 1) == 1 && s.level(l, last) == 0;
-      const int64_t err = o.time * 1000 - (s.t0_ns + static_cast<int64_t>(last) * 50);
-      worst = std::max<int64_t>(worst, err < 0 ? -err : err);
-      checked++;
-      after += shift != 0;
-    }
-  }
-  CHECK(edges && worst <= 1500 && after > 50 && checked > after + 50, "after a slip: %u frames (%u after it) carry their "
-        "real last edge as TIME (within %lld ns)", static_cast<unsigned>(checked), static_cast<unsigned>(after),
-        static_cast<long long>(worst));
-  CHECK(s.st.epoch == 1 && refused >= 1 && refused <= 4, "one slip, one epoch (%u); the frames reserved before it and "
-        "not taken yet refused (%u)", s.st.epoch, static_cast<unsigned>(refused));
-  std::printf("  slips: a render 1.3 chunks late foreseen, the clock moved a chunk; %u frames refused (reserved before "
-              "it), %u cut by the repeat, TIME right after it\n", static_cast<unsigned>(refused), static_cast<unsigned>(cut));
-}
-
-// ================================================================================================ 5./6. the hub's code
-// The hub's loop(), transmit_(), lane_post_() and window code (build/parlio/hub_*.inc, cut unchanged from
-// dig2analog_ultra.cpp) with telemetry and PARLIO on, around the real Scheduler, TelemetryPoller and the lanes of a
-// modelled bus; RMT lines on a modelled RMT.
-namespace hub_lanes {
-
-#define USE_DIG2ANALOG_ULTRA_TELEMETRY
-#define USE_DIG2ANALOG_ULTRA_PARLIO
-static constexpr int ESP_OK = 0;
-using esp_err_t = int;
-static constexpr esp_err_t ESP_ERR_TIMEOUT = 0x107;
-static constexpr uint32_t BUSY_HOLD_MS = 250;
-typedef struct rmt_channel_t *rmt_channel_handle_t;
-struct rmt_tx_done_event_data_t {
-  size_t num_symbols;
-};
-struct rmt_transmit_config_t {
-  uint32_t loop_count;
-};
-struct rmt_symbol_word_t {
-  uint32_t duration0 : 15;
-  uint32_t level0 : 1;
-  uint32_t duration1 : 15;
-  uint32_t level1 : 1;
-};
-static void delayMicroseconds(uint32_t us) { set_clock(clock_us + us); }
-static const char *esp_err_to_name(esp_err_t) { return "refused"; }
-
-struct Pin {   // a direction or receiver enable pin
-  bool level{false};
-  void setup() {}
-  void digital_write(bool v) { this->level = v; }
-};
-struct IsrPin {
-  Pin *pin{nullptr};
-  void digital_write(bool v) { this->pin->level = v; }
-};
-struct Uart {
-  std::vector<uint8_t> rx;
-  size_t available() const { return this->rx.size(); }
-  bool read_array(uint8_t *d, size_t n) {
-    if (n > this->rx.size())
-      return false;
-    std::memcpy(d, this->rx.data(), n);
-    this->rx.erase(this->rx.begin(), this->rx.begin() + static_cast<std::ptrdiff_t>(n));
-    return true;
-  }
-};
-
-/// RMT lines: one frame at a time, done after its bits and its reset symbol (80 MHz ticks), then its interrupt.
-struct UltraHub;
-struct Rmt {
-  bool busy{false};
-  int64_t done_us{0};
-  std::vector<uint8_t> frame;   // the last one
-  int64_t t0_us{0};             // its last bit
-  bool rw_pending{false};
-  UltraHub *hub{nullptr};
-};
-static Rmt rmts[8];
-static esp_err_t rmt_tx_wait_all_done(int ch, int) { return rmts[ch].busy ? -1 : ESP_OK; }
-static esp_err_t rmt_transmit(int ch, int, const uint8_t *data, size_t n, const rmt_transmit_config_t *);
-
-struct UltraHub {
-  void loop();                        // the component's (hub_loop.inc)
-  void transmit_();                   // (hub_transmit.inc)
-  esp_err_t lane_post_();
-  bool rw_due_(bool urgent);          // (hub_rw.inc)
-  bool rw_uart_free_() const;
-  void finish_window_(bool wait);
-  void rw_publish_();
-  static bool rw_done_isr_(rmt_channel_handle_t, const rmt_tx_done_event_data_t *, void *arg);
-  static void rw_lane_release_(void *arg);
-  static int64_t now_us_() { return clock_us; }
-  // stand-ins
-  struct {
-    void stop() {}
-  } high_freq_;
-  void service_calibration_() {}
-  void wake_() {}
-  bool boards_powered_() const { return true; }
-  bool status_has_warning() const { return this->warning_; }
-  void status_set_warning() { this->warning_ = true; }
-  void status_clear_warning() { this->warning_ = false; }
-
-  // the line
-  uint16_t preamble_{0};
-  bool preamble_full_{true}, tx_preamble_end_{false}, synced_once_{false};
-  uint8_t switch_frame_{ULTRA_SWITCH_WS_FRAMES};
-  Scheduler sched_;
-  uint16_t num_boards_{2};
-  std::vector<uint8_t> buf_;
-  uint8_t *tx_buf_{nullptr};
-  size_t tx_bytes_{0};
-  bool tx_prepared_{false}, tx_normal_{true};
-  uint32_t build_peak_us_{0}, frames_{0}, last_busy_ms_{0}, last_frame_ms_{0}, refresh_interval_ms_{200};
-  bool high_freq_active_{false}, has_sent_{false}, started_{true}, warning_{false};
-  int channel_{0}, encoder_{0};
-  struct {
-    FrameSymbols<rmt_symbol_word_t> symbols;
-  } enc_;
-  uint8_t pin_{16};
-  uint32_t reset_ns_{300000};
-  ParlioLane *lane_{nullptr};
-  uint32_t lane_lead_us_{0};
-  // the return channel
-  Uart *rw_uart_{nullptr};
-  Pin *rw_dir_pin_{nullptr};
-  IsrPin rw_dir_isr_;
-  Pin *rw_rx_enable_pin_{nullptr};
-  bool rw_turn_{false};
-  bool rw_driving_{true};
-  volatile bool rw_release_{false};
-  volatile int64_t rw_released_us_{0};
-  TelemetryPoller poller_;
-  PortMonitor port_monitor_;
-  std::vector<uint8_t> rw_slots_, rw_rx_;
-  bool rw_next_{false}, tx_rw_{false};
-  uint32_t rw_window_us_{0};
-  bool rw_open_{false};
-  int64_t rw_t0_us_{0}, rw_end_us_{0}, rw_read_us_{0};
-  bool rw_powered_{true};
-  uint32_t rw_late_{0}, rw_extra_us_{0};
-  rmt_symbol_word_t reset_symbol_{}, rw_reset_symbol_{};
-  struct {
-    std::vector<std::function<void(uint16_t, uint32_t)>> f;
-    void call(uint16_t a, uint32_t b) {
-      for (auto &x : this->f)
-        x(a, b);
-    }
-  } rw_callback_;
-  struct {
-    int calls{0};
-    void call() { this->calls++; }
-  } rw_window_callback_;
-  static std::vector<UltraHub *> hubs_;
-
-  /// as setup() with telemetry (2 receivers at 1 Mbaud, a direction pin, a receiver enable pin): on a lane of the bus
-  /// with the timing on its grid, or on an RMT channel
-  void start(ParlioLane *lane, uint32_t b0h, uint32_t b0l, uint32_t b1h, uint32_t b1l, uint32_t reset_ns, Uart *uart,
-             Pin *dir, Pin *re, uint32_t seed) {
-    this->sched_.init(this->num_boards_, seed, 3);
-    this->sched_.set_bit_timing(b0h, b0l, b1h, b1l);
-    this->reset_ns_ = reset_ns;
-    this->buf_.assign(this->sched_.frame_bytes(), 0);
-    this->tx_buf_ = this->buf_.data();
-    rmt_symbol_word_t rst{}, rw{};
-    rst.duration0 = rst.duration1 = 12000;   // 300 us at 80 MHz
-    rw.duration0 = rw.duration1 = 80;        // 2 us
-    this->enc_.symbols.reset = rst;
-    this->reset_symbol_ = rst;
-    this->rw_reset_symbol_ = dir != nullptr ? rw : rst;
-    this->lane_ = lane;
-    if (lane != nullptr) {
-      lane->begin(this->buf_.size(), UltraHub::rw_lane_release_, this);
-      this->lane_lead_us_ = lane->lead_us();
-    }
-    this->rw_uart_ = uart;
-    this->rw_dir_pin_ = dir;
-    if (dir != nullptr) {
-      dir->level = true;
-      this->rw_dir_isr_.pin = dir;
-    }
-    this->rw_rx_enable_pin_ = re;
-    if (re != nullptr)
-      re->level = false;
-    this->poller_.init(2, ULTRA_RW_RATE_1M, TelemetryIntervals{});
-    this->rw_slots_.assign(ULTRA_SLOT_BYTES * this->num_boards_, 0);
-    this->rw_extra_us_ = this->poller_.max_window_us() + ULTRA_RW_HOLDOFF_US;
-    this->preamble_ = 3;   // the start-up preamble
-    hubs_.push_back(this);
-  }
-};
-std::vector<UltraHub *> UltraHub::hubs_;
-
-#include "hub_loop.inc"
-#include "hub_transmit.inc"
-#include "hub_rw.inc"
-
-/// The receivers of a line answer an RW frame's POLLs (a STATUS whose voltage and chip ids are the line's own,
-/// IDENTITY without optional pages, the rest unsupported): the bytes a window brings to the UART.
-static std::vector<uint8_t> answers(const uint8_t *frame, uint16_t boards, int line) {
-  std::vector<uint8_t> out{0x00};   // the turnaround checks' junk
-  for (uint16_t b = 0; b < boards; b++) {
-    const uint8_t *s = frame + ULTRA_SLOT_BYTES * b;
-    if (ultra_poll_valid(s) != 0 || s[ULTRA_POLL_INDEX] == ULTRA_POLL_RELAY_ONLY)
-      continue;
-    uint8_t a[32]{}, d[24]{};
-    uint8_t page = s[ULTRA_POLL_PAGE];
-    if (page == ULTRA_PAGE_STATUS) {
-      ultra_put24(d + ULTRA_ST_FW_VERSION, 0x000608);
-      ultra_put24(d + ULTRA_ST_UPTIME, static_cast<uint32_t>(clock_us / 1000000));
-      ultra_put16(d + ULTRA_ST_VBUS, static_cast<uint16_t>(2400 + 50 * line));   // line k: 24 V + 0.5 V x k
-      ultra_put16(d + ULTRA_ST_MCU_TEMP, ULTRA_ST_NA);
-      d[ULTRA_ST_MEASURED] = ULTRA_ST_M_VBUS;
-    } else if (page == ULTRA_PAGE_IDENTITY) {
-      d[0] = static_cast<uint8_t>(b + 1);
-    } else {
-      page = ULTRA_PAGE_UNSUPPORTED;
-    }
-    a[0] = ULTRA_RSP_SYNC;
-    a[1] = page;
-    a[2] = static_cast<uint8_t>(s[ULTRA_POLL_INDEX] << 4);
-    a[3] = s[2];
-    ultra_put16(a + 4, static_cast<uint16_t>(0x1000 + 0x10 * line + b));
-    std::memcpy(a + ULTRA_RSP_DATA, d, 24);
-    ultra_put16(a + 30, ultra_crc16(a, 30));
-    out.push_back(ULTRA_RSP_LEAD);
-    out.insert(out.end(), a, a + 32);
-  }
-  return out;
-}
-static uint8_t poll_slots(const uint8_t *frame, uint16_t boards) {
-  for (uint16_t b = 0; b < boards; b++) {
-    const uint8_t *s = frame + ULTRA_SLOT_BYTES * b;
-    if (ultra_poll_valid(s) == 0)
-      return s[ULTRA_POLL_SLOTS];
-  }
-  return 0;
-}
-
-/// The return channel of every line: an RW frame's receivers turn around only when the hub let go of the line by
-/// ULTRA_RW_RELEASE_US after its last bit; their answers reach the line's UART while its receiver is enabled (no
-/// receiver_enable_pin: always); two ports of one UART enabled at once garble each other's bytes.
-struct Telemetry {
-  struct Window {
-    int line;
-    int64_t t0_us, end_us;
-    std::vector<uint8_t> frame;
-  };
-  std::vector<Window> windows;       // every RW frame seen on a wire
-  std::vector<Window> pending;       // its answers still to come
-  int uart_of[16]{};
-  Uart *uarts[8]{};
-  Pin *re[16]{}, *dir[16]{};
-  bool on[16];
-  uint16_t boards{2};
-  int collisions{0}, late{0}, answered{0}, max_enabled{0};
-  Telemetry() { std::fill(std::begin(this->on), std::end(this->on), true); }
-
-  /// an RW frame's last bit on line `line` at t0_us
-  void rw_frame(int line, int64_t t0_us, const std::vector<uint8_t> &frame) {
-    const uint8_t r = poll_slots(frame.data(), this->boards);
-    const int64_t end = t0_us + ultra_rw_window_us(r, ULTRA_RW_RATE_1M);
-    this->windows.push_back(Window{line, t0_us, end, frame});
-    this->pending.push_back(Window{line, t0_us, end, frame});
-  }
-  /// at the window's last burst: the answers to the UART (or not)
-  void tick() {
-    int enabled[8]{};
-    for (int k = 0; k < 16; k++) {
-      if (this->re[k] != nullptr && this->re[k]->level)
-        enabled[this->uart_of[k]]++;
-    }
-    for (int u = 0; u < 8; u++)
-      this->max_enabled = std::max(this->max_enabled, enabled[u]);
-    for (size_t i = 0; i < this->pending.size();) {
-      Window &w = this->pending[i];
-      // the turnaround check: the hub let go by ULTRA_RW_RELEASE_US (checked once, then the window runs)
-      if (this->dir[w.line] != nullptr && w.t0_us + ULTRA_RW_RELEASE_US <= clock_us && w.t0_us >= 0) {
-        if (this->dir[w.line]->level) {
-          this->late++;
-          this->pending.erase(this->pending.begin() + static_cast<std::ptrdiff_t>(i));
-          continue;
-        }
-        w.t0_us = -w.t0_us - 1;   // checked
+      valid++;
+      int hit = -1;
+      for (size_t i = 0; i < lr[l].posted.size() && hit < 0; i++) {
+        if (!lr[l].posted[i].refused && lr[l].posted[i].bytes == f.bytes)
+          hit = static_cast<int>(i);
       }
-      if (clock_us < w.end_us - 50) {
-        i++;
+      if (hit < 0) {
+        unmatched++;
+        if (unmatched <= 3)
+          std::printf("  %s: lane %u: a valid frame of %u bytes no hub posted (at %.3f ms)\n", what, l,
+                      static_cast<unsigned>(f.bytes.size()), (s.time_of(f.t0) - s.wire_t0) / 1e6);
         continue;
       }
-      const int u = this->uart_of[w.line];
-      std::vector<uint8_t> bytes = this->on[w.line] ? answers(w.frame.data(), this->boards, w.line) : std::vector<uint8_t>{0};
-      const bool heard = this->re[w.line] == nullptr || this->re[w.line]->level;
-      if (heard && this->on[w.line]) {
-        if (enabled[u] > 1) {   // another port drives the same RX
-          for (auto &b : bytes)
-            b ^= 0x5A;
-          this->collisions++;
-        }
-        this->uarts[u]->rx.insert(this->uarts[u]->rx.end(), bytes.begin(), bytes.end());
-        this->answered++;
-      }
-      this->pending.erase(this->pending.begin() + static_cast<std::ptrdiff_t>(i));
+      matched_twice += seen[hit]++ > 0;
+      const int64_t err = lr[l].posted[hit].time_full * 1000 - s.time_of(f.t0);
+      worst = std::max<int64_t>(worst, err < 0 ? -err : err);
     }
   }
-  /// windows of lines on one UART that overlap, and of lines on different UARTs
-  void overlaps(int *same, int *across) const {
-    *same = *across = 0;
-    for (size_t i = 0; i < this->windows.size(); i++) {
-      for (size_t j = i + 1; j < this->windows.size(); j++) {
-        const Window &a = this->windows[i], &b = this->windows[j];
-        const int64_t a0 = a.t0_us < 0 ? -a.t0_us - 1 : a.t0_us, b0 = b.t0_us < 0 ? -b.t0_us - 1 : b.t0_us;
-        if (a.line == b.line || a0 >= b.end_us || b0 >= a.end_us)
-          continue;
-        (this->uart_of[a.line] == this->uart_of[b.line] ? *same : *across) += 1;
-      }
-    }
-  }
-};
-static Telemetry tel;
-
-/// The decoder of one lane's wire, as a board's input sees it: high pulses are bits (>= 472 ns a '1'), a low of 50 us
-/// ends the frame (its last falling edge: t0). Checks every Ultra frame's TIME against its t0.
-struct Decoder {
-  struct Frame {
-    int64_t start, t0;   // its first rising and last falling edge (samples)
-    std::vector<uint8_t> bytes;
-  };
-  int64_t rise{-1}, fall{-1}, start{-1};
-  std::vector<uint8_t> bits;
-  std::vector<Frame> frames;
-  void edge(bool up, int64_t s, uint32_t sample_ns) {
-    if (up) {
-      this->rise = s;
-      if (this->bits.empty())
-        this->start = s;
-    } else if (this->rise >= 0) {
-      this->bits.push_back((s - this->rise) * sample_ns >= 472 ? 1 : 0);
-      this->fall = s;
-    }
-  }
-  /// the frame is over once the line stayed low 50 us
-  bool end(int64_t s, uint32_t sample_ns) {
-    if (this->bits.empty() || this->fall < 0 || (s - this->fall) * sample_ns < 50000)
-      return false;
-    std::vector<uint8_t> bytes(this->bits.size() / 8, 0);
-    for (size_t i = 0; i + 8 <= this->bits.size(); i += 8) {
-      for (int j = 0; j < 8; j++)
-        bytes[i / 8] = static_cast<uint8_t>(bytes[i / 8] << 1 | this->bits[i + j]);
-    }
-    this->frames.push_back(Frame{this->start, this->fall, bytes});
-    this->bits.clear();
-    return true;
-  }
-};
-
-static int64_t ceil_us(int64_t ns) { return (ns + 999) / 1000; }
-
-/// 16 lanes, 4 UARTs with 4 lanes each (each lane with its direction and receiver enable pin, 2 receivers): the
-/// hubs' own code polls; every RW frame is decoded from the rendered stream and answered through the modelled
-/// transceivers. Windows on one UART never overlap (and never 2 receivers enabled on one), windows of different UARTs
-/// do; every receiver answers with its own line's values; the direction pin drops within 10 us of each RW frame's
-/// last bit; each lane is quiet for its windows while others send; every frame's TIME is its last edge; a lane whose
-/// receivers go silent leaves the others answering.
-static void test_sixteen_lanes() {
-  set_clock(1000000);
-  UltraHub::hubs_.clear();
-  tel = Telemetry();
-  static Stream bus;
-  const Grid g = grid(50, std::vector<std::array<uint32_t, 4>>(16, std::array<uint32_t, 4>{250, 1050, 700, 650}));
-  bus.init(g, 16, 96, 16, 0, clock_us * 1000 + 321);
-  const uint32_t sample_ns = g.sample_ns, P = g.period;
-  const uint32_t group_ns = 8 * P * sample_ns;
-  const uint32_t reset_ns = (300000 + group_ns - 1) / group_ns * group_ns;   // the reset in whole groups
-  static UltraHub hubs[16];
-  static Uart uarts[4];
-  static Pin dir[16], re[16];
-  for (int k = 0; k < 16; k++) {
-    hubs[k] = UltraHub();
-    hubs[k].pin_ = static_cast<uint8_t>(20 + k);
-    hubs[k].start(&bus.lanes[k], g.lane[k].h0 * sample_ns, (P - g.lane[k].h0) * sample_ns, g.lane[k].h1 * sample_ns,
-                  (P - g.lane[k].h1) * sample_ns, reset_ns, &uarts[k / 4], &dir[k], &re[k], 100 + k);
-    tel.uart_of[k] = k / 4;
-    tel.re[k] = &re[k];
-    tel.dir[k] = &dir[k];
-  }
-  for (int u = 0; u < 4; u++)
-    tel.uarts[u] = &uarts[u];
-  Decoder dec[16];
-  struct Release {
-    int lane;
-    int64_t at_us;
-  };
-  std::vector<Release> due, fired;   // the timer's alarms, and when they dropped a pin
-  size_t decoded_samples = 0;
-  int64_t time_worst = 0;
-  size_t ultra_frames = 0, rw_seen = 0;
-  bool frame_ok = true;
-  struct Quiet {
-    int lane;
-    int64_t from_s, to_s;
-  };
-  std::vector<Quiet> quiet;   // each RW frame's window on its lane (samples)
-
-  auto run = [&](int64_t us) {
-    const int64_t end = clock_us + us;
-    while (clock_us < end) {
-      const int64_t k = bus.st.next_chunk - 1;   // the chunk that starts next
-      const int64_t switch_us = ceil_us(bus.t0_ns + k * static_cast<int64_t>(bus.chunk_ns()));
-      int64_t next = std::min(clock_us + 50, switch_us);
-      for (const Release &r : due)
-        next = std::min(next, r.at_us);
-      for (const Telemetry::Window &w : tel.pending)
-        next = std::min(next, w.t0_us >= 0 ? w.t0_us + ULTRA_RW_RELEASE_US : w.end_us - 50);
-      set_clock(std::max(next, clock_us));
-      if (clock_us >= switch_us) {
-        // chunk k starts: it plays (decoded as the boards see it), the one after it is rendered
-        bus.play(k);
-        for (size_t s = decoded_samples; s < bus.wire.size(); s++) {
-          const uint16_t diff = static_cast<uint16_t>(bus.wire[s] ^ (s ? bus.wire[s - 1] : 0));
-          for (int l = 0; l < 16; l++) {
-            if (diff & (1u << l))
-              dec[l].edge(bus.level(static_cast<uint8_t>(l), s), static_cast<int64_t>(s), sample_ns);
-          }
-        }
-        decoded_samples = bus.wire.size();
-        for (int l = 0; l < 16; l++) {
-          while (dec[l].end(static_cast<int64_t>(decoded_samples), sample_ns)) {
-            const Decoder::Frame &f = dec[l].frames.back();
-            const int64_t t0_ns = bus.t0_ns + f.t0 * sample_ns;
-            if (f.bytes.size() != hubs[l].sched_.frame_bytes())
-              continue;
-            uint32_t t = 0;
-            const uint8_t *h = f.bytes.data() + hubs[l].sched_.header_offset();
-            frame_ok &= ultra_parse_header(h, &t) == 0;
-            // TIME (low 32 bits of the host us) against the last edge (ns)
-            const int64_t d = static_cast<int64_t>(static_cast<int32_t>(t - static_cast<uint32_t>(t0_ns / 1000))) * 1000 -
-                              (t0_ns % 1000);
-            time_worst = std::max<int64_t>(time_worst, d < 0 ? -d : d);
-            ultra_frames++;
-            if (ultra_header_flags(h) & ULTRA_HDR_RW) {
-              rw_seen++;
-              const int64_t t0_us = t0_ns / 1000;
-              tel.rw_frame(l, t0_us, f.bytes);
-              const uint8_t r = poll_slots(f.bytes.data(), 2);
-              quiet.push_back(Quiet{l, f.t0, f.t0 + static_cast<int64_t>((ultra_rw_window_us(r, ULTRA_RW_RATE_1M) +
-                                                                                  ULTRA_RW_HOLDOFF_US) * 1000ULL / sample_ns)});
-            }
-          }
-        }
-        bus.render(switch_us * 1000, switch_us * 1000 + 40000);
-        for (uint8_t i = 0; i < bus.r.releases(); i++) {
-          const ParlioRenderer::Release &r = bus.r.release(i);
-          due.push_back(Release{r.lane, ceil_us(r.at_ns) + 1 + static_cast<int64_t>(due.size() % 3)});   // + the ISR
-        }
-      }
-      for (size_t i = 0; i < due.size();) {
-        if (due[i].at_us <= clock_us) {
-          bus.lanes[due[i].lane].release_now();   // the timer's interrupt
-          fired.push_back(Release{due[i].lane, clock_us});
-          due.erase(due.begin() + static_cast<std::ptrdiff_t>(i));
-        } else {
-          i++;
-        }
-      }
-      tel.tick();
-      for (auto &h : hubs)
-        h.loop();
-    }
-  };
-
-  run(8000000);
-  bool all = true, own = true;
-  for (int k = 0; k < 16; k++) {
-    const TelemetryPoller &p = hubs[k].poller_;
-    all &= p.answering(0) && p.answering(1);
-    own &= std::fabs(telemetry_value(p.data(0), TV_SUPPLY_VOLTAGE) - (24.0f + 0.5f * k)) < 1e-3f &&
-           p.uid16(0) == 0x1000 + 0x10 * k && p.uid16(1) == 0x1001 + 0x10 * k && p.stats().stale == 0;
-  }
-  int same = 0, across = 0;
-  tel.overlaps(&same, &across);
-  CHECK(all, "16 lanes: every lane's 2 receivers answer (%d windows answered)", tel.answered);
-  CHECK(own, "each lane's poller holds only its own receivers (their voltages, chip ids), nothing stale");
-  CHECK(same == 0 && tel.max_enabled <= 1 && tel.collisions == 0, "windows of lanes sharing a UART never overlap "
-        "(%d), never two receivers enabled on one UART (at most %d), no garbled answers (%d)", same, tel.max_enabled,
-        tel.collisions);
-  CHECK(across > 0, "windows of lanes on different UARTs overlap (%d pairs): the 4 groups answer at the same time",
-        across);
-  // the direction pins: each RW frame's release within 10 us after its last bit
-  int64_t worst = 0, least = INT64_MAX;
-  size_t matched = 0;
-  for (const Telemetry::Window &w : tel.windows) {
-    const int64_t t0 = w.t0_us < 0 ? -w.t0_us - 1 : w.t0_us;
-    for (const Release &r : fired) {
-      if (r.lane == w.line && r.at_us >= t0 - 20 && r.at_us <= t0 + 200) {
-        worst = std::max(worst, r.at_us - t0);
-        least = std::min(least, r.at_us - t0);
-        matched++;
-        break;
-      }
-    }
-  }
-  CHECK(tel.late == 0 && matched == tel.windows.size() && least >= 1 && worst <= 10, "the direction pin of every RW "
-        "frame dropped %lld-%lld us after its last bit (%u of %u), none late", static_cast<long long>(least),
-        static_cast<long long>(worst), static_cast<unsigned>(matched), static_cast<unsigned>(tel.windows.size()));
-  // each lane quiet for its windows, the others sending
-  bool lane_quiet = true;
-  size_t others = 0;
-  for (const Quiet &q : quiet) {
-    for (int64_t s = q.from_s; s < q.to_s && s < static_cast<int64_t>(bus.wire.size()); s++) {
-      lane_quiet &= bus.level(static_cast<uint8_t>(q.lane), static_cast<size_t>(s)) == 0;
-      others += s > q.from_s && (bus.wire[s] ^ bus.wire[s - 1]) != 0;
-    }
-  }
-  CHECK(lane_quiet && others > 1000, "%u windows: their lane low throughout, the other lanes sending (%u edges)",
-        static_cast<unsigned>(quiet.size()), static_cast<unsigned>(others));
-  CHECK(frame_ok && time_worst <= 1500 && ultra_frames > 500, "%u Ultra frames decoded from the stream: valid headers, "
-        "TIME their last edge within %lld ns", static_cast<unsigned>(ultra_frames), static_cast<long long>(time_worst));
-  // lane 5's receivers go silent: only they are unavailable
-  tel.on[5] = false;
-  run(6000000);
-  bool others_ok = true;
-  for (int k = 0; k < 16; k++) {
-    if (k != 5)
-      others_ok &= hubs[k].poller_.answering(0) && hubs[k].poller_.answering(1);
-  }
-  CHECK(!hubs[5].poller_.answering(0) && !hubs[5].poller_.answering(1) && others_ok,
-        "lane 5's receivers silent: only they are unavailable, its UART's 3 other lanes and the rest answer");
-  tel.on[5] = true;
-  run(6000000);
-  CHECK(hubs[5].poller_.answering(0) && hubs[5].poller_.answering(1), "and back");
-  tel.overlaps(&same, &across);
-  CHECK(same == 0 && tel.max_enabled <= 1, "still no overlap on a UART after it (%d)", same);
-  uint32_t refused = 0;
-  for (int k = 0; k < 16; k++)
-    refused += bus.lanes[k].refused();
-  CHECK(refused == 0, "no frame refused (%u)", refused);
-  std::printf("  16 lanes, 4 UARTs x 4: %u RW windows (%d pairs overlapping across UARTs, none on one), %u Ultra frames, "
-              "direction pins %lld-%lld us after the last bit\n", static_cast<unsigned>(tel.windows.size()), across,
-              static_cast<unsigned>(ultra_frames), static_cast<long long>(least), static_cast<long long>(worst));
-  UltraHub::hubs_.clear();
+  CHECK(unmatched == 0 && matched_twice == 0 && worst <= 1500, "%s: %u valid frames on the wire, each exactly a posted "
+        "frame, once (%u not, %u twice), TIME its last edge within %lld ns; %u cut frames (the boards drop them)", what,
+        static_cast<unsigned>(valid), static_cast<unsigned>(unmatched), static_cast<unsigned>(matched_twice),
+        static_cast<long long>(worst), static_cast<unsigned>(cut));
+  return valid;
 }
 
-static esp_err_t rmt_transmit(int ch, int, const uint8_t *data, size_t n, const rmt_transmit_config_t *) {
-  Rmt &rmt = rmts[ch];
-  UltraHub *h = rmt.hub;
-  const uint32_t ticks = h->enc_.symbols.reset.duration0 + h->enc_.symbols.reset.duration1;
-  const int64_t bits_us = static_cast<int64_t>(n) * 8 * 1300 / 1000;
-  rmt.busy = true;
-  rmt.t0_us = clock_us + bits_us;
-  rmt.done_us = rmt.t0_us + ticks / 80;
-  rmt.frame.assign(data, data + n);
-  const uint8_t *hd = data + n - ULTRA_HDR_BYTES;
-  rmt.rw_pending = n == h->sched_.frame_bytes() && (ultra_header_flags(hd) & ULTRA_HDR_RW);
-  return ESP_OK;
+static void lanes_for_lateness(Stream &s, LaneRun *lr, const Grid &g) {
+  for (uint8_t l = 0; l < 16; l++) {
+    const uint16_t boards = static_cast<uint16_t>(l < 4 ? 8 : 1 + (l * 7) % 30);
+    lr[l].sched.init(boards, 40 + l, 3);
+    lr[l].sched.set_bit_timing(250, (g.period - 5) * 50, 700, (g.period - 14) * 50);
+    lr[l].buf.assign(lr[l].sched.frame_bytes(), 0);
+    s.s.lane(l)->begin(lr[l].buf.size(), [](void *) {}, nullptr);
+  }
 }
 
-/// RMT lines with the same coordinator: 3 lines share one UART (each with a receiver enable pin), a 4th has its own
-/// (no receiver enable pin): never 2 receivers enabled on the shared UART, no overlapping windows there, every line's
-/// receivers answer with their own values.
-static void test_rmt_shared_uart() {
-  set_clock(50000000);
-  UltraHub::hubs_.clear();
-  tel = Telemetry();
-  static UltraHub hubs[4];
-  static Uart uarts[2];
-  static Pin dir[4], re[4];
-  for (int k = 0; k < 4; k++) {
-    hubs[k] = UltraHub();
-    hubs[k].channel_ = k;
-    hubs[k].pin_ = static_cast<uint8_t>(16 + k);
-    rmts[k] = Rmt();
-    rmts[k].hub = &hubs[k];
-    const bool shared = k < 3;
-    hubs[k].start(nullptr, 250, 1050, 700, 650, 300000, &uarts[shared ? 0 : 1], &dir[k], shared ? &re[k] : nullptr,
-                  200 + k);
-    tel.uart_of[k] = shared ? 0 : 1;
-    tel.re[k] = shared ? &re[k] : nullptr;
-    tel.dir[k] = &dir[k];
-  }
-  tel.uarts[0] = &uarts[0];
-  tel.uarts[1] = &uarts[1];
-  auto run = [&](int64_t us) {
-    const int64_t end = clock_us + us;
-    while (clock_us < end) {
-      set_clock(clock_us + 20);
-      for (int k = 0; k < 4; k++) {
-        Rmt &r = rmts[k];
-        if (r.rw_pending && clock_us >= r.t0_us) {
-          r.rw_pending = false;
-          tel.rw_frame(k, r.t0_us, r.frame);
-        }
-        if (r.busy && clock_us >= r.done_us) {
-          r.busy = false;
-          UltraHub::rw_done_isr_(nullptr, nullptr, &hubs[k]);   // the RMT's done interrupt
-        }
+static void test_late_render() {
+  const Grid g = default_grid(16);
+  {
+    Stream s;
+    s.init(g, 16, 96, 16, 0, 3000000000);
+    static LaneRun lr[16];
+    for (auto &x : lr)
+      x = LaneRun();
+    lanes_for_lateness(s, lr, g);
+    // late by 0.5 / 0.7 of a chunk (the handover still before the deadline), by 1.3 / 0.9 / 3 (a kill)
+    s.late = [](int64_t k) -> int64_t {
+      switch (k % 97) {
+        case 20: return 500000;
+        case 35: return 680000;
+        case 50: return 1350000;
+        case 70: return 900000;
+        case 90: return 3100000;
+        default: return 0;
       }
-      tel.tick();
-      for (auto &h : hubs)
-        h.loop();
+    };
+    const size_t valid = run_lateness(s, lr, g, 600, [](uint8_t l) { return l >= 12; }, "late renders");
+    uint32_t refused = 0, lost = 0;
+    for (uint8_t l = 0; l < 16; l++) {
+      refused += s.s.lane(l)->refused();
+      lost += s.s.lane(l)->lost();
     }
-  };
-  run(10000000);
-  bool all = true, own = true;
-  for (int k = 0; k < 4; k++) {
-    const TelemetryPoller &p = hubs[k].poller_;
-    all &= p.answering(0) && p.answering(1);
-    own &= std::fabs(telemetry_value(p.data(0), TV_SUPPLY_VOLTAGE) - (24.0f + 0.5f * k)) < 1e-3f &&
-           p.uid16(1) == 0x1001 + 0x10 * k && p.stats().stale == 0;
+    CHECK(s.replays == 0 && s.restarts >= 15 && s.s.kills() == static_cast<uint32_t>(s.restarts) && valid > 1500,
+          "late renders: the stream killed before any buffer played twice (%lld repeats), %lld restarts, frames flow "
+          "after them (%u valid)", static_cast<long long>(s.replays), static_cast<long long>(s.restarts),
+          static_cast<unsigned>(valid));
+    std::printf("  late render: %lld kills before a repeat, %u valid frames (each a posted one, once), %u refused and "
+                "%u cut frames counted as lost\n", static_cast<long long>(s.restarts), static_cast<unsigned>(valid),
+                refused, lost);
   }
-  int same = 0, across = 0;
-  tel.overlaps(&same, &across);
-  CHECK(all && own, "RMT lines: 3 sharing a UART and one on its own, every receiver answers with its own values");
-  CHECK(same == 0 && tel.max_enabled <= 1 && tel.collisions == 0 && tel.late == 0, "the shared UART: one window at a "
-        "time (%d overlaps), never 2 receivers enabled (%d), nothing garbled (%d)", same, tel.max_enabled,
-        tel.collisions);
-  CHECK(across > 0, "the line with its own UART answers alongside the shared ones (%d overlaps)", across);
-  std::printf("  RMT lines: 3 on one UART (receiver enable pins) + 1 on its own: %u windows, none overlapping on the "
-              "shared UART\n", static_cast<unsigned>(tel.windows.size()));
-  UltraHub::hubs_.clear();
+  // 8-board frames across chunk boundaries, one render late: the middle chunk would play twice
+  {
+    Stream s;
+    s.init(g, 16, 96, 16, 0, 4000000000);
+    static LaneRun lr[16];
+    for (auto &x : lr)
+      x = LaneRun();
+    lanes_for_lateness(s, lr, g);
+    s.late = [](int64_t k) -> int64_t { return k == 40 ? 1200000 : 0; };
+    run_lateness(s, lr, g, 80, [](uint8_t) { return false; }, "one late render mid-frame");
+    CHECK(s.replays == 0 && s.restarts == 1, "one late render: one kill, no repeat (%lld, %lld)",
+          static_cast<long long>(s.restarts), static_cast<long long>(s.replays));
+  }
 }
 
-#undef USE_DIG2ANALOG_ULTRA_TELEMETRY
-#undef USE_DIG2ANALOG_ULTRA_PARLIO
-
-}  // namespace hub_lanes
-
-// ================================================================================================ 7. update on a lane
-// The update task's session on a lane (build/parlio/hub_update_lane.inc): every frame as the session builds it, after
-// every page the line low at least its reset + the page pause on the stream, whatever the stream's latency; an abort
-// still ends with 12 ABORT frames.
-namespace hub_update {
-
-struct UltraHub;
-static Stream *bus = nullptr;
-static UltraHub *hub = nullptr;
-static uint32_t abort_at = UINT32_MAX;   // the abort request once this many frames went out
-static uint32_t portTICK_PERIOD_MS = 1;
-static void vTaskDelay(uint32_t ticks);
-
-struct UltraHub {
-  enum UpdateResult : uint8_t { UPD_NONE = 0, UPD_DONE, UPD_ABORTED, UPD_FAILED };
-  uint8_t update_lane_();   // the component's
-  ParlioLane *lane_{nullptr};
-  uint8_t buf_[64]{};
-  uint8_t *tx_buf_{buf_};
-  uint32_t reset_ns_{302400};
-  UpdateSession upd_session_;
-  std::atomic<bool> upd_abort_{false};
-  std::atomic<uint32_t> upd_sent_{0};
-  std::atomic<uint8_t> upd_pass_{0};
-};
-
-/// the task sleeps: the stream plays on (its switches, the renders)
-static void vTaskDelay(uint32_t ticks) {
-  const int64_t end = clock_us + static_cast<int64_t>(ticks) * portTICK_PERIOD_MS * 1000;
-  for (;;) {
-    const int64_t k = bus->st.next_chunk - 1;
-    const int64_t sw = (bus->t0_ns + k * static_cast<int64_t>(bus->chunk_ns()) + 999) / 1000;
-    if (sw > end)
-      break;
-    set_clock(sw);
-    bus->step();
+// ================================================================================================ 5. late interrupts
+/// The switch interrupt 700 us late (but the task's handover still in time): no kill, no refusal, every frame's TIME
+/// right, every release on time: no time is taken from an interrupt's timestamp. Then late renders with RW frames in
+/// flight: every release that fires belongs to an RW frame on the wire, 2-10 us after its last edge; the releases of
+/// the frames a kill cut never fire (a release is never moved).
+static void test_late_interrupts() {
+  const Grid g = default_grid(16);
+  {
+    Stream s;
+    s.init(g, 16, 96, 16, 0, 6000000000);
+    s.isr_ns = 700000;
+    s.task_ns = 30000;
+    static LaneRun lr[16];
+    for (auto &x : lr)
+      x = LaneRun();
+    lanes_for_lateness(s, lr, g);
+    const size_t valid = run_lateness(s, lr, g, 300, [](uint8_t l) { return l % 3 == 0; }, "a late switch interrupt");
+    uint32_t refused = 0;
+    for (uint8_t l = 0; l < 16; l++)
+      refused += s.s.lane(l)->refused();
+    CHECK(s.restarts == 0 && s.replays == 0 && refused == 0 && valid > 1000, "the switch interrupt 700 us late: no "
+          "kill, no repeat, nothing refused (%lld, %lld, %u)", static_cast<long long>(s.restarts),
+          static_cast<long long>(s.replays), refused);
   }
-  set_clock(end);
-  if (hub->upd_sent_.load() >= abort_at)
-    hub->upd_abort_.store(true);
-}
-
-#define USE_DIG2ANALOG_ULTRA_UPDATE
-#define USE_DIG2ANALOG_ULTRA_PARLIO
-#include "hub_update_lane.inc"
-#undef USE_DIG2ANALOG_ULTRA_UPDATE
-#undef USE_DIG2ANALOG_ULTRA_PARLIO
-
-static void test_update_on_lane() {
-  static uint8_t img[UPD_DESC_BYTES + 2000];
-  for (size_t i = 0; i < sizeof(img); i++)
-    img[i] = static_cast<uint8_t>(i * 7 + 3);
-  UpdateSession::Options o;
-  o.lead_in_us = 20000;
-  o.end_us = 10000;
-  const Grid g = grid(50, {std::array<uint32_t, 4>{250, 1050, 700, 650}});
-  const uint32_t frame_min_us = (UPD_FRAME_BITS * 1300) / 1000 + 302;
-  for (uint32_t tick_ms : {1u, 10u}) {
-    portTICK_PERIOD_MS = tick_ms;
-    for (int run = 0; run < 2; run++) {
-      static Stream s;
-      set_clock(9000000);
-      s.init(g, 8, 96, 1, 0, clock_us * 1000);
-      bus = &s;
-      UltraHub h;
-      hub = &h;
-      abort_at = run == 1 ? 100 : UINT32_MAX;
-      h.lane_ = &s.lanes[0];
-      h.lane_->begin(UPD_FRAME_BYTES, nullptr, nullptr);
-      h.upd_session_.begin(img, sizeof(img), 0x42, o, frame_min_us);
-      UpdateSession ref;
-      ref.begin(img, sizeof(img), 0x42, o, frame_min_us);
-      const uint8_t result = h.update_lane_();
-      for (int k = 0; k < 6; k++)
-        s.step();   // the last frames on the wire
-      // the lane's frames as a board's input sees them
-      hub_lanes::Decoder dec;
-      for (size_t i = 1; i < s.wire.size(); i++) {
-        if ((s.wire[i] ^ s.wire[i - 1]) & 1u)
-          dec.edge(s.level(0, i), static_cast<int64_t>(i), g.sample_ns);
-        dec.end(static_cast<int64_t>(i), g.sample_ns);
-      }
-      size_t session = 0, pauses = 0, aborts = 0;
-      int64_t least = INT64_MAX;
-      bool same = true, paused = true;
-      for (size_t i = 0; i < dec.frames.size(); i++) {
-        const std::vector<uint8_t> &f = dec.frames[i].bytes;
-        same &= f.size() == UPD_FRAME_BYTES && upd_check_frame(f.data()) == 0;
-        if (f.size() == UPD_FRAME_BYTES && f[UPD_B_TYPE] == UPD_ABORT) {
-          aborts++;
-          continue;
+  {
+    Stream s;
+    s.init(g, 16, 96, 16, 0, 7000000000);
+    s.late = [](int64_t k) -> int64_t { return k % 23 == 11 ? 1100000 : 0; };
+    static LaneRun lr[16];
+    for (auto &x : lr)
+      x = LaneRun();
+    lanes_for_lateness(s, lr, g);
+    run_lateness(s, lr, g, 400, [](uint8_t) { return true; }, "late renders, RW frames on every lane");
+    // each release: an RW frame on the wire on its lane, 2-10 us before
+    size_t matched = 0, stray = 0;
+    int64_t worst = 0, least = INT64_MAX;
+    std::vector<Decoder> dec;
+    for (uint8_t l = 0; l < 16; l++)
+      dec.push_back(Decoder::of(s, l));
+    for (const Stream::Fired &f : s.fired) {
+      bool hit = false;
+      for (const Decoder::Frame &fr : dec[f.lane].frames) {
+        const int64_t d = f.at - s.time_of(fr.t0);
+        if (valid_ultra(fr.bytes) && d >= 0 && d <= 10000) {
+          hit = true;
+          worst = std::max(worst, d);
+          least = std::min(least, d);
+          break;
         }
-        uint8_t r[UPD_FRAME_BYTES];
-        uint32_t pause_us = 0;
-        same &= ref.next(r, 0, &pause_us) && f.size() == UPD_FRAME_BYTES &&
-                std::memcmp(r, f.data(), UPD_BLOCK_BYTES) == 0;
-        if (pause_us != 0 && i + 1 < dec.frames.size()) {
-          // the low time from its last falling edge to the next frame's first rising edge
-          const int64_t low_us = (dec.frames[i + 1].start - dec.frames[i].t0) * g.sample_ns / 1000;
-          paused &= low_us >= 300 + static_cast<int64_t>(pause_us);   // its reset and the page pause
-          least = std::min(least, low_us);
-          pauses++;
-        }
-        session++;
       }
-      CHECK(same && paused, "update on a lane, %u ms tick, run %d: %u frames "
-            "as the session built them, after %u pages the line low >= reset + page pause (least %lld us)", tick_ms, run,
-            static_cast<unsigned>(session), static_cast<unsigned>(pauses), static_cast<long long>(least));
-      if (run == 0) {
-        CHECK(result == UltraHub::UPD_DONE && session == ref.total_frames() && pauses == 3 * 8 && aborts == 0,
-              "a whole session on a lane: done, %u frames, %u page pauses", static_cast<unsigned>(session),
-              static_cast<unsigned>(pauses));
-      } else {
-        CHECK(result == UltraHub::UPD_ABORTED && session >= 100 && session <= 101 && aborts == 12,
-              "an abort after frame 100: the frames up to it, then 12 ABORT frames (%u, %u)",
-              static_cast<unsigned>(session), static_cast<unsigned>(aborts));
-      }
+      matched += hit;
+      stray += !hit;
     }
+    CHECK(stray == 0 && matched > 500 && least >= 2000 && worst <= 10000 && s.restarts >= 10,
+          "through %lld kills: %u releases, each 2-10 us after an RW frame's last edge on its lane (%.1f-%.1f us), %u "
+          "for frames that didn't complete", static_cast<long long>(s.restarts), static_cast<unsigned>(matched),
+          least / 1000.0, worst / 1000.0, static_cast<unsigned>(stray));
+    std::printf("  late interrupts: a 700 us late switch changes nothing; through %lld kills %u releases, all on time, "
+                "none for a cut frame\n", static_cast<long long>(s.restarts), static_cast<unsigned>(matched));
   }
-  portTICK_PERIOD_MS = 1;
-  std::printf("  update on a lane: every frame as the session built it, after every page the line low >= its reset + "
-              "the page pause (1 kHz and 100 Hz tick)\n");
 }
 
-}  // namespace hub_update
+//BUS_TESTS_END
+}  // namespace esphome::dig2analog_ultra
 
+#include "ultra_parlio_test_hubs.inc"
+
+namespace esphome::dig2analog_ultra {
 // ================================================================================================ the render's cost
 /// The render per chunk, built with -O2 and no sanitizers by tests/run_ultra_parlio_test.py: every lane busy with
 /// 8-board frames back to back (the worst case), and the same bus idle. Prints ns per chunk and the share of a core.
 static int bench() {
-  std::printf("bench sizes: a lane %u B (+ its frame's copy), the renderer %u B + %u B per group of a chunk "
-              "(96 groups: %u B)\n", static_cast<unsigned>(sizeof(ParlioLane)), static_cast<unsigned>(sizeof(ParlioRenderer)),
-              20u + 2u, static_cast<unsigned>(sizeof(ParlioRenderer) + 96 * 22));
+  std::printf("bench sizes: a lane %u B (+ its frame's copy), the stream %u B, + %u B per group of a chunk "
+              "(96 groups: %u B)\n", static_cast<unsigned>(sizeof(ParlioLane)), static_cast<unsigned>(sizeof(ParlioStream)),
+              20u + 2u, 96u * 22u);
   struct Case {
     const char *name;
     uint8_t lanes, width;
@@ -1347,58 +845,45 @@ static int bench() {
       {"16 lanes, 16-bit, 20 MHz, idle", 16, 16, 50, false},
   };
   for (const Case &c : cases) {
-    const Grid g = grid(c.sample_ns, std::vector<std::array<uint32_t, 4>>(c.lanes, std::array<uint32_t, 4>{250, 1050, 700, 650}));
-    const uint32_t groups = c.sample_ns == 50 ? 96 : 96;   // ~1 ms at 20 MHz, ~0.54 ms at 10 MHz... (whole groups)
-    ParlioClock clock;
-    clock.configure(c.sample_ns, g.period, groups);
-    ParlioLane lanes[PARLIO_MAX_LANES];
-    ParlioLane *ls[PARLIO_MAX_LANES];
-    for (uint8_t k = 0; k < PARLIO_MAX_LANES; k++) {
-      lanes[k].attach(&clock, k);
-      ls[k] = &lanes[k];
-    }
-    ParlioRenderer r;
-    r.init(c.width, g.period, groups, g.lane, c.lanes, 0);
+    const Grid g = default_grid(c.lanes, c.sample_ns);
+    ParlioStream st;
+    st.init(g.lane, c.lanes, 0, c.sample_ns, c.width, g.period, 96, margin_ns(c.sample_ns, c.width));
     std::vector<uint8_t> buf[2];
     for (int i = 0; i < 2; i++) {
-      buf[i].assign(r.chunk_bytes(), 0);
-      r.clear(buf[i].data(), static_cast<uint8_t>(i));
+      buf[i].assign(st.chunk_bytes(), 0);
+      st.clear(buf[i].data(), static_cast<uint8_t>(i));
     }
-    ParlioClock::State st{};
-    st.next_chunk = 2;
-    st.running = true;
-    clock.write(st);
+    st.start(0, 0);
+    void *bufs[2] = {buf[0].data(), buf[1].data()};
     std::vector<uint8_t> frame(ultra_frame_bytes(8));   // 8 boards
     std::mt19937 rng(1);
     for (auto &b : frame)
       b = static_cast<uint8_t>(rng());
     for (uint8_t k = 0; k < c.lanes; k++)
-      lanes[k].begin(frame.size(), nullptr, nullptr);
+      st.lane(k)->begin(frame.size(), nullptr, nullptr);
     const int chunks = 20000;
     int64_t ns = 0;
     uint64_t sink = 0;
     for (int i = 0; i < chunks; i++) {
       if (c.busy) {
         for (uint8_t k = 0; k < c.lanes; k++) {
-          if (!lanes[k].busy()) {
-            lanes[k].reserve_us();
-            lanes[k].post(frame.data(), frame.size(), 300, false);
+          if (!st.lane(k)->busy()) {
+            st.lane(k)->reserve_us();
+            st.lane(k)->post(frame.data(), frame.size(), 300, false);
           }
         }
       }
-      const int64_t ch = st.next_chunk;
-      st.next_chunk = ch + 1;
-      clock.write(st);
       const auto a = std::chrono::steady_clock::now();
-      r.render(ch, static_cast<uint8_t>(ch & 1), buf[ch & 1].data(), ls, &clock, st);
+      const int64_t ch = st.render(bufs);
+      st.handed_over(ch);
       ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - a).count();
       sink += buf[ch & 1][static_cast<size_t>(i) % buf[0].size()];
     }
     const double per_chunk = static_cast<double>(ns) / chunks;
-    const double chunk_ns = static_cast<double>(clock.chunk_ns());
+    const double chunk_ns = static_cast<double>(st.chunk_ns());
     const double frame_ns = (ultra_frame_bytes(8) * 8.0 * g.period * c.sample_ns) + 302400.0;   // a frame and its reset
     std::printf("bench %-38s: %7.0f ns per chunk of %4.0f us (%u B): %5.2f %% of a host core; per 8-board frame cycle "
-                "(%.2f ms) %.1f us%s\n", c.name, per_chunk, chunk_ns / 1000.0, static_cast<unsigned>(r.chunk_bytes()),
+                "(%.2f ms) %.1f us%s\n", c.name, per_chunk, chunk_ns / 1000.0, static_cast<unsigned>(st.chunk_bytes()),
                 100.0 * per_chunk / chunk_ns, frame_ns / 1e6, per_chunk * frame_ns / chunk_ns / 1000.0,
                 sink == 1 ? " " : "");
   }
@@ -1413,10 +898,15 @@ int main(int argc, char **argv) {
   test_waveform();
   test_time();
   test_windows();
-  test_slips();
+  test_late_render();
+  test_late_interrupts();
   hub_lanes::test_sixteen_lanes();
   hub_lanes::test_rmt_shared_uart();
+  hub_lanes::test_fair_uart();
+  hub_lanes::test_failed_poll_then_update();
+  hub_lanes::test_group_cadence();
   hub_update::test_update_on_lane();
+  hub_update::test_update_failures();
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "ALL ULTRA PARLIO TESTS PASSED", failures);
   return failures ? 1 : 0;
 }

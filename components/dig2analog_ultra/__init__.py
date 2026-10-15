@@ -569,7 +569,8 @@ def parlio_hub_timing(full, conf):
         for h in (hubs if isinstance(hubs, list) else [hubs])
         if str(h.get(CONF_PARLIO_ID, "")) == str(bus[CONF_ID])
     }
-    lay = parlio_layout(bus["sample_rate"], len(bus["pins"]), lanes, int(bus["buffer_time"].total_microseconds) * 1000)
+    buffer = int(bus["buffer_time"].total_microseconds) * 1000 if "buffer_time" in bus else None
+    lay = parlio_layout(bus["sample_rate"], len(bus["pins"]), lanes, buffer)
     return lay["lanes"].get(conf[CONF_LANE])
 
 

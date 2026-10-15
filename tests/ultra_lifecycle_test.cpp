@@ -1110,7 +1110,8 @@ struct UltraHub {
   void loop();                        // the component's (hub_loop.inc)
   void transmit_();                   // (hub_transmit.inc)
   bool rw_due_(bool urgent);          // (hub_rw.inc)
-  bool rw_uart_free_() const;
+  bool rw_uart_turn_();
+  void rw_drop_turn_();
   void finish_window_(bool wait);
   void rw_publish_();
   static bool rw_done_isr_(rmt_channel_handle_t, const rmt_tx_done_event_data_t *, void *arg);
@@ -1157,7 +1158,9 @@ struct UltraHub {
   Pin *rw_dir_pin_{nullptr};
   IsrPin rw_dir_isr_;
   Pin *rw_rx_enable_pin_{nullptr};   // (lines sharing a UART: tests/ultra_parlio_test.cpp)
-  bool rw_turn_{false};
+  bool rw_turn_{false}, rw_waiting_{false};
+  uint32_t rw_wait_order_{0}, rw_wait_seen_ms_{0};
+  static uint32_t rw_wait_seq_;
   bool rw_driving_{true};
   volatile bool rw_release_{false};
   volatile int64_t rw_released_us_{0};
@@ -1220,6 +1223,8 @@ struct UltraHub {
   }
 };
 std::vector<UltraHub *> UltraHub::hubs_;
+uint32_t UltraHub::rw_wait_seq_ = 0;
+static constexpr uint32_t RW_WAIT_STALE_MS = 100;
 
 #include "hub_loop.inc"
 #include "hub_transmit.inc"

@@ -4,7 +4,8 @@ calibration, the version display, the board firmware update with a power supply 
 the hub's code. Also tests/build/ultra/ultra-strip.yaml: the dig2analog_ultra_strip example with a partition, effect_glide modes
 and the downlight notification pattern; tests/build/ultra/ultra-telemetry.yaml: ultra-example with Diff-Power receiver
 telemetry (the UART, the direction pin, every receiver sensor and text); tests/build/ultra/ultra-p4-telemetry.yaml (4
-RMT lines with telemetry on a P4) and ultra-p4-parlio.yaml (16 PARLIO lanes, 4 shared UARTs). The examples themselves:
+RMT lines with telemetry on a P4), ultra-p4-parlio.yaml (16 PARLIO lanes, 4 shared UARTs) and
+ultra-p4-parlio-lights.yaml (8 lanes at 10 MHz, no telemetry). The examples themselves:
 tests/local_examples.py.
 
 Usage: .venv/Scripts/python tests/make_ultra_compile_config.py
@@ -509,6 +510,22 @@ def p4_parlio_config() -> str:
             "\ndig2analog_ultra:\n" + hubs + "\nlight:\n" + lights)
 
 
+def p4_parlio_lights_config() -> str:
+    """tests/build/ultra/ultra-p4-parlio-lights.yaml: 8 lanes of a PARLIO bus on an ESP32-P4 at 10 MHz (8-bit samples,
+    the automatic buffer time), lights only: no telemetry, no UART (the build without the direction pins' code)."""
+    hubs, lights = "", ""
+    for k in range(8):
+        hubs += f"  - id: port{k + 1}\n    parlio_id: ports\n    lane: {k}\n    num_boards: 1\n"
+        lights += (f"  - platform: dig2analog_ultra\n    dig2analog_ultra_id: port{k + 1}\n    name: Port {k + 1} RGBCCT\n"
+                   f"    board: 0\n    red: 1\n    green: 2\n    blue: 3\n    cold_white: 4\n    warm_white: 5\n")
+    return ("esphome:\n  name: d2a-ultra-p4-parlio-lights\n\nesp32:\n  board: esp32-p4_r3\n  framework:\n"
+            "    type: esp-idf\n\nexternal_components:\n  - source:\n      type: local\n      path: ../../../components\n"
+            "    components: [dig2analog_ultra, dig2analog_ultra_parlio]\n\nlogger:\n\n"
+            "dig2analog_ultra_parlio:\n  - id: ports\n    sample_rate: 10MHz\n    pins: ["
+            + ", ".join(f"GPIO{i}" for i in range(8)) + "]\n"
+            "\ndig2analog_ultra:\n" + hubs + "\nlight:\n" + lights)
+
+
 def telemetry_config(example: str) -> str:
     """tests/build/ultra/ultra-telemetry.yaml: ultra-example with Diff-Power receiver telemetry on its line: a
     device per receiver, the four lights of board 1 on their own devices (their estimates)."""
@@ -577,11 +594,13 @@ def main() -> None:
     (OUT / "ultra-p4-telemetry.yaml").write_text(p4_telemetry_config(), encoding="utf-8")
     (OUT / "ultra-diffpower.yaml").write_text(DIFFPOWER_CONFIG, encoding="utf-8")
     (OUT / "ultra-p4-parlio.yaml").write_text(p4_parlio_config(), encoding="utf-8")
+    (OUT / "ultra-p4-parlio-lights.yaml").write_text(p4_parlio_lights_config(), encoding="utf-8")
     secrets = OUT / "secrets.yaml"
     if not secrets.exists():
         secrets.write_text('wifi_ssid: "test"\nwifi_password: "testtest"\n', encoding="utf-8")
     print(f"written {OUT / 'ultra-example.yaml'}, {OUT / 'ultra-strip.yaml'}, {OUT / 'ultra-telemetry.yaml'}, "
-          f"{OUT / 'ultra-p4-telemetry.yaml'}, {OUT / 'ultra-diffpower.yaml'}, {OUT / 'ultra-p4-parlio.yaml'}")
+          f"{OUT / 'ultra-p4-telemetry.yaml'}, {OUT / 'ultra-diffpower.yaml'}, {OUT / 'ultra-p4-parlio.yaml'}, "
+          f"{OUT / 'ultra-p4-parlio-lights.yaml'}")
 
 
 if __name__ == "__main__":

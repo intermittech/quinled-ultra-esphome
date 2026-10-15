@@ -17,6 +17,9 @@
 #include <esp_clk_tree.h>
 #include <esp_random.h>
 #include <esp_timer.h>
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+#include <esp_memory_utils.h>
+#endif
 
 namespace esphome::dig2analog_ultra {
 
@@ -93,6 +96,10 @@ void UltraHub::set_pwm_frequency(int board, float hz) {
 // whole chain lock (boards that were locked to a WS protocol show dark meanwhile) before the commands come.
 void UltraHub::resync(bool power_on) {
   this->tx_prepared_ = false;  // a frame the RMT refused: dropped, the replay sends everything again
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  this->tx_rw_ = false;
+  this->rw_drop_turn_();       // (a poll frame among them: its UART's turn goes to the next line)
+#endif
   this->preamble_full_ = !(power_on && this->synced_once_);
   this->preamble_ = this->preamble_full_ ? preamble_frames(this->num_boards_) : power_on_preamble_frames(this->num_boards_);
   int64_t lead_us = static_cast<int64_t>(this->preamble_) * (this->frame_us_ + 200);
@@ -111,7 +118,7 @@ UltraHub::Diagnostics UltraHub::take_diagnostics() {
   uint32_t underruns = this->enc_.watch.count;
 #ifdef USE_DIG2ANALOG_ULTRA_PARLIO
   if (this->lane_ != nullptr)
-    underruns = this->lane_->refused();   // frames the stream couldn't take (it slipped): lost like an underrun's
+    underruns = this->lane_->refused() + this->lane_->lost();   // frames a restart of the stream lost
 #endif
   const Diagnostics d{this->sched_.take_queue_peak(), this->sched_.take_memory_peak(), this->build_peak_us_,
                       underruns, this->frames_};
@@ -123,7 +130,12 @@ std::vector<UltraHub *> UltraHub::hubs_;
 GroupStart UltraHub::group_;
 
 int64_t UltraHub::lead_us(size_t commands, size_t waiting) const {
-  const uint32_t frame = this->frame_us_ + 500;   // a frame and the gap to the next
+  uint32_t frame = this->frame_us_ + 500;   // a frame and the gap to the next
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+  // a lane's mailbox takes a frame at most every few chunks (a frame waits for the one before it to be taken):
+  // short frames on long chunks come that far apart
+  frame = std::max(frame, this->lane_lead_us_);
+#endif
   if (this->start_delay_us_ >= 0)
     return this->start_delay_us_ + static_cast<int64_t>(commands > 1 ? commands - 1 : 0) * frame;
   int64_t lead = start_lead_us(frame, commands, waiting);
@@ -150,7 +162,11 @@ int64_t UltraHub::start_time_us(uint16_t board) {
     lead = std::max(lead, hub->command_lead_us_());
   // a command joins the open group while its first copy gets out by its start: the frame on the wire, what waits
   // on its board, its own frame
-  int64_t reach = start_lead_us(this->frame_us_ + 500, 1, this->sched_.waiting(board)) - START_SLACK_US;
+  uint32_t frame = this->frame_us_ + 500;
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+  frame = std::max(frame, this->lane_lead_us_);
+#endif
+  int64_t reach = start_lead_us(frame, 1, this->sched_.waiting(board)) - START_SLACK_US;
 #ifdef USE_DIG2ANALOG_ULTRA_PARLIO
   reach += this->lane_lead_us_;
 #endif
@@ -203,6 +219,10 @@ bool UltraHub::start_update(const uint8_t *image, size_t size, const UpdateSessi
                                 this->update_frame_min_us()))
     return false;
   this->tx_prepared_ = false;  // the session takes the buffer; post-session replay repairs normal state
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  this->tx_rw_ = false;        // a poll frame that never went out: its UART's turn goes to the next line
+  this->rw_drop_turn_();
+#endif
   this->upd_total_ = this->upd_session_.total_frames();
   this->upd_sent_.store(0);
   this->upd_pass_.store(0);
@@ -307,49 +327,81 @@ void UltraHub::update_task_(void *arg) {
 
 #ifdef USE_DIG2ANALOG_ULTRA_PARLIO
 // The session on a PARLIO lane: each frame posted with its page pause as the lane's quiet after it (so the line stays
-// low that long after its reset, whatever the stream's latency), the next built once the renderer took it. A frame the
-// stream refused (it slipped) or that came too late for its start goes again (a new start).
+// low that long after its reset, whatever the stream's latency), the next built once the renderer took it. A frame
+// whose start passed before it was posted, or that the stream refused (it restarted before the frame went out), goes
+// again at a new start, its time stamped again. Every wait is bounded (~2 s without the stream taking a frame: failed;
+// after that or an abort ~100 ms) and ends on an abort; the session is over once its last frame is out on the wire.
+static void upd_stamp(uint8_t *frame, uint32_t time_us) {
+  upd_put32(frame + UPD_BLOCK_BYTES + 3u, time_us);
+  frame[UPD_BLOCK_BYTES + 7u] = upd_crc8(frame + UPD_BLOCK_BYTES, 7);
+}
+
 uint8_t UltraHub::update_lane_() {
-  uint8_t result = UPD_DONE;
-  uint32_t pause_us = 0;
+  enum : uint8_t { SENT = 0, AGAIN, ABORT, STOPPED };
   const uint32_t reset_us = this->reset_ns_ / 1000;
-  auto send = [this](uint32_t quiet_us) -> bool {
-    for (int tries = 0; tries < 400; tries++) {   // ~2 s
-      while (this->lane_->busy())
-        vTaskDelay(1);
-      if (this->lane_->post(this->tx_buf_, UPD_FRAME_BYTES, quiet_us, false))
-        return true;
+  uint32_t limit = 2000 / portTICK_PERIOD_MS + 2;   // ticks without the stream taking a frame: it stopped
+  // until the lane took the posted frame (SENT) or refused it (AGAIN)
+  auto settle = [&](bool abortable) -> uint8_t {
+    for (uint32_t t = 0; this->lane_->busy(); t++) {
+      if (abortable && this->upd_abort_.load())
+        return ABORT;
+      if (t > limit)
+        return STOPPED;
       vTaskDelay(1);
     }
-    return false;
+    return this->lane_->take_refused() ? AGAIN : SENT;
   };
+  // tx_buf_'s frame on the wire, at a fresh start; abortable: an abort ends the wait (not for the ABORT frames)
+  auto send = [&](uint32_t quiet_us, bool abortable) -> uint8_t {
+    for (uint32_t t = 0;; t++) {
+      if (abortable && this->upd_abort_.load())
+        return ABORT;
+      if (t > limit)
+        return STOPPED;
+      if (!this->lane_->ready()) {   // (the stream restarting)
+        vTaskDelay(1);
+        continue;
+      }
+      upd_stamp(this->tx_buf_, static_cast<uint32_t>(this->lane_->reserve_us()));
+      if (!this->lane_->post(this->tx_buf_, UPD_FRAME_BYTES, quiet_us, false)) {
+        vTaskDelay(1);   // its start passed (or the stream restarted): a new one
+        continue;
+      }
+      const uint8_t r = settle(abortable);
+      if (r != AGAIN)
+        return r;
+    }
+  };
+  uint8_t result = UPD_DONE;
+  uint32_t pause_us = 0;
   for (;;) {
     if (this->upd_abort_.load()) {
       result = UPD_ABORTED;
       break;
     }
-    while (this->lane_->busy())
-      vTaskDelay(1);
-    const int64_t start = this->lane_->reserve_us();
-    if (!this->upd_session_.next(this->tx_buf_, static_cast<uint32_t>(start), &pause_us))
+    if (!this->upd_session_.next(this->tx_buf_, 0, &pause_us))
       break;
-    if (!send(reset_us + pause_us)) {   // the boards program a page in the pause
-      result = UPD_FAILED;
+    const uint8_t s = send(reset_us + pause_us, true);   // the boards program a page in the pause
+    if (s != SENT) {
+      result = s == ABORT ? UPD_ABORTED : UPD_FAILED;
       break;
     }
     this->upd_sent_.store(this->upd_session_.frames_sent());
     this->upd_pass_.store(this->upd_session_.pass());
   }
+  // after an abort or a failure, the ABORT frames and the last frame's end are best effort: a stream that takes no
+  // frame for ~100 ms (it takes one within 3 buffers) holds them up no longer
+  if (result != UPD_DONE)
+    limit = 100 / portTICK_PERIOD_MS + 2;
   if (result == UPD_ABORTED) {
     for (int i = 0; i < 12; i++) {
-      while (this->lane_->busy())
-        vTaskDelay(1);
-      this->upd_session_.abort_frame(this->tx_buf_, static_cast<uint32_t>(this->lane_->reserve_us()));
-      if (!send(reset_us))
+      this->upd_session_.abort_frame(this->tx_buf_, 0);
+      if (send(reset_us, false) != SENT)
         break;
     }
   }
-  while (this->lane_->busy())
+  // the last frame out on the wire (and its quiet), before the line goes back
+  for (uint32_t t = 0; now_us_() < this->lane_->end_us() && t <= limit; t++)
     vTaskDelay(1);
   return result;
 }
@@ -360,7 +412,12 @@ uint8_t UltraHub::update_lane_() {
 // An RW frame may go out now: telemetry configured, the boards powered, nothing urgent (commands, a preamble, a PING
 // burst, a WS switch go first), no window open, and the poller has a page due (it keeps the lock and the spacing).
 bool UltraHub::rw_due_(bool urgent) {
-  if (this->rw_uart_ == nullptr || !this->started_)
+  if (this->rw_uart_ == nullptr)
+    return false;
+  // a line that held its UART for a poll frame that was dropped since: it lets go
+  if (this->rw_turn_ && !this->rw_open_ && !(this->tx_prepared_ && this->tx_rw_))
+    this->rw_drop_turn_();
+  if (!this->started_)
     return false;
   // the receivers have no supply: unavailable until they answer again; on a Diff-Power port in standby they show
   // Standby, and once it is powered their status follows their answers again: every receiver's sensors both times
@@ -381,15 +438,10 @@ bool UltraHub::rw_due_(bool urgent) {
     this->poller_.touch_all();
     this->rw_publish_();
   }
-  // a line that held its UART for an RW frame that was dropped since (a resync): it lets go
-  if (this->rw_turn_ && !this->rw_open_ && !(this->tx_prepared_ && this->tx_rw_)) {
-    this->rw_turn_ = false;
-    if (this->rw_rx_enable_pin_ != nullptr)
-      this->rw_rx_enable_pin_->digital_write(false);
-  }
-  // lines sharing a UART (each with a receiver_enable_pin): one window at a time
-  if (urgent || this->rw_open_ || !this->rw_uart_free_())
+  if (urgent || this->rw_open_) {
+    this->rw_waiting_ = false;   // (not waiting for the UART)
     return false;
+  }
   // the lock interval from the last lock frame's end (it was set when the frame was built)
   if (this->rw_lock_end_) {
     if (rmt_tx_wait_all_done(this->channel_, 0) != ESP_OK)
@@ -397,7 +449,11 @@ bool UltraHub::rw_due_(bool urgent) {
     this->poller_.locked(millis());
     this->rw_lock_end_ = false;
   }
-  return this->poller_.due(millis());
+  if (!this->poller_.due(millis())) {
+    this->rw_waiting_ = false;
+    return false;
+  }
+  return this->rw_uart_turn_();
 }
 
 // Just woken and not evaluated yet: not heard, not missed enough to be gone, not behind one that is gone (it can't be
@@ -410,12 +466,37 @@ bool UltraHub::rx_settling(uint16_t receiver) const {
   return !(cut >= 0 && cut < receiver);
 }
 
-bool UltraHub::rw_uart_free_() const {
+// Lines sharing a UART (each with a receiver_enable_pin): one window at a time, and when one ends the line that has
+// waited longest goes next, so a line with polls always due can't keep the UART. A line that stopped waiting (its
+// commands go first now, or nothing is due) is no longer in the queue; one whose loop hasn't run for a while neither.
+uint32_t UltraHub::rw_wait_seq_ = 0;
+static constexpr uint32_t RW_WAIT_STALE_MS = 100;
+
+bool UltraHub::rw_uart_turn_() {
+  const uint32_t now = millis();
+  if (!this->rw_waiting_) {
+    this->rw_waiting_ = true;
+    this->rw_wait_order_ = ++rw_wait_seq_;
+  }
+  this->rw_wait_seen_ms_ = now;
   for (const UltraHub *hub : hubs_) {
-    if (hub != this && hub->rw_turn_ && hub->rw_uart_ == this->rw_uart_)
-      return false;
+    if (hub == this || hub->rw_uart_ != this->rw_uart_)
+      continue;
+    if (hub->rw_turn_)
+      return false;   // its window is open
+    if (hub->rw_waiting_ && now - hub->rw_wait_seen_ms_ < RW_WAIT_STALE_MS &&
+        static_cast<int32_t>(hub->rw_wait_order_ - this->rw_wait_order_) < 0)
+      return false;   // it has waited longer
   }
   return true;
+}
+
+void UltraHub::rw_drop_turn_() {
+  if (!this->rw_turn_ || this->rw_open_)
+    return;
+  this->rw_turn_ = false;
+  if (this->rw_rx_enable_pin_ != nullptr)
+    this->rw_rx_enable_pin_->digital_write(false);
 }
 
 // The RMT's interrupt after an RW frame's last symbol: let go of the line (ULTRA_RW_RELEASE_US after its last bit).
@@ -738,7 +819,19 @@ void UltraHub::setup() {
 #ifdef USE_DIG2ANALOG_ULTRA_PARLIO
   if (this->lane_ != nullptr) {
     // a PARLIO lane: the bus renders the frames; the timing (set_timing) is already on its sample grid
-    if (!this->lane_->begin(buf_bytes, UltraHub::rw_lane_release_, this)) {
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+    const ParlioLane::ReleaseFn release = UltraHub::rw_lane_release_;   // the direction pin (telemetry)
+    // the bus' timer lets go of the direction pin also while flash writes have the cache off: what it touches here
+    // must be in internal RAM (malloc puts objects this small there; PSRAM only when internal RAM is exhausted)
+    if (this->rw_dir_pin_ != nullptr && !esp_ptr_internal(this)) {
+      ESP_LOGE(TAG, "PARLIO lane %u: the line's state is in PSRAM (internal RAM full)", this->lane_->index());
+      this->mark_failed();
+      return;
+    }
+#else
+    const ParlioLane::ReleaseFn release = nullptr;
+#endif
+    if (!this->lane_->begin(buf_bytes, release, this)) {
       ESP_LOGE(TAG, "PARLIO lane %u: no bus or no memory", this->lane_->index());
       this->mark_failed();
       return;
@@ -1069,6 +1162,7 @@ void UltraHub::transmit_() {
       this->tx_rw_ = true;
       // the UART is this line's until the window is read: its receiver on before the frame's last bit
       this->rw_turn_ = true;
+      this->rw_waiting_ = false;
       if (this->rw_rx_enable_pin_ != nullptr)
         this->rw_rx_enable_pin_->digital_write(true);
 #endif

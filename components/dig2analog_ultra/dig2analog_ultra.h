@@ -354,13 +354,19 @@ class UltraHub final : public Component {
   void finish_window_(bool wait);
   void rw_publish_();
   static bool rw_done_isr_(rmt_channel_handle_t channel, const rmt_tx_done_event_data_t *edata, void *arg);
-  /// No other line holds this line's UART (lines sharing one take turns: one window open per UART).
-  bool rw_uart_free_() const;
+  /// This line's turn on its UART (lines sharing one take turns: one window at a time, the longest waiting first).
+  bool rw_uart_turn_();
+  /// The turn of a poll frame that won't go out (a resync, an update): let go of it (an open window keeps it).
+  void rw_drop_turn_();
   uart::UARTComponent *rw_uart_{nullptr};
   InternalGPIOPin *rw_dir_pin_{nullptr};
   ISRInternalGPIOPin rw_dir_isr_;
   GPIOPin *rw_rx_enable_pin_{nullptr};
   bool rw_turn_{false};                   // this line holds its UART: from its RW frame until its window is read
+  bool rw_waiting_{false};                // ... a poll is due, the UART is another line's: it waits its turn
+  uint32_t rw_wait_order_{0};             // when it started waiting (the order among the lines)
+  uint32_t rw_wait_seen_ms_{0};           // its loop saw it still waiting
+  static uint32_t rw_wait_seq_;
   bool rw_driving_{true};                 // the direction pin is high (the hub drives the line)
   volatile bool rw_release_{false};       // the RMT's done interrupt lets go of the line (an RW frame is on the wire)
   volatile int64_t rw_released_us_{0};
@@ -479,7 +485,9 @@ class UltraHub final : public Component {
   ParlioLane *lane_{nullptr};
   uint32_t lane_lead_us_{0};    // how far ahead of now its frames start at most
   esp_err_t lane_post_();
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   static void rw_lane_release_(void *arg);
+#endif
 #endif
 
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE

@@ -11,129 +11,170 @@
 #include <esp_attr.h>
 #include <esp_heap_caps.h>
 #include <esp_memory_utils.h>
+#include <esp_rom_gpio.h>
 #include <esp_timer.h>
+#include <hal/gpio_ll.h>
+#include <soc/gpio_sig_map.h>
+#include <soc/parlio_periph.h>
 
 namespace esphome::dig2analog_ultra {
 
 static const char *const TAG = "dig2analog_ultra_parlio";
 
-static constexpr size_t BUFFER_ALIGN = 128;      // DMA and cache line alignment (internal memory and PSRAM)
-static constexpr uint32_t RENDER_PRIORITY = 20;   // above ESPHome's loop and the network tasks
-static constexpr BaseType_t RENDER_CORE = 1;      // off the core of ESPHome's main loop
-static constexpr int64_t RENDER_MARGIN_NS = 30000;   // a chunk handed over this close to the switch may be late
+static constexpr size_t BUFFER_ALIGN = 128;   // DMA and cache line alignment (internal memory and PSRAM)
+// The render task: priority 20 on core 1, ESPHome's loop core (its loop task runs at priority 1 and is preempted for
+// the render's ~0.1 ms per chunk); core 0 carries the network stack, IPC and esp_timer tasks at priorities around and
+// above 20, which would delay the render. Its lateness is bounded either way: a chunk late for its deadline kills the
+// stream safely (ParlioStream).
+static constexpr uint32_t RENDER_PRIORITY = 20;
+static constexpr BaseType_t RENDER_CORE = 1;
 
 // The driver switched to the newer buffer (the older one ended and is free): the task renders the next chunk into it.
-bool IRAM_ATTR UltraParlioBus::on_switch_(parlio_tx_unit_handle_t, const parlio_tx_buffer_switched_event_data_t *,
+bool IRAM_ATTR UltraParlioBus::on_switch_(parlio_tx_unit_handle_t, const parlio_tx_buffer_switched_event_data_t *edata,
                                           void *arg) {
   auto *bus = static_cast<UltraParlioBus *>(arg);
-  bus->switch_us_ = esp_timer_get_time();
+  bus->switched_to_ = edata->new_buffer_addr;
   bus->switches_ = bus->switches_ + 1;
   BaseType_t woken = pdFALSE;
   vTaskNotifyGiveFromISR(bus->task_, &woken);
   return woken == pdTRUE;
 }
 
-// The timer: every lane whose RW frame's last bit is out lets go of its line; then the next release.
+// The timer, also with the cache off (CONFIG_GPTIMER_ISR_CACHE_SAFE, its control functions in IRAM; everything it
+// touches is in internal RAM): the direction pins of the RW frames that ended, and the render deadline.
 bool IRAM_ATTR UltraParlioBus::on_alarm_(gptimer_handle_t, const gptimer_alarm_event_data_t *, void *arg) {
   auto *bus = static_cast<UltraParlioBus *>(arg);
   const int64_t now = esp_timer_get_time();
-  portENTER_CRITICAL_ISR(&bus->release_lock_);
+  bool kill = false;
+  portENTER_CRITICAL_ISR(&bus->lock_);
+  const uint16_t mask = bus->stream_.alarm(now, &kill);
+  if (kill)
+    bus->pins_to_idle_();   // before the DMA could repeat its buffer: every frame on the wire is cut
   for (uint8_t k = 0; k < PARLIO_MAX_LANES; k++) {
-    if (bus->release_at_[k] != 0 && bus->release_at_[k] <= now + 1) {
-      bus->release_at_[k] = 0;
-      bus->lanes_[k].release_now();
-    }
+    if (mask & (1u << k))
+      bus->stream_.lane(k)->release_now();
   }
   bus->arm_();
-  portEXIT_CRITICAL_ISR(&bus->release_lock_);
-  return false;
+  portEXIT_CRITICAL_ISR(&bus->lock_);
+  BaseType_t woken = pdFALSE;
+  if (kill)
+    vTaskNotifyGiveFromISR(bus->task_, &woken);   // the task restarts the stream
+  return woken == pdTRUE;
 }
 
-// (under release_lock_) the alarm at the earliest release
+// (under lock_) the timer at the stream's next alarm; an alarm already passed fires at once
 void IRAM_ATTR UltraParlioBus::arm_() {
-  int64_t first = 0;
-  for (int64_t at : this->release_at_) {
-    if (at != 0 && (first == 0 || at < first))
-      first = at;
-  }
-  if (first == 0)
+  const int64_t at = this->stream_.next_alarm_us();
+  if (at == 0)
     return;
-  // an alarm the counter already passed would wait for its wrap: then 2 us from now
-  uint64_t raw = 0;
-  gptimer_get_raw_count(this->timer_, &raw);
   gptimer_alarm_config_t alarm{};
-  alarm.alarm_count = std::max<uint64_t>(static_cast<uint64_t>(first - this->gp_base_us_), raw + 2);
+  alarm.alarm_count = static_cast<uint64_t>(at - this->gp_base_us_);
   gptimer_set_alarm_action(this->timer_, &alarm);
 }
 
-void UltraParlioBus::schedule_release_(uint8_t lane, int64_t at_us) {
-  if (esp_timer_get_time() + 2 >= at_us) {   // (only when the render was late) at once
-    this->lanes_[lane].release_now();
-    return;
+void IRAM_ATTR UltraParlioBus::pins_to_idle_() {
+  for (uint8_t k = 0; k < PARLIO_MAX_LANES; k++) {
+    const int8_t pin = this->pins_[k];
+    if (pin < 0)
+      continue;
+    gpio_ll_set_level(&GPIO, pin, (this->invert_ >> k) & 1u);
+    esp_rom_gpio_connect_out_signal(pin, SIG_GPIO_OUT_IDX, false, false);
   }
-  portENTER_CRITICAL(&this->release_lock_);
-  this->release_at_[lane] = at_us;
-  this->arm_();
-  portEXIT_CRITICAL(&this->release_lock_);
+}
+
+void UltraParlioBus::pins_to_parlio_() {
+  for (uint8_t k = 0; k < PARLIO_MAX_LANES; k++) {
+    if (this->pins_[k] >= 0)
+      esp_rom_gpio_connect_out_signal(this->pins_[k], parlio_periph_signals.groups[0].tx_units[0].data_sigs[k], false,
+                                      false);
+  }
 }
 
 void UltraParlioBus::render_task_(void *arg) {
   auto *bus = static_cast<UltraParlioBus *>(arg);
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    bus->render_next_();
+    if (bus->stream_.killed())
+      bus->restart_();
+    else
+      bus->render_next_();
   }
 }
 
 // The next chunk into the buffer just freed, handed to the driver (it plays after the one that just started).
 void UltraParlioBus::render_next_() {
   const int64_t t_start = esp_timer_get_time();
-  ParlioClock::State &st = this->state_;
-  const int64_t ready_ns = (t_start * 1000) + this->render_ns_est_ + RENDER_MARGIN_NS;
-  const int64_t moved = parlio_slip(st, this->clock_.chunk_ns(), this->switch_us_ * 1000, ready_ns);
-  if (moved != 0) {
-    this->slips_ += static_cast<uint32_t>(moved > 0 ? moved : -moved);
-    // the releases scheduled before: their frames move with the stream
-    const int64_t shift_us = moved * static_cast<int64_t>(this->clock_.chunk_ns() / 1000);
-    portENTER_CRITICAL(&this->release_lock_);
-    for (int64_t &at : this->release_at_) {
-      if (at != 0)
-        at += shift_us;
-    }
+  const int64_t chunk = this->stream_.next_chunk();
+  // the buffer the driver switched to must be the chunk before this one: else something went wrong, start over
+  if (this->switched_to_ != this->buf_[(chunk - 1) & 1]) {
+    portENTER_CRITICAL(&this->lock_);
+    this->stream_.kill();
+    this->pins_to_idle_();
+    portEXIT_CRITICAL(&this->lock_);
+    this->restart_();
+    return;
+  }
+  void *bufs[2] = {this->buf_[0], this->buf_[1]};
+  this->stream_.render(bufs);
+  if (parlio_tx_unit_transmit(this->unit_, this->buf_[chunk & 1], this->stream_.chunk_bytes() * 8, &this->tx_cfg_) !=
+      ESP_OK) {
+    this->tx_errors_++;   // (the deadline kills the stream)
+    return;
+  }
+  portENTER_CRITICAL(&this->lock_);
+  if (!this->stream_.killed()) {
+    this->stream_.handed_over(chunk);
     this->arm_();
-    portEXIT_CRITICAL(&this->release_lock_);
   }
-  const int64_t chunk = st.next_chunk;
-  st.next_chunk = chunk + 1;
-  this->clock_.write(st);   // hubs reserve from the chunk after it on
-  ParlioLane *lanes[PARLIO_MAX_LANES];
-  for (uint8_t k = 0; k < PARLIO_MAX_LANES; k++)
-    lanes[k] = &this->lanes_[k];
-  uint8_t *buf = this->buf_[chunk & 1];
-  this->renderer_.render(chunk, static_cast<uint8_t>(chunk & 1), buf, lanes, &this->clock_, st);
-  for (uint8_t i = 0; i < this->renderer_.releases(); i++) {
-    const ParlioRenderer::Release &r = this->renderer_.release(i);
-    this->schedule_release_(r.lane, (r.at_ns + 999) / 1000);
-  }
-  // (it can't fail with a valid buffer; if it did, the DMA would play the last chunk forever: tried again, counted)
-  if (parlio_tx_unit_transmit(this->unit_, buf, this->renderer_.chunk_bytes() * 8, &this->tx_cfg_) != ESP_OK &&
-      parlio_tx_unit_transmit(this->unit_, buf, this->renderer_.chunk_bytes() * 8, &this->tx_cfg_) != ESP_OK)
-    this->tx_errors_++;
-  const int64_t took = esp_timer_get_time() - t_start;
-  this->render_ns_est_ += (took * 1000 - this->render_ns_est_) / 8;
-  this->render_us_max_ = std::max(this->render_us_max_, static_cast<uint32_t>(took));
-  this->render_us_sum_ += static_cast<uint32_t>(took);
+  portEXIT_CRITICAL(&this->lock_);
+  const uint32_t took = static_cast<uint32_t>(esp_timer_get_time() - t_start);
+  this->render_us_max_ = std::max(this->render_us_max_, took);
+  this->render_us_sum_ += took;
   this->renders_++;
 }
 
+// Two idle chunks, the first starting now: the stream's (re)start. false: the driver refused.
+bool UltraParlioBus::start_stream_() {
+  const int64_t first = this->stream_.next_chunk();
+  for (int i = 0; i < 2; i++)
+    this->stream_.clear(this->buf_[i], static_cast<uint8_t>(i));
+  if (parlio_tx_unit_enable(this->unit_) != ESP_OK ||
+      parlio_tx_unit_transmit(this->unit_, this->buf_[first & 1], this->stream_.chunk_bytes() * 8, &this->tx_cfg_) !=
+          ESP_OK)
+    return false;
+  const int64_t t0 = esp_timer_get_time();   // (its first sample went out just before)
+  this->switched_to_ = this->buf_[first & 1];
+  if (parlio_tx_unit_transmit(this->unit_, this->buf_[(first + 1) & 1], this->stream_.chunk_bytes() * 8,
+                              &this->tx_cfg_) != ESP_OK)
+    return false;
+  portENTER_CRITICAL(&this->lock_);
+  this->stream_.start(first, t0 * 1000);
+  this->arm_();
+  portEXIT_CRITICAL(&this->lock_);
+  return true;
+}
+
+// After a kill: the DMA stopped, every frame on the wire dropped, the stream started again with idle chunks; then the
+// pins back on the PARLIO (it plays idle chunks by then).
+void UltraParlioBus::restart_() {
+  parlio_tx_unit_disable(this->unit_);
+  this->stream_.drop_all();
+  this->restarts_++;
+  if (!this->start_stream_()) {
+    this->tx_errors_++;
+    return;   // (the pins stay idle; loop() reports it)
+  }
+  this->pins_to_parlio_();
+}
+
 void UltraParlioBus::setup() {
-  if (!this->renderer_.init(this->width_, this->period_, this->clock_.chunk_groups(), this->timing_,
-                            this->lanes_used_, this->invert_)) {
+  if (!this->stream_.init(this->timing_, this->lanes_used_, this->invert_, 1000000000u / this->rate_hz_, this->width_,
+                          this->period_, this->chunk_groups_, this->margin_ns_)) {
     ESP_LOGE(TAG, "Timing does not fit the sample grid");
     this->mark_failed();
     return;
   }
-  const size_t bytes = this->renderer_.chunk_bytes();
+  const size_t bytes = this->stream_.chunk_bytes();
   for (int i = 0; i < 2; i++) {
     const uint32_t internal = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT;
     const uint32_t spiram = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
@@ -146,10 +187,9 @@ void UltraParlioBus::setup() {
       return;
     }
     this->in_psram_ |= esp_ptr_external_ram(this->buf_[i]);
-    this->renderer_.clear(this->buf_[i], static_cast<uint8_t>(i));
   }
 
-  // the releases' timer: 1 MHz, free running, on the host clock
+  // the timer: 1 MHz, free running, on the host clock
   gptimer_config_t tc{};
   tc.clk_src = GPTIMER_CLK_SRC_DEFAULT;
   tc.direction = GPTIMER_COUNT_UP;
@@ -165,11 +205,11 @@ void UltraParlioBus::setup() {
   }
   {
     uint64_t raw = 0;
-    portENTER_CRITICAL(&this->release_lock_);
+    portENTER_CRITICAL(&this->lock_);
     const int64_t now = esp_timer_get_time();
     gptimer_get_raw_count(this->timer_, &raw);
     this->gp_base_us_ = now - static_cast<int64_t>(raw);
-    portEXIT_CRITICAL(&this->release_lock_);
+    portEXIT_CRITICAL(&this->lock_);
   }
 
   parlio_tx_unit_config_t cfg{};
@@ -192,9 +232,8 @@ void UltraParlioBus::setup() {
   }
   parlio_tx_event_callbacks_t cbs{};
   cbs.on_buffer_switched = UltraParlioBus::on_switch_;
-  if (parlio_tx_unit_register_event_callbacks(this->unit_, &cbs, this) != ESP_OK ||
-      parlio_tx_unit_enable(this->unit_) != ESP_OK) {
-    ESP_LOGE(TAG, "PARLIO TX unit enable failed");
+  if (parlio_tx_unit_register_event_callbacks(this->unit_, &cbs, this) != ESP_OK) {
+    ESP_LOGE(TAG, "PARLIO TX callback failed");
     this->mark_failed();
     return;
   }
@@ -204,34 +243,27 @@ void UltraParlioBus::setup() {
     this->mark_failed();
     return;
   }
-
-  // the stream: chunk 0 (idle) plays and loops, chunk 1 (idle) waits; the switch to it renders chunk 2
+  // the stream: chunk 0 (idle) plays, chunk 1 (idle) waits; the switch to it renders chunk 2
   this->tx_cfg_.idle_value = this->invert_;
   this->tx_cfg_.flags.loop_transmission = 1;
-  if (parlio_tx_unit_transmit(this->unit_, this->buf_[0], bytes * 8, &this->tx_cfg_) != ESP_OK) {
+  if (!this->start_stream_()) {
     ESP_LOGE(TAG, "PARLIO transmit failed");
     this->mark_failed();
     return;
   }
-  const int64_t t0 = esp_timer_get_time();   // (the first sample went out just before)
-  this->switch_us_ = t0 + static_cast<int64_t>(this->clock_.chunk_ns() / 1000);
-  this->state_.t0_ns = t0 * 1000;
-  this->state_.next_chunk = 2;
-  this->state_.running = true;
-  parlio_tx_unit_transmit(this->unit_, this->buf_[1], bytes * 8, &this->tx_cfg_);
-  this->clock_.write(this->state_);
   this->log_ms_ = millis();
 }
 
 void UltraParlioBus::loop() {
   if (millis() - this->log_ms_ < 10000)
     return;
-  // the stream slipped (the render task was late: a chunk played twice): frames in flight were lost
-  const uint32_t slips = this->slips_;
-  if (slips != this->slips_logged_) {
-    ESP_LOGW(TAG, "The stream slipped %" PRIu32 " chunk(s) so far (the render task was late; frames lost)", slips);
-    this->slips_logged_ = slips;
-    this->log_ms_ = millis();
+  this->log_ms_ = millis();
+  // a chunk was late for its deadline (the render task held up, e.g. by flash writes with the cache off): the stream
+  // was stopped before any buffer could play twice and started again; the frames on the wire then were lost
+  const uint32_t restarts = this->restarts_;
+  if (restarts != this->restarts_logged_) {
+    ESP_LOGW(TAG, "The stream restarted %" PRIu32 " time(s) so far (the render task was late; frames lost)", restarts);
+    this->restarts_logged_ = restarts;
   }
   // no buffer switch in 10 s: the stream stopped (the driver refused a buffer)
   const uint32_t switches = this->switches_;
@@ -240,23 +272,22 @@ void UltraParlioBus::loop() {
     this->status_set_error();
   }
   this->switches_seen_ = switches;
-  this->log_ms_ = millis();
 }
 
 void UltraParlioBus::dump_config() {
-  const uint32_t ns = this->clock_.sample_ns();
+  const uint32_t ns = this->stream_.clock().sample_ns();
   ESP_LOGCONFIG(TAG,
                 "QuinLED dig2analog Ultra PARLIO bus:\n"
                 "  Lanes: %u, %u-bit samples at %" PRIu32 " Hz (%" PRIu32 " ns)\n"
                 "  Bit: %u samples (%" PRIu32 " ns), a group of 8 bits %" PRIu32 " ns\n"
-                "  Buffers: 2 x %u B in %s, a chunk of %" PRIu32 " groups (%" PRIu32 " us)\n"
-                "  Render: %" PRIu32 " us per chunk on average, %" PRIu32 " us at most; %" PRIu32 " slip(s)",
+                "  Buffers: 2 x %u B in %s, a chunk of %" PRIu32 " groups (%" PRIu32 " us), handed over %" PRIu32
+                " us before the one playing ends\n"
+                "  Render: %" PRIu32 " us per chunk on average, %" PRIu32 " us at most; %" PRIu32 " restart(s)",
                 this->lanes_used_, this->width_, this->rate_hz_, ns, this->period_, this->period_ * ns,
-                this->clock_.group_ns(), static_cast<unsigned>(this->renderer_.chunk_bytes()),
-                this->in_psram_ ? "PSRAM" : "internal RAM", this->clock_.chunk_groups(),
-                static_cast<uint32_t>(this->clock_.chunk_ns() / 1000),
-                this->renders_ ? this->render_us_sum_ / this->renders_ : 0, this->render_us_max_,
-                static_cast<uint32_t>(this->slips_));
+                this->stream_.clock().group_ns(), static_cast<unsigned>(this->stream_.chunk_bytes()),
+                this->in_psram_ ? "PSRAM" : "internal RAM", this->chunk_groups_,
+                static_cast<uint32_t>(this->stream_.chunk_ns() / 1000), this->margin_ns_ / 1000,
+                this->renders_ ? this->render_us_sum_ / this->renders_ : 0, this->render_us_max_, this->restarts_);
   for (uint8_t k = 0; k < this->lanes_used_; k++) {
     if (this->pins_[k] < 0)
       continue;

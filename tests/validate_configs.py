@@ -1227,6 +1227,14 @@ CASES = [
      True, None, P4),
     ("parlio buffer_time 20 ms", parlio(lanes=2, telemetry=False, extra_bus="    buffer_time: 20ms\n"), False,
      "buffer_time", P4),
+    # a buffer must be with the DMA two descriptors (2 x 4095 B) before the one playing ends, and leave the render time
+    ("parlio 8 lanes at 10 MHz, buffer_time 1 ms (shorter than the DMA's look-ahead + the render)",
+     parlio(lanes=8, telemetry=False, extra_bus="    sample_rate: 10MHz\n    buffer_time: 1ms\n"), False,
+     "buffer_time 1000 us is too short at 10 MHz with 8-bit samples", P4),
+    ("parlio 8 lanes at 10 MHz, buffer_time auto (longer than 1 ms)",
+     parlio(lanes=8, telemetry=False, extra_bus="    sample_rate: 10MHz\n"), True, None, P4),
+    ("parlio 16 lanes, buffer_time 600 us", parlio(telemetry=False, extra_bus="    buffer_time: 600us\n"), False,
+     "at least 655 us", P4),
     # lanes don't use the RMT: 16 lanes and the P4's 4 RMT lines (3 x 48 + DMA) fit; the RMT lines still add up
     ("parlio 16 lanes and 4 RMT lines (3 x 48 symbols + DMA)",
      parlio(telemetry=False) + PARLIO_RMT_LINES + "  - id: m3\n    pin: GPIO39\n    num_boards: 1\n    use_dma: true\n",

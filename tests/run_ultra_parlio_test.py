@@ -1,16 +1,22 @@
 """Build and run tests/ultra_parlio_test.cpp with the zig C/C++ compiler (pip install ziglang): the PARLIO lanes
-(ultra_parlio.h) and the telemetry coordinator for lines sharing a UART, with the hub's own loop / transmit / window
-code cut unchanged from components/dig2analog_ultra/dig2analog_ultra.cpp (as run_ultra_lifecycle_test.py does).
+(ultra_parlio.h) and the telemetry coordinator for lines sharing a UART, with the hub's own loop / transmit / window /
+start / update code cut unchanged from components/dig2analog_ultra/dig2analog_ultra.cpp (as run_ultra_lifecycle_test.py
+does).
 
-Then the negative controls: the same test against copies of the sources with one thing broken (a frame rendered a
-group late, the turn-taking on a shared UART gone, the direction pin let go of a byte early or 200 us late); each
-must fail. And the render's cost per chunk (-O2, no sanitizers).
+Before it, the feature check: dig2analog_ultra.cpp and .h preprocessed with every combination of telemetry, PARLIO and
+updates; every member the .cpp uses must be declared in the .h for that combination (a build with PARLIO lanes and no
+telemetry once named a callback that only exists with telemetry).
 
-Usage: python tests/run_ultra_parlio_test.py [--no-negative] [--no-bench]
+Then the negative controls: the same checks against copies of the sources with one thing broken (a fix undone, or a
+property the tests guard); each must fail. And the render's cost per chunk (-O2, no sanitizers).
+
+Usage: python tests/run_ultra_parlio_test.py [--no-negative] [--no-bench] [--only TEXT (the negative controls whose
+description has TEXT)]
 """
 
+from itertools import product
 from pathlib import Path
-import shutil
+import re
 import subprocess
 import sys
 
@@ -21,24 +27,54 @@ ROOT = HERE.parent
 COMP = ROOT / "components" / "dig2analog_ultra"
 BUILD = HERE / "build" / "parlio"
 ZIG = [sys.executable, "-m", "ziglang"]
+SOURCES = ("dig2analog_ultra.cpp", "dig2analog_ultra.h", "ultra_parlio.h")
 
 # <name>.inc: the definitions in dig2analog_ultra.cpp that start with these signatures
 PIECES = {
     "hub_loop.inc": ["void UltraHub::loop("],
     "hub_transmit.inc": ["void UltraHub::transmit_(", "esp_err_t UltraHub::lane_post_("],
     "hub_rw.inc": [
-        "bool UltraHub::rw_due_(", "bool UltraHub::rw_uart_free_(", "bool IRAM_ATTR UltraHub::rw_done_isr_(",
-        "void IRAM_ATTR UltraHub::rw_lane_release_(", "void UltraHub::finish_window_(", "void UltraHub::rw_publish_(",
+        "bool UltraHub::rw_due_(", "bool UltraHub::rw_uart_turn_(", "void UltraHub::rw_drop_turn_(",
+        "bool IRAM_ATTR UltraHub::rw_done_isr_(", "void IRAM_ATTR UltraHub::rw_lane_release_(",
+        "void UltraHub::finish_window_(", "void UltraHub::rw_publish_(",
     ],
-    "hub_update_lane.inc": ["uint8_t UltraHub::update_lane_("],
+    "hub_start.inc": ["int64_t UltraHub::lead_us(", "int64_t UltraHub::command_lead_us_(", "int64_t UltraHub::start_time_us("],
+    "hub_update_start.inc": ["bool UltraHub::start_update("],
+    "hub_update_lane.inc": ["static void upd_stamp(", "uint8_t UltraHub::update_lane_("],
 }
 
-# (what breaks, file, the text, its broken version): the test must fail with each
+# (what breaks, file, the text, its broken version): the checks must fail with each
 NEGATIVE = [
     ("a frame rendered a group after its reserved start", "ultra_parlio.h",
      "      lane->cur_start_ = lane->p_start_;\n", "      lane->cur_start_ = lane->p_start_ + 1;\n"),
+    ("no render deadline (the DMA plays a late chunk's buffer again)", "ultra_parlio.h",
+     "  int64_t deadline_of_(int64_t k) const {\n    return ParlioClock",
+     "  int64_t deadline_of_(int64_t k) const {\n    return 0 * ParlioClock"),
+    ("a kill leaves the releases of the frames it cut armed", "ultra_parlio.h",
+     "      } else if (late) {\n        this->release_us_[k] = 0;\n", "      } else if (false) {\n        this->release_us_[k] = 0;\n"),
+    ("the lane's release callback named without telemetry", "dig2analog_ultra.cpp",
+     "#else\n    const ParlioLane::ReleaseFn release = nullptr;\n#endif\n",
+     "#else\n    const ParlioLane::ReleaseFn release = UltraHub::rw_lane_release_;\n#endif\n"),
+    ("a frame the stream refused counted as sent", "dig2analog_ultra.cpp",
+     "    return this->lane_->take_refused() ? AGAIN : SENT;\n", "    return SENT;\n"),
+    ("an expired reservation ends the session", "dig2analog_ultra.cpp",
+     "        vTaskDelay(1);   // its start passed (or the stream restarted): a new one\n        continue;\n",
+     "        return STOPPED;\n"),
+    ("an abort doesn't end the wait for the stream", "dig2analog_ultra.cpp",
+     "    for (uint32_t t = 0; this->lane_->busy(); t++) {\n      if (abortable && this->upd_abort_.load())\n"
+     "        return ABORT;\n", "    for (uint32_t t = 0; this->lane_->busy(); t++) {\n"),
+    ("the group start without a lane's frame cadence", "dig2analog_ultra.cpp",
+     "  frame = std::max(frame, this->lane_lead_us_);\n#endif\n  if (this->start_delay_us_",
+     "#endif\n  if (this->start_delay_us_"),
+    ("the UART to whichever line asks first (no queue)", "dig2analog_ultra.cpp",
+     "    if (hub->rw_waiting_ && now - hub->rw_wait_seen_ms_ < RW_WAIT_STALE_MS &&\n"
+     "        static_cast<int32_t>(hub->rw_wait_order_ - this->rw_wait_order_) < 0)\n"
+     "      return false;   // it has waited longer\n", ""),
+    ("an update keeps the turn of a poll frame that never went out", "dig2analog_ultra.cpp",
+     "  this->tx_rw_ = false;        // a poll frame that never went out: its UART's turn goes to the next line\n"
+     "  this->rw_drop_turn_();\n", ""),
     ("no turn-taking on a shared UART", "dig2analog_ultra.cpp",
-     "  if (urgent || this->rw_open_ || !this->rw_uart_free_())\n", "  if (urgent || this->rw_open_)\n"),
+     "    if (hub->rw_turn_)\n      return false;   // its window is open\n", ""),
     ("the direction pin let go of a byte before the RW frame's end", "ultra_parlio.h",
      "const int64_t bit_start = (lane->cur_start_ + lane->cur_bytes_) * this->group_samples() - this->period_;",
      "const int64_t bit_start = (lane->cur_start_ + lane->cur_bytes_ - 1) * this->group_samples() - this->period_;"),
@@ -46,15 +82,46 @@ NEGATIVE = [
      "static constexpr uint32_t PARLIO_RELEASE_NS = 2000;", "static constexpr uint32_t PARLIO_RELEASE_NS = 200000;"),
 ]
 
+FEATURES = ("USE_DIG2ANALOG_ULTRA_TELEMETRY", "USE_DIG2ANALOG_ULTRA_PARLIO", "USE_DIG2ANALOG_ULTRA_UPDATE")
 
-def prepare(out: Path, mutation=None) -> None:
-    """build/parlio/<variant>: the cut hub pieces and ultra_parlio.h, with one mutation applied."""
-    out.mkdir(parents=True, exist_ok=True)
-    sources = {name: (COMP / name).read_text(encoding="utf-8") for name in ("dig2analog_ultra.cpp", "ultra_parlio.h")}
+
+def read_sources(mutation=None) -> dict:
+    sources = {name: (COMP / name).read_text(encoding="utf-8") for name in SOURCES}
     if mutation is not None:
         _, name, old, new = mutation
-        assert sources[name].count(old) == 1, f"negative control: '{old.strip()}' not found once in {name}"
+        assert sources[name].count(old) == 1, f"negative control: '{old.strip()[:60]}' not found once in {name}"
         sources[name] = sources[name].replace(old, new)
+    return sources
+
+
+def preprocess(text: str, defines, out: Path) -> str:
+    src = out / "pp.cpp"
+    src.write_text("".join(line for line in text.splitlines(keepends=True) if not line.lstrip().startswith("#include")),
+                   encoding="utf-8")
+    cmd = ZIG + ["c++", "-E", "-P", "-x", "c++", "-DUSE_ESP32", *(f"-D{d}" for d in defines), str(src)]
+    return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+
+
+def feature_check(sources: dict, out: Path) -> list:
+    """For every combination of the features: the members of UltraHub the .cpp names are declared in the .h."""
+    out.mkdir(parents=True, exist_ok=True)
+    fails = []
+    for on in product((False, True), repeat=len(FEATURES)):
+        defines = [d for d, o in zip(FEATURES, on) if o]
+        header = preprocess(sources["dig2analog_ultra.h"], defines, out)
+        body = preprocess(sources["dig2analog_ultra.cpp"], defines, out)
+        declared = set(re.findall(r"\b(\w+)\s*[({;=\[]", header)) | set(re.findall(r"\b(\w+)\b", header))
+        used = set(re.findall(r"\bUltraHub::(\w+)", body)) | set(re.findall(r"\bthis->(\w+_)\b", body))
+        missing = sorted(n for n in used if n not in declared)
+        if missing:
+            fails.append(f"FAIL feature check: with {' + '.join(d[20:].lower() for d in defines) or 'no options'}, "
+                         f"dig2analog_ultra.cpp names {', '.join(missing)}, not declared in dig2analog_ultra.h")
+    return fails
+
+
+def prepare(out: Path, sources: dict) -> None:
+    """build/parlio/<variant>: the cut hub pieces and ultra_parlio.h."""
+    out.mkdir(parents=True, exist_ok=True)
     for inc, signatures in PIECES.items():
         text = sources["dig2analog_ultra.cpp"]
         (out / inc).write_text("\n\n".join(definition(text, s) for s in signatures) + "\n", encoding="utf-8")
@@ -63,14 +130,14 @@ def prepare(out: Path, mutation=None) -> None:
 
 def build(out: Path, flags) -> Path:
     exe = out / ("ultra_parlio_test.exe" if sys.platform == "win32" else "ultra_parlio_test")
-    test = (HERE / "ultra_parlio_test.cpp").read_text(encoding="utf-8")
-    # the test's include of ultra_parlio.h comes from the variant's copy
-    src = out / "ultra_parlio_test.cpp"
-    src.write_text(test.replace('#include "../components/dig2analog_ultra/ultra_parlio.h"', '#include "ultra_parlio.h"')
-                   .replace('#include "../components/', f'#include "{(ROOT / "components").as_posix()}/'),
-                   encoding="utf-8")
+    # the test's include of ultra_parlio.h comes from the variant's copy, its hub part from tests/
+    for name in ("ultra_parlio_test.cpp", "ultra_parlio_test_hubs.inc"):
+        text = (HERE / name).read_text(encoding="utf-8")
+        (out / name).write_text(
+            text.replace('#include "../components/dig2analog_ultra/ultra_parlio.h"', '#include "ultra_parlio.h"')
+            .replace('#include "../components/', f'#include "{(ROOT / "components").as_posix()}/'), encoding="utf-8")
     cmd = ZIG + ["c++", "-std=c++17", "-Wall", "-Wno-unused-variable", "-Wno-unused-function",
-                 "-Wno-nullability-completeness", f"-I{out}", *flags, str(src), "-o", str(exe)]
+                 "-Wno-nullability-completeness", f"-I{out}", *flags, str(out / "ultra_parlio_test.cpp"), "-o", str(exe)]
     subprocess.run(cmd, check=True)
     return exe
 
@@ -79,18 +146,34 @@ def main() -> int:
     args = sys.argv[1:]
     checked = ["-O1", "-fsanitize=undefined", "-fno-sanitize-recover=all"]
     base = BUILD / "test"
-    prepare(base)
+    sources = read_sources()
+    fails = feature_check(sources, base)
+    for line in fails:
+        print(line, flush=True)
+    print(f"feature check: the members dig2analog_ultra.cpp names are declared, with each of the "
+          f"{2 ** len(FEATURES)} combinations of telemetry / PARLIO / updates: {'FAILED' if fails else 'ok'}", flush=True)
+    prepare(base, sources)
     rc = subprocess.run([str(build(base, checked))]).returncode
+    if fails:
+        rc = 1
     if rc != 0:
         return rc
     if "--no-negative" not in args:
         print("\nnegative controls (each must fail):", flush=True)
+        only = args[args.index("--only") + 1] if "--only" in args else ""
         for i, m in enumerate(NEGATIVE):
+            if only not in m[0]:
+                continue
             out = BUILD / f"negative{i}"
-            prepare(out, m)
-            proc = subprocess.run([str(build(out, checked))], capture_output=True, text=True)
-            fails = [line for line in proc.stdout.splitlines() if line.startswith("FAIL ")]
-            ok = proc.returncode != 0 and fails
+            sources = read_sources(m)
+            fails = feature_check(sources, out)
+            prepare(out, sources)
+            try:
+                proc = subprocess.run([str(build(out, checked))], capture_output=True, text=True, timeout=900)
+                fails += [line for line in proc.stdout.splitlines() if line.startswith("FAIL ")]
+            except subprocess.TimeoutExpired:
+                fails.append("FAIL: the test hung (900 s)")
+            ok = bool(fails)
             print(f"  {'ok  ' if ok else 'MISS'} {m[0]}: {len(fails)} check(s) failed", flush=True)
             for line in fails[:4]:
                 print(f"         {line.split(': ', 1)[-1][:150]}", flush=True)
@@ -99,7 +182,7 @@ def main() -> int:
     if "--no-bench" not in args:
         print("\nthe render's cost (-O2, this PC):", flush=True)
         out = BUILD / "bench"
-        prepare(out)
+        prepare(out, read_sources())
         subprocess.run([str(build(out, ["-O2", "-DNDEBUG"])), "--bench"], check=True)
     return rc
 

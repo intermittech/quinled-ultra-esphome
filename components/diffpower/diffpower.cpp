@@ -1,6 +1,9 @@
 #include "diffpower.h"
 
 #include "esphome/components/light/light_output.h"
+#ifdef USE_DIFFPOWER_HA
+#include "esphome/components/api/api_server.h"
+#endif
 #include "esphome/core/application.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
@@ -20,6 +23,17 @@ static const uint32_t RESEND_MS[] = {300, 1000};
 
 std::vector<DiffPowerPort *> DiffPowerPort::ports_;
 bool DiffPowerPort::shut_down_{false};
+bool DiffPowerPort::any_sun_{false};
+#ifdef USE_DIFFPOWER_DARK
+uint8_t DiffPowerPort::dark_logged_{0xFF};
+#endif
+#ifdef USE_DIFFPOWER_HA
+const char *DiffPowerPort::ha_entity_{"sun.sun"};
+int64_t DiffPowerPort::ha_rise_{0};
+int64_t DiffPowerPort::ha_set_{0};
+uint8_t DiffPowerPort::ha_have_{0};
+bool DiffPowerPort::ha_subscribed_{false};
+#endif
 
 void DiffPowerPort::setup() {
   ports_.push_back(this);
@@ -36,7 +50,37 @@ void DiffPowerPort::setup() {
   this->saved_cycles_ = this->core_.standby_cycles();
   this->saved_drops_ = this->core_.drops();
   this->publish_();
+#ifdef USE_DIFFPOWER_HA
+  // Home Assistant's sun times: one subscription for all ports (Home Assistant sends them on each connection, and
+  // again whenever they move on)
+  if (this->clock_ != nullptr && !ha_subscribed_) {
+    ha_subscribed_ = true;
+    api::global_api_server->subscribe_home_assistant_state(
+        ha_entity_, "next_rising", [](StringRef v) { ha_value_(v.c_str(), v.size(), 1); });
+    api::global_api_server->subscribe_home_assistant_state(
+        ha_entity_, "next_setting", [](StringRef v) { ha_value_(v.c_str(), v.size(), 2); });
+  }
+#endif
 }
+
+#ifdef USE_DIFFPOWER_HA
+void DiffPowerPort::ha_value_(const char *s, size_t n, uint8_t bit) {
+  int64_t t = 0;
+  const bool ok = parse_iso8601(s, n, &t);
+  int64_t &slot = bit == 1 ? ha_rise_ : ha_set_;
+  if (ok == ((ha_have_ & bit) != 0) && (!ok || t == slot))
+    return;   // (unchanged)
+  ESP_LOGD(TAG, "Home Assistant's next %s: %.*s", bit == 1 ? "sunrise" : "sunset", static_cast<int>(n), s);
+  if (ok) {
+    slot = t;
+    ha_have_ |= bit;
+  } else {
+    ha_have_ &= ~bit;
+  }
+  for (auto *p : ports_)
+    p->dark_checked_ = false;   // (the dark window again now, not at its next minute)
+}
+#endif
 
 void DiffPowerPort::dump_config() {
   const PortConfig &c = this->core_.config();
@@ -51,33 +95,61 @@ void DiffPowerPort::dump_config() {
                 this->core_.standby_cycles(), this->core_.drops());
   LOG_PIN("  Enable: ", this->enable_pin_);
   LOG_PIN("  Detect: ", this->detect_pin_);
-#ifdef USE_DIFFPOWER_SUN
-  if (this->sun_ != nullptr) {
-    ESP_LOGCONFIG(TAG, "  During dark: %" PRIu32 " min before sunset to %" PRIu32 " min after sunrise; no time: %s",
-                  this->before_s_ / 60, this->after_s_ / 60, c.unknown_on ? "Always on" : "Standby");
+#ifdef USE_DIFFPOWER_DARK
+  if (this->clock_ != nullptr) {
+#ifdef USE_DIFFPOWER_HA
+    const char *from = this->sun_ ? "Home Assistant, ESPHome's sun as the backup" : "Home Assistant";
+#else
+    const char *from = "ESPHome's sun";
+#endif
+    ESP_LOGCONFIG(TAG,
+                  "  During dark: %" PRIu32 " min before sunset to %" PRIu32 " min after sunrise, from %s; without: %s",
+                  this->before_s_ / 60, this->after_s_ / 60, from, c.unknown_on ? "Always on" : "Standby");
   }
 #endif
 }
 
-bool DiffPowerPort::has_sun_() const {
-#ifdef USE_DIFFPOWER_SUN
-  return this->sun_ != nullptr;
+bool DiffPowerPort::has_dark_() const {
+#ifdef USE_DIFFPOWER_DARK
+  return this->clock_ != nullptr;
 #else
   return false;
 #endif
 }
 
-// "During dark": the sun's elevation before_s ahead and after_s back (diffpower_core.h); no valid time: unknown
+// "During dark" (diffpower_core.h): Home Assistant's next sunrise / sunset while fresh, else the sun's elevation
+// before_s ahead and after_s back (ESPHome's sun), else unknown (no valid time, or neither: time_unknown decides)
 void DiffPowerPort::update_dark_(uint32_t now) {
-#ifdef USE_DIFFPOWER_SUN
-  if (this->sun_ == nullptr || (this->dark_checked_ && now - this->dark_ms_ < DARK_CHECK_MS))
+#ifdef USE_DIFFPOWER_DARK
+  if (this->clock_ == nullptr || (this->dark_checked_ && now - this->dark_ms_ < DARK_CHECK_MS))
     return;
   this->dark_checked_ = true;
   this->dark_ms_ = now;
-  const ESPTime t = this->sun_->get_time()->now();
-  const bool known = t.is_valid();
-  const bool dark = known && dark_window(static_cast<double>(t.timestamp), this->lat_, this->lon_, this->before_s_,
-                                         this->after_s_);
+  const ESPTime t = this->clock_->now();
+  const int64_t at = static_cast<int64_t>(t.timestamp);
+#ifdef USE_DIFFPOWER_HA
+  const DarkSource src = dark_source(t.is_valid(), ha_have_, at, ha_rise_, ha_set_, any_sun_);
+#else
+  const DarkSource src = dark_source(t.is_valid(), 0, at, 0, 0, any_sun_);
+#endif
+  if (src != dark_logged_) {   // (the hub's source: the same for every port, logged once)
+    static const char *const FROM[] = {"none (no valid time, or Home Assistant's missing or stale)", "Home Assistant",
+                                       "ESPHome's sun"};
+    ESP_LOGI(TAG, "During dark: the sunrise / sunset from %s", FROM[src]);
+    dark_logged_ = src;
+  }
+  bool dark = false, known = true;
+  if (src == DARK_HA) {
+#ifdef USE_DIFFPOWER_HA
+    dark = ha_dark(at, ha_rise_, ha_set_, this->before_s_, this->after_s_);
+#endif
+  } else if (src == DARK_SUN && this->sun_) {
+#ifdef USE_DIFFPOWER_SUN
+    dark = dark_window(static_cast<double>(at), this->lat_, this->lon_, this->before_s_, this->after_s_);
+#endif
+  } else {
+    known = false;
+  }
   if (dark != this->core_.dark()) {
     ESP_LOGD(TAG, "Port '%s': %s the dark window", this->name_, dark ? "in" : "out of");
   }
@@ -239,13 +311,13 @@ bool DiffPowerPort::has_light(light::LightState *light) const {
 
 #ifdef USE_SELECT
 uint8_t PowerModeSelect::mode_of_(size_t index) const {
-  if (!this->port_->has_sun() && index >= MODE_DURING_DARK)
+  if (!this->port_->has_dark_source() && index >= MODE_DURING_DARK)
     return static_cast<uint8_t>(index + 1);   // (Standby, Always on)
   return static_cast<uint8_t>(index);
 }
 
 size_t PowerModeSelect::index_of_(uint8_t mode) const {
-  if (!this->port_->has_sun() && mode >= MODE_DURING_DARK)
+  if (!this->port_->has_dark_source() && mode >= MODE_DURING_DARK)
     return mode == MODE_DURING_DARK ? 0 : mode - 1;
   return mode;
 }
@@ -253,9 +325,10 @@ size_t PowerModeSelect::index_of_(uint8_t mode) const {
 void PowerModeSelect::setup() {
   this->pref_ = this->make_entity_preference<uint32_t>();
   uint32_t stored;
-  // the stored mode if this select still offers it (During dark without a sun any more: the YAML's mode, stored)
+  // the stored mode if this select still offers it (During dark without a dark source any more: the YAML's mode,
+  // stored)
   if (this->pref_.load(&stored) && stored < MODE_COUNT) {
-    if (stored == MODE_DURING_DARK && !this->port_->has_sun()) {
+    if (stored == MODE_DURING_DARK && !this->port_->has_dark_source()) {
       stored = this->port_->get_mode();
       this->pref_.save(&stored);
     } else {

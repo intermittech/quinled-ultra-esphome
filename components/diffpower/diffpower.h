@@ -3,7 +3,8 @@
 // A QuinLED Diff-Power sender port in ESPHome (wiki: Diff-Power ports): its enable output, its detect input, the
 // lights on it (any ESPHome light; a dig2analog_ultra hub on it adds its own), its power mode and the dark window. The
 // logic is diffpower_core.h; this drives the pins, polls the lights, sends their state again once the port is powered,
-// keeps its counters across reboots and publishes the port's status.
+// keeps its counters across reboots and publishes the port's status. The dark window's sunrise / sunset: Home
+// Assistant's sun entity (one subscription for all ports), ESPHome's sun (latitude / longitude) as the backup.
 
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
@@ -26,8 +27,8 @@
 #ifdef USE_TEXT_SENSOR
 #include "esphome/components/text_sensor/text_sensor.h"
 #endif
-#ifdef USE_DIFFPOWER_SUN
-#include "esphome/components/sun/sun.h"
+#ifdef USE_DIFFPOWER_DARK
+#include "esphome/components/time/real_time_clock.h"
 #endif
 
 #include "diffpower_core.h"
@@ -75,17 +76,30 @@ class DiffPowerPort final : public Component {
     this->dark_checked_ = false;   // (the dark window again now)
   }
   uint8_t get_mode() const { return this->core_.mode(); }
-#ifdef USE_DIFFPOWER_SUN
-  /// the sun's time source and place (its latitude / longitude, copied at codegen: sun::Sun doesn't share them)
-  void set_sun(sun::Sun *sun, float latitude, float longitude, uint32_t before_s, uint32_t after_s) {
-    this->sun_ = sun;
-    this->lat_ = latitude;
-    this->lon_ = longitude;
+#ifdef USE_DIFFPOWER_DARK
+  /// "During dark": the time now from clock; from before_s before sunset to after_s after sunrise
+  void set_dark(time::RealTimeClock *clock, uint32_t before_s, uint32_t after_s) {
+    this->clock_ = clock;
     this->before_s_ = before_s;
     this->after_s_ = after_s;
   }
 #endif
-  bool has_sun() const { return this->has_sun_(); }
+#ifdef USE_DIFFPOWER_SUN
+  /// ESPHome's sun: its latitude / longitude (copied at codegen: sun::Sun doesn't share them); the backup of Home
+  /// Assistant's sun times, or the only source without Home Assistant
+  void set_sun(float latitude, float longitude) {
+    this->sun_ = true;
+    any_sun_ = true;
+    this->lat_ = latitude;
+    this->lon_ = longitude;
+  }
+#endif
+#ifdef USE_DIFFPOWER_HA
+  /// Home Assistant's sun entity (one for all ports): its next_rising / next_setting
+  void set_sun_entity(const char *entity) { ha_entity_ = entity; }
+#endif
+  /// "During dark" possible (a clock, and Home Assistant's sun times or ESPHome's sun)
+  bool has_dark_source() const { return this->has_dark_(); }
   /// any ESPHome light on this port; hold_ms: its own turn-off period (0: the port's). Its state is sent again once
   /// the port is powered.
   void add_light(light::LightState *light, uint32_t hold_ms) {
@@ -151,8 +165,12 @@ class DiffPowerPort final : public Component {
   struct Stats {
     uint32_t cycles, standby_s, drops;
   };
-  bool has_sun_() const;
+  bool has_dark_() const;
   void update_dark_(uint32_t now);
+#ifdef USE_DIFFPOWER_HA
+  /// Home Assistant's next_rising (bit 1) or next_setting (bit 2): a new value, or none ("unknown", not a time)
+  static void ha_value_(const char *s, size_t n, uint8_t bit);
+#endif
   void apply_(uint8_t ev, uint32_t now);
   void resend_();
   void publish_();
@@ -170,13 +188,22 @@ class DiffPowerPort final : public Component {
   std::vector<std::function<bool(bool)>> prepare_cb_;
   bool prepare_first_{false};
   static constexpr uint32_t PREPARE_MAX_MS = 3000;
-#ifdef USE_DIFFPOWER_SUN
-  sun::Sun *sun_{nullptr};
+#ifdef USE_DIFFPOWER_DARK
+  time::RealTimeClock *clock_{nullptr};
+  static uint8_t dark_logged_;   // the source last logged (DarkSource; one line for all ports at each change)
+#endif
+#ifdef USE_DIFFPOWER_HA
+  static const char *ha_entity_;
+  static int64_t ha_rise_, ha_set_;   // Home Assistant's next sunrise / sunset (s since 1970)
+  static uint8_t ha_have_;            // ... received: bit 0 the sunrise, bit 1 the sunset
+  static bool ha_subscribed_;
 #endif
   float lat_{0}, lon_{0};
   uint32_t before_s_{0}, after_s_{0};
   uint32_t dark_ms_{0};
   bool dark_checked_{false};
+  bool sun_{false};   // ESPHome's sun (lat_ / lon_)
+  static bool any_sun_;
   ESPPreferenceObject stats_pref_;
   uint32_t saved_standby_s_{0}, saved_cycles_{0}, saved_drops_{0}, minute_ms_{0};
 #ifdef USE_TEXT_SENSOR
@@ -203,7 +230,7 @@ class PowerModeSelect final : public select::Select, public Component {
 
  protected:
   void control(size_t index) override;
-  /// option index <-> PowerMode (without a sun: no "During dark")
+  /// option index <-> PowerMode (without a dark source: no "During dark")
   uint8_t mode_of_(size_t index) const;
   size_t index_of_(uint8_t mode) const;
   DiffPowerPort *port_{nullptr};

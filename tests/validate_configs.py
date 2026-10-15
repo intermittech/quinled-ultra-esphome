@@ -215,6 +215,16 @@ sun:
   latitude: 52.1
   longitude: 5.1
 """
+# "During dark" from Home Assistant: the API and its time
+DP_HA = """\
+wifi:
+  ssid: x
+  password: xxxxxxxx
+api:
+time:
+  - platform: homeassistant
+    id: ha_time
+"""
 
 
 def tel_lines(n, uarts=None, names=None, devices=None, extra=""):
@@ -921,7 +931,26 @@ CASES = [
         True,
         None,
     ),
-    ("diffpower during_dark without a sun", DP_PORT + "    power_mode: during_dark\n", False, "needs a sun_id"),
+    ("diffpower during_dark without a source", DP_PORT + "    power_mode: during_dark\n", False,
+     "needs the sunrise / sunset: from Home Assistant (api:"),
+    ("diffpower during_dark from Home Assistant (api:, its time)", DP_PORT + "    power_mode: during_dark\n" + DP_HA,
+     True, "sun_entity: sun.sun"),
+    ("diffpower during_dark, api: without a time",
+     DP_PORT + "    power_mode: during_dark\n" + DP_HA.split("time:")[0], False, "needs the time now"),
+    ("diffpower during_dark, api: and two times",
+     DP_PORT + "    power_mode: during_dark\n" + DP_HA + "  - platform: sntp\n    id: t2\n", False,
+     "say which one with time_id"),
+    ("diffpower during_dark, api: and two times, time_id",
+     DP_PORT + "    power_mode: during_dark\n    time_id: t2\n" + DP_HA + "  - platform: sntp\n    id: t2\n", True,
+     None),
+    ("diffpower during_dark from Home Assistant, the sun the backup",
+     DP_PORT + "    power_mode: during_dark\n    sun_id: s\n" + DP_SUN + "api:\n", True, None),
+    ("diffpower sun_entity", DP_PORT + "    power_mode: during_dark\n    sun_entity: sun.home\n" + DP_HA, True,
+     "sun_entity: sun.home"),
+    ("diffpower sun_entity not an entity id", DP_PORT + "    sun_entity: sun\n" + DP_HA, False, "sun_entity"),
+    ("diffpower two ports, two sun entities",
+     DP_PORT + "    sun_entity: sun.home\n  - id: p2\n    name: Port 2\n    enable_pin: GPIO25\n" + DP_HA, False,
+     "sun_entity: one for all ports"),
     (
         "diffpower during_dark with the sun",
         DP_PORT + "    power_mode: during_dark\n    sun_id: s\n    dark_before: 30min\n    dark_after: 2h\n"

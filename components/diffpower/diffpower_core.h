@@ -129,6 +129,94 @@ inline bool dark_window(double unix_s, double lat_deg, double lon_deg, uint32_t 
   return false;
 }
 
+/// The number in len digits at s (digits checked by the caller)
+inline int iso_num(const char *s, int len) {
+  int v = 0;
+  while (len-- > 0)
+    v = v * 10 + (*s++ - '0');
+  return v;
+}
+
+/// An ISO-8601 time with its zone as Home Assistant sends it ("2026-10-16T05:58:41.237114+00:00", "...Z", "+02:00",
+/// "+0200", "+02"; the fraction dropped): seconds since 1970. The years 1970 to 2099 (every fourth a leap year). False
+/// if it isn't one (also "unknown", no seconds, no zone).
+inline bool parse_iso8601(const char *s, size_t n, int64_t *out) {
+  static const char FORM[] = "dddd-dd-ddTdd:dd:dd";   // (a space for the T too)
+  if (n < 20)
+    return false;
+  for (size_t k = 0; k < 19; k++) {
+    const char c = s[k];
+    if (FORM[k] == 'd' ? c < '0' || c > '9' : c != FORM[k] && !(k == 10 && c == ' '))
+      return false;
+  }
+  size_t i = 19;
+  if (s[i] == '.' || s[i] == ',') {
+    const size_t f = ++i;
+    while (i < n && s[i] >= '0' && s[i] <= '9')
+      i++;
+    if (i == f)
+      return false;
+  }
+  int zone = 0;   // the offset east of UTC, in minutes
+  if (i + 1 != n || (s[i] != 'Z' && s[i] != 'z')) {
+    if (i >= n || (s[i] != '+' && s[i] != '-'))
+      return false;
+    const char *z = s + i + 1;
+    const size_t len = n - i - 1;   // HH, HHMM or HH:MM
+    const size_t m = len == 5 && z[2] == ':' ? 3 : 2;
+    if (len != 2 && len != 4 && m != 3)
+      return false;
+    for (size_t k = 0; k < len; k++) {
+      if (k != 2 || m != 3) {
+        if (z[k] < '0' || z[k] > '9')
+          return false;
+      }
+    }
+    const int zh = iso_num(z, 2), zm = len > 2 ? iso_num(z + m, 2) : 0;
+    if (zh > 23 || zm > 59)
+      return false;
+    zone = (s[i] == '-' ? -1 : 1) * (zh * 60 + zm);
+  }
+  const int y = iso_num(s, 4), mo = iso_num(s + 5, 2), d = iso_num(s + 8, 2), h = iso_num(s + 11, 2),
+            mi = iso_num(s + 14, 2), sec = iso_num(s + 17, 2);
+  if (y < 1970 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || sec > 60)
+    return false;
+  // the day of the year (1-based) by the month's formula, then the days since 1970 (2000 a leap year as well)
+  const int yday = 275 * mo / 9 - ((y & 3) == 0 ? 1 : 2) * ((mo + 9) / 12) + d - 30;
+  const int days = (y - 1970) * 365 + (y - 1969) / 4 + yday - 1;
+  *out = static_cast<int64_t>(days) * 86400 + h * 3600 + mi * 60 + sec - zone * 60;
+  return true;
+}
+
+/// Home Assistant's sun times unusable once either is this far in the past (it moves them on at each event)
+static constexpr int64_t HA_STALE_S = 600;
+
+/// "During dark" from Home Assistant's next sunrise and next sunset (rise, set; s since 1970), without any state: from
+/// before_s before the next sunset (also one that passed and wasn't moved on yet), and up to after_s after the last
+/// sunrise. That is the next one while it comes before the next sunset (night: until it, and after_s on), else the
+/// next one less a day: off by the sunrise's daily drift (a minute or two at mid latitudes, more toward the polar
+/// circles, most around the equinoxes); none if that is still ahead (polar day: no sunrise for days).
+inline bool ha_dark(int64_t now, int64_t rise, int64_t set, uint32_t before_s, uint32_t after_s) {
+  if (now >= set - static_cast<int64_t>(before_s))
+    return true;
+  const int64_t last = rise < set ? rise : rise - 86400;
+  return now < last + static_cast<int64_t>(after_s) && (rise < set || last <= now);
+}
+
+/// Where "During dark" comes from (the first that has an answer); NONE: unknown (time_unknown decides)
+enum DarkSource : uint8_t { DARK_NONE = 0, DARK_HA, DARK_SUN };
+
+/// The source now: Home Assistant's sun times while both were received and neither is stale (kept through an API
+/// disconnect: they stay right until a sunrise or sunset passes unmoved), else ESPHome's sun if there is one; nothing
+/// without a valid time. have: bit 0 the sunrise received, bit 1 the sunset.
+inline DarkSource dark_source(bool time_valid, uint8_t have, int64_t now, int64_t rise, int64_t set, bool sun) {
+  if (!time_valid)
+    return DARK_NONE;
+  if (have == 3 && now <= rise + HA_STALE_S && now <= set + HA_STALE_S)
+    return DARK_HA;
+  return sun ? DARK_SUN : DARK_NONE;
+}
+
 class PortCore {
  public:
   void configure(const PortConfig &c) {

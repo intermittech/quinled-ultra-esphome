@@ -311,7 +311,8 @@ uart:
 
 DIFFPOWER_CONFIG = """\
 # tests/build/ultra/ultra-diffpower.yaml: a 4-port QuinLED Diff-Power sender on a classic ESP32 (diffpower): two
-# Ultra lines on ports (one with telemetry), two plain strips on ports, During dark from the sun, a motion pre-wake.
+# Ultra lines on ports (one with telemetry), two plain strips on ports, During dark (Home Assistant's sun times, the
+# sun the backup on port 1), a motion pre-wake.
 esphome:
   name: d2a-diffpower
 

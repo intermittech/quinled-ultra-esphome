@@ -8,6 +8,7 @@ blocks the loop.)"""
 from esphome import automation, pins
 import esphome.codegen as cg
 from esphome.components import binary_sensor, button, light, select, sensor, sun, text_sensor
+from esphome.components import time as time_
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_DEVICE_ID,
@@ -15,6 +16,7 @@ from esphome.const import (
     CONF_LATITUDE,
     CONF_LONGITUDE,
     CONF_NAME,
+    CONF_TIME_ID,
     CONF_TIMEOUT,
     DEVICE_CLASS_DURATION,
     DEVICE_CLASS_PROBLEM,
@@ -49,6 +51,7 @@ CONF_NOTICE_TIME = "notice_time"
 CONF_MIN_OFF_TIME = "min_off_time"
 CONF_MIN_ON_TIME = "min_on_time"
 CONF_SUN_ID = "sun_id"
+CONF_SUN_ENTITY = "sun_entity"
 CONF_DARK_BEFORE = "dark_before"
 CONF_DARK_AFTER = "dark_after"
 CONF_TIME_UNKNOWN = "time_unknown"
@@ -66,7 +69,7 @@ CONF_WAKE_TIMEOUT = "wake_timeout"
 # PowerMode (diffpower_core.h), and the select's options in that order
 POWER_MODES = {"standby": 0, "during_dark": 1, "always_on": 2}
 MODE_OPTIONS = ["Standby", "During dark", "Always on"]
-# During dark without a valid time
+# During dark without sun times (no valid time yet; Home Assistant's missing or stale and no sun_id)
 TIME_UNKNOWN = {"always_on": True, "standby": False}
 
 
@@ -167,19 +170,51 @@ def _defaults(config):
     return config
 
 
-def _validate(config):
-    if config[CONF_POWER_MODE] == "during_dark" and CONF_SUN_ID not in config:
-        raise cv.Invalid("power_mode: during_dark needs a sun_id (ESPHome's sun component: latitude, longitude, time)")
-    return config
-
-
-def _sun_place(sun_id):
-    """The latitude / longitude of the sun component sun_id (sun::Sun keeps them to itself)."""
-    confs = CORE.config.get("sun", [])
+def _sun_conf(full, sun_id):
+    """The sun component sun_id's configuration (its latitude / longitude: sun::Sun keeps them to itself)."""
+    confs = full.get("sun", [])
     for conf in confs if isinstance(confs, list) else [confs]:
         if conf.get(CONF_ID) == sun_id:
-            return float(conf[CONF_LATITUDE]), float(conf[CONF_LONGITUDE])
+            return conf
     raise cv.Invalid(f"diffpower: sun '{sun_id}' not found")
+
+
+def _dark_plan(config, full):
+    """Where a port's "During dark" comes from: (its clock's id or None, Home Assistant's sun times, the sun's
+    configuration or None). The clock: time_id, else the sun's, else the only time component. Home Assistant's sun
+    times: with api: and a clock (ESPHome's sun the backup)."""
+    sun_conf = _sun_conf(full, config[CONF_SUN_ID]) if CONF_SUN_ID in config else None
+    clock = config.get(CONF_TIME_ID)
+    if clock is None and sun_conf is not None:
+        clock = sun_conf[CONF_TIME_ID]
+    times = full.get("time", [])
+    if clock is None and len(times) == 1:
+        clock = times[0][CONF_ID]
+    return clock, "api" in full and clock is not None, sun_conf
+
+
+def _mode_options(config, full):
+    """The power mode select's options: "During dark" with a dark source."""
+    _clock, ha, sun_conf = _dark_plan(config, full)
+    return MODE_OPTIONS if ha or sun_conf is not None else [MODE_OPTIONS[0], MODE_OPTIONS[2]]
+
+
+def _validate_dark(config, full):
+    """power_mode: during_dark needs a dark source; sun_entity: one for all ports."""
+    _clock, ha, sun_conf = _dark_plan(config, full)
+    if config[CONF_POWER_MODE] == "during_dark" and not ha and sun_conf is None:
+        if "api" not in full:
+            msg = ("power_mode: during_dark needs the sunrise / sunset: from Home Assistant (api:, and a time: "
+                   "component), or from ESPHome's sun component (sun_id: latitude, longitude)")
+        elif not full.get("time"):
+            msg = ("power_mode: during_dark needs the time now: add a time: component (e.g. platform: homeassistant), "
+                   "or a sun_id")
+        else:
+            msg = "power_mode: during_dark: there are several time components, say which one with time_id"
+        raise cv.Invalid(msg, path=[CONF_POWER_MODE])
+    entities = {p.get(CONF_SUN_ENTITY) for p in full.get("diffpower", [])} - {None}
+    if len(entities) > 1:
+        raise cv.Invalid(f"sun_entity: one for all ports ({', '.join(sorted(entities))})", path=[CONF_SUN_ENTITY])
 
 
 PORT_SCHEMA = cv.All(
@@ -194,7 +229,8 @@ PORT_SCHEMA = cv.All(
             cv.Required(CONF_ENABLE_PIN): pins.gpio_output_pin_schema,
             cv.Optional(CONF_DETECT_PIN): pins.gpio_input_pin_schema,
             # standby (sleep after the turn-off period, wake on a command or a pre-wake), during_dark (also powered
-            # from dark_before before sunset to dark_after after sunrise), always_on; the select changes it
+            # from dark_before before sunset to dark_after after sunrise: Home Assistant's sun times, or the sun_id's),
+            # always_on; the select changes it
             cv.Optional(CONF_POWER_MODE, default="standby"): cv.one_of(*POWER_MODES, lower=True),
             # the turn-off period: powered this long after its last light went off (a light may set its own; at least
             # min_on_time)
@@ -226,21 +262,26 @@ PORT_SCHEMA = cv.All(
             cv.Optional(CONF_WAKE_TIMEOUT, default="2min"): cv.All(
                 cv.positive_time_period_milliseconds, cv.Range(max=cv.TimePeriod(hours=24))
             ),
+            # "During dark": the sunrise / sunset from Home Assistant's sun entity (with api:), ESPHome's sun (sun_id:
+            # latitude, longitude) as the backup, or alone without Home Assistant. The time now: time_id, else the
+            # sun's, else the only time component.
+            cv.Optional(CONF_SUN_ENTITY, default="sun.sun"): cv.entity_id,
             cv.Optional(CONF_SUN_ID): cv.use_id(sun.Sun),
+            cv.Optional(CONF_TIME_ID): cv.use_id(time_.RealTimeClock),
             cv.Optional(CONF_DARK_BEFORE, default="60min"): cv.All(
                 cv.positive_time_period_seconds, cv.Range(max=cv.TimePeriod(hours=12))
             ),
             cv.Optional(CONF_DARK_AFTER, default="60min"): cv.All(
                 cv.positive_time_period_seconds, cv.Range(max=cv.TimePeriod(hours=12))
             ),
-            # During dark until the ESP32 has a valid time
+            # During dark without sun times: until the ESP32 has a valid time, or with Home Assistant's missing or
+            # stale (more than 10 min past) and no sun_id
             cv.Optional(CONF_TIME_UNKNOWN, default="always_on"): cv.one_of(*TIME_UNKNOWN, lower=True),
             # the lights on this port (any ESPHome light; a dig2analog_ultra hub with `port:` adds its own)
             cv.Optional(CONF_LIGHTS, default=[]): cv.ensure_list(_light_entry),
             **{cv.Optional(key): spec[2] for key, spec in PORT_ENTITIES.items()},
         }
     ).extend(cv.COMPONENT_SCHEMA),
-    _validate,
 )
 
 CONFIG_SCHEMA = PORT_SCHEMA
@@ -309,8 +350,9 @@ def _port_lights(full):
 
 
 def _final_validate(config):
-    """diffpower.wake's lights: each one on a port (else the action does nothing for it)."""
+    """During dark's source; diffpower.wake's lights: each one on a port (else the action does nothing for it)."""
     full = fv.full_config.get()
+    _validate_dark(config, full)
     on_ports = _port_lights(full)
     for lid in sorted(CORE.data.get("diffpower_wake_lights", set())):
         if lid not in on_ports:
@@ -345,18 +387,23 @@ async def to_code(config):
     )
     cg.add(var.set_unknown_on(TIME_UNKNOWN[config[CONF_TIME_UNKNOWN]]))
     cg.add(var.set_mode(POWER_MODES[config[CONF_POWER_MODE]]))
-    if CONF_SUN_ID in config:
-        cg.add_define("USE_DIFFPOWER_SUN")
-        lat, lon = _sun_place(config[CONF_SUN_ID])
+    clock, ha, sun_conf = _dark_plan(config, CORE.config)
+    if ha or sun_conf is not None:
+        cg.add_define("USE_DIFFPOWER_DARK")
         cg.add(
-            var.set_sun(
-                await cg.get_variable(config[CONF_SUN_ID]),
-                lat,
-                lon,
+            var.set_dark(
+                await cg.get_variable(clock),
                 int(config[CONF_DARK_BEFORE].total_seconds),
                 int(config[CONF_DARK_AFTER].total_seconds),
             )
         )
+        if ha:   # (one subscription for all ports)
+            cg.add_define("USE_DIFFPOWER_HA")
+            cg.add_define("USE_API_HOMEASSISTANT_STATES")
+            cg.add(var.set_sun_entity(config[CONF_SUN_ENTITY]))
+        if sun_conf is not None:
+            cg.add_define("USE_DIFFPOWER_SUN")
+            cg.add(var.set_sun(float(sun_conf[CONF_LATITUDE]), float(sun_conf[CONF_LONGITUDE])))
     for entry in config[CONF_LIGHTS]:
         hold = int(entry[CONF_STANDBY_AFTER].total_milliseconds) if CONF_STANDBY_AFTER in entry else 0
         cg.add(var.add_light(await cg.get_variable(entry[CONF_ID]), hold))
@@ -380,8 +427,7 @@ async def to_code(config):
         cg.add(btn.set_port(var))
         cg.add(btn.set_timeout(int(config[CONF_WAKE_TIMEOUT].total_milliseconds)))
     if conf := config.get(CONF_POWER_MODE_SELECT):
-        options = MODE_OPTIONS if CONF_SUN_ID in config else [MODE_OPTIONS[0], MODE_OPTIONS[2]]
-        sel = await select.new_select(conf, options=options)
+        sel = await select.new_select(conf, options=_mode_options(config, CORE.config))
         await cg.register_component(sel, conf)
         cg.add(sel.set_port(var))
 

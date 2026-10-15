@@ -2593,11 +2593,11 @@ struct DiffPowerPort {
     this->core_.configure(c);
   }
   void notice_sent() { this->core_.notice_sent(millis()); }
-  bool has_sun() const { return this->sun; }
+  bool has_dark_source() const { return this->dark; }
   void set_mode(uint8_t mode) { this->core_.set_mode(static_cast<PowerMode>(mode)); }
   uint8_t get_mode() const { return this->core_.mode(); }
   // stand-ins
-  bool sun{false};
+  bool dark{false};   // (a dark source: Home Assistant's sun times or ESPHome's sun)
   void update_dark_(uint32_t) {}
   struct Timer {
     uint32_t at;
@@ -2923,7 +2923,7 @@ static void test_port() {
           "same name, two ids: two records; a new name keeps its id's counters");
     DiffPowerPort::ports_.clear();
   }
-  // During dark stored, the sun gone from the YAML: the YAML's mode, stored and shown
+  // During dark stored, its dark source gone from the YAML: the YAML's mode, stored and shown
   {
     DiffPowerPort m;
     m.set_mode(MODE_STANDBY);
@@ -2933,16 +2933,16 @@ static void test_port() {
     sel.pref_.v = MODE_DURING_DARK;
     sel.setup();
     CHECK(m.get_mode() == MODE_STANDBY && sel.pref_.v == MODE_STANDBY && sel.published == 0,
-          "During dark without a sun: the YAML's Standby (mode %u, stored %u, shown %u)", m.get_mode(), sel.pref_.v,
+          "During dark without a dark source: the YAML's Standby (mode %u, stored %u, shown %u)", m.get_mode(), sel.pref_.v,
           static_cast<unsigned>(sel.published));
     DiffPowerPort s2;
-    s2.sun = true;
+    s2.dark = true;
     PowerModeSelect sel2;
     sel2.port_ = &s2;
     sel2.pref_.have = true;
     sel2.pref_.v = MODE_DURING_DARK;
     sel2.setup();
-    CHECK(s2.get_mode() == MODE_DURING_DARK && sel2.published == 1, "with a sun: During dark restored");
+    CHECK(s2.get_mode() == MODE_DURING_DARK && sel2.published == 1, "with a dark source: During dark restored");
   }
 
   // a port without a board: 'No board'; a light on: the enable high (a board plugged in gets power), a problem
@@ -2964,13 +2964,13 @@ static void test_port() {
         "a light on, no board: enabled, a problem, nothing sent");
   // negative control: a light not on a port is never touched
   CHECK(other.out.writes == 0, "a light not on the port: untouched");
-  // the power mode select without a sun: Standby, Always on
+  // the power mode select without a dark source: Standby, Always on
   PowerModeSelect sel;
   sel.port_ = &p;
   sel.control(1);
   CHECK(p.get_mode() == MODE_ALWAYS_ON && sel.pref_.v == MODE_ALWAYS_ON && sel.published == 1 &&
             sel.index_of_(MODE_STANDBY) == 0 && sel.index_of_(MODE_ALWAYS_ON) == 1,
-        "the select without a sun: option 1 is Always on");
+        "the select without a dark source: option 1 is Always on");
   now_ms = 0;
   std::printf("  Diff-Power port: wake, a plain light sent again, the notice, the shutdown hook (2 + 1 ports, during a "
               "notice, slow transmitters, standby time), the counters per id, the select\n");

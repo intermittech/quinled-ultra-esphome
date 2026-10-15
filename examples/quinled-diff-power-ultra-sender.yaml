@@ -73,6 +73,13 @@ wifi:
   ap: {}
 captive_portal:
 
+# The time now, for the ports' "During dark" power mode (its sunrise / sunset come from Home Assistant's sun.sun: no
+# coordinates needed; without Home Assistant, or as its backup, add ESPHome's sun and a sun_id per port: wiki,
+# Diff-Power ports)
+time:
+  - platform: homeassistant
+    id: ha_time
+
 uart:
   - id: rs485_1
     rx_pin: ${port1_rx}
@@ -84,7 +91,7 @@ uart:
     rx_buffer_size: 1024
 
 # The ports' power: on while a light on them is lit (and its turn-off period), standby otherwise; each with a Wake
-# button (motion automations press it)
+# button (motion automations press it) and a Power mode select (Standby, During dark, Always on)
 diffpower:
   - id: port1
     name: Port 1

@@ -1,6 +1,8 @@
 """The Diff-Power port's codegen helpers (components/diffpower/__init__.py) on hand-made configurations: the lights
 that share pixels with a port's lights (partitions at any depth, the strips under them, a cycle), their turn-off
-periods, and the lights diffpower.wake may name (design review, round 8). Needs ESPHome (the venv).
+periods, and the lights diffpower.wake may name (design review, round 8); "During dark"'s source in each configuration
+(Home Assistant's sun times, ESPHome's sun, both, none: the select's options) and what during_dark is refused without.
+Needs ESPHome (the venv).
 
 Run: python tests/diffpower_config_test.py"""
 
@@ -77,6 +79,59 @@ cfg4 = full(strip("strip"), partition("part", "strip"), partition("outer", "part
             ports=[port], hubs=[hub_on, hub_off])
 on = dp._port_lights(cfg4)
 check({"strip", "part", "outer", "u1"} <= on and "u2" not in on, f"wake targets: {sorted(on)}")
+
+# "During dark"'s source in each configuration: Home Assistant's sun times (api: and a clock), ESPHome's sun (sun_id),
+# both (the sun the backup), or none (the select without "During dark"); the clock: time_id, the sun's, the only time
+ALL3, TWO = dp.MODE_OPTIONS, [dp.MODE_OPTIONS[0], dp.MODE_OPTIONS[2]]
+SUN = {"id": ID("s"), "latitude": 52.1, "longitude": 5.1, "time_id": ID("t_sun")}
+
+
+def dark(port_extra=None, api=False, times=(), sun=False):
+    cfg = {"time": [{"id": ID(x)} for x in times]}
+    if api:
+        cfg["api"] = {}
+    if sun:
+        cfg["sun"] = SUN
+    conf = {"power_mode": "standby", "sun_entity": "sun.sun", **(port_extra or {})}
+    clock, ha, sun_conf = dp._dark_plan(conf, cfg)
+    return (str(clock) if clock is not None else None), ha, sun_conf is not None, dp._mode_options(conf, cfg)
+
+
+for what, args, want in [
+    ("api, one time: Home Assistant's", dict(api=True, times=["ha_time"]), ("ha_time", True, False, ALL3)),
+    ("api, no time: none", dict(api=True), (None, False, False, TWO)),
+    ("api, two times: none (time_id needed)", dict(api=True, times=["a", "b"]), (None, False, False, TWO)),
+    ("api, two times, time_id", dict(port_extra={"time_id": ID("b")}, api=True, times=["a", "b"]),
+     ("b", True, False, ALL3)),
+    ("api and a sun: Home Assistant's, the sun the backup (its clock)",
+     dict(port_extra={"sun_id": ID("s")}, api=True, times=["t_sun", "other"], sun=True), ("t_sun", True, True, ALL3)),
+    ("no api, a sun: the sun alone", dict(port_extra={"sun_id": ID("s")}, times=["t_sun"], sun=True),
+     ("t_sun", False, True, ALL3)),
+    ("no api, one time, no sun: none", dict(times=["t"]), ("t", False, False, TWO)),
+    ("no api, no time: none", dict(), (None, False, False, TWO)),
+]:
+    got = dark(**args)
+    check(got == want, f"{what}: {got}")
+
+# power_mode: during_dark without a source: refused, with what is missing
+for what, args, needle in [
+    ("no api, no sun", dict(), "from Home Assistant (api:"),
+    ("api, no time", dict(api=True), "needs the time now"),
+    ("api, two times", dict(api=True, times=["a", "b"]), "say which one with time_id"),
+]:
+    cfg = {"time": [{"id": ID(x)} for x in args.get("times", [])], **({"api": {}} if args.get("api") else {})}
+    try:
+        dp._validate_dark({"power_mode": "during_dark"}, cfg)
+        check(False, f"during_dark, {what}: refused")
+    except Exception as e:  # cv.Invalid
+        check(needle in str(e), f"during_dark, {what}: refused ('{e}')")
+try:
+    dp._validate_dark({"power_mode": "during_dark"}, {"api": {}, "time": [{"id": ID("t")}],
+                                                       "diffpower": [{"sun_entity": "sun.sun"},
+                                                                     {"sun_entity": "sun.other"}]})
+    check(False, "two sun entities: refused")
+except Exception as e:
+    check("one for all ports" in str(e), f"two sun entities: refused ('{e}')")
 
 print(f"{'ALL DIFFPOWER CONFIG TESTS PASSED' if not failures else 'FAILED'} ({failures} failures)")
 sys.exit(1 if failures else 0)

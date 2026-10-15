@@ -7,7 +7,9 @@
 // boot; millis() wrapping. Then the review's failures as regressions: a plug across the millis() wrap, a
 // detect dropout shorter than the debounce (waking and on), the notice's copies timed from their delivery (a slow
 // loop, a slow or dead transmitter), a pre-wake masked for 25 days, dark offsets up to 12 h (against a brute-force
-// search of the elevation), a shutdown during a notice, a deliberate power cycle. Negative controls alongside: what
+// search of the elevation), a shutdown during a notice, a deliberate power cycle. "During dark" from Home Assistant:
+// its ISO-8601 times, the stateless rule against the elevation (a year at 0 / 52 / 65 N, polar day and night), the
+// source (fresh, stale, missing, disconnected; the sun as the backup). Negative controls alongside: what
 // must NOT wake or drop the port.
 //
 // Build and run: python tests/run_diffpower_test.py
@@ -17,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -655,6 +658,196 @@ static void test_dark_offsets() {
   CHECK(wrong == 0, "%d of %d cases differ from the brute-force search", wrong, cases);
 }
 
+/// Home Assistant's sun times (ISO-8601, as its sun entity sends them): the fraction dropped, Z / +00:00 / other zones;
+/// not a time (unknown, no zone, out of range, trailing text): refused
+static void test_iso8601() {
+  std::printf("Home Assistant's sun times: ISO-8601 with a zone\n");
+  struct Case {
+    const char *s;
+    double want;   // (< 0: refused)
+  };
+  const double t0 = unix_at(2026, 10, 16, 5, 58) + 41;
+  const Case cases[] = {
+      {"2026-10-16T05:58:41.237114+00:00", t0},
+      {"2026-10-16T05:58:41+00:00", t0},
+      {"2026-10-16T05:58:41Z", t0},
+      {"2026-10-16T05:58:41.999999Z", t0},
+      {"2026-10-16 05:58:41+00:00", t0},
+      {"2026-10-16T07:58:41.5+02:00", t0},
+      {"2026-10-16T07:58:41+0200", t0},
+      {"2026-10-16T00:28:41-05:30", t0},
+      {"2026-10-16T07:58:41+02", t0},
+      {"2026-12-31T23:59:59Z", unix_at(2027, 1, 1, 0, 0) - 1},
+      {"2000-03-01T00:00:00Z", unix_at(2000, 3, 1, 0, 0)},
+      {"2099-12-31T00:00:00Z", unix_at(2099, 12, 31, 0, 0)},
+      {"1970-01-01T00:00:00Z", 0},
+      {"2024-02-29T00:00:00+00:00", unix_at(2024, 2, 29, 0, 0)},
+      {"2026-01-01T00:30:00+01:00", unix_at(2025, 12, 31, 23, 30)},
+      {"unknown", -1},
+      {"None", -1},
+      {"", -1},
+      {"2026-10-16T05:58:41", -1},
+      {"2026-13-16T05:58:41Z", -1},
+      {"2026-10-16T25:58:41Z", -1},
+      {"2026-10-16T05:58:41.Z", -1},
+      {"2026-10-16T05:58:41+00:00 ", -1},
+      {"2026-10-16T05:58:41+00:0", -1},
+      {"2026-10-16T05:58:41+24:00", -1},
+      {"2026-10-16T05:58Z", -1},
+      {"2026-10-16T05:58:41Zz", -1},
+      {"2026-10-16T05:58:41+02:0x", -1},
+      {"2026-10-16T05:58:41+02:000", -1},
+      {"2026-1a-16T05:58:41Z", -1},
+      {"1969-12-31T23:59:59Z", -1},
+      {"2100-01-01T00:00:00Z", -1},
+  };
+  for (const Case &c : cases) {
+    int64_t t = -7;
+    const bool ok = parse_iso8601(c.s, std::strlen(c.s), &t);
+    CHECK(c.want < 0 ? !ok : (ok && t == static_cast<int64_t>(c.want)), "'%s': %s (%lld)", c.s,
+          ok ? "parsed" : "refused", static_cast<long long>(t));
+  }
+  // every day from 1970 to 2099 (its leap years, the months' lengths) against the civil calendar
+  static const int MONTH_DAYS[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  int wrong = 0, days = 0;
+  for (int y = 1970; y <= 2099; y++) {
+    for (int m = 1; m <= 12; m++) {
+      for (int d = 1; d <= MONTH_DAYS[m - 1] + (m == 2 && y % 4 == 0); d++, days++) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT12:34:56+00:00", y, m, d);
+        int64_t t = 0;
+        wrong += !parse_iso8601(buf, std::strlen(buf), &t) || t != static_cast<int64_t>(unix_at(y, m, d, 12, 34)) + 56;
+      }
+    }
+  }
+  CHECK(wrong == 0, "every day 1970-2099: %d of %d wrong", wrong, days);
+}
+
+/// The sunrises and sunsets (the horizon crossings, to the second) from t0 to t1: what Home Assistant's sun entity
+/// gives as next_rising / next_setting, with the same sun as dark_window
+static void sun_events(double lat, double lon, double t0, double t1, std::vector<int64_t> *rises,
+                       std::vector<int64_t> *sets) {
+  const double step = 300;
+  bool below = solar_elevation(t0, lat, lon) < SUN_HORIZON;
+  for (double t = t0 + step; t <= t1; t += step) {
+    const bool b = solar_elevation(t, lat, lon) < SUN_HORIZON;
+    if (b != below) {
+      double lo = t - step, hi = t;
+      for (int k = 0; k < 24; k++) {
+        const double mid = (lo + hi) / 2;
+        ((solar_elevation(mid, lat, lon) < SUN_HORIZON) == below ? lo : hi) = mid;
+      }
+      (below ? rises : sets)->push_back(static_cast<int64_t>(std::lround(hi)));
+      below = b;
+    }
+  }
+}
+
+/// Home Assistant's next sunrise / sunset at t (moved on at each event): the first of each after t
+struct HaFeed {
+  std::vector<int64_t> rises, sets;
+  size_t r{0}, s{0};
+  void at(int64_t t) {
+    while (this->r < this->rises.size() && this->rises[this->r] <= t)
+      this->r++;
+    while (this->s < this->sets.size() && this->sets[this->s] <= t)
+      this->s++;
+  }
+  int64_t rise() const { return this->rises[this->r]; }
+  int64_t set() const { return this->sets[this->s]; }
+};
+
+/// The stateless rule against the sun's elevation (dark_window), every minute of a year at 0, 52 and 65 degrees north:
+/// the longest run of minutes they differ at a window's edge, for the default offsets (60 / 60 min), 30 min / 2 h and
+/// none. Then 78 N: polar day never dark, polar night always.
+static void test_ha_dark() {
+  std::printf("During dark from Home Assistant's next sunrise / sunset: against the sun's elevation, a year\n");
+  struct Place {
+    double lat, lon;
+    int max_min;   // the longest run of differing minutes allowed
+  };
+  const Place places[] = {{0, 0, 2}, {52.1, 5.1, 4}, {65, 25.5, 6}};
+  const uint32_t offs[][2] = {{3600, 3600}, {1800, 7200}, {0, 0}};
+  const double y0 = unix_at(2026, 1, 1, 0, 0), y1 = y0 + 365 * 86400.0;
+  for (const Place &pl : places) {
+    HaFeed f;
+    sun_events(pl.lat, pl.lon, y0 - 3 * 86400.0, y1 + 3 * 86400.0, &f.rises, &f.sets);
+    for (const auto &o : offs) {
+      int run = 0, longest = 0, minutes = 0;
+      f.r = f.s = 0;
+      for (double t = y0; t < y1; t += 60) {
+        const int64_t now = static_cast<int64_t>(t);
+        f.at(now);
+        const bool differ = ha_dark(now, f.rise(), f.set(), o[0], o[1]) != dark_window(t, pl.lat, pl.lon, o[0], o[1]);
+        run = differ ? run + 1 : 0;
+        longest = std::max(longest, run);
+        minutes += differ;
+      }
+      std::printf("  %4.1f N, %3u / %3u min: %5d minutes differ in the year, at most %d in a row\n", pl.lat,
+                  o[0] / 60, o[1] / 60, minutes, longest);
+      CHECK(longest <= pl.max_min, "%.1f N, %u / %u min: %d minutes in a row differ (at most %d)", pl.lat, o[0] / 60,
+            o[1] / 60, longest, pl.max_min);
+    }
+  }
+  // 78 N (Longyearbyen): Home Assistant's times weeks ahead in polar day and night
+  HaFeed f;
+  sun_events(78.2, 15.6, y0 - 3 * 86400.0, y1 + 120 * 86400.0, &f.rises, &f.sets);
+  bool june = false, december = true, agree = true;
+  for (int h = 0; h < 24; h++) {
+    const int64_t jt = static_cast<int64_t>(unix_at(2026, 6, 21, h, 0)), dt = static_cast<int64_t>(unix_at(2026, 12, 21, h, 0));
+    f.r = f.s = 0;
+    f.at(jt);
+    june |= ha_dark(jt, f.rise(), f.set(), 3600, 3600);
+    agree &= f.set() - jt > 30 * 86400 && f.rise() > f.set();
+    f.at(dt);
+    december &= ha_dark(dt, f.rise(), f.set(), 3600, 3600);
+    agree &= f.rise() - dt > 30 * 86400 && f.rise() < f.set();
+  }
+  CHECK(agree && !june && december, "78 N: polar day never dark, polar night always (times weeks ahead: %s)",
+        agree ? "yes" : "no");
+}
+
+/// Which source decides: Home Assistant's while both times are there and neither is stale (more than 10 min past;
+/// kept through a disconnect), else ESPHome's sun, else unknown; no valid time: unknown. Then a whole disconnect at
+/// noon: Home Assistant's frozen times until the sunset is 10 min past, then the backup (none without one).
+static void test_dark_source() {
+  std::printf("During dark's source: Home Assistant's while fresh, else ESPHome's sun, else unknown\n");
+  const int64_t now = static_cast<int64_t>(unix_at(2026, 10, 16, 12, 0));
+  const int64_t rise = now + 19 * 3600, set = now + 5 * 3600;
+  CHECK(dark_source(true, 3, now, rise, set, true) == DARK_HA && dark_source(true, 3, now, rise, set, false) == DARK_HA,
+        "both there, ahead: Home Assistant's (with or without the backup)");
+  CHECK(dark_source(false, 3, now, rise, set, true) == DARK_NONE && dark_source(false, 0, now, 0, 0, true) == DARK_NONE,
+        "no valid time: unknown");
+  for (uint8_t have : {0, 1, 2})
+    CHECK(dark_source(true, have, now, rise, set, true) == DARK_SUN &&
+              dark_source(true, have, now, rise, set, false) == DARK_NONE,
+          "received %u of 3: the sun (with one), else unknown", have);
+  CHECK(dark_source(true, 3, set + 600, rise, set, false) == DARK_HA &&
+            dark_source(true, 3, set + 601, rise, set, true) == DARK_SUN &&
+            dark_source(true, 3, set + 601, rise, set, false) == DARK_NONE,
+        "the sunset 10 min past, not moved on: still; a second later stale: the sun, or unknown");
+  CHECK(dark_source(true, 3, rise + 601, rise, rise + 3600, true) == DARK_SUN, "a stale sunrise too");
+  // disconnected at noon (52 N): the frozen times decide until the sunset is 10 min past, then the sun's
+  HaFeed f;
+  const double day = unix_at(2026, 10, 16, 0, 0);
+  sun_events(52.1, 5.1, day - 86400, day + 3 * 86400, &f.rises, &f.sets);
+  f.at(now);
+  const int64_t fr = f.rise(), fs = f.set();
+  int64_t ha_until = 0;
+  int wrong = 0;
+  for (int64_t t = now; t < now + 36 * 3600; t += 60) {
+    const DarkSource src = dark_source(true, 3, t, fr, fs, true);
+    if (src == DARK_HA)
+      ha_until = t;
+    const bool dark = src == DARK_HA ? ha_dark(t, fr, fs, 3600, 3600) : dark_window(t, 52.1, 5.1, 3600, 3600);
+    wrong += dark != dark_window(t, 52.1, 5.1, 3600, 3600);
+    CHECK(dark_source(true, 3, t, fr, fs, false) == (src == DARK_HA ? DARK_HA : DARK_NONE), "without the backup");
+  }
+  CHECK(ha_until >= fs + 540 && ha_until <= fs + 600 && wrong == 0,
+        "disconnected at noon: Home Assistant's until %+lld s after the sunset, then the sun's; %d minutes wrong",
+        static_cast<long long>(ha_until - fs), wrong);
+}
+
 static void test_shutdown_during_notice() {
   std::printf("a shutdown during a notice: it goes on with its own\n");
   Sim s(1);
@@ -752,6 +945,9 @@ int main() {
   test_notice_delivery();
   test_masked_prewake();
   test_dark_offsets();
+  test_iso8601();
+  test_ha_dark();
+  test_dark_source();
   test_shutdown_during_notice();
   test_power_cycle();
   test_prewake_at_expiry();

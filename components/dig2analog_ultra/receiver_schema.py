@@ -45,6 +45,7 @@ UltraLightTelemetry = ns.class_("UltraLightTelemetry")   # not a Component: made
 CONF_TELEMETRY = "telemetry"
 CONF_RECEIVERS = "receivers"
 CONF_DIRECTION_PIN = "direction_pin"
+CONF_RECEIVER_ENABLE_PIN = "receiver_enable_pin"
 CONF_POLL_INTERVALS = "poll_intervals"
 CONF_DIAGNOSTICS = "diagnostics"
 CONF_LIGHT_ENTITIES = "light_entities"
@@ -212,6 +213,10 @@ TELEMETRY_SCHEMA = cv.Schema(
         # the hub's RS-485 driver enable (high = the hub drives the line): let go of right after each poll frame, so
         # the receivers can answer. Leave it out when the hardware lets go of the line by itself.
         cv.Optional(CONF_DIRECTION_PIN): pins.internal_gpio_output_pin_schema,
+        # the port's RS-485 receiver enable (high = its output drives the UART's RX; `inverted: true` for a /RE): on
+        # from this line's poll frame until its window is read. With it on every line of a UART, several lines share
+        # that UART (one window at a time); without, each line needs a UART of its own.
+        cv.Optional(CONF_RECEIVER_ENABLE_PIN): pins.gpio_output_pin_schema,
         cv.Optional(CONF_POLL_INTERVALS, default={}): cv.Schema(
             dict(
                 [
@@ -301,23 +306,29 @@ def uart_of(full, uart_id):
 
 
 def validate_telemetry_lines(full):
-    """Across the lines: each line's telemetry has a UART of its own (its own RS-485 receiver: a line's response
-    windows are timed on that line only). Two ports with one name or one device: ESPHome's own check refuses their
-    entities' names (unique per device)."""
+    """Across the lines: a UART carries one line's telemetry, or several lines' when each of them has a
+    receiver_enable_pin (only the port whose window is open drives the UART's RX; the hubs take turns: one window
+    per UART at a time). Two ports with one name or one device: ESPHome's own check refuses their entities' names
+    (unique per device)."""
     hubs = full.get("dig2analog_ultra", []) or []
     uarts = {}
     for conf in hubs if isinstance(hubs, list) else [hubs]:
         tel = conf.get(CONF_TELEMETRY)
         if tel is None:
             continue
-        hub = str(conf[CONF_ID])
-        uart_id = str(tel[CONF_UART_ID])
-        if uart_id in uarts:
+        uarts.setdefault(str(tel[CONF_UART_ID]), []).append(conf)
+    for uart_id, confs in uarts.items():
+        if len(confs) < 2:
+            continue
+        missing = [str(c[CONF_ID]) for c in confs if CONF_RECEIVER_ENABLE_PIN not in c[CONF_TELEMETRY]]
+        if missing:
+            names = " and ".join(f"'{c[CONF_ID]}'" for c in confs)
             raise cv.Invalid(
-                f"the telemetry of '{uarts[uart_id]}' and of '{hub}' use the same uart '{uart_id}': each line needs a "
-                "UART of its own, with its own RS-485 receiver (a line's response windows are timed on that line only)"
+                f"the telemetry of {names} use the same uart '{uart_id}': lines share a UART only when each has a "
+                f"receiver_enable_pin (its port's RS-485 receiver, on only during its own window); "
+                f"{', '.join(repr(m) for m in missing)} {'has' if len(missing) == 1 else 'have'} none. Or give each "
+                "line a UART of its own"
             )
-        uarts[uart_id] = hub
 
 
 def validate_telemetry(full, conf, num_boards):
@@ -381,6 +392,8 @@ async def telemetry_to_code(hub, config):
     )
     if CONF_DIRECTION_PIN in tel:
         cg.add(hub.set_telemetry_direction_pin(await cg.gpio_pin_expression(tel[CONF_DIRECTION_PIN])))
+    if CONF_RECEIVER_ENABLE_PIN in tel:
+        cg.add(hub.set_telemetry_receiver_enable_pin(await cg.gpio_pin_expression(tel[CONF_RECEIVER_ENABLE_PIN])))
     cg.add(
         hub.set_telemetry_port(
             tel[CONF_PORT_LIMIT],

@@ -64,6 +64,9 @@ jobs:
       - name: Update retry test (auto_retry with the sender through the board firmware's bootloader)
         working-directory: quinled-ultra-esphome
         run: python tests/run_ultra_update_retry_test.py
+      - name: PARLIO test (16 lanes, the shared-UART coordinator, negative controls, the render's cost)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_parlio_test.py
       - name: Schema tests
         working-directory: quinled-ultra-esphome
         run: python tests/validate_configs.py
@@ -80,6 +83,7 @@ jobs:
           - ultra/ultra-telemetry.yaml
           - ultra/ultra-p4-telemetry.yaml
           - ultra/ultra-diffpower.yaml
+          - ultra/ultra-p4-parlio.yaml
           - examples-local/quinled-dig2analog-ultra-rgbcct.yaml
           - examples-local/quinled-dig2analog-ultra-downlights.yaml
           - examples-local/quinled-dig2analog-ultra-candle-niche.yaml

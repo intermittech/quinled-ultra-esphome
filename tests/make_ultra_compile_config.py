@@ -3,7 +3,8 @@ a few test-only additions (boot protocol, power-on scene and effects, dim to war
 calibration, the version display, the board firmware update with a power supply on the line), so one compile covers
 the hub's code. Also tests/build/ultra/ultra-strip.yaml: the dig2analog_ultra_strip example with a partition, effect_glide modes
 and the downlight notification pattern; tests/build/ultra/ultra-telemetry.yaml: ultra-example with Diff-Power receiver
-telemetry (the UART, the direction pin, every receiver sensor and text). The examples themselves:
+telemetry (the UART, the direction pin, every receiver sensor and text); tests/build/ultra/ultra-p4-telemetry.yaml (4
+RMT lines with telemetry on a P4) and ultra-p4-parlio.yaml (16 PARLIO lanes, 4 shared UARTs). The examples themselves:
 tests/local_examples.py.
 
 Usage: .venv/Scripts/python tests/make_ultra_compile_config.py
@@ -480,6 +481,34 @@ def p4_telemetry_config() -> str:
             "\ndig2analog_ultra:\n" + hubs + "\nlight:\n" + lights)
 
 
+def p4_parlio_config() -> str:
+    """tests/build/ultra/ultra-p4-parlio.yaml: a 16-port sender on an ESP32-P4: 16 lanes of one PARLIO bus, telemetry
+    on 4 UARTs shared by 4 lanes each (a direction pin per lane on the P4, its receiver enable on an MCP23017: any
+    output pin will do), a light per lane, and an RMT line next to them."""
+    de = [20, 21, 22, 23, 26, 27, 28, 29, 30, 31, 32, 33, 39, 40, 41, 42]
+    uarts, hubs, lights = "", "", ""
+    for g in range(4):
+        uarts += (f"  - id: rs485_g{g + 1}\n    rx_pin: GPIO{16 + g}\n    baud_rate: 1000000\n"
+                  f"    rx_buffer_size: 1024\n")
+    for k in range(16):
+        hubs += (f"  - id: port{k + 1}\n    parlio_id: ports\n    lane: {k}\n    num_boards: 2\n    telemetry:\n"
+                 f"      uart_id: rs485_g{k // 4 + 1}\n      name: Port {k + 1}\n      receivers: 2\n"
+                 f"      diagnostics: basic\n      direction_pin: GPIO{de[k]}\n      receiver_enable_pin:\n"
+                 f"        mcp23xxx: rx_enable\n        number: {k}\n")
+        lights += (f"  - platform: dig2analog_ultra\n    dig2analog_ultra_id: port{k + 1}\n    name: Port {k + 1} RGBCCT\n"
+                   f"    board: 0\n    red: 1\n    green: 2\n    blue: 3\n    cold_white: 4\n    warm_white: 5\n")
+    hubs += "  - id: rmt_line\n    pin: GPIO45\n    num_boards: 1\n    rmt_symbols: 48\n"
+    lights += ("  - platform: dig2analog_ultra\n    dig2analog_ultra_id: rmt_line\n    name: RMT line\n    board: 0\n"
+               "    channel: 1\n")
+    return ("esphome:\n  name: d2a-ultra-p4-parlio\n\nesp32:\n  board: esp32-p4_r3\n  framework:\n    type: esp-idf\n\n"
+            "external_components:\n  - source:\n      type: local\n      path: ../../../components\n"
+            "    components: [dig2analog_ultra, dig2analog_ultra_parlio]\n\nlogger:\n\n"
+            "i2c:\n  sda: GPIO43\n  scl: GPIO44\n\nmcp23017:\n  - id: rx_enable\n    address: 0x20\n\n"
+            "uart:\n" + uarts +
+            "\ndig2analog_ultra_parlio:\n  - id: ports\n    pins: [" + ", ".join(f"GPIO{i}" for i in range(16)) + "]\n"
+            "\ndig2analog_ultra:\n" + hubs + "\nlight:\n" + lights)
+
+
 def telemetry_config(example: str) -> str:
     """tests/build/ultra/ultra-telemetry.yaml: ultra-example with Diff-Power receiver telemetry on its line: a
     device per receiver, the four lights of board 1 on their own devices (their estimates)."""
@@ -547,11 +576,12 @@ def main() -> None:
     (OUT / "ultra-telemetry.yaml").write_text(telemetry_config(src), encoding="utf-8")
     (OUT / "ultra-p4-telemetry.yaml").write_text(p4_telemetry_config(), encoding="utf-8")
     (OUT / "ultra-diffpower.yaml").write_text(DIFFPOWER_CONFIG, encoding="utf-8")
+    (OUT / "ultra-p4-parlio.yaml").write_text(p4_parlio_config(), encoding="utf-8")
     secrets = OUT / "secrets.yaml"
     if not secrets.exists():
         secrets.write_text('wifi_ssid: "test"\nwifi_password: "testtest"\n', encoding="utf-8")
     print(f"written {OUT / 'ultra-example.yaml'}, {OUT / 'ultra-strip.yaml'}, {OUT / 'ultra-telemetry.yaml'}, "
-          f"{OUT / 'ultra-p4-telemetry.yaml'}, {OUT / 'ultra-diffpower.yaml'}")
+          f"{OUT / 'ultra-p4-telemetry.yaml'}, {OUT / 'ultra-diffpower.yaml'}, {OUT / 'ultra-p4-parlio.yaml'}")
 
 
 if __name__ == "__main__":

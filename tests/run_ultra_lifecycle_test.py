@@ -48,7 +48,8 @@ PIECES = {
     ),
     "hub_rw.inc": (
         "dig2analog_ultra.cpp",
-        ["bool UltraHub::rw_due_(", "bool UltraHub::rx_settling(", "bool IRAM_ATTR UltraHub::rw_done_isr_(",
+        ["bool UltraHub::rw_due_(", "bool UltraHub::rx_settling(", "bool UltraHub::rw_uart_free_(",
+         "bool IRAM_ATTR UltraHub::rw_done_isr_(",
          "void UltraHub::finish_window_(", "void UltraHub::rw_publish_("],
     ),
     # the Diff-Power port (components/diffpower) and the hub's side of it

@@ -33,6 +33,10 @@
 #include "ultra_telemetry.h"
 #endif
 
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+#include "ultra_parlio.h"
+#endif
+
 namespace esphome::dig2analog_ultra {
 
 class UltraLight;
@@ -64,6 +68,11 @@ class UltraHub final : public Component {
   void set_max_commands(uint8_t n) { this->max_commands_ = n; }
   void set_rmt_symbols(uint32_t n) { this->rmt_symbols_ = n; }
   void set_use_dma(bool use_dma) { this->use_dma_ = use_dma; }
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+  /// A lane of a dig2analog_ultra_parlio bus (ESP32-P4) instead of an RMT channel; set_timing() then carries the
+  /// lane's timing on the bus' sample grid.
+  void set_parlio_lane(ParlioLane *lane) { this->lane_ = lane; }
+#endif
   void set_timing(uint32_t bit0_high_ns, uint32_t bit0_low_ns, uint32_t bit1_high_ns, uint32_t bit1_low_ns,
                   uint32_t reset_ns) {
     this->bit0_high_ns_ = bit0_high_ns;
@@ -264,6 +273,12 @@ class UltraHub final : public Component {
   uint32_t get_frame_us() const { return this->frame_us_; }
   Scheduler &scheduler() { return this->sched_; }
   uint8_t get_pin() const { return this->pin_; }
+  /// the line is a lane of a dig2analog_ultra_parlio bus
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+  bool on_parlio() const { return this->lane_ != nullptr; }
+#else
+  bool on_parlio() const { return false; }
+#endif
   void wake_();
   void add_light(UltraLight *light) { this->lights_.push_back(light); }
 
@@ -279,8 +294,12 @@ class UltraHub final : public Component {
                        TelemetryIntervals{status_ms, power_ms, energy_ms, supply_ms, health_ms, lifetime_ms, diag_ms});
   }
   /// The hub's RS-485 driver enable (high: it drives the line). Low within ~10 us of an RW frame's last bit (the
-  /// RMT's interrupt), high again before the next frame. Without it the hardware must let go of the line itself.
+  /// RMT's interrupt; on a PARLIO lane a timer alarm from the stream's timing), high again before the next frame.
+  /// Without it the hardware must let go of the line itself.
   void set_telemetry_direction_pin(InternalGPIOPin *pin) { this->rw_dir_pin_ = pin; }
+  /// The port's RS-485 receiver enable (high: its output drives the UART's RX): on from this line's RW frame until its
+  /// window is read, off otherwise, so several lines can share one UART (one window open per UART at a time).
+  void set_telemetry_receiver_enable_pin(GPIOPin *pin) { this->rw_rx_enable_pin_ = pin; }
   /// receiver k has several lights: read its OUTPUTS too (their estimated power, why they're dim)
   void set_telemetry_outputs(uint16_t k, bool on) { this->poller_.set_outputs(k, on); }
   /// the sender port: its current limit (A), its voltage (V, NAN: learned), the load's warning / problem (%) and how
@@ -335,9 +354,13 @@ class UltraHub final : public Component {
   void finish_window_(bool wait);
   void rw_publish_();
   static bool rw_done_isr_(rmt_channel_handle_t channel, const rmt_tx_done_event_data_t *edata, void *arg);
+  /// No other line holds this line's UART (lines sharing one take turns: one window open per UART).
+  bool rw_uart_free_() const;
   uart::UARTComponent *rw_uart_{nullptr};
   InternalGPIOPin *rw_dir_pin_{nullptr};
   ISRInternalGPIOPin rw_dir_isr_;
+  GPIOPin *rw_rx_enable_pin_{nullptr};
+  bool rw_turn_{false};                   // this line holds its UART: from its RW frame until its window is read
   bool rw_driving_{true};                 // the direction pin is high (the hub drives the line)
   volatile bool rw_release_{false};       // the RMT's done interrupt lets go of the line (an RW frame is on the wire)
   volatile int64_t rw_released_us_{0};
@@ -441,6 +464,7 @@ class UltraHub final : public Component {
   uint32_t psu_released_ms_{0};
 #endif
 
+  bool setup_rmt_();
   uint8_t *tx_buf_{nullptr};
   bool tx_prepared_{false};      // tx_buf_ holds a frame the RMT refused: sent again first
   bool tx_normal_{true};         // it is a normal / DARK frame (retime_frame gives it a new TIME)
@@ -450,10 +474,20 @@ class UltraHub final : public Component {
   uint32_t build_peak_us_{0};   // the longest frame build since take_diagnostics()
   rmt_channel_handle_t channel_{nullptr};
   rmt_encoder_handle_t encoder_{nullptr};
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+  // a PARLIO lane instead of the RMT: frames are posted to the bus' stream a few ms ahead (ultra_parlio.h)
+  ParlioLane *lane_{nullptr};
+  uint32_t lane_lead_us_{0};    // how far ahead of now its frames start at most
+  esp_err_t lane_post_();
+  static void rw_lane_release_(void *arg);
+#endif
 
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
   enum UpdateState : uint8_t { UPD_IDLE = 0, UPD_RUNNING, UPD_FINISHED };
   static void update_task_(void *arg);
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+  uint8_t update_lane_();
+#endif
   void arm_ping_burst_();
   UpdateSession upd_session_;
   TaskHandle_t upd_task_{nullptr};

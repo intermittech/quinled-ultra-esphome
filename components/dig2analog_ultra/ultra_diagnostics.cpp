@@ -28,7 +28,12 @@ void UltraDiagnostics::update() {
     this->build_time_->publish_state(static_cast<float>(d.build_us));
   if (this->underruns_ != nullptr) {
     this->underruns_->publish_state(static_cast<float>(d.underruns));
-    if (d.underruns != this->last_underruns_)
+    if (d.underruns != this->last_underruns_ && this->hub_->on_parlio())
+      ESP_LOGW(TAG,
+               "GPIO%u: %" PRIu32 " frame(s) lost to a slip of the PARLIO stream since the last update (its render "
+               "task was late)",
+               this->hub_->get_pin(), d.underruns - this->last_underruns_);
+    else if (d.underruns != this->last_underruns_)
       ESP_LOGW(TAG,
                "GPIO%u: %" PRIu32 " RMT underrun(s) since the last update: those frames were broken (interrupts "
                "held up; use_dma or a larger rmt_symbols give the RMT more time)",

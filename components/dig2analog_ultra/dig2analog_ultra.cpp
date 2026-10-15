@@ -108,8 +108,13 @@ void UltraHub::resync(bool power_on) {
 }
 
 UltraHub::Diagnostics UltraHub::take_diagnostics() {
+  uint32_t underruns = this->enc_.watch.count;
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+  if (this->lane_ != nullptr)
+    underruns = this->lane_->refused();   // frames the stream couldn't take (it slipped): lost like an underrun's
+#endif
   const Diagnostics d{this->sched_.take_queue_peak(), this->sched_.take_memory_peak(), this->build_peak_us_,
-                      this->enc_.watch.count, this->frames_};
+                      underruns, this->frames_};
   this->build_peak_us_ = 0;
   return d;
 }
@@ -121,12 +126,14 @@ int64_t UltraHub::lead_us(size_t commands, size_t waiting) const {
   const uint32_t frame = this->frame_us_ + 500;   // a frame and the gap to the next
   if (this->start_delay_us_ >= 0)
     return this->start_delay_us_ + static_cast<int64_t>(commands > 1 ? commands - 1 : 0) * frame;
+  int64_t lead = start_lead_us(frame, commands, waiting);
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
-  // a command queued as a response window opens waits for its end
-  return start_lead_us(frame, commands, waiting) + this->rw_extra_us_;
-#else
-  return start_lead_us(frame, commands, waiting);
+  lead += this->rw_extra_us_;   // a command queued as a response window opens waits for its end
 #endif
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+  lead += this->lane_lead_us_;  // a lane's frame starts a few ms ahead of now
+#endif
+  return lead;
 }
 
 // A group change: every command it can give the busiest board (a SET per light, an effect's EFFECT and STEPs, a
@@ -143,7 +150,10 @@ int64_t UltraHub::start_time_us(uint16_t board) {
     lead = std::max(lead, hub->command_lead_us_());
   // a command joins the open group while its first copy gets out by its start: the frame on the wire, what waits
   // on its board, its own frame
-  const int64_t reach = start_lead_us(this->frame_us_ + 500, 1, this->sched_.waiting(board)) - START_SLACK_US;
+  int64_t reach = start_lead_us(this->frame_us_ + 500, 1, this->sched_.waiting(board)) - START_SLACK_US;
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+  reach += this->lane_lead_us_;
+#endif
   return group_.start(this->now_us_(), lead, reach);
 }
 
@@ -249,6 +259,14 @@ void UltraHub::power_cycle() {
 // (and its reset) is on the wire, the page pause if it asked for one, then the next.
 void UltraHub::update_task_(void *arg) {
   auto *hub = static_cast<UltraHub *>(arg);
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+  if (hub->lane_ != nullptr) {
+    hub->upd_result_.store(hub->update_lane_());
+    hub->upd_state_.store(UPD_FINISHED);
+    vTaskDelete(nullptr);
+    return;
+  }
+#endif
   rmt_transmit_config_t cfg;
   memset(&cfg, 0, sizeof(cfg));
   uint8_t result = UPD_DONE;
@@ -286,6 +304,56 @@ void UltraHub::update_task_(void *arg) {
   hub->upd_state_.store(UPD_FINISHED);
   vTaskDelete(nullptr);
 }
+
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+// The session on a PARLIO lane: each frame posted with its page pause as the lane's quiet after it (so the line stays
+// low that long after its reset, whatever the stream's latency), the next built once the renderer took it. A frame the
+// stream refused (it slipped) or that came too late for its start goes again (a new start).
+uint8_t UltraHub::update_lane_() {
+  uint8_t result = UPD_DONE;
+  uint32_t pause_us = 0;
+  const uint32_t reset_us = this->reset_ns_ / 1000;
+  auto send = [this](uint32_t quiet_us) -> bool {
+    for (int tries = 0; tries < 400; tries++) {   // ~2 s
+      while (this->lane_->busy())
+        vTaskDelay(1);
+      if (this->lane_->post(this->tx_buf_, UPD_FRAME_BYTES, quiet_us, false))
+        return true;
+      vTaskDelay(1);
+    }
+    return false;
+  };
+  for (;;) {
+    if (this->upd_abort_.load()) {
+      result = UPD_ABORTED;
+      break;
+    }
+    while (this->lane_->busy())
+      vTaskDelay(1);
+    const int64_t start = this->lane_->reserve_us();
+    if (!this->upd_session_.next(this->tx_buf_, static_cast<uint32_t>(start), &pause_us))
+      break;
+    if (!send(reset_us + pause_us)) {   // the boards program a page in the pause
+      result = UPD_FAILED;
+      break;
+    }
+    this->upd_sent_.store(this->upd_session_.frames_sent());
+    this->upd_pass_.store(this->upd_session_.pass());
+  }
+  if (result == UPD_ABORTED) {
+    for (int i = 0; i < 12; i++) {
+      while (this->lane_->busy())
+        vTaskDelay(1);
+      this->upd_session_.abort_frame(this->tx_buf_, static_cast<uint32_t>(this->lane_->reserve_us()));
+      if (!send(reset_us))
+        break;
+    }
+  }
+  while (this->lane_->busy())
+    vTaskDelay(1);
+  return result;
+}
+#endif
 #endif
 
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
@@ -313,8 +381,14 @@ bool UltraHub::rw_due_(bool urgent) {
     this->poller_.touch_all();
     this->rw_publish_();
   }
-  // (every line has a UART of its own: the configuration check refuses one shared by two lines)
-  if (urgent || this->rw_open_)
+  // a line that held its UART for an RW frame that was dropped since (a resync): it lets go
+  if (this->rw_turn_ && !this->rw_open_ && !(this->tx_prepared_ && this->tx_rw_)) {
+    this->rw_turn_ = false;
+    if (this->rw_rx_enable_pin_ != nullptr)
+      this->rw_rx_enable_pin_->digital_write(false);
+  }
+  // lines sharing a UART (each with a receiver_enable_pin): one window at a time
+  if (urgent || this->rw_open_ || !this->rw_uart_free_())
     return false;
   // the lock interval from the last lock frame's end (it was set when the frame was built)
   if (this->rw_lock_end_) {
@@ -336,6 +410,14 @@ bool UltraHub::rx_settling(uint16_t receiver) const {
   return !(cut >= 0 && cut < receiver);
 }
 
+bool UltraHub::rw_uart_free_() const {
+  for (const UltraHub *hub : hubs_) {
+    if (hub != this && hub->rw_turn_ && hub->rw_uart_ == this->rw_uart_)
+      return false;
+  }
+  return true;
+}
+
 // The RMT's interrupt after an RW frame's last symbol: let go of the line (ULTRA_RW_RELEASE_US after its last bit).
 bool IRAM_ATTR UltraHub::rw_done_isr_(rmt_channel_handle_t, const rmt_tx_done_event_data_t *, void *arg) {
   auto *hub = static_cast<UltraHub *>(arg);
@@ -346,6 +428,11 @@ bool IRAM_ATTR UltraHub::rw_done_isr_(rmt_channel_handle_t, const rmt_tx_done_ev
   }
   return false;
 }
+
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+// A lane: the bus' timer alarm at the RW frame's last bit (PARLIO_RELEASE_NS after it), from the stream's timing.
+void IRAM_ATTR UltraHub::rw_lane_release_(void *arg) { UltraHub::rw_done_isr_(nullptr, nullptr, arg); }
+#endif
 
 // The window is over (wait: until its bytes can be read; <= 26 ms): the UART's bytes to the poller, the sensors.
 void UltraHub::finish_window_(bool wait) {
@@ -376,6 +463,10 @@ void UltraHub::finish_window_(bool wait) {
       break;
     this->rw_rx_.insert(this->rw_rx_.end(), buf, buf + n);
   }
+  // the window's bytes are read: the port's receiver off, the UART free for the next line on it
+  if (this->rw_rx_enable_pin_ != nullptr)
+    this->rw_rx_enable_pin_->digital_write(false);
+  this->rw_turn_ = false;
   this->poller_.finish(millis(), this->rw_rx_.data(), this->rw_rx_.size());
   this->rw_publish_();
 }
@@ -644,6 +735,56 @@ void UltraHub::setup() {
     return;
   }
 
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+  if (this->lane_ != nullptr) {
+    // a PARLIO lane: the bus renders the frames; the timing (set_timing) is already on its sample grid
+    if (!this->lane_->begin(buf_bytes, UltraHub::rw_lane_release_, this)) {
+      ESP_LOGE(TAG, "PARLIO lane %u: no bus or no memory", this->lane_->index());
+      this->mark_failed();
+      return;
+    }
+    this->lane_lead_us_ = this->lane_->lead_us();
+    this->sched_.set_bit_timing(this->bit0_high_ns_, this->bit0_low_ns_, this->bit1_high_ns_, this->bit1_low_ns_);
+  } else if (!this->setup_rmt_()) {
+    return;
+  }
+#else
+  if (!this->setup_rmt_())
+    return;
+#endif
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  if (this->rw_uart_ != nullptr) {
+    this->rw_slots_.assign(static_cast<size_t>(ULTRA_SLOT_BYTES) * this->num_boards_, 0);
+    this->rw_extra_us_ = this->poller_.max_window_us() + ULTRA_RW_HOLDOFF_US;
+    if (this->rw_dir_pin_ != nullptr) {
+      this->rw_dir_pin_->setup();         // the hub drives the line
+      this->rw_dir_pin_->digital_write(true);
+      this->rw_dir_isr_ = this->rw_dir_pin_->to_isr();
+    }
+    if (this->rw_rx_enable_pin_ != nullptr) {
+      this->rw_rx_enable_pin_->setup();   // off until this line's first window (its UART may be shared)
+      this->rw_rx_enable_pin_->digital_write(false);
+    }
+  }
+#endif
+  const uint32_t worst = std::max(this->bit0_high_ns_ + this->bit0_low_ns_, this->bit1_high_ns_ + this->bit1_low_ns_);
+  this->frame_us_ = static_cast<uint32_t>((static_cast<uint64_t>(this->sched_.frame_bytes()) * 8 * worst) / 1000) +
+                    this->reset_ns_ / 1000;
+  this->switch_frame_us_ =
+      static_cast<uint32_t>((static_cast<uint64_t>(ultra_switch_frame_bytes(this->num_boards_)) * 8 * worst) / 1000) +
+      this->reset_ns_ / 1000;
+  this->preamble_ = preamble_frames(this->num_boards_);
+#ifdef USE_DIG2ANALOG_ULTRA_UPDATE
+  this->arm_ping_burst_();
+#endif
+  // Line is idle low now; guarantee one full reset period before the first frame.
+  delayMicroseconds(this->reset_ns_ / 1000 + 1);
+  this->wake_();
+}
+
+// The line's RMT channel and encoder (and with a telemetry direction pin, the RMT's done interrupt that lets go of
+// the line after an RW frame). false: failed (logged, marked).
+bool UltraHub::setup_rmt_() {
   const uint32_t res = rmt_resolution_hz();
   const uint32_t t0h = ns_to_ticks(this->bit0_high_ns_, res), t0l = ns_to_ticks(this->bit0_low_ns_, res);
   const uint32_t t1h = ns_to_ticks(this->bit1_high_ns_, res), t1l = ns_to_ticks(this->bit1_low_ns_, res);
@@ -653,7 +794,7 @@ void UltraHub::setup() {
       t0l > RMT_DURATION_MAX || t1h > RMT_DURATION_MAX || t1l > RMT_DURATION_MAX || rst1 > RMT_DURATION_MAX) {
     ESP_LOGE(TAG, "Timing does not fit an RMT symbol at %" PRIu32 " Hz", res);
     this->mark_failed();
-    return;
+    return false;
   }
   this->sched_.set_bit_timing(this->bit0_high_ns_, this->bit0_low_ns_, this->bit1_high_ns_, this->bit1_low_ns_);
   this->enc_.symbols.bit0 = make_symbol(t0h, 1, t0l, 0);
@@ -676,7 +817,7 @@ void UltraHub::setup() {
   if (rmt_new_tx_channel(&ch, &this->channel_) != ESP_OK) {
     ESP_LOGE(TAG, "RMT TX channel creation failed");
     this->mark_failed();
-    return;
+    return false;
   }
   rmt_simple_encoder_config_t enc;
   memset(&enc, 0, sizeof(enc));
@@ -686,50 +827,31 @@ void UltraHub::setup() {
   if (rmt_new_simple_encoder(&enc, &this->encoder_) != ESP_OK) {
     ESP_LOGE(TAG, "RMT encoder creation failed");
     this->mark_failed();
-    return;
+    return false;
   }
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   this->reset_symbol_ = this->enc_.symbols.reset;
   this->rw_reset_symbol_ = this->reset_symbol_;
-  if (this->rw_uart_ != nullptr) {
-    this->rw_slots_.assign(static_cast<size_t>(ULTRA_SLOT_BYTES) * this->num_boards_, 0);
-    this->rw_extra_us_ = this->poller_.max_window_us() + ULTRA_RW_HOLDOFF_US;
-    if (this->rw_dir_pin_ != nullptr) {
-      this->rw_dir_pin_->setup();
-      this->rw_dir_pin_->digital_write(true);
-      this->rw_dir_isr_ = this->rw_dir_pin_->to_isr();
-      // an RW frame ends with a 2 us low, then the RMT's interrupt lets go of the line: the window is its reset
-      const uint32_t us1 = ns_to_ticks(1000, res);
-      this->rw_reset_symbol_ = make_symbol(us1, 0, us1, 0);
-      rmt_tx_event_callbacks_t cbs;
-      memset(&cbs, 0, sizeof(cbs));
-      cbs.on_trans_done = UltraHub::rw_done_isr_;
-      if (rmt_tx_register_event_callbacks(this->channel_, &cbs, this) != ESP_OK) {
-        ESP_LOGE(TAG, "RMT event callback failed (telemetry direction pin)");
-        this->mark_failed();
-        return;
-      }
+  if (this->rw_uart_ != nullptr && this->rw_dir_pin_ != nullptr) {
+    // an RW frame ends with a 2 us low, then the RMT's interrupt lets go of the line: the window is its reset
+    const uint32_t us1 = ns_to_ticks(1000, res);
+    this->rw_reset_symbol_ = make_symbol(us1, 0, us1, 0);
+    rmt_tx_event_callbacks_t cbs;
+    memset(&cbs, 0, sizeof(cbs));
+    cbs.on_trans_done = UltraHub::rw_done_isr_;
+    if (rmt_tx_register_event_callbacks(this->channel_, &cbs, this) != ESP_OK) {
+      ESP_LOGE(TAG, "RMT event callback failed (telemetry direction pin)");
+      this->mark_failed();
+      return false;
     }
   }
 #endif
   if (rmt_enable(this->channel_) != ESP_OK) {
     ESP_LOGE(TAG, "RMT enable failed");
     this->mark_failed();
-    return;
+    return false;
   }
-  const uint32_t worst = std::max(this->bit0_high_ns_ + this->bit0_low_ns_, this->bit1_high_ns_ + this->bit1_low_ns_);
-  this->frame_us_ = static_cast<uint32_t>((static_cast<uint64_t>(this->sched_.frame_bytes()) * 8 * worst) / 1000) +
-                    this->reset_ns_ / 1000;
-  this->switch_frame_us_ =
-      static_cast<uint32_t>((static_cast<uint64_t>(ultra_switch_frame_bytes(this->num_boards_)) * 8 * worst) / 1000) +
-      this->reset_ns_ / 1000;
-  this->preamble_ = preamble_frames(this->num_boards_);
-#ifdef USE_DIG2ANALOG_ULTRA_UPDATE
-  this->arm_ping_burst_();
-#endif
-  // Line is idle low now; guarantee one full reset period before the first frame.
-  delayMicroseconds(this->reset_ns_ / 1000 + 1);
-  this->wake_();
+  return true;
 }
 
 #ifdef USE_DIFFPOWER
@@ -870,9 +992,16 @@ void UltraHub::loop() {
   }
   if (!urgent && !rw && this->has_sent_ && millis() - this->last_frame_ms_ < this->refresh_interval_ms_)
     return;
-  // Non-blocking: if the previous frame (incl. its reset) is still on the wire, retry next loop.
+  // Non-blocking: if the previous frame (incl. its reset) is still on the wire, retry next loop. A lane: the renderer
+  // hasn't taken the posted frame yet (it is a few ms ahead of the wire).
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+  if (this->lane_ != nullptr ? !this->lane_->ready() || this->lane_->busy()
+                             : rmt_tx_wait_all_done(this->channel_, 0) != ESP_OK)
+    return;
+#else
   if (rmt_tx_wait_all_done(this->channel_, 0) != ESP_OK)
     return;
+#endif
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
   if (this->upd_resync_pending_ && !this->tx_prepared_ && this->preamble_ == 0 && !ping_pending) {
     this->upd_resync_pending_ = false;   // the PING burst and its dark tail are on the wire
@@ -888,8 +1017,13 @@ void UltraHub::loop() {
 void UltraHub::transmit_() {
   // The header (the frame's trailer) carries the host clock at the frame's last bit: the start, taken right before
   // the frame goes out, plus its bits on the wire. A frame the RMT refused is sent again (with a new TIME), not built
-  // anew: its commands were taken from the queues already.
-  const int64_t start = now_us_();
+  // anew: its commands were taken from the queues already. A lane's frame starts where the stream has room for it.
+  const int64_t now = now_us_();
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+  const int64_t start = this->lane_ != nullptr ? this->lane_->reserve_us() : now;
+#else
+  const int64_t start = now;
+#endif
   [[maybe_unused]] int64_t time_us = 0;   // the frame's TIME: the host clock at its last bit (telemetry: t0)
   if (!this->tx_prepared_) {
     this->tx_normal_ = true;
@@ -933,10 +1067,14 @@ void UltraHub::transmit_() {
       // an RW frame: POLL slots for the receivers, the boards behind them as usual
       time_us = this->sched_.build_rw_frame(start, this->tx_buf_, this->rw_slots_.data(), polls);
       this->tx_rw_ = true;
+      // the UART is this line's until the window is read: its receiver on before the frame's last bit
+      this->rw_turn_ = true;
+      if (this->rw_rx_enable_pin_ != nullptr)
+        this->rw_rx_enable_pin_->digital_write(true);
 #endif
     } else {
       this->sched_.build_frame(start, this->tx_buf_);
-      this->build_peak_us_ = std::max(this->build_peak_us_, static_cast<uint32_t>(now_us_() - start));
+      this->build_peak_us_ = std::max(this->build_peak_us_, static_cast<uint32_t>(now_us_() - now));
     }
     this->tx_bytes_ = bytes;
     this->tx_prepared_ = true;
@@ -960,7 +1098,13 @@ void UltraHub::transmit_() {
 #endif
   rmt_transmit_config_t cfg;
   memset(&cfg, 0, sizeof(cfg));
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+  const esp_err_t err = this->lane_ != nullptr
+                            ? this->lane_post_()
+                            : rmt_transmit(this->channel_, this->encoder_, this->tx_buf_, this->tx_bytes_, &cfg);
+#else
   const esp_err_t err = rmt_transmit(this->channel_, this->encoder_, this->tx_buf_, this->tx_bytes_, &cfg);
+#endif
   if (err != ESP_OK) {
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
     this->rw_release_ = false;
@@ -996,6 +1140,23 @@ void UltraHub::transmit_() {
   this->frames_++;
 }
 
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+// The frame to the lane: its quiet after it is the reset, after an RW frame the window (the receivers answer) and the
+// hold-off; with a direction pin the bus' timer lets go of the line at its last bit. ESP_ERR_TIMEOUT: its start
+// passed while it was built (sent again with a new start next loop, like a frame the RMT refused).
+esp_err_t UltraHub::lane_post_() {
+  uint32_t quiet = this->reset_ns_ / 1000;
+  bool release = false;
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  if (this->tx_rw_) {
+    quiet = std::max<uint32_t>(quiet, this->rw_window_us_ + ULTRA_RW_HOLDOFF_US);
+    release = this->rw_dir_pin_ != nullptr;
+  }
+#endif
+  return this->lane_->post(this->tx_buf_, this->tx_bytes_, quiet, release) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+#endif
+
 void UltraHub::dump_config() {
   const uint32_t period0 = this->bit0_high_ns_ + this->bit0_low_ns_;
   const uint32_t period1 = this->bit1_high_ns_ + this->bit1_low_ns_;
@@ -1006,12 +1167,18 @@ void UltraHub::dump_config() {
                 "QuinLED dig2analog Ultra line:\n"
                 "  Boards: %u\n"
                 "  Pin: GPIO%u%s\n"
-                "  RMT symbols: %" PRIu32 "%s\n"
+                "  %s: %" PRIu32 "%s\n"
                 "  Bit0: %" PRIu32 "/%" PRIu32 " ns, Bit1: %" PRIu32 "/%" PRIu32 " ns, Reset: %" PRIu32 " us\n"
                 "  Frame: %" PRIu32 " us (%" PRIu32 " frames/s max)\n"
                 "  Refresh: every %" PRIu32 " ms, start delay %" PRIu32 " ms%s, %u copies per command\n"
                 "  Preamble: %u frames of DARK slots (after a supply switch-on: %u)",
-                this->num_boards_, this->pin_, this->inverted_ ? " (inverted)" : "", this->rmt_symbols_,
+                this->num_boards_, this->pin_, this->inverted_ ? " (inverted)" : "",
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+                this->lane_ != nullptr ? "PARLIO lane" : "RMT symbols",
+                this->lane_ != nullptr ? static_cast<uint32_t>(this->lane_->index()) : this->rmt_symbols_,
+#else
+                "RMT symbols", this->rmt_symbols_,
+#endif
                 this->use_dma_ ? " (DMA)" : "", this->bit0_high_ns_, this->bit0_low_ns_, this->bit1_high_ns_,
                 this->bit1_low_ns_, this->reset_ns_ / 1000, frame_us, frame_us ? 1000000 / frame_us : 0,
                 this->refresh_interval_ms_, this->start_delay_ms(),
@@ -1044,9 +1211,10 @@ void UltraHub::dump_config() {
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   if (this->rw_uart_ != nullptr) {
     static const char *const RATES[] = {"1 Mbaud", "500 kbaud", "250 kbaud"};
-    ESP_LOGCONFIG(TAG, "  Telemetry: %u receiver(s) (boards 0-%u), answers at %s, windows up to %" PRIu32 " us%s",
+    ESP_LOGCONFIG(TAG, "  Telemetry: %u receiver(s) (boards 0-%u), answers at %s, windows up to %" PRIu32 " us%s%s",
                   this->poller_.receivers(), this->poller_.receivers() - 1, RATES[this->poller_.rate() % 3],
-                  this->poller_.max_window_us(), this->rw_dir_pin_ != nullptr ? ", direction pin" : "");
+                  this->poller_.max_window_us(), this->rw_dir_pin_ != nullptr ? ", direction pin" : "",
+                  this->rw_rx_enable_pin_ != nullptr ? ", receiver enable pin (its UART may be shared)" : "");
   }
 #endif
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE

@@ -1,8 +1,9 @@
 """QuinLED dig2analog boards in Ultra mode: the boards run transitions, gamma and effects themselves.
 
-The hub sends commands on one data line (WS2915-style one-wire pulses, ESP-IDF RMT). Lights are the
-`dig2analog_ultra` light platform (light.py). Board settings are host-managed: the values here are sent
-to every board at boot and repeated, and never stored in the boards' flash (except `boot_protocol`).
+The hub sends commands on one data line (WS2915-style one-wire pulses, ESP-IDF RMT; or a lane of a
+dig2analog_ultra_parlio bus on an ESP32-P4). Lights are the `dig2analog_ultra` light platform (light.py). Board
+settings are host-managed: the values here are sent to every board at boot and repeated, and never stored in the
+boards' flash (except `boot_protocol`).
 """
 
 import logging
@@ -30,6 +31,7 @@ from esphome.const import (
 from esphome.core import CORE
 from esphome.types import ConfigType
 
+from .parlio_timing import layout as parlio_layout
 from .receiver_schema import (
     CONF_TELEMETRY,
     TELEMETRY_SCHEMA,
@@ -59,6 +61,8 @@ SwitchBoardsToUltraAction = dig2analog_ultra_ns.class_("SwitchBoardsToUltraActio
 CalibrateCurrentAction = dig2analog_ultra_ns.class_("CalibrateCurrentAction", automation.Action)
 CancelCalibrationAction = dig2analog_ultra_ns.class_("CancelCalibrationAction", automation.Action)
 ShowVersionAction = dig2analog_ultra_ns.class_("ShowVersionAction", automation.Action)
+# (dig2analog_ultra_parlio's bus, by name: that component imports this one)
+UltraParlioBus = dig2analog_ultra_ns.class_("UltraParlioBus", cg.Component)
 
 CONF_DIG2ANALOG_ULTRA_ID = "dig2analog_ultra_id"
 CONF_NUM_BOARDS = "num_boards"
@@ -99,6 +103,8 @@ CONF_INTERVAL = "interval"
 CONF_ONLY_WHEN_OFF = "only_when_off"
 CONF_BOARDS = "boards"
 CONF_LEVEL = "level"
+CONF_PARLIO_ID = "parlio_id"
+CONF_LANE = "lane"
 
 # light platform keys that take a channel, and their roles (ULTRA_ROLE_*)
 ROLE_KEYS = ["channel", "red", "green", "blue", "white", "cold_white", "warm_white"]
@@ -338,6 +344,17 @@ CURRENT_CALIBRATION_SCHEMA = cv.Schema(
     }
 )
 
+def _validate_transmitter(config):
+    """An RMT line (pin) or a lane of a dig2analog_ultra_parlio bus (parlio_id + lane), not both."""
+    if (CONF_PIN in config) == (CONF_PARLIO_ID in config):
+        raise cv.Invalid("give the line a pin (RMT), or a parlio_id and lane (a dig2analog_ultra_parlio bus)")
+    if (CONF_LANE in config) != (CONF_PARLIO_ID in config):
+        raise cv.Invalid("lane goes with parlio_id: the bus' pin of that lane is the line's")
+    if CONF_PARLIO_ID in config and CONF_USE_DMA in config:
+        raise cv.Invalid("use_dma is an RMT option; a PARLIO lane always streams by DMA", [CONF_USE_DMA])
+    return config
+
+
 CONFIG_SCHEMA = cv.All(
     telemetry_defaults,   # the receivers' entities, named for their devices (before they are validated)
     esp32.only_on_variant(
@@ -347,7 +364,10 @@ CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
             cv.GenerateID(): cv.declare_id(UltraHub),
-            cv.Required(CONF_PIN): pins.internal_gpio_output_pin_schema,
+            # the data line: an RMT channel on this pin, or a lane of a dig2analog_ultra_parlio bus (ESP32-P4)
+            cv.Optional(CONF_PIN): pins.internal_gpio_output_pin_schema,
+            cv.Optional(CONF_PARLIO_ID): cv.use_id(UltraParlioBus),
+            cv.Optional(CONF_LANE): cv.int_range(min=0, max=15),
             cv.Required(CONF_NUM_BOARDS): cv.int_range(min=1, max=64),
             # '0' 250 ns, '1' 700 ns: centred on the boards' 472 ns decision, so the pulse-width change of every
             # board's forwarding may add up in either direction over 50 boards (wiki: Ultra Mode)
@@ -427,6 +447,7 @@ CONFIG_SCHEMA = cv.All(
             ),
         }
     ).extend(cv.COMPONENT_SCHEMA),
+    _validate_transmitter,
 )
 
 
@@ -477,7 +498,7 @@ def _validate_rmt_memory(full):
     channels, block = RMT_TX_MEMORY[variant]
     hubs = full.get("dig2analog_ultra", []) or []
     hubs = hubs if isinstance(hubs, list) else [hubs]
-    users = [(f"dig2analog_ultra '{h[CONF_ID]}'", h) for h in hubs]
+    users = [(f"dig2analog_ultra '{h[CONF_ID]}'", h) for h in hubs if CONF_PARLIO_ID not in h]   # (lanes: PARLIO)
     users += [
         (f"light '{c.get('name', c[CONF_ID])}'", c)
         for c in full.get("light", []) or []
@@ -525,9 +546,59 @@ def _validate_ports(full):
         seen[port] = str(conf[CONF_ID])
 
 
+def parlio_bus_of(full, conf):
+    """The dig2analog_ultra_parlio bus a lane hub is on (None: an RMT line)."""
+    if CONF_PARLIO_ID not in conf:
+        return None
+    for bus in full.get("dig2analog_ultra_parlio", []) or []:
+        if str(bus[CONF_ID]) == str(conf[CONF_PARLIO_ID]):
+            return bus
+    return None
+
+
+def parlio_hub_timing(full, conf):
+    """A lane hub's timing on its bus' sample grid (bit0_high, bit0_low, bit1_high, bit1_low, reset; ns), so its
+    frames' TIME is the stream's; None for an RMT line."""
+    bus = parlio_bus_of(full, conf)
+    if bus is None:
+        return None
+    hubs = full.get("dig2analog_ultra", []) or []
+    keys = (CONF_BIT0_HIGH, CONF_BIT0_LOW, CONF_BIT1_HIGH, CONF_BIT1_LOW, CONF_RESET_TIME)
+    lanes = {
+        h[CONF_LANE]: tuple(int(h[k].total_nanoseconds) for k in keys)
+        for h in (hubs if isinstance(hubs, list) else [hubs])
+        if str(h.get(CONF_PARLIO_ID, "")) == str(bus[CONF_ID])
+    }
+    lay = parlio_layout(bus["sample_rate"], len(bus["pins"]), lanes, int(bus["buffer_time"].total_microseconds) * 1000)
+    return lay["lanes"].get(conf[CONF_LANE])
+
+
+def _validate_lanes(full):
+    """Each lane of a bus has one hub, within the bus' pins."""
+    hubs = full.get("dig2analog_ultra", []) or []
+    taken = {}
+    for h in hubs if isinstance(hubs, list) else [hubs]:
+        bus = parlio_bus_of(full, h)
+        if bus is None:
+            continue   # an RMT line (a missing bus: use_id says so)
+        lane = h[CONF_LANE]
+        if lane >= len(bus["pins"]):
+            raise cv.Invalid(
+                f"dig2analog_ultra '{h[CONF_ID]}': lane {lane}, but '{bus[CONF_ID]}' has {len(bus['pins'])} pins "
+                f"(lanes 0-{len(bus['pins']) - 1})"
+            )
+        key = (str(bus[CONF_ID]), lane)
+        if key in taken:
+            raise cv.Invalid(
+                f"dig2analog_ultra '{taken[key]}' and '{h[CONF_ID]}' are both on lane {lane} of '{bus[CONF_ID]}'"
+            )
+        taken[key] = str(h[CONF_ID])
+
+
 def _final_validate(configs):
     full = fv.full_config.get()
     _validate_rmt_memory(full)
+    _validate_lanes(full)
     validate_telemetry_lines(full)
     _validate_ports(full)
     for conf in configs if isinstance(configs, list) else [configs]:
@@ -604,8 +675,20 @@ async def to_code(config: ConfigType) -> None:
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
-    cg.add(var.set_pin(config[CONF_PIN][CONF_NUMBER]))
-    if config[CONF_PIN][CONF_INVERTED]:
+    timing = tuple(
+        int(config[k].total_nanoseconds)
+        for k in (CONF_BIT0_HIGH, CONF_BIT0_LOW, CONF_BIT1_HIGH, CONF_BIT1_LOW, CONF_RESET_TIME)
+    )
+    if CONF_PARLIO_ID in config:
+        # a lane: the bus' pin, and the timing on its sample grid (the frames' TIME is the stream's)
+        bus = await cg.get_variable(config[CONF_PARLIO_ID])
+        cg.add(var.set_parlio_lane(bus.lane(config[CONF_LANE])))
+        pin = parlio_bus_of(CORE.config, config)["pins"][config[CONF_LANE]]
+        timing = parlio_hub_timing(CORE.config, config)
+    else:
+        pin = config[CONF_PIN]
+    cg.add(var.set_pin(pin[CONF_NUMBER]))
+    if pin[CONF_INVERTED]:
         cg.add(var.set_inverted(True))
     cg.add(var.set_num_boards(config[CONF_NUM_BOARDS]))
     # lights per board: the hub clears the other light indices on the boards (left by an earlier configuration)
@@ -617,15 +700,7 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_rmt_symbols(config[CONF_RMT_SYMBOLS]))
     if CONF_USE_DMA in config:
         cg.add(var.set_use_dma(config[CONF_USE_DMA]))
-    cg.add(
-        var.set_timing(
-            int(config[CONF_BIT0_HIGH].total_nanoseconds),
-            int(config[CONF_BIT0_LOW].total_nanoseconds),
-            int(config[CONF_BIT1_HIGH].total_nanoseconds),
-            int(config[CONF_BIT1_LOW].total_nanoseconds),
-            int(config[CONF_RESET_TIME].total_nanoseconds),
-        )
-    )
+    cg.add(var.set_timing(*timing))
     cg.add(var.set_refresh_interval(config[CONF_REFRESH_INTERVAL].total_milliseconds))
     if config[CONF_START_DELAY] != "auto":
         cg.add(var.set_start_delay(config[CONF_START_DELAY].total_milliseconds))

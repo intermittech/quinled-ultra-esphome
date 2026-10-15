@@ -32,7 +32,7 @@ external_components:
   - source:
       type: local
       path: {components}
-    components: [dig2analog_ultra, dig2analog_ultra_strip, diffpower]
+    components: [dig2analog_ultra, dig2analog_ultra_strip, diffpower, dig2analog_ultra_parlio]
 """
 
 PSU = """\
@@ -229,6 +229,40 @@ def lines(n, symbols=None):
         if symbols:
             out += f"    rmt_symbols: {symbols}\n"
     return out
+
+
+def parlio(lanes=16, pins=None, extra_bus="", hub_extra=None, uarts=4, telemetry=True, re=True):
+    """dig2analog_ultra_parlio on an ESP32-P4: a bus of `pins` data pins (GPIO 0..), `lanes` hubs on lanes 0.. with 1
+    board each; with telemetry 4 lanes share each of `uarts` UARTs (rx GPIO 16..), each lane a direction pin (GPIO 20..)
+    and a receiver enable pin (GPIO 43..) unless re is False. hub_extra: {lane: extra YAML lines}."""
+    pins = lanes if pins is None else pins
+    de = [20, 21, 22, 23, 26, 27, 28, 29, 30, 31, 32, 33, 39, 40, 41, 42]
+    rx_en = [43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 34, 35, 36, 37]
+    out = "dig2analog_ultra_parlio:\n  - id: ports\n    pins: [" + ", ".join(f"GPIO{i}" for i in range(pins)) + "]\n"
+    out += extra_bus
+    if telemetry:
+        out += "uart:\n"
+        for u in range(uarts):
+            out += f"  - id: g{u}\n    rx_pin: GPIO{16 + u}\n    baud_rate: 1000000\n    rx_buffer_size: 1024\n"
+    out += "dig2analog_ultra:\n"
+    for k in range(lanes):
+        out += f"  - id: p{k}\n    parlio_id: ports\n    lane: {k}\n    num_boards: 1\n"
+        out += (hub_extra or {}).get(k, "")
+        if telemetry:
+            out += (f"    telemetry:\n      uart_id: g{k // 4 % uarts}\n      name: Port {k + 1}\n      receivers: 1\n"
+                    f"      diagnostics: none\n      direction_pin: GPIO{de[k]}\n")
+            if re:
+                strap = "        ignore_strapping_warning: true\n" if rx_en[k] in (34, 35, 36, 37) else ""
+                out += f"      receiver_enable_pin:\n        number: GPIO{rx_en[k]}\n{strap}"
+    return out
+
+
+P4 = "esp32-p4_r3"
+PARLIO_RMT_LINES = (
+    "  - id: m0\n    pin: GPIO24\n    num_boards: 1\n    rmt_symbols: 48\n"
+    "  - id: m1\n    pin: GPIO25\n    num_boards: 1\n    rmt_symbols: 48\n"
+    "  - id: m2\n    pin: GPIO38\n    num_boards: 1\n    rmt_symbols: 48\n"
+)
 
 
 # board firmware update entity (update.py)
@@ -1127,6 +1161,75 @@ CASES = [
         True,
         None,
     ),
+    # several lines on one UART: each with a receiver_enable_pin (one window at a time)
+    (
+        "ultra telemetry 2 lines on one UART with receiver enable pins",
+        tel_lines(2, uarts=[0, 0]).replace("      receivers: 1\n", "      receivers: 1\n      receiver_enable_pin: GPIO{}\n").format(4, 5),
+        True,
+        None,
+    ),
+    (
+        "ultra telemetry 3 lines on one UART, one without a receiver enable pin",
+        tel_lines(3, uarts=[0, 0, 0], extra="    rmt_symbols: 128\n").replace("      receivers: 1\n", "      receivers: 1\n      receiver_enable_pin: GPIO{}\n", 2).format(4, 5),
+        False,
+        "'u2' has none",
+    ),
+    (
+        "ultra telemetry receiver enable pin on a line of its own (allowed, not needed)",
+        ULTRA + TELEMETRY + "    receiver_enable_pin:\n      number: GPIO4\n      inverted: true\n" + RX_UART,
+        True,
+        None,
+    ),
+    # PARLIO: up to 16 lanes on an ESP32-P4, telemetry on 4 UARTs shared by 4 lanes each
+    ("parlio 16 lanes, 4 UARTs x 4 lanes with receiver enable pins", parlio(), True, None, P4),
+    ("parlio 16 lanes without telemetry", parlio(telemetry=False), True, None, P4),
+    ("parlio 3 lanes (8-bit samples)", parlio(lanes=3, telemetry=False), True, None, P4),
+    ("parlio 2 lanes of a 4-pin bus (2 idle)", parlio(lanes=2, pins=4, telemetry=False), True, None, P4),
+    ("parlio 4 lanes sharing a UART without receiver enable pins", parlio(lanes=4, uarts=1, re=False), False,
+     "use the same uart 'g0'", P4),
+    ("parlio on an esp32", parlio(lanes=2, telemetry=False), False, "dig2analog_ultra_parlio (PARLIO TX, 16 lines)"),
+    ("parlio on an esp32-s3", parlio(lanes=2, telemetry=False), False, "dig2analog_ultra_parlio",
+     "esp32-s3-devkitc-1"),
+    ("parlio two hubs on one lane", parlio(lanes=2, telemetry=False).replace("lane: 1\n", "lane: 0\n"), False,
+     "are both on lane 0 of 'ports'", P4),
+    ("parlio a lane beyond the pins", parlio(lanes=3, pins=2, telemetry=False), False, "has 2 pins (lanes 0-1)", P4),
+    ("parlio 17 pins", parlio(lanes=1, pins=16, telemetry=False).replace("GPIO15]", "GPIO15, GPIO26]"), False,
+     "1-16 data pins", P4),
+    ("parlio a hub with a pin and a parlio_id", parlio(lanes=1, telemetry=False, hub_extra={0: "    pin: GPIO26\n"}),
+     False, "give the line a pin (RMT), or a parlio_id and lane", P4),
+    ("parlio a lane without parlio_id",
+     parlio(lanes=1, telemetry=False).replace("    parlio_id: ports\n", "    pin: GPIO26\n"), False,
+     "lane goes with parlio_id", P4),
+    ("parlio use_dma on a lane", parlio(lanes=1, telemetry=False, hub_extra={0: "    use_dma: true\n"}), False,
+     "use_dma is an RMT option", P4),
+    ("parlio an unknown bus", parlio(lanes=1, telemetry=False).replace("parlio_id: ports", "parlio_id: nowhere"),
+     False, "nowhere", P4),
+    ("parlio one data pin twice", parlio(lanes=2, telemetry=False).replace("GPIO1]", "GPIO0]"), False,
+     "Pin 0 is used in multiple places", P4),
+    ("parlio sample_rate 10 MHz ('0' high 300 ns)", parlio(lanes=2, telemetry=False, extra_bus="    sample_rate: 10MHz\n"),
+     True, None, P4),
+    ("parlio sample_rate 40 MHz", parlio(lanes=2, telemetry=False, extra_bus="    sample_rate: 40MHz\n"), True, None,
+     P4),
+    ("parlio sample_rate 16 MHz (not whole ns)", parlio(lanes=2, telemetry=False, extra_bus="    sample_rate: 16MHz\n"),
+     False, "sample_rate must divide the PARLIO clock", P4),
+    ("parlio sample_rate 5 MHz ('0' high 200 ns)", parlio(lanes=2, telemetry=False, extra_bus="    sample_rate: 5MHz\n"),
+     False, "lane 0: bit0_high becomes 200 ns at 5 MHz", P4),
+    ("parlio a lane's bit1_high 2.1 us", parlio(lanes=2, telemetry=False, hub_extra={1: "    bit1_high: 2100ns\n"}),
+     False, "lane 1: bit1_high becomes 2100 ns", P4),
+    ("parlio lanes with their own high times", parlio(lanes=2, telemetry=False, hub_extra={1: "    bit0_high: 300ns\n"
+                                                                                           "    bit1_high: 800ns\n"}),
+     True, None, P4),
+    ("parlio buffer in PSRAM, 2 ms", parlio(lanes=2, telemetry=False, extra_bus="    psram: true\n    buffer_time: 2ms\n"),
+     True, None, P4),
+    ("parlio buffer_time 20 ms", parlio(lanes=2, telemetry=False, extra_bus="    buffer_time: 20ms\n"), False,
+     "buffer_time", P4),
+    # lanes don't use the RMT: 16 lanes and the P4's 4 RMT lines (3 x 48 + DMA) fit; the RMT lines still add up
+    ("parlio 16 lanes and 4 RMT lines (3 x 48 symbols + DMA)",
+     parlio(telemetry=False) + PARLIO_RMT_LINES + "  - id: m3\n    pin: GPIO39\n    num_boards: 1\n    use_dma: true\n",
+     True, None, P4),
+    ("parlio 16 lanes and 5 RMT lines at 48 symbols",
+     parlio(telemetry=False) + PARLIO_RMT_LINES + "  - id: m3\n    pin: GPIO39\n    num_boards: 1\n    rmt_symbols: 48\n"
+     "  - id: m4\n    pin: GPIO40\n    num_boards: 1\n    rmt_symbols: 48\n", False, "need 5 x 48", P4),
 ]
 
 

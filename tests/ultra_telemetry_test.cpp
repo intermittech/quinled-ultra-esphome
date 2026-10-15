@@ -1811,6 +1811,50 @@ static void test_r9_uid16_collision() {
         h.k.energy_wh(0), before, ull(l.find(b.uid) ? l.find(b.uid)->c.mwh : 0));
 }
 
+/// Review r9 F1: the ESP32 restarts under a board whose ledger leads its own lifetime (50 Wh it lost earlier): the
+/// stored checkpoint (the board's count since power-up when the ledger was stored) carries the use since then, so
+/// the position goes on from what it showed (160 Wh), not from the stored 150 or the board's 110. GPT's
+/// OFFSET_RESTART probe.
+static void test_r9_restart_with_lead() {
+  Chain c(1);
+  ledger_board(c.rx[0]);
+  c.rx[0].total_wh = 100;
+  c.rx[0].boot_mwh = 0;
+  LifetimeLedger l;
+  l.init(8, 4);
+  LedgerHub h;
+  HaView ha;
+  start_hub(h, c, l);
+  drive(c, h, ha, 10000);
+  l.find(c.rx[0].uid)->c.mwh = 150000;   // (a lead: records the board lost before)
+  drive(c, h, ha, 5000);
+  std::vector<uint8_t> blob(l.blob_size());
+  l.save(blob.data(), 1);
+  c.rx[0].use(10000);
+  drive(c, h, ha, 5000);
+  const double shown = h.k.energy_wh(0);
+  LifetimeLedger restored;
+  restored.init(8, 4);
+  uint32_t gen = 0;
+  restored.load(blob.data(), blob.size(), &gen);
+  start_hub(h, c, restored);
+  drive(c, h, ha, 10000);
+  CHECK(near(shown, 160.0) && near(h.k.energy_wh(0), shown) && ha.worst_back == 0,
+        "F1: the ESP32 restarted under a board 50 Wh behind its ledger: %.3f Wh (shown before %.3f, back %.3f)",
+        h.k.energy_wh(0), shown, ha.worst_back);
+  // ... and the board power-cycled while the ESP32 was off (a new session: its whole count new)
+  restored.save(blob.data(), 2);
+  c.rx[0].power_up();
+  c.rx[0].use(2000);
+  LifetimeLedger again;
+  again.init(8, 4);
+  again.load(blob.data(), blob.size(), &gen);
+  start_hub(h, c, again);
+  drive(c, h, ha, 10000);
+  CHECK(near(h.k.energy_wh(0), shown + 2.0), "F1: a board power-cycled meanwhile: its new session counted (%.3f)",
+        h.k.energy_wh(0));
+}
+
 /// (0.2.6) DIAG 20 bit 7: the receiver's lifetime record held: a note after the Status detail, no problem
 static void test_record_held() {
   Chain c(1);
@@ -1865,6 +1909,7 @@ int main() {
   test_r9_long_runs();
   test_r9_load_replaces();
   test_r9_uid16_collision();
+  test_r9_restart_with_lead();
   test_record_held();
   test_status();
   test_port();

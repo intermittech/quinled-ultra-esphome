@@ -1,4 +1,4 @@
-# QuinLED dig2analog-ultra-5ch in Ultra mode: five single-channel white downlights on one board (CH1-CH5), each its
+# QuinLED Dig2Analog-Ultra-5ch in Ultra mode: five single-channel white downlights on one board (CH1-CH5), each its
 # own light in Home Assistant, plus a hidden strip over all five for a chase as a notification.
 #   - Everyday use: the five downlights, as usual.
 #   - Notification: the "notify_chase" action (from Home Assistant, or the test button) runs a chase over the five,
@@ -8,11 +8,14 @@
 
 substitutions:
   name: d2a-ultra-downlights
-  friendly_name: QuinLED dig2analog Ultra downlights
+  friendly_name: Dig2Analog-Ultra downlights
 
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
+  project:                      # Home Assistant: manufacturer quinled, the board as model
+    name: quinled.dig2analog-ultra-5ch
+    version: "0.1.0"
 
 esp32:
   board: esp32dev

@@ -1,16 +1,19 @@
-# QuinLED dig2analog-ultra-5ch in Ultra mode: four boards, one RGB light each (e.g. four garden posts), and
+# QuinLED Dig2Analog-Ultra-5ch in Ultra mode: four boards, one RGB light each (e.g. four garden posts), and
 # one virtual strip over them, so ESPHome's addressable effects (rainbow, color wipe, scan, twinkle, ...) run
 # across the posts. Each post is one pixel; its board applies gamma and glides between the effect's steps.
 # ESP32 classic, ESP-IDF. Boards in Ultra mode: protocol 3 (or auto: they recognise Ultra frames).
 
 substitutions:
   name: d2a-ultra-strip
-  friendly_name: QuinLED dig2analog Ultra strip
+  friendly_name: Dig2Analog-Ultra strip
   data_pin: GPIO16   # controller output wired to the first board's Data-In
 
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
+  project:                      # Home Assistant: manufacturer quinled, the board as model
+    name: quinled.dig2analog-ultra-5ch
+    version: "0.1.0"
 
 esp32:
   board: esp32dev

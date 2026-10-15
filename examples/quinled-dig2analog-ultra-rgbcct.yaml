@@ -1,4 +1,4 @@
-# QuinLED dig2analog-ultra-5ch in Ultra mode: the board runs gamma, transitions and effects itself
+# QuinLED Dig2Analog-Ultra-5ch in Ultra mode: the board runs gamma, transitions and effects itself
 # (16-bit, recomputed every 1 ms), ESPHome only sends what should happen.
 #   Board 0: one RGBCCT light (CH1 R, CH2 G, CH3 B, CH4 warm white, CH5 cold white)
 #   Board 1: a CW/WW light on CH1-CH2 and three single-channel lights on CH3-CH5
@@ -6,12 +6,15 @@
 
 substitutions:
   name: d2a-ultra
-  friendly_name: QuinLED dig2analog Ultra
+  friendly_name: Dig2Analog-Ultra
   data_pin: GPIO16   # controller output wired to the first board's Data-In
 
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
+  project:                      # Home Assistant: manufacturer quinled, the board as model
+    name: quinled.dig2analog-ultra-5ch
+    version: "0.1.0"
 
 esp32:
   board: esp32dev

@@ -1,4 +1,4 @@
-# QuinLED dig2analog-ultra-5ch in Ultra mode, advanced: two data lines with mixed lights, a virtual strip per line,
+# QuinLED Dig2Analog-Ultra-5ch in Ultra mode, advanced: two data lines with mixed lights, a virtual strip per line,
 # and ESPHome's partition joining both into one "Facade" strip for effects across the whole front.
 #   Front line (GPIO16): 3 boards, one RGBW uplight each
 #   Side line (GPIO17):  board 0 = an RGB light + two single-channel path spots, board 1 = an RGBCCT light
@@ -10,11 +10,14 @@
 
 substitutions:
   name: d2a-ultra-facade
-  friendly_name: QuinLED dig2analog Ultra facade
+  friendly_name: Dig2Analog-Ultra facade
 
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
+  project:                      # Home Assistant: manufacturer quinled, the board as model
+    name: quinled.dig2analog-ultra-5ch
+    version: "0.1.0"
 
 esp32:
   board: esp32dev

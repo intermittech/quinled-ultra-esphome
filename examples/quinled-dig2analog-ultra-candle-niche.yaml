@@ -1,4 +1,4 @@
-# QuinLED dig2analog-ultra-5ch in Ultra mode: candle niches that flicker as soon as the power comes on, also while
+# QuinLED Dig2Analog-Ultra-5ch in Ultra mode: candle niches that flicker as soon as the power comes on, also while
 # ESPHome is off or still booting. The board stores each light's power_on_effect and runs it from its own power-up;
 # when ESPHome takes over, the light cross-fades (default_transition_length) to the state ESPHome restores.
 #   - CH1, CH2: single-colour niches, a candle each (the second one calmer and dimmer).
@@ -9,11 +9,14 @@
 
 substitutions:
   name: d2a-ultra-candles
-  friendly_name: QuinLED dig2analog Ultra candles
+  friendly_name: Dig2Analog-Ultra candles
 
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
+  project:                      # Home Assistant: manufacturer quinled, the board as model
+    name: quinled.dig2analog-ultra-5ch
+    version: "0.1.0"
 
 esp32:
   board: esp32dev

@@ -16,6 +16,7 @@ extern "C" {
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1725,7 +1726,68 @@ static void test_signal_loss_recovery() {
 }
 #endif
 
+/// wire_ns counts the 1 bits four bytes at a time: the same as one bit at a time (the reference), for every length up
+/// to a 50-board frame (1,608 bytes) at densities from all-zero to all-one, with two bit timings; and its cost (host).
+static void test_wire_ns() {
+  auto reference = [](const uint8_t *b, size_t n, uint32_t t0h, uint32_t t0l, uint32_t t1h, uint32_t t1l) -> uint64_t {
+    if (n == 0)
+      return 0;
+    uint64_t ones = 0;
+    for (size_t i = 0; i < n; i++)
+      for (int k = 0; k < 8; k++)
+        ones += (b[i] >> k) & 1;
+    const uint64_t all = ones * (t1h + t1l) + (n * 8 - ones) * (t0h + t0l);
+    return all - ((b[n - 1] & 1U) ? t1l : t0l);
+  };
+  std::mt19937 rng(7);
+  std::vector<uint8_t> buf(1608);
+  const uint32_t timings[2][4] = {{250, 1050, 700, 650}, {300, 950, 800, 450}};
+  int wrong = 0, cases = 0;
+  for (const auto &tm : timings) {
+    Scheduler s;
+    s.set_bit_timing(tm[0], tm[1], tm[2], tm[3]);
+    for (size_t n = 0; n <= buf.size(); n += (n < 64 ? 1 : 37)) {
+      for (int density : {0, 1, 4, 8, 12, 15, 16}) {   // (sixteenths of the bits set)
+        for (auto &v : buf) {
+          uint8_t x = 0;
+          for (int k = 0; k < 8; k++)
+            x |= static_cast<uint8_t>((static_cast<int>(rng() % 16) < density) << k);
+          v = x;
+        }
+        const size_t off = n % 4;   // (unaligned starts too)
+        const size_t len = std::min(n, buf.size() - off);
+        cases++;
+        wrong += s.wire_ns(buf.data() + off, len) != reference(buf.data() + off, len, tm[0], tm[1], tm[2], tm[3]);
+      }
+    }
+  }
+  CHECK(wrong == 0, "wire_ns = the bit-by-bit count in %d of %d cases", cases - wrong, cases);
+  // the cost of a 50-board frame (host): typical slot data
+  for (auto &v : buf)
+    v = static_cast<uint8_t>(rng());
+  Scheduler s;
+  volatile uint64_t sink = 0;
+  auto ns = [&](bool swar) {
+    const auto a = std::chrono::steady_clock::now();
+    for (int i = 0; i < 20000; i++) {
+      if (swar) {
+        sink = sink + s.wire_ns(buf.data(), buf.size());
+      } else {
+        uint32_t ones = 0;   // (the loop before: one bit at a time)
+        for (size_t j = 0; j < buf.size(); j++)
+          for (uint8_t v = buf[j]; v != 0; v = static_cast<uint8_t>(v & (v - 1)))
+            ones++;
+        sink = sink + ones;
+      }
+    }
+    return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - a).count() / 20000;
+  };
+  const double before = ns(false), now = ns(true);
+  std::printf("  wire_ns of a 50-board frame (host): %.0f ns, the bit loop before %.0f ns\n", now, before);
+}
+
 int main() {
+  test_wire_ns();
   test_mapping();
   test_scheduler();
   test_defined_values();

@@ -250,11 +250,21 @@ class Scheduler {
   uint64_t wire_ns(const uint8_t *bytes, size_t size) const {
     if (size == 0)
       return 0;
+    // the 1 bits, four bytes at a time (SWAR: no table, no bit loop; the ESP32 has no popcount instruction)
+    auto ones32 = [](uint32_t x) {
+      x = x - ((x >> 1) & 0x55555555u);
+      x = (x & 0x33333333u) + ((x >> 2) & 0x33333333u);
+      return (((x + (x >> 4)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24;
+    };
     uint32_t ones = 0;
-    for (size_t i = 0; i < size; i++) {
-      for (uint8_t v = bytes[i]; v != 0; v = static_cast<uint8_t>(v & (v - 1)))
-        ones++;
+    size_t i = 0;
+    for (; i + 4 <= size; i += 4) {
+      uint32_t w;
+      std::memcpy(&w, bytes + i, 4);
+      ones += ones32(w);
     }
+    for (; i < size; i++)
+      ones += ones32(bytes[i]);
     const uint64_t bits = static_cast<uint64_t>(size) * 8;
     const uint64_t all = ones * static_cast<uint64_t>(this->t1h_ + this->t1l_) +
                          (bits - ones) * static_cast<uint64_t>(this->t0h_ + this->t0l_);

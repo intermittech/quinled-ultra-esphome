@@ -1603,11 +1603,18 @@ struct MonthEnd {
   uint32_t truth_ups, board_ups, writes, syncs, applied;
   uint32_t results[8];   // the syncs' results (ULTRA_LS_R_*)
   bool attention;
-  bool within(int64_t a, int64_t b, int64_t c, int64_t d) const {
-    return std::llabs(a) <= 1 && std::llabs(b) <= 1 && std::llabs(c) <= 1 && std::llabs(d) <= 1;
+  double e_board, e_hub;  // the board's / the ledger's energy - the truth, mWh
+  uint32_t cuts;
+  bool within(int64_t a, int64_t b, int64_t c) const {
+    return std::llabs(a) <= 1 && std::llabs(b) <= 1 && std::llabs(c) <= 1;
   }
-  bool board_ok() const { return within(d_pow, d_lit, d_ups, d_wh); }
-  bool hub_ok() const { return within(h_pow, h_lit, h_ups, h_wh); }
+  /// energy: never above the truth; below it by at most a mWh a cut (the board counts whole mWh: its last reading's
+  /// fraction isn't seen) and the Wh fraction a first contact can't see
+  bool energy_ok(double e) const { return e <= 0.0 && e >= -(this->cuts + 1000.0); }
+  bool board_ok() const {
+    return within(d_pow, d_lit, d_ups) && energy_ok(e_board) && e_board >= e_hub - 1000.0;
+  }
+  bool hub_ok() const { return within(h_pow, h_lit, h_ups) && energy_ok(e_hub); }
 };
 
 /// One port, one receiver: `wakes` power-ups (a light 60 s at 30 W, its turn-off period of 170 s dark, the
@@ -1779,12 +1786,16 @@ static MonthEnd month_run(const life_rec_t &rec, int wakes, bool long_tenth, boo
   r.d_lit = static_cast<int64_t>(b.e.lt.lit_s / 360u) - tl;
   r.d_ups = static_cast<int64_t>(b.e.lt.ups) - b.t_ups;
   r.d_wh = static_cast<int64_t>(energy_total_wh(&b.e)) - tw;
+  const double truth_mwh = static_cast<double>(b.t_uj) / 3600000.0;
+  r.e_board = energy_total_wh(&b.e) * 1000.0 + (b.e.boot_mwh - b.e.mwh_seen) % 1000u - truth_mwh;
+  r.cuts = static_cast<uint32_t>(wakes);
   const LifeCounters *c = echo ? nullptr : k.counters(0);
   if (c != nullptr) {
     r.h_pow = static_cast<int64_t>(c->powered) - tp;
     r.h_lit = static_cast<int64_t>(c->lit) - tl;
     r.h_ups = static_cast<int64_t>(c->ups) - b.t_ups;
     r.h_wh = static_cast<int64_t>(c->mwh / 1000) - tw;
+    r.e_hub = static_cast<double>(c->mwh) - truth_mwh;
   }
   return r;
 }
@@ -1815,27 +1826,27 @@ static void sc_month() {
   const MonthEnd a = month_run(used, 3000, false, false, 11);
   month_print("hub ledger, nothing stored", a);
   CHECK(a.board_ok() && a.hub_ok() && a.writes == 0 && !a.attention && a.results[ULTRA_LS_R_UID] == 0,
-        "month: every counter back within a unit (board - truth: powered %lld, lit %lld, power-ups %lld, %lld Wh; "
-        "ledger: %lld, %lld, %lld, %lld; %u writes)",
-        (long long) a.d_pow, (long long) a.d_lit, (long long) a.d_ups, (long long) a.d_wh, (long long) a.h_pow,
-        (long long) a.h_lit, (long long) a.h_ups, (long long) a.h_wh, a.writes);
+        "month: every counter back within a unit, energy never above (board - truth: powered %lld, lit %lld, "
+        "power-ups %lld, %.0f mWh; ledger: %lld, %lld, %lld, %.0f mWh; %u writes)",
+        (long long) a.d_pow, (long long) a.d_lit, (long long) a.d_ups, a.e_board, (long long) a.h_pow,
+        (long long) a.h_lit, (long long) a.h_ups, a.e_hub, a.writes);
   const MonthEnd s = month_run(used, 3000, true, false, 12);
   month_print("hub ledger, every 10th stored", s);
   CHECK(s.board_ok() && s.hub_ok() && s.writes >= 250 && !s.attention && s.results[ULTRA_LS_R_UID] == 0,
-        "month, every tenth wake stored: within a unit (board - truth: %lld, %lld, %lld, %lld Wh; ledger: %lld, %lld, "
-        "%lld, %lld; %u writes)",
-        (long long) s.d_pow, (long long) s.d_lit, (long long) s.d_ups, (long long) s.d_wh, (long long) s.h_pow,
-        (long long) s.h_lit, (long long) s.h_ups, (long long) s.h_wh, s.writes);
+        "month, every tenth wake stored: within a unit, energy never above (board - truth: %lld, %lld, %lld, %.0f mWh; "
+        "ledger: %lld, %lld, %lld, %.0f mWh; %u writes)",
+        (long long) s.d_pow, (long long) s.d_lit, (long long) s.d_ups, s.e_board, (long long) s.h_pow,
+        (long long) s.h_lit, (long long) s.h_ups, s.e_hub, s.writes);
   // a year of it (design review, round 9: a hub that takes the board's rounded value back during sessions it saw adopts
   // the board's own remainder, ~6 h a year): the truth is summed apart from the ledger (the port's on-times, the lit
   // spans, the integrated power, the boots), so a slow drift shows
   const MonthEnd y = month_run(used, 36500, true, false, 13);
   month_print("hub ledger, a year, every 10th stored", y);
   CHECK(y.board_ok() && y.hub_ok() && !y.attention && y.results[ULTRA_LS_R_UID] == 0,
-        "a year, every tenth wake stored: within a unit, no drift (board - truth: %lld, %lld, %lld, %lld Wh; ledger: "
-        "%lld, %lld, %lld, %lld; %u writes)",
-        (long long) y.d_pow, (long long) y.d_lit, (long long) y.d_ups, (long long) y.d_wh, (long long) y.h_pow,
-        (long long) y.h_lit, (long long) y.h_ups, (long long) y.h_wh, y.writes);
+        "a year, every tenth wake stored: within a unit, no drift, energy never above (board - truth: %lld, %lld, %lld, "
+        "%.0f mWh; ledger: %lld, %lld, %lld, %.0f mWh; %u writes)",
+        (long long) y.d_pow, (long long) y.d_lit, (long long) y.d_ups, y.e_board, (long long) y.h_pow,
+        (long long) y.h_lit, (long long) y.h_ups, y.e_hub, y.writes);
   // the read-to-POLL race against the real merge (design review, round 9): the board's own time passes
   // a 0.1 h between the hub's read and its LIFE_SYNC POLL (its powered step one less, its other caps with it); a ledger
   // ahead in every field, sent at the caps that read allows, still comes back applied
@@ -1883,11 +1894,243 @@ static void sc_month() {
         "month, echo control with remainders: it runs ahead (%.1f h for %.1f)", f.board_h, f.truth_h);
 }
 
+// ---------------------------------------------- the ledger against an independent truth (design review, round 9)
+/// One hub's ledger side, stepped by hand: its ledger, its poller fed the board's pages, its keeper; restart(): the
+/// ESP32 restarts (its ledger as last stored, a new poller and keeper).
+struct ProbeHub {
+  LifetimeLedger l;
+  FeedPoller p;
+  LedgerKeeper k;
+  void init(uint32_t now) {
+    this->l.init(8, 4);
+    this->restart(now, false);
+  }
+  void restart(uint32_t now, bool stored = true) {
+    if (stored) {
+      std::vector<uint8_t> blob(this->l.blob_size());
+      this->l.save(blob.data(), 1);
+      LifetimeLedger back;
+      back.init(8, 4);
+      uint32_t gen = 0;
+      back.load(blob.data(), blob.size(), &gen);
+      this->l = back;
+    }
+    this->p = FeedPoller{};
+    this->p.init(1, ULTRA_RW_RATE_1M, TelemetryIntervals{});
+    this->k = LedgerKeeper{};
+    this->k.attach(&this->l, 1u << 16, 1, now);
+  }
+  void page(MonthRx &b, uint8_t tp, uint32_t now) {
+    uint8_t d[24];
+    b.page(tp, now, d);
+    this->p.answer(tp, d, b.uid16, now);
+    this->k.on_updates(this->p, 0, this->p.take_updates(0), now);
+  }
+  /// its reads (IDENTITY first after a power-up or a restart), and the sync the keeper asks for
+  void sample(MonthRx &b, uint32_t now, bool identity = false, bool sync = true) {
+    if (identity)
+      this->page(b, TP_IDENTITY, now);
+    this->page(b, TP_LIFETIME, now);
+    this->page(b, TP_ENERGY, now);
+    this->page(b, TP_STATUS, now);
+    if (sync && this->k.sync_sent(0)) {
+      uint8_t d[24];
+      b.sync(this->p.sync_args(), now, d);
+      this->p.answer(TP_SYNC, d, b.uid16, now);
+      this->k.on_updates(this->p, 0, this->p.take_updates(0), now);
+    }
+  }
+};
+
+static life_rec_t used_board() {   // (a used board: 500 h powered and 319 s, 200 h lit and 271 s, 2 kWh, 900 power-ups)
+  life_rec_t r{};
+  r.magic = LIFE_MAGIC;
+  r.on_s = 500 * 3600 + 319;
+  r.lit_s = 200 * 3600 + 271;
+  r.wh = 2000;
+  r.ups = 900;
+  return r;
+}
+static uint64_t ledger_pow_ms(const LedgerEntry &e) { return uint64_t{e.c.powered} * UNIT_MS + e.pow_rem; }
+static uint64_t ledger_lit_ms(const LedgerEntry &e) { return uint64_t{e.c.lit} * UNIT_MS + e.lit_rem; }
+
+/// Days of a fixed load (each day 50 wakes lit 60 s at 30 W, 180 s dark at 0.6 W, and one lit 3 h, 810 s dark;
+/// the last read at the cut): the same unreported fraction at every cut, which random phases would average away.
+/// The truth summed apart from the ledger and the board's counters. restart: the ESP32 restarts 30 s into each long
+/// wake, the board powered on.
+static void ledger_truth(int days, bool restart) {
+  MonthRx b;
+  b.init(used_board());
+  ProbeHub h;
+  uint32_t now = 1000;
+  h.init(now);
+  uint64_t true_pow = uint64_t{used_board().on_s} * 1000, true_lit = uint64_t{used_board().lit_s} * 1000;
+  uint32_t boots = used_board().ups;
+  for (int day = 0; day < days; day++) {
+    for (int w = 0; w < 51; w++) {
+      const uint32_t on = now;
+      h.k.power_on(on);
+      b.power_up(on);
+      boots++;
+      now += 1000;
+      h.sample(b, now, true);
+      const uint32_t light = w == 50 ? 10800000 : 60000;
+      b.set_lit(true, now);
+      h.k.lit_tick(0, true, now);
+      const uint32_t off = now + light;
+      while (static_cast<int32_t>(off - now) > 0) {
+        now += std::min<uint32_t>(30000, off - now);
+        h.sample(b, now);
+        h.k.lit_tick(0, true, now);
+        if (restart && w == 50 && now == on + 31000) {
+          h.restart(now);
+          h.k.lit_tick(0, true, now);
+          h.sample(b, now, true);
+        }
+      }
+      true_lit += light;
+      b.set_lit(false, now);
+      h.k.lit_tick(0, false, now);
+      now += w == 50 ? 810000 : 180000;
+      h.sample(b, now);
+      b.notice(now);
+      b.cut(now, on);
+      h.k.cut(now);
+      true_pow += now - on;
+      now += 10000;
+    }
+  }
+  const LedgerEntry *e = h.l.find(b.uid);
+  const double truth_mwh = static_cast<double>(b.t_uj) / 3600000.0;
+  const double e_mwh = e != nullptr ? static_cast<double>(e->c.mwh) - truth_mwh : 0.0;
+  std::printf("  fixed load, %d days%s: powered %+lld ms, lit %+lld ms, %+.3f Wh, power-ups %u of %u (%u writes)\n", days,
+              restart ? ", ESP32 restarts" : "", e ? (long long) (ledger_pow_ms(*e) - true_pow) : 0LL,
+              e ? (long long) (ledger_lit_ms(*e) - true_lit) : 0LL, e_mwh / 1000.0, e ? e->c.ups : 0, boots, b.writes);
+  CHECK(e != nullptr && ledger_pow_ms(*e) < true_pow + UNIT_MS && ledger_lit_ms(*e) < true_lit + UNIT_MS &&
+            e_mwh <= 0.0 && e->c.ups == boots,
+        "fixed load, %d days (restarts %d): never above the truth (powered, lit by a unit at most; energy %+.3f mWh: "
+        "never), power-ups exact",
+        days, restart, e_mwh);
+}
+
+/// A sync's reply lost (the board merged; asked again: ONCE), an hour on, then the ESP32 restarts with the board still
+/// powered: that hour and this power-up's energy aren't counted again (a sync moves the power-ups count without a
+/// power-up). lose = false: the control, the reply received.
+static void ledger_lost_reply(bool lose) {
+  MonthRx b;
+  life_rec_t rec = used_board();
+  rec.ups = 890;
+  b.init(rec);
+  uint32_t now = 1000;
+  b.power_up(now);
+  ProbeHub h;
+  h.init(now);
+  bool made = false;
+  LedgerEntry *e = h.l.touch(b.uid, &made);
+  e->c.powered = rec.on_s / 360;
+  e->c.lit = rec.lit_s / 360;
+  e->c.mwh = uint64_t{rec.wh} * 1000;
+  e->c.ups = 900;   // (the ledger knows ten power-ups the board lost)
+  h.k.power_on(now);
+  now += 1000;
+  h.sample(b, now, true, false);
+  uint8_t answer[24];
+  b.sync(h.p.sync_args(), now, answer);   // (merged on the board)
+  if (lose)
+    b.sync(h.p.sync_args(), now + 20, answer);   // (its reply lost: asked again, ONCE)
+  h.p.answer(TP_SYNC, answer, b.uid16, now + 20);
+  h.k.on_updates(h.p, 0, h.p.take_updates(0), now + 20);
+  b.set_lit(true, now + 20);
+  now += 3600020;
+  h.sample(b, now);
+  const LedgerEntry before = *h.l.find(b.uid);
+  h.restart(now);
+  h.sample(b, now, true);
+  const LedgerEntry *after = h.l.find(b.uid);
+  CHECK(after->c.mwh == before.c.mwh && ledger_pow_ms(*after) == ledger_pow_ms(before) && after->c.ups == before.c.ups,
+        "a sync's reply %s, an hour on, the ESP32 restarted: nothing counted again (%+lld mWh, %+lld ms, %u -> %u "
+        "power-ups)",
+        lose ? "lost (ONCE)" : "received", (long long) (after->c.mwh - before.c.mwh),
+        (long long) (ledger_pow_ms(*after) - ledger_pow_ms(before)), before.c.ups, after->c.ups);
+}
+
+/// Another hub (B, with the fuller history) syncs a board this hub (A) counts, in the same power-up; back to A after
+/// its restart, the board still powered: this power-up isn't new again.
+static void ledger_two_hubs() {
+  MonthRx b;
+  life_rec_t rec = used_board();
+  rec.ups = 890;
+  b.init(rec);
+  uint32_t now = 1000;
+  b.power_up(now);
+  ProbeHub a, other;
+  a.init(now);
+  other.init(now);
+  now += 1000;
+  a.sample(b, now, true);   // (A: first contact)
+  bool made = false;
+  LedgerEntry *oe = other.l.touch(b.uid, &made);
+  oe->c = receiver_counters(a.p.data(0));
+  oe->c.ups = 900;   // (B knows ten more power-ups)
+  b.set_lit(true, now);
+  now += 3600000;
+  a.sample(b, now);   // (A counts an hour of this power-up)
+  const LedgerEntry before = *a.l.find(b.uid);
+  other.k.power_on(b.boot);
+  other.sample(b, now, true);   // (B saw this power-up: it syncs 901)
+  a.restart(now);
+  a.sample(b, now, true);
+  const LedgerEntry *after = a.l.find(b.uid);
+  CHECK(b.e.lt.ups == 901 && after->c.mwh == before.c.mwh && ledger_pow_ms(*after) == ledger_pow_ms(before),
+        "another hub synced this power-up (board %u power-ups): back at this hub, nothing new (%+lld mWh, %+lld ms)",
+        b.e.lt.ups, (long long) (after->c.mwh - before.c.mwh),
+        (long long) (ledger_pow_ms(*after) - ledger_pow_ms(before)));
+}
+
+/// A cut after a power read while lit, the lights off since (no read after them): no tail from that power (it
+/// would count 30 W for the dark seconds); the energy never above the truth.
+static void ledger_lit_tail() {
+  MonthRx b;
+  b.init(used_board());
+  ProbeHub h;
+  uint32_t now = 1000;
+  h.init(now);
+  const uint32_t on = now;
+  h.k.power_on(on);
+  b.power_up(on);
+  now += 1000;
+  h.sample(b, now, true);
+  b.set_lit(true, now);
+  h.k.lit_tick(0, true, now);
+  now += 30000;
+  h.sample(b, now);   // (its power read while lit)
+  b.set_lit(false, now + 1000);
+  h.k.lit_tick(0, false, now + 1000);
+  now += 40000;   // (dark, no read: then the cut)
+  b.notice(now);
+  b.cut(now, on);
+  h.k.cut(now);
+  const LedgerEntry *e = h.l.find(b.uid);
+  const double over = e != nullptr ? static_cast<double>(e->c.mwh) - static_cast<double>(b.t_uj) / 3600000.0 : 0.0;
+  CHECK(e != nullptr && over <= 0.0, "a cut after a lit power read, dark since: no tail from it (%+.1f mWh)", over);
+}
+
+static void sc_ledger_truth() {
+  std::printf("ledger truth: a fixed load against an independent truth, a lost sync reply, two hubs\n");
+  ledger_truth(365, false);
+  ledger_truth(30, true);
+  ledger_lost_reply(false);
+  ledger_lost_reply(true);
+  ledger_two_hubs();
+  ledger_lit_tail();
+}
+
 int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   const auto t0 = std::chrono::steady_clock::now();
-  if (argc > 1 && std::strcmp(argv[1], "month") == 0) {   // (that one alone)
+  if (argc > 1 && std::strcmp(argv[1], "month") == 0) {   // (those alone)
     sc_month();
+    sc_ledger_truth();
     std::printf("ultra telemetry contract test (month): %s (%d failures), %.1f s\n", failures ? "FAILED" : "passed",
                 failures, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     return failures ? 1 : 0;
@@ -1904,6 +2147,7 @@ int main(int argc, char **argv) {
   sc_retry();
   sc_update_repeat();
   sc_month();
+  sc_ledger_truth();
   const int soak = ucrx_soak_failures();
   CHECK(soak == 0, "the firmware model's own checks: %d failures", soak);
   const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

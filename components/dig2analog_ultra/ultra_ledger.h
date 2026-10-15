@@ -23,6 +23,7 @@ namespace esphome::dig2analog_ultra {
 static constexpr uint32_t LEDGER_MAGIC = 0x4C444733;    // "LDG3" (each board's session checkpoint, its sub-units)
 static constexpr uint32_t UNIT_MS = 360000;             // the wire's 0.1 h
 static constexpr uint32_t CUT_TAIL_MS = 60000;          // a cut: the last power read counts this long at most
+static constexpr uint32_t SESS_UP_WRAP = 0xFFFFFFu - 86400u;   // an uptime below one counted from here: its wrap
 static constexpr uint32_t SESS_UPS_UNKNOWN = 0xFFFFFFFFu;
 static constexpr uint32_t LEDGER_AGE_DAYS = 90;         // a board not seen this many hub days: its entry may go
 static constexpr uint32_t LEDGER_SAVE_MS = 15 * 60000;  // saved at most this often while on (and at a planned cut)
@@ -58,9 +59,10 @@ struct LedgerEntry {
   uint8_t uid[12]{};
   uint32_t records{0};    // the board's RECORDS (u24) as last read: its low 8 bits are the sync's compare-and-swap
   uint32_t last_day{0};   // the hub day it was last seen
-  // its session as last counted (stored with the energy it is part of): its count since power-up then, its uptime
-  // and its power-ups count; the same session later (an ESP32 restart under it, the board moved while powered) goes
-  // on from that count, so nothing is lost and nothing counted twice
+  // its session as last counted (stored with the energy it is part of): its count since power-up then and its
+  // uptime; the same session later (an ESP32 restart under it, the board moved while powered) goes on from that
+  // count, so nothing is counted twice. (sess_ups: its power-ups count then, stored but no longer read: a sync moves
+  // that count without a power-up, so it can't tell one)
   uint32_t sess_boot{0}, sess_up{0}, sess_ups{SESS_UPS_UNKNOWN};
   // the hub's powered and lit time below a wire unit (ms): kept, so whole units add up over any number of short runs
   uint32_t pow_rem{0}, lit_rem{0};
@@ -547,6 +549,7 @@ class LedgerKeeper {
       session_reset_(x);
       if (!d.have_identity)
         x.pending = 0;          // another board: the one before's last readings dropped (a hot swap: rare)
+      x.rebooted = d.have_identity;   // (its uptime fell behind the hub's clock: a power-up, the evidence of one)
     }
     // the board here by its full UID (whatever its UID16 says): another one starts afresh, nothing of the one before
     // (its readings, its count since power-up) carried over
@@ -555,6 +558,7 @@ class LedgerKeeper {
         session_reset_(x);
         x.pending = 0;
         x.have_boot = false;
+        x.rebooted = false;   // (another board: its own checkpoint decides)
       }
       std::memcpy(x.uid, d.uid, 12);
       x.have_uid = true;
@@ -687,10 +691,11 @@ class LedgerKeeper {
         const uint32_t ms = at_ms - x.count_ms;
         this->ledger_->add_time(e, false, ms);
         e.sess_up += ms / 1000;
-        if (x.en_counted) {   // (and half a mWh: its count is whole mWh, on average half a mWh short; below a mWh kept)
+        if (x.en_counted && x.mw_dark) {
+          // its power read while dark (its lights off since): that draw up to the cut, never more (a power read
+          // while lit, or lit since, can't say what it drew after: none); below a mWh kept for the next cut
           const uint32_t tail = at_ms - x.en_ms;
-          const uint64_t mw_ms = e.en_rem + static_cast<uint64_t>(x.mw) * (tail < CUT_TAIL_MS ? tail : CUT_TAIL_MS) +
-                                 ENERGY_MS_PER_MWH / 2;
+          const uint64_t mw_ms = e.en_rem + static_cast<uint64_t>(x.mw) * (tail < CUT_TAIL_MS ? tail : CUT_TAIL_MS);
           this->ledger_->add_energy(e, mw_ms / ENERGY_MS_PER_MWH);
           e.en_rem = static_cast<uint32_t>(mw_ms % ENERGY_MS_PER_MWH);
         }
@@ -707,6 +712,8 @@ class LedgerKeeper {
       return;
     Rx &x = this->rx_[i];
     this->lit_end_(x, now_ms);
+    if (lit != x.lit_on)
+      x.mw_dark = false;   // (its lights changed since its power was read)
     x.lit_on = lit;
   }
   /// The position's Energy (Wh; NAN until its board's ENERGY was read once)
@@ -757,7 +764,10 @@ class LedgerKeeper {
     bool on_known{false};         // the line's power-on seen: the next session starts at on_ms
     bool adopt_due{false};        // first contact: its powered / lit time and power-ups from its next LIFETIME
     bool en_counted{false};       // an ENERGY reading counted this session
+    bool mw_dark{false};          // ... its power (mw) read while dark, and dark since (the cut's tail from it)
     bool lit_on{false};           // its lights as last told (lit_tick)
+    bool rebooted{false};         // the poller saw its uptime fall (a power-up) since its last session started
+    bool fresh{false};            // this session a new one (a power-up): what it counted elsewhere taken at its start
     bool have_energy{false};
     bool lt_read{false}, en_read{false};   // read since this power-up (or the sync before)
     bool energy_seen{false};               // its ENERGY read since this power-up / since the hub started
@@ -803,8 +813,10 @@ class LedgerKeeper {
     x.count_ms = now_ms;
     e.sess_up = d.uptime_s;
     const float w = telemetry_value(d, TV_INPUT_POWER);
-    if (!std::isnan(w))
+    if (!std::isnan(w)) {
       x.mw = w > 0.0f ? static_cast<uint32_t>(w * 1000.0f) : 0;
+      x.mw_dark = !x.lit_on;
+    }
     this->readings_(x, e);
   }
 
@@ -823,28 +835,28 @@ class LedgerKeeper {
       part = static_cast<uint32_t>(now_ms - x.on_ms);
       x.boot_base = 0;
     } else if (e.sess) {
-      // the session the ledger last counted (its UID's, at any position): still the same one (its power-ups count
-      // unchanged, its uptime not less) -> on from where it was counted; else a new one: all of it
-      const bool same = (!life || e.sess_ups == SESS_UPS_UNKNOWN || d.lt_power_ups == e.sess_ups) &&
-                        d.uptime_s >= e.sess_up;
-      fresh = !same;
-      part = same ? static_cast<uint64_t>(d.uptime_s - e.sess_up) * 1000u : up_ms;
-      x.boot_base = same ? e.sess_boot : 0;
+      // the session the ledger last counted (its UID's, at any position): a new one only on evidence of a power-up
+      // (the poller saw its uptime fall, or it is below the one counted; never its power-ups count, which a sync
+      // moves without one); else (the ESP32 restarted under it, a powered board moved, another hub synced it) on from
+      // where it was counted, never twice: a power-up missed so is counted less, not more
+      fresh = x.rebooted || (d.uptime_s < e.sess_up && e.sess_up < SESS_UP_WRAP);
+      part = fresh ? up_ms : d.uptime_s >= e.sess_up ? static_cast<uint64_t>(d.uptime_s - e.sess_up) * 1000u : 0;
+      x.boot_base = fresh ? 0 : e.sess_boot;
     } else if (up_ms <= up + BOOT_SLACK_MS) {
       fresh = true;   // (no session known: it came on after the hub)
       part = up_ms;
       x.boot_base = 0;
     }
-    x.on_known = false;
+    x.on_known = x.rebooted = false;
+    x.fresh = fresh;
     x.sess_started = true;
     x.restart_due = true;   // (its first reading dated against its start)
     x.start_ms = now_ms - d.uptime_s * 1000u;
     if (fresh)
       this->ledger_->add_power_up(e);
     this->ledger_->add_time(e, false, part);
-    if (life && x.life_fresh && !x.adopted)
-      this->ledger_->take(e, receiver_counters(d), false);   // (its time elsewhere; its power-ups this one included)
-    e.sess_ups = life ? d.lt_power_ups : SESS_UPS_UNKNOWN;
+    if (fresh && life && x.life_fresh)   // (only at a new session: its time elsewhere; this power-up included)
+      this->ledger_->take(e, receiver_counters(d), false);
     e.sess = true;
   }
 
@@ -873,8 +885,8 @@ class LedgerKeeper {
       this->ledger_->add_energy(e, add);
       if (x.adopted && !x.energy_seen)
         this->ledger_->take_energy(e, r.exact(), true);    // (first contact: its lifetime)
-      else if (first)
-        this->ledger_->take_energy(e, r.exact(), false);   // (a session's start: what the hub didn't see)
+      else if (first && x.fresh)
+        this->ledger_->take_energy(e, r.exact(), false);   // (a new session's start: what the hub didn't see)
       x.boot_last = r.boot;
       x.have_boot = true;
       x.energy_seen = true;
@@ -883,6 +895,7 @@ class LedgerKeeper {
         x.en_counted = true;
         x.en_ms = r.ms;
         x.mw = r.mw;
+        x.mw_dark = !x.lit_on;
       }
     }
     if (x.pending != 0)
@@ -910,8 +923,6 @@ class LedgerKeeper {
         x.merged = true;
         x.phase = DONE;
         x.attention = false;
-        if (x.entry != nullptr && x.entry->sess && x.entry->sess_ups != SESS_UPS_UNKNOWN)
-          x.entry->sess_ups = d.lt_power_ups;   // (the same session: its power-ups count raised by the sync)
         return EV_SYNCED;
       case ULTRA_LS_R_NOOP:
       case ULTRA_LS_R_CAPPED:   // (capped: the rest at its next power-up)

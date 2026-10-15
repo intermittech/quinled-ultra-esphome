@@ -553,6 +553,7 @@ class UltraHub final : public Component {
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
   enum UpdateState : uint8_t { UPD_IDLE = 0, UPD_RUNNING, UPD_FINISHED };
   static void update_task_(void *arg);
+  void abort_update_for_shutdown_();
 #ifdef USE_DIG2ANALOG_ULTRA_PARLIO
   uint8_t update_lane_();
 #endif

@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <thread>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -884,6 +885,7 @@ struct UltraHub {
   enum UpdateResult : uint8_t { UPD_NONE = 0, UPD_DONE, UPD_ABORTED, UPD_FAILED };
   enum UpdateState : uint8_t { UPD_IDLE = 0, UPD_RUNNING, UPD_FINISHED };
   static void update_task_(void *arg);    // the component's
+  void abort_update_for_shutdown_();      // the component's
   uint32_t update_frame_us() const;       // the component's
   uint32_t update_frame_min_us() const;   // the component's
   static int64_t now_us_() { return 5000000; }
@@ -907,8 +909,10 @@ struct Line {
   bool on_wire{false};
   int overlapped{0}, refused{0};
   size_t abort_at{SIZE_MAX};                // the abort request comes with this frame
+  bool slow{false};                         // (the shutdown test: a pause per frame in real time)
 };
 static Line line;
+static std::atomic<size_t> line_sent{0};   // (frames handed over, for the shutdown test's other thread)
 static esp_err_t rmt_transmit(int, int, const uint8_t *data, size_t n, const rmt_transmit_config_t *) {
   if (n != UPD_FRAME_BYTES) {
     line.refused++;
@@ -918,12 +922,15 @@ static esp_err_t rmt_transmit(int, int, const uint8_t *data, size_t n, const rmt
   line.wire.emplace_back(data, data + n);
   line.quiet_us.push_back(0);
   line.on_wire = true;
+  line_sent++;
   if (line.wire.size() == line.abort_at)
     line.hub->upd_abort_.store(true);
   return ESP_OK;
 }
 static esp_err_t rmt_tx_wait_all_done(int, int) {
   line.on_wire = false;
+  if (line.slow)
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
   return ESP_OK;
 }
 static void vTaskDelay(uint32_t ticks) {
@@ -931,8 +938,60 @@ static void vTaskDelay(uint32_t ticks) {
   if (!line.quiet_us.empty() && ticks > 0)
     line.quiet_us.back() += (ticks - 1) * portTICK_PERIOD_MS * 1000;
 }
+// (the shutdown's wait: real time, the task running on its own thread)
+static uint32_t millis() {
+  return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+}
+static void delay(uint32_t ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+struct AppStub {
+  int feeds{0};
+  void feed_wdt() { this->feeds++; }
+};
+static AppStub App;
 
 #include "hub_update.inc"
+
+/// An ESPHome OTA / reboot during a session (on_shutdown): the task, on its own thread, is told to abort; the
+/// shutdown waits until its ABORT frames are out (bounded), then goes on. Not running: nothing happens.
+static void test_update_shutdown() {
+  static uint8_t img[UPD_DESC_BYTES + 2000];
+  for (size_t i = 0; i < sizeof(img); i++)
+    img[i] = static_cast<uint8_t>(i * 7 + 3);
+  UpdateSession::Options o;
+  o.lead_in_us = 20000;
+  o.end_us = 10000;
+  UltraHub idle;
+  idle.upd_state_.store(UltraHub::UPD_IDLE);
+  idle.abort_update_for_shutdown_();
+  CHECK(!idle.upd_abort_.load(), "no session: the shutdown changes nothing");
+  UltraHub h;
+  line = Line();
+  line.hub = &h;
+  line.slow = true;   // (a frame every ~0.2 ms: the task is still sending when the shutdown comes)
+  line_sent = 0;
+  h.upd_session_.begin(img, sizeof(img), 0x42, o, h.update_frame_min_us());
+  std::thread task([&h]() { UltraHub::update_task_(&h); });
+  while (line_sent.load() < 50)
+    std::this_thread::yield();
+  const auto t0 = std::chrono::steady_clock::now();
+  h.abort_update_for_shutdown_();
+  const double waited = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  const bool finished = h.upd_state_.load() == UltraHub::UPD_FINISHED;
+  task.join();
+  size_t aborts = 0, last_session = 0;
+  for (size_t i = 0; i < line.wire.size(); i++) {
+    if (line.wire[i][UPD_B_TYPE] == UPD_ABORT)
+      aborts++;
+    else
+      last_session = i + 1;
+  }
+  CHECK(finished && h.upd_result_.load() == UltraHub::UPD_ABORTED && aborts == 12 && last_session + 12 == line.wire.size(),
+        "a shutdown during the session: aborted, its 12 ABORT frames last on the wire, the task done before the "
+        "shutdown went on (%.1f ms, %u frames first)", waited, static_cast<unsigned>(last_session));
+  line.slow = false;
+}
 
 /// The bootloader's page pause after a frame's reset (its README: "the host's 2.7 ms pause" covers a page program at
 /// HCLK / 2 and the decoder's resync): the update task keeps the line low at least that long after every page's last
@@ -4064,9 +4123,11 @@ int main() {
   sun::test_sun_end();
   hub_start::test_group_budget();
   hub_update::test_update_task();
+  hub_update::test_update_shutdown();
   hub_update::test_update_lead_in();
   hub_rw::test_telemetry_window();
   hub_rw::test_rw_fast_share();
+  hub_rw::test_rw_no_standby();
   hub_rw::test_several_lines();
   hub_rw::test_tied_shared_uart();
   hub_rw::test_standby_support();

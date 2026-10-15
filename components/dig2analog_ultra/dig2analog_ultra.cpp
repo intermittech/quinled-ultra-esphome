@@ -278,6 +278,21 @@ void UltraHub::power_cycle() {
   this->cycle_ms_ = millis();
 }
 
+// An ESPHome OTA or reboot while a session runs: abort it and wait (1 s at most) until its ABORT frames are out, so
+// the boards that hadn't started erasing go back to their firmware (the others wait in recovery for the next install)
+// instead of the task dying mid-session.
+void UltraHub::abort_update_for_shutdown_() {
+  if (this->upd_state_.load() != UPD_RUNNING)
+    return;
+  ESP_LOGW(TAG, "Shutdown during a board firmware update session: aborting it");
+  this->upd_abort_.store(true);
+  const uint32_t t0 = millis();
+  while (this->upd_state_.load() == UPD_RUNNING && millis() - t0 < 1000) {
+    delay(1);
+    App.feed_wdt();
+  }
+}
+
 // The session owns the RMT channel (the main loop sends nothing meanwhile). Frame by frame: wait until the last one
 // (and its reset) is on the wire, the page pause if it asked for one, then the next.
 void UltraHub::update_task_(void *arg) {
@@ -1157,6 +1172,9 @@ void UltraHub::ledger_line_() {
 #endif
 
 void UltraHub::on_shutdown() {
+#ifdef USE_DIG2ANALOG_ULTRA_UPDATE
+  this->abort_update_for_shutdown_();   // (a board update session: its ABORT frames first)
+#endif
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   this->shutdown_callback_.call();   // (the energies one last time)
 #ifdef USE_DIFFPOWER

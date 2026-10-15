@@ -46,7 +46,8 @@ PIECES = {
     ),
     "hub_update.inc": (
         "dig2analog_ultra.cpp",
-        ["uint32_t UltraHub::update_frame_us(", "uint32_t UltraHub::update_frame_min_us(", "void UltraHub::update_task_("],
+        ["uint32_t UltraHub::update_frame_us(", "uint32_t UltraHub::update_frame_min_us(", "void UltraHub::update_task_(",
+         "void UltraHub::abort_update_for_shutdown_("],
     ),
     "hub_rw.inc": (
         "dig2analog_ultra.cpp",

@@ -595,6 +595,7 @@ class Scheduler {
   /// back joins in phase with the others (a sunrise continues where it is).
   void replay(int64_t start_us) {
     for (auto &b : this->boards_) {
+      restart_rotation_(b);
       for (uint8_t p = 0; p < CONFIG_PAGES; p++) {
         if (b.config[p].valid)
           this->queue_(b, key_(ULTRA_LIGHT_BOARD, ULTRA_CONFIG, p));
@@ -631,6 +632,7 @@ class Scheduler {
       return;
     Board &b = this->boards_[board];
     b.first_unused = first_unused > ULTRA_LIGHTS ? ULTRA_LIGHTS : first_unused;
+    restart_rotation_(b);
     for (uint8_t l = b.first_unused; l < ULTRA_LIGHTS; l++) {
       for (uint8_t type : {ULTRA_LIGHT_DEF, ULTRA_SCENE, ULTRA_SCENE_EFFECT}) {
         this->next_seq_(b, l, type);
@@ -764,13 +766,17 @@ class Scheduler {
   /// take ~42 KB of the ESP32's heap (wiki: Ultra line options). The queue holds keys (12 B per command) and is freed whenever
   /// it empties.
   static_assert(ULTRA_CFG_COUNT <= 32, "Board::cfg_have holds a bit per CONFIG id");
+  /// the refresh list: CONFIG pages, then per light DEF, OPT, SET, EFFECT, SCENE, SCENE_EFFECT and its STEPs
+  static constexpr uint16_t REFRESH_ITEMS = CONFIG_PAGES + ULTRA_LIGHTS * (6 + ULTRA_MAX_STEPS);
+  static_assert(REFRESH_ITEMS <= 255, "Board::rr holds a refresh position");
   struct Board {   // (the slots first: no padding)
     Item config[CONFIG_PAGES];
     Item identify;  // the last IDENTIFY (identify, version, dark, release, calibrate)
     std::vector<Cmd> queue;
     std::unique_ptr<LightItems> light[ULTRA_LIGHTS];
     uint16_t cfg[ULTRA_CFG_COUNT]{};
-    uint16_t rr{0};
+    uint8_t rr{0};    // the refresh list's next position (REFRESH_ITEMS of them)
+    uint8_t rot{0};   // complete refresh rounds since its init / a resync / a change of its lights: 0..6, then 3..6
     uint32_t cfg_have{0};   // the CONFIG ids set (bit per id)
     bool cfg_dirty{false};
     uint8_t seq[ULTRA_LIGHTS + 1][ULTRA_TYPES]{};
@@ -829,9 +835,16 @@ class Scheduler {
   }
   bool valid_(uint16_t board, uint8_t light) const { return board < this->boards_.size() && light < ULTRA_LIGHTS; }
   static LightItems &li_(Board &b, uint8_t light) {
-    if (!b.light[light])
+    if (!b.light[light]) {
       b.light[light].reset(new LightItems());
+      restart_rotation_(b);   // (its lights changed)
+    }
     return *b.light[light];
+  }
+  /// The refresh rotation from its start: the list from its first item, the clearing slots in every round again
+  static void restart_rotation_(Board &b) {
+    b.rr = 0;
+    b.rot = 0;
   }
   static uint8_t next_seq_(Board &b, uint8_t light, uint8_t type) {
     return ++b.seq[light < ULTRA_LIGHTS ? light : ULTRA_LIGHTS][type];
@@ -988,19 +1001,25 @@ class Scheduler {
 
   /// Next item of the board's refresh list: CONFIG pages, then per light DEF, OPT, SET, EFFECT, SCENE, SCENE_EFFECT,
   /// STEPs; for a light index not in the YAML its clearing DEF, SCENE and SCENE_EFFECT (clear_unused_lights).
+  /// The rotation (the same in the QuinLED Ultra sender library): the clearing slots are in every round for the first
+  /// 3 complete rounds after the board's init, a resync or a change of its lights, then in every 4th round only
+  /// (rounds 0, 1, 2, 6, 10, ...); the used lights' items in every round. A round ends where the list starts again.
   bool take_refresh_(Board &b, uint8_t *s, size_t slot, int64_t now_us) {
     const uint16_t per_light = 6 + ULTRA_MAX_STEPS;
-    const uint16_t total = CONFIG_PAGES + ULTRA_LIGHTS * per_light;
+    const uint16_t total = REFRESH_ITEMS;
     for (uint16_t tries = 0; tries < total; tries++) {
       const uint16_t pos = b.rr;
-      b.rr = static_cast<uint16_t>((b.rr + 1) % total);
+      const uint8_t rot = b.rot;   // (the round this position is in)
+      b.rr = static_cast<uint8_t>((b.rr + 1) % total);
+      if (b.rr == 0)
+        b.rot = b.rot < 6 ? static_cast<uint8_t>(b.rot + 1) : 3;   // a round done: 0..6, then 3, 4, 5, 6, 3, ...
       const Item *it = nullptr;
       if (pos < CONFIG_PAGES) {
         it = &b.config[pos];
       } else {
         const uint16_t l = (pos - CONFIG_PAGES) / per_light, k = (pos - CONFIG_PAGES) % per_light;
         if (!b.light[l]) {
-          if (l < b.first_unused || (k != 0 && k != 4 && k != 5))
+          if (l < b.first_unused || (k != 0 && k != 4 && k != 5) || !(rot < 3 || rot % 4 == 2))
             continue;
           const uint8_t type = k == 0 ? ULTRA_LIGHT_DEF : k == 4 ? ULTRA_SCENE : ULTRA_SCENE_EFFECT;
           std::memcpy(s, unused_item_(b, static_cast<uint8_t>(l), type).slot, ULTRA_SLOT_BYTES);

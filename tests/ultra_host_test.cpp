@@ -1109,6 +1109,161 @@ struct SchedPeek : Scheduler {
   }
 };
 
+/// The refresh rotation (the rule shared with the sender library): idle frames take each board's refresh list; the
+/// clearing slots of unused light indices are in rounds 0, 1, 2, 6, 10, ... after the init, and again after a change
+/// of the board's lights (from round 0); the used lights' items in every round. 3 boards with 1 / 3 / 5 lights, 20
+/// rounds; then board 0 to 2 lights and 10 more. The rounds go to the cross-check trace (the sender's in the same
+/// folder) when that folder exists. And a 1-light board's SET refresh period before / now.
+struct RotPeek : Scheduler {
+  /// board b's next refresh slot (as an idle frame takes it) and its position in the list
+  bool next(uint16_t b, uint8_t *s, uint16_t *pos) {
+    Board &bd = this->boards_[b];
+    if (!this->take_refresh_(bd, s, 0, 0))
+      return false;
+    const uint16_t total = CONFIG_PAGES + ULTRA_LIGHTS * (6 + ULTRA_MAX_STEPS);
+    *pos = static_cast<uint16_t>((bd.rr + total - 1) % total);
+    return true;
+  }
+};
+
+static void rot_lights(RotPeek &s, uint16_t b, uint8_t from, uint8_t n) {
+  const uint16_t z[5] = {0, 0, 0, 0, 0}, one[5] = {65535, 65535, 65535, 65535, 65535};
+  for (uint8_t l = from; l < n; l++) {
+    s.light_def(b, l, MONO1, 1000, 0, z, one);
+    s.light_opt(b, l, 0, 0, 0, 0, 0);
+    s.light_scene(b, l, 0, 0, 0, z, one);
+    s.light_scene_effect(b, l, ULTRA_FX_NONE, nullptr, 0);
+    s.light_set(b, l, 0, 30000, one, one, 0, 0);
+  }
+  s.clear_unused_lights(b, n);
+}
+
+static void test_refresh_rotation() {
+  std::printf("the refresh rotation: the clearing slots in rounds 0, 1, 2, 6, 10, ...\n");
+  uint8_t lights[3] = {1, 3, 5};
+  RotPeek s;
+  s.init(3, 11, 3);
+  for (uint16_t b = 0; b < 3; b++) {
+    s.set_config(b, 1, 25000);
+    s.set_config(b, 2, 1);
+  }
+  s.flush_config();
+  for (uint16_t b = 0; b < 3; b++)
+    rot_lights(s, b, 0, lights[b]);
+  // per board: its rounds, each the (type, light) pairs of its refresh slots; a round ends where the list restarts
+  std::vector<std::vector<std::vector<std::pair<int, int>>>> rounds(3);
+  std::vector<int> last(3, -1);
+  auto restart = [&](uint16_t b) {   // (a change: the list from its start, a new round)
+    rounds[b].emplace_back();
+    last[b] = -1;
+  };
+  for (uint16_t b = 0; b < 3; b++)
+    restart(b);
+  auto run = [&](const size_t want[3]) {   // until board b has want[b] complete rounds (and the next one begun)
+    for (bool more = true; more;) {
+      more = false;
+      for (uint16_t b = 0; b < 3; b++) {
+        if (rounds[b].size() > want[b])
+          continue;
+        uint8_t slot[ULTRA_SLOT_BYTES];
+        uint16_t pos;
+        if (!s.next(b, slot, &pos))
+          continue;
+        if (static_cast<int>(pos) <= last[b])
+          rounds[b].emplace_back();
+        last[b] = pos;
+        rounds[b].back().push_back({slot[0], slot[1] >> 4});
+        more = true;
+      }
+    }
+  };
+  // one line per round, as the sender library's trace: the cleared light indices, the used lights' DEF / SET
+  std::vector<std::string> trace;
+  auto line = [&](const char *phase, uint16_t b, size_t r, size_t label) {
+    const auto &v = rounds[b][r];
+    std::string clear, used;
+    for (int l = 0; l < static_cast<int>(ULTRA_LIGHTS); l++) {
+      bool cl = false, def = false, set = false;
+      for (const auto &p : v) {
+        if (p.second != l)
+          continue;
+        cl |= l >= lights[b];
+        def |= l < lights[b] && p.first == ULTRA_LIGHT_DEF;
+        set |= l < lights[b] && p.first == ULTRA_SET;
+      }
+      if (cl)
+        clear += (clear.empty() ? "" : ",") + std::to_string(l);
+      if (def)
+        used += " DEF" + std::to_string(l);
+      if (set)
+        used += " SET" + std::to_string(l);
+    }
+    trace.push_back(std::string(phase) + " b" + std::to_string(b) + " r" + std::to_string(label) + " clear " +
+                    (clear.empty() ? "-" : clear) + " |" + (used.empty() ? "" : " used" + used));
+  };
+  auto clears_ok = [&](uint16_t b, size_t from, size_t n) {   // rounds from..from+n-1: rounds 0, 1, 2, 6, ... clear
+    bool ok = true;
+    for (size_t r = 0; r < n; r++) {
+      int c = 0, sets = 0;
+      for (const auto &p : rounds[b][from + r]) {
+        c += p.second >= lights[b] && p.second < static_cast<int>(ULTRA_LIGHTS);
+        sets += p.first == ULTRA_SET;
+      }
+      ok &= c == ((r < 3 || r % 4 == 2) ? 3 * (ULTRA_LIGHTS - lights[b]) : 0) && sets == lights[b];
+    }
+    return ok;
+  };
+  // init: 20 rounds each
+  const size_t w1[3] = {20, 20, 20};
+  run(w1);
+  bool rule = true;
+  for (uint16_t b = 0; b < 3; b++) {
+    rule &= clears_ok(b, 0, 20);
+    for (size_t r = 0; r < 20; r++)
+      line("init", b, r, r);
+  }
+  CHECK(rule, "init, 20 rounds: the clearing slots in rounds 0, 1, 2, 6, 10, 14, 18 only, every used light's SET in "
+        "every round");
+  const size_t with = rounds[0][0].size(), without = rounds[0][3].size();
+  std::printf("  a 1-light board's SET every %zu idle frames in the first rounds, %zu after (at 200 ms: %.1f s -> "
+              "%.1f s; 3 of 4 rounds)\n", with, without, with * 0.2, without * 0.2);
+  // set_lights: board 0 to 2 lights (the clears from round 0 again, for 2-4); the others go on (rounds 20-29)
+  rot_lights(s, 0, 1, 2);
+  lights[0] = 2;
+  const size_t m0 = rounds[0].size();
+  restart(0);
+  const size_t w2[3] = {m0 + 10, 30, 30};
+  run(w2);
+  CHECK(clears_ok(0, m0, 10), "set_lights: board 0's clearing slots (lights 2-4) from round 0 again");
+  for (size_t r = 0; r < 10; r++)
+    line("set_lights", 0, m0 + r, r);
+  for (uint16_t b = 1; b < 3; b++)
+    for (size_t r = 20; r < 30; r++)
+      line("set_lights", b, r, r);
+  // resync: every board from round 0 again
+  s.replay(0);
+  size_t m[3];
+  for (uint16_t b = 0; b < 3; b++) {
+    m[b] = rounds[b].size();
+    restart(b);
+  }
+  const size_t w3[3] = {m[0] + 10, m[1] + 10, m[2] + 10};
+  run(w3);
+  bool again = true;
+  for (uint16_t b = 0; b < 3; b++) {
+    again &= clears_ok(b, m[b], 10);
+    for (size_t r = 0; r < 10; r++)
+      line("resync", b, m[b] + r, r);
+  }
+  CHECK(again, "resync: every board's clearing slots from round 0 again");
+  // the cross-check trace (review-r11/rotation-trace/esphome.txt; compare.py there), when that folder exists
+  if (FILE *f = std::fopen("D:/Claude-Folders/Claude-WS2915_dig2analog/review-r11/rotation-trace/esphome.txt", "w")) {
+    for (const auto &l : trace)
+      std::fprintf(f, "%s\n", l.c_str());
+    std::fclose(f);
+  }
+}
+
 static void test_fifty_boards() {
   const uint16_t N = 50;
   std::printf("50 boards on one pin\n");
@@ -1788,6 +1943,7 @@ static void test_wire_ns() {
 
 int main() {
   test_wire_ns();
+  test_refresh_rotation();
   test_mapping();
   test_scheduler();
   test_defined_values();

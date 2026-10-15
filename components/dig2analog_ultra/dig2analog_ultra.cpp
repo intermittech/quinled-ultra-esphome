@@ -149,6 +149,10 @@ int64_t UltraHub::start_time_us(uint16_t board) {
 
 // The boards have power as far as the hub knows: no supply configured, or it is on and its delay is over.
 bool UltraHub::boards_powered_() const {
+#ifdef USE_DIFFPOWER
+  if (this->port_ != nullptr)
+    return this->port_->is_ready();
+#endif
 #ifdef USE_POWER_SUPPLY
   if (this->psu_ != nullptr)
     return this->psu_->is_enabled() && !this->power_waiting_;
@@ -215,6 +219,10 @@ UltraHub::UpdateResult UltraHub::take_update_result() {
 }
 
 bool UltraHub::has_power_supply() const {
+#ifdef USE_DIFFPOWER
+  if (this->port_ != nullptr)
+    return true;
+#endif
 #ifdef USE_POWER_SUPPLY
   return this->psu_ != nullptr;
 #else
@@ -225,6 +233,14 @@ bool UltraHub::has_power_supply() const {
 void UltraHub::power_cycle() {
   if (!this->has_power_supply())
     return;
+#ifdef USE_DIFFPOWER
+  if (this->port_ != nullptr) {   // the port's enable low now (no notice: the session owns the line), then a wake
+    this->port_->power_cycle();
+    this->cycle_ = CYCLE_OFF;
+    this->cycle_ms_ = millis();
+    return;
+  }
+#endif
   this->cycle_ = CYCLE_WAIT_OFF;
   this->cycle_ms_ = millis();
 }
@@ -278,19 +294,46 @@ void UltraHub::update_task_(void *arg) {
 bool UltraHub::rw_due_(bool urgent) {
   if (this->rw_uart_ == nullptr || !this->started_)
     return false;
+  // the receivers have no supply: unavailable until they answer again; on a Diff-Power port in standby they show
+  // Standby, and once it is powered their status follows their answers again: every receiver's sensors both times
   if (!this->boards_powered_()) {
-    if (this->rw_powered_) {   // the receivers have no supply: unavailable until they answer again
+    if (this->rw_powered_) {
       this->rw_powered_ = false;
       this->poller_.unpowered();
+      this->poller_.touch_all();
       this->rw_publish_();
     }
     return false;
   }
-  this->rw_powered_ = true;
+  if (!this->rw_powered_) {   // (every receiver Waking until it answers, or misses enough to be gone)
+    this->rw_powered_ = true;
+    this->rx_note_.resize(this->poller_.receivers(), 0);
+    for (auto &n : this->rx_note_)
+      n |= RX_SETTLING;
+    this->poller_.touch_all();
+    this->rw_publish_();
+  }
   // (every line has a UART of its own: the configuration check refuses one shared by two lines)
   if (urgent || this->rw_open_)
     return false;
+  // the lock interval from the last lock frame's end (it was set when the frame was built)
+  if (this->rw_lock_end_) {
+    if (rmt_tx_wait_all_done(this->channel_, 0) != ESP_OK)
+      return false;
+    this->poller_.locked(millis());
+    this->rw_lock_end_ = false;
+  }
   return this->poller_.due(millis());
+}
+
+// Just woken and not evaluated yet: not heard, not missed enough to be gone, not behind one that is gone (it can't be
+// polled then: "can't be heard")
+bool UltraHub::rx_settling(uint16_t receiver) const {
+  if (receiver >= this->rx_note_.size() || !(this->rx_note_[receiver] & RX_SETTLING) ||
+      this->poller_.answering(receiver) || this->poller_.misses(receiver) >= TelemetryPoller::UNAVAILABLE_MISSES)
+    return false;
+  const int cut = this->poller_.cut_at(millis());
+  return !(cut >= 0 && cut < receiver);
 }
 
 // The RMT's interrupt after an RW frame's last symbol: let go of the line (ULTRA_RW_RELEASE_US after its last bit).
@@ -341,11 +384,19 @@ void UltraHub::finish_window_(bool wait) {
 void UltraHub::rw_publish_() {
   this->port_monitor_.update(millis(), this->poller_);
   for (uint16_t i = 0; i < this->poller_.receivers(); i++) {
-    const uint32_t u = this->poller_.take_updates(i);
+    uint32_t u = this->poller_.take_updates(i);
+    uint8_t note = i < this->rx_note_.size() ? this->rx_note_[i] : 0;
+    if ((note & RX_SETTLING) && !this->rx_settling(i)) {   // after a wake: heard, or missed enough: its status now
+      note &= ~RX_SETTLING;
+      u |= TU_AVAILABILITY;
+    }
     if (u == 0)
       continue;
     const ReceiverData &d = this->poller_.data(i);
-    if (u & TU_AVAILABILITY) {
+    if ((u & TU_AVAILABILITY) && (this->port_standby() || (note & RX_SETTLING))) {
+      // (its line's power switched on purpose: off, or just back and not evaluated yet)
+      ESP_LOGD(TAG, "Receiver %u on GPIO%u: %s", i, this->pin_, this->port_standby() ? "standby" : "waking");
+    } else if (u & TU_AVAILABILITY) {
       if (this->poller_.answering(i)) {
         ESP_LOGI(TAG, "Receiver %u on GPIO%u answers", i, this->pin_);
       } else {
@@ -357,8 +408,23 @@ void UltraHub::rw_publish_() {
           ESP_LOGW(TAG, "Receiver %u on GPIO%u doesn't answer", i, this->pin_);
       }
     }
-    if (u & TU_RESTART)
-      ESP_LOGI(TAG, "Receiver %u on GPIO%u restarted or was replaced", i, this->pin_);
+    if (u & TU_RESTART) {
+      if ((note & RX_WOKE) && millis() - this->woke_ms_ < 60000) {   // (its port's wake: expected)
+        ESP_LOGD(TAG, "Receiver %u on GPIO%u restarted (its port woke)", i, this->pin_);
+      } else {
+        ESP_LOGI(TAG, "Receiver %u on GPIO%u restarted or was replaced", i, this->pin_);
+      }
+      note &= ~RX_WOKE;
+    }
+#ifdef USE_DIFFPOWER
+    if (this->port_ != nullptr && d.have_identity && !(d.features & ULTRA_FEAT_STANDBY) && !(note & RX_WARNED)) {
+      note |= RX_WARNED;
+      ESP_LOGW(TAG, "Receiver %u on GPIO%u has no standby support (firmware before 0.6.10): it shows its power-on "
+               "scene at each wake of its port; update it", i, this->pin_);
+    }
+#endif
+    if (i < this->rx_note_.size())
+      this->rx_note_[i] = note;
     if ((u & (1u << TP_POWER)) && d.pw_latched != 0)
       ESP_LOGW(TAG, "Receiver %u on GPIO%u power events: %s", i, this->pin_, telemetry_power_events_text(d).c_str());
     this->rw_callback_.call(i, u);
@@ -450,7 +516,7 @@ void UltraHub::service_calibration_() {
   }
   // a request waits until the boards have power and took the preamble
   if (this->cal_pending_) {
-    bool ready = this->started_ && this->preamble_ == 0;
+    bool ready = this->started_ && this->preamble_ == 0 && !this->port_standby();
 #ifdef USE_POWER_SUPPLY
     if (this->psu_ != nullptr)
       ready &= this->psu_->is_enabled() && !this->power_waiting_;
@@ -666,7 +732,77 @@ void UltraHub::setup() {
   this->wake_();
 }
 
+#ifdef USE_DIFFPOWER
+// The port powers this line while a light here is lit (or within its turn-off period) and while a calibration or an
+// update holds it; once powered, everything again (the boards booted dark); before it drops, the notice.
+void UltraHub::attach_port_() {
+  this->port_attached_ = true;
+  for (auto *l : this->lights_)
+    this->port_->add_load(l->get_standby_after(), [l](uint32_t now) { return l->is_lit(now); }, l->get_state());
+  this->port_->add_load(1, [this](uint32_t) {
+#ifdef USE_DIG2ANALOG_ULTRA_UPDATE
+    return this->cal_power_hold_ || this->upd_power_hold_;
+#else
+    return this->cal_power_hold_;
+#endif
+  });
+  this->port_->add_on_ready_callback([this]() {
+    ESP_LOGD(TAG, "GPIO%u: the port is powered, replaying the boards' state", this->pin_);
+    this->sched_.cancel_power_off();   // (a notice copy not sent before the power-off: stale now)
+#ifdef USE_DIG2ANALOG_ULTRA_UPDATE
+    if (this->cycle_ == CYCLE_OFF)
+      this->cycle_ = CYCLE_DONE;   // (a recovery's power cycle: powered again)
+#endif
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+    this->rx_note_.resize(this->poller_.receivers(), 0);
+    for (auto &n : this->rx_note_)
+      n |= RX_WOKE;
+    this->woke_ms_ = millis();
+#endif
+    this->resync(true);
+  });
+  this->port_->add_on_notice_callback([this](uint8_t copy) { this->send_power_off_notice(copy); });
+  this->port_->add_on_pump_callback([this]() { this->pump_notice_(); });
+}
+
+void UltraHub::send_power_off_notice(uint8_t copy) {
+  for (uint16_t i = 0; i < this->num_boards_; i++)
+    this->sched_.power_off(i, copy == 0);
+  if (copy == 0) {
+    this->notices_++;
+    ESP_LOGD(TAG, "GPIO%u: the planned power-off notice to %u board(s)", this->pin_, this->num_boards_);
+  }
+  this->wake_();
+}
+
+// The controller's shutdown (the loop doesn't run any more): a queued notice copy out now if the line is free, else
+// at the next call (no waiting here: the port serves every line in turn). A response window ends first; an update
+// session owns the line: nothing.
+void UltraHub::pump_notice_() {
+  if (this->is_failed() || this->sched_.power_off_left() == 0)
+    return;
+#ifdef USE_DIG2ANALOG_ULTRA_UPDATE
+  if (this->upd_state_.load() != UPD_IDLE)
+    return;
+#endif
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  if (this->rw_open_) {
+    if (now_us_() < this->rw_end_us_)
+      return;
+    this->rw_open_ = false;
+  }
+  this->rw_next_ = false;
+#endif
+  if (rmt_tx_wait_all_done(this->channel_, 0) == ESP_OK)
+    this->transmit_();
+}
+#endif
+
 void UltraHub::loop() {
+#ifdef USE_DIFFPOWER
+  if (this->port_ != nullptr && !this->port_attached_)
+    this->attach_port_();
+#endif
   this->service_calibration_();
 #ifdef USE_POWER_SUPPLY
   this->service_power_();
@@ -766,17 +902,19 @@ void UltraHub::transmit_() {
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
                                       || this->ping_left_ > 0 || this->dark_tail_ > 0
 #endif
-                                      ))
+                                      )) {
       this->poller_.locked(millis());
-    else if (this->rw_next_)
+      this->rw_lock_end_ = true;
+    } else if (this->rw_next_) {
       polls = this->poller_.build(millis(), this->rw_slots_.data(), &this->rw_window_us_);
+    }
 #endif
     size_t bytes = this->sched_.frame_bytes();
     if (this->switch_frame_ < ULTRA_SWITCH_WS_FRAMES) {
       // switch_boards_to_ultra: a WS config frame (no Ultra header), with the same bit timing
       this->tx_normal_ = false;
       bytes = ultra_switch_frame(this->tx_buf_, this->switch_frame_++, this->num_boards_);
-    } else if (this->preamble_ > 0) {
+    } else if (this->preamble_ > 0 && this->sched_.power_off_left() == 0) {   // (a notice copy first)
       this->preamble_--;
       this->sched_.build_dark_frame(start, this->tx_buf_);
       this->tx_preamble_end_ = this->preamble_ == 0 && this->preamble_full_;
@@ -846,6 +984,10 @@ void UltraHub::transmit_() {
   }
 #endif
   this->tx_prepared_ = false;
+#ifdef USE_DIFFPOWER
+  if (this->sched_.take_power_off_sent() && this->port_ != nullptr)
+    this->port_->notice_sent();   // (its next copy 50 ms from now)
+#endif
   if (this->tx_preamble_end_ && this->boards_powered_())
     this->synced_once_ = true;
   this->status_clear_warning();

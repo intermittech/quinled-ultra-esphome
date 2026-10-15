@@ -32,7 +32,7 @@ external_components:
   - source:
       type: local
       path: {components}
-    components: [dig2analog_ultra, dig2analog_ultra_strip]
+    components: [dig2analog_ultra, dig2analog_ultra_strip, diffpower]
 """
 
 PSU = """\
@@ -149,6 +149,60 @@ uart:
 TELEMETRY = "  telemetry:\n    uart_id: rx\n"
 
 RX_LIST = "    name: Port 1\n    receivers:\n      - device_id: r1\n      - device_id: r2\n"
+
+
+# Diff-Power ports (diffpower): a port with a plain light, a time source and the sun for "During dark"
+DP_PORT = """\
+diffpower:
+  - id: p1
+    name: Port 1
+    enable_pin: GPIO26
+    detect_pin: GPIO27
+"""
+DP_MONO = """\
+output:
+  - platform: ledc
+    id: o1
+    pin: GPIO25
+light:
+  - platform: monochromatic
+    id: mono
+    name: mono
+    output: o1
+"""
+DP_STRIP = """\
+light:
+  - platform: esp32_rmt_led_strip
+    id: strip
+    name: strip
+    pin: GPIO18
+    num_leds: 30
+    chipset: ws2812
+    rgb_order: GRB
+  - platform: partition
+    id: part
+    name: part
+    segments:
+      - id: strip
+        from: 0
+        to: 9
+"""
+DP_WAKE = (
+    "button:\n  - platform: template\n    name: Wake\n    on_press:\n      - diffpower.wake:\n"
+    "          lights: [{light}]\n"
+)
+DP_SUN = """\
+wifi:
+  ssid: x
+  password: xxxxxxxx
+time:
+  - platform: sntp
+    id: t
+sun:
+  id: s
+  latitude: 52.1
+  longitude: 5.1
+"""
 
 
 def tel_lines(n, uarts=None, names=None, devices=None, extra=""):
@@ -810,6 +864,112 @@ CASES = [
     ("ultra esp32-c2 rejected (no RMT)", ULTRA, False, "RMT", "esp32-c2-devkitm-1"),
     # Diff-Power receiver telemetry
     ("ultra telemetry minimal (receivers: every board, on the hub's device)", ULTRA + TELEMETRY + RX_UART, True, None),
+    # Diff-Power ports
+    ("diffpower port minimal", DP_PORT.replace("    detect_pin: GPIO27\n", ""), True, None),
+    (
+        "diffpower port: a plain light with its own turn-off period, options",
+        DP_PORT + "    standby_after: 5min\n    hotplug_delay: 2s\n    boot_margin: 300ms\n    notice_time: 250ms\n"
+        "    min_off_time: 2s\n    min_on_time: 5min\n    power_mode: always_on\n"
+        "    lights:\n      - id: mono\n        standby_after: 30min\n    standby_cycles: false\n"
+        "    standby_hours:\n      name: Port 1 standby\n    detect_drops: false\n" + DP_MONO,
+        True,
+        None,
+    ),
+    ("diffpower during_dark without a sun", DP_PORT + "    power_mode: during_dark\n", False, "needs a sun_id"),
+    (
+        "diffpower during_dark with the sun",
+        DP_PORT + "    power_mode: during_dark\n    sun_id: s\n    dark_before: 30min\n    dark_after: 2h\n"
+        "    time_unknown: standby\n" + DP_SUN,
+        True,
+        None,
+    ),
+    ("diffpower time_unknown bogus", DP_PORT + "    time_unknown: maybe\n", False, "time_unknown"),
+    ("diffpower notice_time too short", DP_PORT + "    notice_time: 100ms\n", False, "notice_time"),
+    ("diffpower power mode bogus", DP_PORT + "    power_mode: sometimes\n", False, "power_mode"),
+    ("diffpower turn-off period too long", DP_PORT + "    standby_after: 2d\n", False, "standby_after"),
+    ("diffpower unknown light", DP_PORT + "    lights: [nope]\n", False, "Couldn't find ID 'nope'"),
+    # review-r8/portmgr-gpt 8: the off time at least 1 s; a light's turn-off period at most 24 h; wake targets on a port
+    ("diffpower min_off_time 0", DP_PORT + "    min_off_time: 0ms\n", False, "min_off_time"),
+    ("diffpower min_off_time 500 ms", DP_PORT + "    min_off_time: 500ms\n", False, "min_off_time"),
+    (
+        "diffpower light turn-off period 60 days",
+        DP_PORT + "    lights:\n      - id: mono\n        standby_after: 60d\n" + DP_MONO,
+        False,
+        "standby_after",
+    ),
+    (
+        "diffpower.wake: a light on no port",
+        DP_PORT + DP_MONO + DP_WAKE.format(light="mono"),
+        False,
+        "light 'mono' is on no Diff-Power port",
+    ),
+    (
+        "diffpower.wake: a light of an Ultra line on a port",
+        DP_PORT + ULTRA + "  port: p1\n" + "light:\n  - platform: dig2analog_ultra\n    id: l1\n    name: l1\n"
+        "    board: 0\n    channel: 1\n" + DP_WAKE.format(light="l1"),
+        True,
+        None,
+    ),
+    (
+        "diffpower.wake: a light of an Ultra line without a port",
+        DP_PORT + ULTRA + "light:\n  - platform: dig2analog_ultra\n    id: l1\n    name: l1\n"
+        "    board: 0\n    channel: 1\n" + DP_WAKE.format(light="l1"),
+        False,
+        "light 'l1' is on no Diff-Power port",
+    ),
+    # portmgr-gpt 9: a partition of a strip on the port is the port's too (its pixels)
+    (
+        "diffpower: a strip on a port, wake by its partition",
+        DP_PORT + "    lights: [strip]\n" + DP_STRIP + DP_WAKE.format(light="part"),
+        True,
+        None,
+    ),
+    # portmgr-gpt 10: two ports with one name (their entities off): accepted, their counters kept apart by id
+    (
+        "diffpower two ports with one name",
+        DP_PORT + "    status: false\n    problem: false\n    standby_cycles: false\n    standby_hours: false\n"
+        "    detect_drops: false\n    power_mode_select: false\n"
+        "  - id: p2\n    name: Port 1\n    enable_pin: GPIO32\n    detect_pin: GPIO33\n    status: false\n"
+        "    problem: false\n    standby_cycles: false\n    standby_hours: false\n    detect_drops: false\n"
+        "    power_mode_select: false\n",
+        True,
+        None,
+    ),
+    (
+        "ultra line on a port, a light with its own turn-off period",
+        DP_PORT + ULTRA + "  port: p1\n" + "light:\n  - platform: dig2analog_ultra\n    name: l1\n    board: 0\n"
+        "    channel: 1\n    standby_after: 1h\n",
+        True,
+        None,
+    ),
+    (
+        "ultra line on a port and a power_supply",
+        DP_PORT + ULTRA + "  port: p1\n  power_supply: psu\n" + PSU.format(enable="20ms"),
+        False,
+        "port and power_supply both power the line",
+    ),
+    (
+        "two ultra lines on one port",
+        DP_PORT + "dig2analog_ultra:\n  - id: a\n    pin: GPIO16\n    num_boards: 1\n    port: p1\n"
+        "  - id: b\n    pin: GPIO17\n    num_boards: 1\n    port: p1\n",
+        False,
+        "are both on port 'p1'",
+    ),
+    (
+        "diffpower.wake: ports and lights",
+        DP_PORT + "    lights: [mono]\n" + DP_MONO + "binary_sensor:\n  - platform: gpio\n    pin: GPIO33\n"
+        "    name: motion\n    on_press:\n      - diffpower.wake:\n          ports: [p1]\n          timeout: 3min\n"
+        "      - diffpower.wake:\n          lights: [mono]\n",
+        True,
+        None,
+    ),
+    (
+        "diffpower.wake without ports or lights",
+        DP_PORT + "binary_sensor:\n  - platform: gpio\n    pin: GPIO33\n    name: motion\n    on_press:\n"
+        "      - diffpower.wake:\n          timeout: 3min\n",
+        False,
+        "give ports, lights or both",
+    ),
     # several lines with telemetry: a UART, a port name and a port device each
     ("ultra telemetry on 2 lines, a UART each", tel_lines(2), True, None),
     ("ultra telemetry 2 lines on one UART", tel_lines(2, uarts=[0, 0]), False, "use the same uart 'rx0'"),

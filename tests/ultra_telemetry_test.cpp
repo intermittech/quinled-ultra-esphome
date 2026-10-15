@@ -66,6 +66,7 @@ struct Model {
   uint8_t fm_trip{0}, fm_rst{0};
   uint16_t fm_trip_h{0};
   uint8_t fm_dip_pct{0};
+  uint8_t flash_pending{0};  // DIAG 20 (0.2.6: ULTRA_DG_FP_EXHAUSTED)
   uint32_t diag_parts[3]{};  // DIAG POLLs per part (2: any other)
 
   void set025() {
@@ -204,6 +205,7 @@ struct Model {
           ultra_put16(d + ULTRA_DG_BC_PC, 0x1A2C);
           ultra_put24(d + ULTRA_DG_BC_UPTIME, 12600);
           ultra_put16(d + ULTRA_DG_SUPPLY_Z, this->supply_z);
+          d[ULTRA_DG_FLASH_PENDING] = this->flash_pending;
           d[ULTRA_DG_C10_LOAD] = d[ULTRA_DG_C10_PEAK] = 0xFF;
         } else {
           d[ULTRA_DG_TRIP] = this->fm_trip;
@@ -967,6 +969,97 @@ static void test_025() {
         "a board without the peak counts with its average: %.2f A", pm.peak_a());
 }
 
+/// Energy never goes back (Home Assistant would count a lower total_increasing value as a reset: the whole total again):
+/// the hub's total grows by the receiver's mWh since its power-up; a wake that brings back an older stored lifetime, a
+/// restart, the ESP32's restart (its stored total), another board at the position: never lower, nothing twice.
+static void test_energy() {
+  TelemetryIntervals iv;
+  iv.energy_ms = 2000;
+  Chain c(1);
+  TelemetryPoller p = started(c, 1, ULTRA_RW_RATE_1M, iv);
+  std::vector<float> seen;
+  auto run = [&](TelemetryPoller &q, uint32_t ms) {
+    c.run(q, ms);
+    seen.push_back(telemetry_value(q.data(0), TV_ENERGY));
+  };
+  run(p, 8000);
+  CHECK(std::fabs(seen.back() - 1234.0f) < 1e-3f, "first answer: the receiver's lifetime (%.3f Wh)", seen.back());
+  c.rx[0].boot_mwh += 2500;   // 2.5 Wh used
+  c.rx[0].total_wh += 2;
+  run(p, 8000);
+  CHECK(std::fabs(seen.back() - 1236.5f) < 1e-3f, "+2.5 Wh (its count since power-up, in mWh): %.3f", seen.back());
+  // a wake: the board lost what it hadn't stored (lifetime 1230 again), a new power-up
+  c.rx[0].restart();
+  c.rx[0].total_wh = 1230;
+  c.rx[0].boot_mwh = 300;
+  run(p, 8000);
+  CHECK(std::fabs(seen.back() - 1236.8f) < 1e-3f, "a wake with an older stored lifetime: +0.3 Wh, not back (%.3f)",
+        seen.back());
+  c.rx[0].boot_mwh = 1300;
+  run(p, 8000);
+  CHECK(std::fabs(seen.back() - 1237.8f) < 1e-3f, "then +1.0 Wh (%.3f)", seen.back());
+  // a power-off that didn't cut it (a supply kept on): its count goes on: only the new mWh, never its session again
+  p.unpowered();
+  p.locked(c.now_ms);   // (powered again: the preamble locks the chain)
+  c.rx[0].boot_mwh = 1400;
+  run(p, 8000);
+  CHECK(std::fabs(seen.back() - 1237.9f) < 1e-3f, "a power-off without a cut: +0.1 Wh, not its session twice (%.3f)",
+        seen.back());
+  // the ESP32 restarts: its stored total seeds the new poller; the receiver's lifetime is lower
+  const uint64_t stored = p.energy_mwh(0);
+  TelemetryPoller q = started(c, 1, ULTRA_RW_RATE_1M, iv);
+  q.seed_energy(0, stored);
+  run(q, 8000);
+  CHECK(std::fabs(seen.back() - 1237.9f) < 1e-3f, "after the ESP32's restart: the stored total (%.3f)", seen.back());
+  c.rx[0].boot_mwh += 200;
+  run(q, 8000);
+  CHECK(std::fabs(seen.back() - 1238.1f) < 1e-3f, "and on from there (%.3f)", seen.back());
+  // ... and with the receiver ahead (it stored more while the hub was off): its lifetime
+  TelemetryPoller r = started(c, 1, ULTRA_RW_RATE_1M, iv);
+  r.seed_energy(0, 1000000);
+  c.rx[0].total_wh = 1500;
+  run(r, 8000);
+  CHECK(std::fabs(seen.back() - 1500.0f) < 1e-3f, "the receiver's lifetime ahead of the stored total (%.3f)", seen.back());
+  // another board at the position (a new UID), its own large count: the base, nothing added for it
+  for (auto &b : c.rx[0].uid)
+    b ^= 0x5A;
+  c.rx[0].boot_mwh = 900000;
+  c.rx[0].total_wh = 50;
+  run(r, 8000);
+  const float before = seen.back();
+  c.rx[0].boot_mwh += 100;
+  run(r, 8000);
+  CHECK(std::fabs(before - 1500.0f) < 1e-3f && std::fabs(seen.back() - 1500.1f) < 1e-3f,
+        "another board: nothing added for its count (%.3f), then its use (%.3f)", before, seen.back());
+  bool never_back = true;
+  for (size_t i = 1; i < seen.size(); i++)
+    never_back = never_back && (seen[i] >= seen[i - 1] || i == 7);   // (7: a new poller seeded higher, not lower)
+  CHECK(never_back, "Energy never went back");
+  // negative control: the old rule (the receiver's lifetime, at most up) would have shown 1230 after the restart
+  std::printf("  Energy: never back after a wake, a restart, the ESP32's restart, another board\n");
+}
+
+/// (0.2.6) DIAG 20 bit 7: the receiver's lifetime record held: a note after the Status detail, no problem
+static void test_record_held() {
+  Chain c(1);
+  c.rx[0].set025();
+  c.rx[0].he_flags = ULTRA_HE_F_TESTED;   // (healthy: its status only shows what this note does)
+  c.rx[0].ch2_class = ULTRA_HE_NORMAL;
+  c.rx[0].flash_pending = ULTRA_DG_FP_EXHAUSTED;
+  TelemetryPoller p = started(c, 1);
+  c.run(p, 8000);
+  const ReceiverData &d = p.data(0);
+  CHECK(d.have_diag && receiver_status_notes(d) ==
+                           " Lifetime record held: the receiver saves less often to protect its flash." &&
+            !receiver_status_problem(receiver_status(d, true)),
+        "the record held: '%s', no problem", receiver_status_notes(d).c_str());
+  Chain n(1);
+  n.rx[0].set025();
+  TelemetryPoller q = started(n, 1);
+  n.run(q, 8000);
+  CHECK(q.data(0).have_diag && receiver_status_notes(q.data(0)).empty(), "not held: no note");
+}
+
 static void test_wraps() {
   Chain c(2);
   c.now_ms = 0xFFFF0000u;   // millis() wraps during the run
@@ -988,6 +1081,8 @@ int main() {
   test_long_chain();
   test_unpowered();
   test_wraps();
+  test_energy();
+  test_record_held();
   test_status();
   test_port();
   test_025();

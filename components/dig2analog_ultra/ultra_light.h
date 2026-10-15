@@ -142,6 +142,9 @@ class UltraLight final : public light::LightOutput, public light::LightRemoteVal
   /// board effect runs again, in phase).
   void layer_end(UltraLayer *layer, uint32_t fade_ms);
   bool layer_top(const UltraLayer *layer) const { return !this->layers_.empty() && this->layers_.back() == layer; }
+  /// its own turn-off period on a Diff-Power port (0: the port's)
+  void set_standby_after(uint32_t ms) { this->standby_after_ms_ = ms; }
+  uint32_t get_standby_after() const { return this->standby_after_ms_; }
   /// On, or still fading out on the board (power supply request).
   bool is_lit(uint32_t now_ms) {
     if (this->fading_out_ && static_cast<int32_t>(this->off_until_ms_ - now_ms) <= 0)
@@ -197,6 +200,7 @@ class UltraLight final : public light::LightOutput, public light::LightRemoteVal
   bool sent_{false};
   bool on_{false};
   bool fading_out_{false};  // off_until_ms_ is a fade-out still running (is_lit retires it: no millis() wrap)
+  uint32_t standby_after_ms_{0};
   uint32_t off_until_ms_{0};
   uint16_t last_m_{0}, last_a_[CHANNELS]{}, last_b_[CHANNELS]{};
 

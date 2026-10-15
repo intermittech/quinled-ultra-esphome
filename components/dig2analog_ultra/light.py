@@ -81,6 +81,7 @@ CONF_PERIOD = "period"
 CONF_SATURATION = "saturation"
 CONF_ZERO_MEANS_ZERO = "zero_means_zero"
 CONF_POWER_ON_SCENE = "power_on_scene"
+CONF_STANDBY_AFTER = "standby_after"
 CONF_POWER_ON_EFFECT = "power_on_effect"
 CONF_DIM_TO_WARM = "dim_to_warm"
 CONF_RED_ASSIST = "red_assist"
@@ -395,6 +396,12 @@ CONFIG_SCHEMA = cv.All(
             # The board stores the state this light comes back in (restore_mode / initial_state) and shows it
             # ~30 ms after its own power-up, until ESPHome takes over (cross-fade over default_transition_length).
             cv.Optional(CONF_POWER_ON_SCENE, default=False): cv.boolean,
+            # On a Diff-Power port (the hub's port): the port stays powered this long after this light went off
+            # (instead of the port's standby_after), so it reacts at once when switched again
+            cv.Optional(CONF_STANDBY_AFTER): cv.All(
+                cv.positive_time_period_milliseconds,
+                cv.Range(min=cv.TimePeriod(milliseconds=1), max=cv.TimePeriod(hours=24)),
+            ),
             # One of the light's ultra_* effects, which the board stores and runs from its own power-up (on the
             # brightness / colour given here) until ESPHome takes over: e.g. a candle that works without ESPHome.
             cv.Optional(CONF_POWER_ON_EFFECT): _validate_power_on_effect,
@@ -446,6 +453,8 @@ async def to_code(config: ConfigType) -> None:
         cg.add(var.set_warm_white_temperature(config[CONF_WARM_WHITE_COLOR_TEMPERATURE]))
     if config[CONF_POWER_ON_SCENE]:
         cg.add(var.set_power_on_scene(POWER_ON_SCENE_MODES[str(config[CONF_RESTORE_MODE])]))
+    if CONF_STANDBY_AFTER in config:
+        cg.add(var.set_standby_after(int(config[CONF_STANDBY_AFTER].total_milliseconds)))
     if (dtw := config.get(CONF_DIM_TO_WARM)) is not None:
         points = dtw.get(CONF_POINTS, [])
         if points:

@@ -8,6 +8,9 @@
 
 #include "ultra_core.h"
 
+#ifdef USE_DIFFPOWER
+#include "esphome/components/diffpower/diffpower.h"
+#endif
 #ifdef USE_POWER_SUPPLY
 #include "esphome/components/power_supply/power_supply.h"
 #endif
@@ -57,7 +60,7 @@ class UltraHub final : public Component {
   void set_pin(uint8_t pin) { this->pin_ = pin; }
   void set_inverted(bool inverted) { this->inverted_ = inverted; }
   void set_num_boards(uint16_t n) { this->num_boards_ = n; }
-  void set_light_counts(const std::vector<uint8_t> &counts) { this->light_counts_ = counts; }
+  void set_light_counts(std::vector<uint8_t> counts) { this->light_counts_ = std::move(counts); }
   void set_max_commands(uint8_t n) { this->max_commands_ = n; }
   void set_rmt_symbols(uint32_t n) { this->rmt_symbols_ = n; }
   void set_use_dma(bool use_dma) { this->use_dma_ = use_dma; }
@@ -84,6 +87,24 @@ class UltraHub final : public Component {
     this->psu_keep_on_ms_ = keep_on_time_ms;
   }
 #endif
+#ifdef USE_DIFFPOWER
+  /// The QuinLED Diff-Power port this line is on (diffpower): it wakes while a light here is on (or within its
+  /// turn-off period), and once it is powered everything is sent again; the receivers show Standby while it isn't.
+  void set_port(diffpower::DiffPowerPort *port) { this->port_ = port; }
+  /// A copy of the planned power-off notice (protocol 0.2.6: IDENTIFY 7 POWER_OFF to every board in the next frame,
+  /// ahead of a preamble; its port asks for copy 0, 1, 2, each 50 ms after the last one went out, which the hub
+  /// reports: notice_sent())
+  void send_power_off_notice(uint8_t copy);
+  uint32_t power_off_notices() const { return this->notices_; }
+#endif
+  /// on a Diff-Power port that isn't powered now (standby or waking)
+  bool port_standby() const {
+#ifdef USE_DIFFPOWER
+    return this->port_ != nullptr && !this->port_->is_ready();
+#else
+    return false;
+#endif
+  }
 
   // Board settings (ULTRA_CFG_* ids), board -1 = all boards. Before setup they are the YAML defaults.
   void set_board_config(int board, uint8_t id, uint16_t value);
@@ -183,7 +204,7 @@ class UltraHub final : public Component {
   /// board that takes it blinks its acknowledge pattern, and boards of the second format flash for a few ms.
   void switch_boards_to_ultra(uint8_t boot_protocol);
   uint16_t get_num_boards() const { return this->num_boards_; }
-  bool is_power_ready() const { return !this->power_waiting_; }
+  bool is_power_ready() const { return !this->power_waiting_ && !this->port_standby(); }
 
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
   // Board firmware update (fw_update.h). One session on this line, sent by its own task: the normal frames pause
@@ -216,6 +237,10 @@ class UltraHub final : public Component {
   /// How long a power cycle takes from power_cycle() until the boards have power again: the supply's keep_on_time
   /// (its pin stays high that long after the hub's release), then 1.5 s off.
   uint32_t power_cycle_ms() const {
+#ifdef USE_DIFFPOWER
+    if (this->port_ != nullptr)
+      return this->port_->power_cycle_ms();   // (off, the hot-plug delay, the boot)
+#endif
 #ifdef USE_POWER_SUPPLY
     return this->psu_keep_on_ms_ + 1500;
 #else
@@ -266,6 +291,11 @@ class UltraHub final : public Component {
   const PortMonitor &port_monitor() const { return this->port_monitor_; }
   bool has_telemetry() const { return this->rw_uart_ != nullptr; }
   const TelemetryPoller &telemetry() const { return this->poller_; }
+  /// a receiver's stored Energy total (mWh), at the start: it goes on from there
+  void seed_energy(uint16_t receiver, uint64_t mwh) { this->poller_.seed_energy(receiver, mwh); }
+  /// Its line's power just came back (a port's wake): not heard yet, not missed enough to count as gone (its status:
+  /// Waking, no problem)
+  bool rx_settling(uint16_t receiver) const;
   /// After each response window: (receiver, what changed: ultra_telemetry.h take_updates() bits), for the receivers
   /// whose data changed.
   void add_on_telemetry_callback(std::function<void(uint16_t, uint32_t)> &&callback) {
@@ -321,6 +351,12 @@ class UltraHub final : public Component {
   bool rw_open_{false};                   // a window: nothing goes out before rw_end_us_, the UART is read at rw_read_us_
   int64_t rw_t0_us_{0}, rw_end_us_{0}, rw_read_us_{0};
   bool rw_powered_{true};
+  bool rw_lock_end_{false};               // a lock frame is out: the lock interval from its end (rw_due_)
+  // per receiver: RX_WOKE (its port just woke: its restart is expected), RX_WARNED (no standby support: said once)
+  // RX_SETTLING (its line's power just came back: not heard, not missed enough to be gone)
+  static constexpr uint8_t RX_WOKE = 1, RX_WARNED = 2, RX_SETTLING = 4;
+  std::vector<uint8_t> rx_note_;
+  uint32_t woke_ms_{0};
   uint32_t rw_late_{0};                   // windows where the line was let go of later than ULTRA_RW_RELEASE_US
   uint32_t rw_extra_us_{0};               // a command queued at a window's start waits this much longer (lead_us)
   rmt_symbol_word_t reset_symbol_{}, rw_reset_symbol_{};
@@ -378,6 +414,13 @@ class UltraHub final : public Component {
   uint8_t cal_req_duty_{0};
   uint32_t cal_wait_ms_{0};             // the request waits for the supply since
   bool cal_power_hold_{false};          // the supply stays requested for the run
+#ifdef USE_DIFFPOWER
+  diffpower::DiffPowerPort *port_{nullptr};
+  bool port_attached_{false};           // its loads registered (the first loop: the lights have their states)
+  uint32_t notices_{0};
+  void attach_port_();
+  void pump_notice_();
+#endif
   bool cal_on_boot_{false};
   bool cal_boot_done_{false};
   uint32_t cal_interval_ms_{0};

@@ -523,6 +523,37 @@ class Scheduler {
     it.start_us = NO_START;
     this->queue_(b, key_(ULTRA_LIGHT_BOARD, ULTRA_IDENTIFY, 0));
   }
+  /// A copy of the planned power-off notice (IDENTIFY 7 POWER_OFF, argument 0; its Diff-Power port times them: 0 /
+  /// 50 / 100 ms): the board's supply drops soon. In its slot of the next frame, before anything queued; the first
+  /// copy takes a new SEQ, the others repeat it (the board acts once). Boards before 0.2.6 ignore it.
+  void power_off(uint16_t board, bool first) {
+    if (board >= this->boards_.size())
+      return;
+    Board &b = this->boards_[board];
+    if (first)
+      b.off_seq = this->next_seq_(b, ULTRA_LIGHT_BOARD, ULTRA_IDENTIFY);
+    b.off_left = 1;
+  }
+  /// Boards whose notice copy hasn't gone out yet.
+  uint16_t power_off_left() const {
+    uint16_t n = 0;
+    for (const auto &b : this->boards_)
+      n += b.off_left != 0;
+    return n;
+  }
+  /// The frame just built carried a notice copy (once: the hub reports it once the frame went out).
+  bool take_power_off_sent() {
+    const bool sent = this->off_sent_;
+    this->off_sent_ = false;
+    return sent;
+  }
+  /// A notice copy not sent by now is stale (its port woke again): dropped.
+  void cancel_power_off() {
+    for (auto &b : this->boards_)
+      b.off_left = 0;
+    this->off_sent_ = false;
+  }
+
   /// The board's last IDENTIFY (identify, calibrate, dark, release) still has copies to send.
   bool identify_pending(uint16_t board) const {
     if (board >= this->boards_.size())
@@ -600,19 +631,21 @@ class Scheduler {
   /// Commands waiting to be sent.
   bool pending() const {
     for (const auto &b : this->boards_) {
-      if (!b.queue.empty())
+      if (!b.queue.empty() || b.off_left > 0)
         return true;
     }
     return false;
   }
   size_t queued(uint16_t board) const { return board < this->boards_.size() ? this->boards_[board].queue.size() : 0; }
   /// First copies waiting on a board: frames before a new command's first copy goes out.
-  size_t waiting(uint16_t board) const { return board < this->boards_.size() ? this->boards_[board].unsent : 0; }
+  size_t waiting(uint16_t board) const {
+    return board < this->boards_.size() ? this->boards_[board].unsent + this->boards_[board].off_left : 0;
+  }
   /// ... on the busiest board.
   size_t waiting() const {
     size_t n = 0;
     for (const auto &b : this->boards_)
-      n = b.unsent > n ? b.unsent : n;
+      n = b.unsent + b.off_left > n ? b.unsent + b.off_left : n;
     return n;
   }
   /// The most commands queued for one board since the last call (diagnostics).
@@ -732,6 +765,7 @@ class Scheduler {
     uint8_t urgent_run{0};   // queued commands sent in a row (build_frame: every 16th slot a refresh)
     uint8_t first_unused{ULTRA_LIGHTS};   // light indices from here on are not in the YAML
     uint8_t unsent{0};                    // queued commands of which no copy went out yet
+    uint8_t off_left{0}, off_seq{0};      // the power-off notice: a copy to send, its SEQ
   };
 
   /// The commands that clear a light index not in the YAML (clear_unused_lights), with its current sequence number.
@@ -884,9 +918,13 @@ class Scheduler {
     this->starts_[i] = NO_START;
     this->floors_[i] = 0;
     Board &b = this->boards_[i];
-    // every 16th slot of a board with a continuous stream is a refresh: a board that rebooted meanwhile still gets
-    // its CONFIG and light definitions
-    if (b.urgent_run >= 15 && this->take_refresh_(b, s, i, start_us)) {
+    // the power-off notice first (consecutive frames); every 16th slot of a board with a continuous stream is a
+    // refresh: a board that rebooted meanwhile still gets its CONFIG and light definitions
+    if (b.off_left > 0) {
+      ultra_slot_power_off(s, b.off_seq);
+      b.off_left = 0;
+      this->off_sent_ = true;
+    } else if (b.urgent_run >= 15 && this->take_refresh_(b, s, i, start_us)) {
       b.urgent_run = 0;
     } else if (this->take_urgent_(b, s, i, start_us)) {
       b.urgent_run++;
@@ -1000,6 +1038,7 @@ class Scheduler {
   uint8_t hdr_flags_{0};             // the frame being built: ULTRA_HDR_RW for an RW frame (retime_frame keeps it)
   uint32_t t0h_{250}, t0l_{1050}, t1h_{700}, t1l_{650};
   uint8_t repeats_{3};
+  bool off_sent_{false};        // the frame just built carried a power-off notice copy
   uint32_t order_{0};
   size_t queue_peak_{0};        // the most commands queued for one board (take_queue_peak)
   size_t queue_bytes_{0};       // the queues' heap now, and its peak (take_memory_peak)

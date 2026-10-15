@@ -453,11 +453,62 @@ static void test_gamma_zero() {
   }
 }
 
+// ----------------------------------------------------------------------------------------- the power-off notice
+/// The Diff-Power port's notice (protocol 0.2.6): IDENTIFY 7 POWER_OFF in every board's slot, 3 copies 50 ms apart
+/// (frames at rest between them). A board without standby support (the dig2analog ultra engine built here; firmware
+/// before 0.6.10 on any board) ignores it: its light and its output stay as they were, and an IDENTIFY sent with it
+/// still works. (The Diff-Power receiver's own handling: the firmware's tests.)
+static void test_power_off_ignored() {
+  const uint16_t N = 4;
+  Pin p;
+  p.init(N, 31, 0.0);
+  for (uint16_t b = 0; b < N; b++) {
+    p.s.light_def(b, 0, MONO1, 1000, 0, Z5, ONE5);
+    p.s.light_set(b, 0, 0, static_cast<uint16_t>(20000 + 1000 * b), ONE5, ONE5, 0, 0);
+  }
+  p.boot();
+  p.drain();
+  p.rest(1000);
+  std::vector<uint16_t> before(N);
+  std::vector<uint8_t> ident(N);
+  for (uint16_t b = 0; b < N; b++) {
+    uint16_t out[5];
+    ultra_render(&p.boards[b].u, p.boards[b].tick(p.now_us), out);
+    before[b] = out[0];
+    ident[b] = p.boards[b].u.identify;
+  }
+  p.s.identify(1, true);   // queued with the notice
+  int notice_slots = 0;
+  for (int k = 0; k < 3; k++) {
+    for (uint16_t b = 0; b < N; b++)
+      p.s.power_off(b, k == 0);
+    p.frame();
+    for (uint16_t b = 0; b < N; b++) {
+      const uint8_t *sl = p.f.data() + ULTRA_SLOT_BYTES * b;
+      notice_slots += sl[0] == ULTRA_IDENTIFY && sl[ULTRA_PAYLOAD] == ULTRA_IDENT_POWER_OFF && ultra_slot_check(sl) == 0;
+    }
+    p.rest(50);
+  }
+  bool same = true;
+  for (uint16_t b = 0; b < N; b++) {
+    uint16_t out[5];
+    ultra_render(&p.boards[b].u, p.boards[b].tick(p.now_us), out);
+    same = same && out[0] == before[b] && (b == 1 || p.boards[b].u.identify == ident[b]);
+  }
+  CHECK(notice_slots == 3 * N && same, "the notice in %d of %d slots; the boards ignore it (light, identify unchanged)",
+        notice_slots, 3 * N);
+  CHECK(p.boards[1].u.identify == ULTRA_IDENT_ON, "the IDENTIFY sent with the notice works (board 1: %u)",
+        p.boards[1].u.identify);
+  std::printf("  the power-off notice (IDENTIFY 7, 0.2.6): 3 copies, every board; a board without standby support "
+              "ignores it\n");
+}
+
 int main() {
   test_every_command();
   test_group_phase();
   test_long_running_effect();
   test_gamma_zero();
+  test_power_off_ignored();
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "ALL ULTRA CONTRACT TESTS PASSED", failures);
   return failures ? 1 : 0;
 }

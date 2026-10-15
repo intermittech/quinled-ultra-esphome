@@ -48,12 +48,28 @@ PIECES = {
     ),
     "hub_rw.inc": (
         "dig2analog_ultra.cpp",
-        ["bool UltraHub::rw_due_(", "bool IRAM_ATTR UltraHub::rw_done_isr_(", "void UltraHub::finish_window_(",
-         "void UltraHub::rw_publish_("],
+        ["bool UltraHub::rw_due_(", "bool UltraHub::rx_settling(", "bool IRAM_ATTR UltraHub::rw_done_isr_(",
+         "void UltraHub::finish_window_(", "void UltraHub::rw_publish_("],
+    ),
+    # the Diff-Power port (components/diffpower) and the hub's side of it
+    "diffpower_methods.inc": (
+        "../diffpower/diffpower.cpp",
+        ["void DiffPowerPort::setup(", "void DiffPowerPort::loop(", "void DiffPowerPort::apply_(",
+         "void DiffPowerPort::resend_(",
+         "void DiffPowerPort::save_stats_(", "void DiffPowerPort::publish_(", "void DiffPowerPort::shutdown_all(",
+         "void DiffPowerPort::wake(",
+         "bool DiffPowerPort::has_light(", "uint8_t PowerModeSelect::mode_of_(", "size_t PowerModeSelect::index_of_(",
+         "void PowerModeSelect::setup(", "void PowerModeSelect::control("],
+    ),
+    "hub_port.inc": (
+        "dig2analog_ultra.cpp",
+        ["void UltraHub::attach_port_(", "void UltraHub::send_power_off_notice(", "void UltraHub::pump_notice_(",
+         "bool UltraHub::boards_powered_(", "bool UltraHub::has_power_supply(", "void UltraHub::power_cycle("],
     ),
     "receiver_methods.inc": (
         "ultra_receiver.cpp",
         ["void UltraReceiver::value_(", "void UltraReceiver::text_(", "void UltraReceiver::update_(",
+         "void UltraReceiver::save_energy_(",
          "void UltraTelemetryPort::update_(", "void UltraLightTelemetry::update_("],
     ),
 }

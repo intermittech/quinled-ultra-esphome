@@ -306,18 +306,164 @@ uart:
 """
 
 
+DIFFPOWER_CONFIG = """\
+# tests/build/ultra/ultra-diffpower.yaml: a 4-port QuinLED Diff-Power sender on a classic ESP32 (diffpower): two
+# Ultra lines on ports (one with telemetry), two plain strips on ports, During dark from the sun, a motion pre-wake.
+esphome:
+  name: d2a-diffpower
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+external_components:
+  - source:
+      type: local
+      path: ../../../components
+    components: [dig2analog_ultra, diffpower]
+
+logger:
+api:
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+sun:
+  id: sun_
+  latitude: 52.1
+  longitude: 5.1
+
+uart:
+  - id: rs485_rx
+    rx_pin: GPIO34
+    baud_rate: 1000000
+    rx_buffer_size: 1024
+
+diffpower:
+  - id: port1
+    name: Port 1
+    enable_pin: GPIO25
+    detect_pin: GPIO35
+    power_mode: during_dark
+    sun_id: sun_
+    dark_before: 45min
+    dark_after: 30min
+  - id: port2
+    name: Port 2
+    enable_pin: GPIO26
+    detect_pin: GPIO36
+    standby_after: 30min
+  - id: port3
+    name: Port 3
+    enable_pin: GPIO27
+    detect_pin: GPIO39
+    lights: [hall_strip]
+  - id: port4
+    name: Port 4
+    enable_pin: GPIO14
+    detect_pin: GPIO32
+    power_mode: always_on
+    lights:
+      - id: garden_strip
+        standby_after: 1h
+
+dig2analog_ultra:
+  - id: line1
+    pin: GPIO16
+    num_boards: 2
+    rmt_symbols: 128
+    port: port1
+    telemetry:
+      uart_id: rs485_rx
+      name: Port 1
+      direction_pin: GPIO4
+  - id: line2
+    pin: GPIO17
+    num_boards: 1
+    rmt_symbols: 128
+    port: port2
+
+light:
+  - platform: dig2analog_ultra
+    dig2analog_ultra_id: line1
+    name: Living cove
+    board: 0
+    red: 1
+    green: 2
+    blue: 3
+    cold_white: 4
+    warm_white: 5
+  - platform: dig2analog_ultra
+    dig2analog_ultra_id: line1
+    name: Shelf 1
+    board: 1
+    channel: 1
+    standby_after: 1h
+  - platform: dig2analog_ultra
+    dig2analog_ultra_id: line1
+    name: Shelf 2
+    board: 1
+    channel: 2
+  - platform: dig2analog_ultra
+    dig2analog_ultra_id: line2
+    name: Kitchen
+    board: 0
+    cold_white: 1
+    warm_white: 2
+  - platform: esp32_rmt_led_strip
+    id: hall_strip
+    name: Hall strip
+    pin: GPIO18
+    num_leds: 30
+    chipset: ws2812
+    rgb_order: GRB
+    rmt_symbols: 64
+  - platform: partition              # (its pixels are the hall strip's: the port powers it too)
+    id: hall_door
+    name: Hall door
+    segments:
+      - id: hall_strip
+        from: 0
+        to: 9
+  - platform: esp32_rmt_led_strip
+    id: garden_strip
+    name: Garden strip
+    pin: GPIO19
+    num_leds: 60
+    chipset: ws2812
+    rgb_order: GRB
+    rmt_symbols: 64
+
+binary_sensor:
+  - platform: gpio
+    pin: GPIO33
+    name: Hall motion
+    on_press:
+      - diffpower.wake:
+          lights: [hall_strip]
+          timeout: 2min
+"""
+
+
 def p4_telemetry_config() -> str:
     """tests/build/ultra/ultra-p4-telemetry.yaml: a larger sender on an ESP32-P4: 4 data lines, each with telemetry on
     a UART of its own (2 receivers each, devices per receiver), within the P4's RMT (3 lines of 48 symbols and one with
     DMA: 4 transmit channels) and its UARTs (5; the log on USB Serial/JTAG)."""
-    devices, uarts, hubs, lights = "", "", "", ""
+    devices, uarts, hubs, lights, ports = "", "", "", "", ""
     for k in range(1, 5):
         devices += (f"    - id: p{k}_r1\n      name: Port {k} receiver 1\n"
                     f"    - id: p{k}_r2\n      name: Port {k} receiver 2\n")
         uarts += (f"  - id: rs485_rx{k}\n    rx_pin: GPIO{25 + k}\n    baud_rate: 1000000\n"
                   f"    rx_buffer_size: 1024\n")
         rmt = "    use_dma: true\n" if k == 4 else "    rmt_symbols: 48\n"
-        hubs += (f"  - id: port{k}\n    pin: GPIO{19 + k}\n    num_boards: 2\n{rmt}    telemetry:\n"
+        ports += (f"  - id: dp{k}\n    name: Port {k}\n    enable_pin: GPIO{43 + k}\n"
+                  f"    detect_pin: GPIO{47 + k}\n")
+        hubs += (f"  - id: port{k}\n    pin: GPIO{19 + k}\n    num_boards: 2\n{rmt}    port: dp{k}\n    telemetry:\n"
                  f"      uart_id: rs485_rx{k}\n      name: Port {k}\n      direction_pin: GPIO{29 + k}\n"
                  f"      receivers:\n        - device_id: p{k}_r1\n        - device_id: p{k}_r2\n")
         lights += (f"  - platform: dig2analog_ultra\n    dig2analog_ultra_id: port{k}\n    name: Port {k} RGBCCT\n"
@@ -329,7 +475,8 @@ def p4_telemetry_config() -> str:
     return ("esphome:\n  name: d2a-ultra-p4\n  devices:\n" + devices +
             "\nesp32:\n  board: esp32-p4_r3\n  framework:\n    type: esp-idf\n\n"
             "external_components:\n  - source:\n      type: local\n      path: ../../../components\n"
-            "    components: [dig2analog_ultra]\n\nlogger:\n\nuart:\n" + uarts +
+            "    components: [dig2analog_ultra, diffpower]\n\nlogger:\n\nuart:\n" + uarts +
+            "\ndiffpower:\n" + ports +
             "\ndig2analog_ultra:\n" + hubs + "\nlight:\n" + lights)
 
 
@@ -399,11 +546,12 @@ def main() -> None:
     (OUT / "ultra-strip.yaml").write_text(strip_config(), encoding="utf-8")
     (OUT / "ultra-telemetry.yaml").write_text(telemetry_config(src), encoding="utf-8")
     (OUT / "ultra-p4-telemetry.yaml").write_text(p4_telemetry_config(), encoding="utf-8")
+    (OUT / "ultra-diffpower.yaml").write_text(DIFFPOWER_CONFIG, encoding="utf-8")
     secrets = OUT / "secrets.yaml"
     if not secrets.exists():
         secrets.write_text('wifi_ssid: "test"\nwifi_password: "testtest"\n', encoding="utf-8")
     print(f"written {OUT / 'ultra-example.yaml'}, {OUT / 'ultra-strip.yaml'}, {OUT / 'ultra-telemetry.yaml'}, "
-          f"{OUT / 'ultra-p4-telemetry.yaml'}")
+          f"{OUT / 'ultra-p4-telemetry.yaml'}, {OUT / 'ultra-diffpower.yaml'}")
 
 
 if __name__ == "__main__":

@@ -71,6 +71,9 @@ CONF_REFRESH_INTERVAL = "refresh_interval"
 CONF_START_DELAY = "start_delay"
 CONF_REPEATS = "repeats"
 CONF_POWER_ON_DELAY = "power_on_delay"
+CONF_PORT = "port"
+# the diffpower component's port, by name (no import: a configuration without diffpower must not need it)
+DiffPowerPort = cg.esphome_ns.namespace("diffpower").class_("DiffPowerPort", cg.Component)
 CONF_PWM_FREQUENCY = "pwm_frequency"
 CONF_DITHERING = "dithering"
 CONF_DITHER_THRESHOLD = "dither_threshold"
@@ -400,6 +403,9 @@ CONFIG_SCHEMA = cv.All(
             # Supply of the boards / LEDs: requested while a light is on; the boards' state is sent again
             # power_on_delay after it switched on (fades that ran in the dark are replayed).
             cv.Optional(CONF_POWER_SUPPLY): cv.use_id(power_supply.PowerSupply),
+            # or: the QuinLED Diff-Power port this line is on (diffpower): woken while a light here is on, and in
+            # standby (4.5 V) after its turn-off period; everything is sent again once it is powered
+            cv.Optional(CONF_PORT): cv.use_id(DiffPowerPort),
             cv.Optional(CONF_POWER_ON_DELAY, default="100ms"): cv.All(
                 cv.positive_time_period_milliseconds,
                 cv.Range(max=cv.TimePeriod(seconds=30)),
@@ -499,10 +505,31 @@ def _validate_rmt_memory(full):
         )
 
 
+def _validate_ports(full):
+    """A line on a Diff-Power port: not also on a power_supply (the port powers it); one line per port."""
+    hubs = full.get("dig2analog_ultra", []) or []
+    seen = {}
+    for conf in hubs if isinstance(hubs, list) else [hubs]:
+        if CONF_PORT not in conf:
+            continue
+        if CONF_POWER_SUPPLY in conf:
+            raise cv.Invalid(
+                f"dig2analog_ultra '{conf[CONF_ID]}': port and power_supply both power the line; give one of them"
+            )
+        port = str(conf[CONF_PORT])
+        if port in seen:
+            raise cv.Invalid(
+                f"dig2analog_ultra '{seen[port]}' and '{conf[CONF_ID]}' are both on port '{port}': a Diff-Power port "
+                "carries one data line"
+            )
+        seen[port] = str(conf[CONF_ID])
+
+
 def _final_validate(configs):
     full = fv.full_config.get()
     _validate_rmt_memory(full)
     validate_telemetry_lines(full)
+    _validate_ports(full)
     for conf in configs if isinstance(configs, list) else [configs]:
         validate_telemetry(full, conf, conf[CONF_NUM_BOARDS])
         # signal_loss off / fade_off: a board switches off after signal_loss_timeout (sent in 100 ms) without a good
@@ -628,6 +655,8 @@ async def to_code(config: ConfigType) -> None:
         interval = int(config[CONF_TRIP_RETRY_INTERVAL].total_seconds) if CONF_TRIP_RETRY_INTERVAL in config else 1
         cg.add(var.set_board_config(-1, CFG_RETRY, count | interval << 8))
 
+    if CONF_PORT in config:
+        cg.add(var.set_port(await cg.get_variable(config[CONF_PORT])))
     if CONF_POWER_SUPPLY in config:
         psu = await cg.get_variable(config[CONF_POWER_SUPPLY])
         cg.add(var.set_power_supply(psu, _keep_on_time_ms(CORE.config, config[CONF_POWER_SUPPLY])))

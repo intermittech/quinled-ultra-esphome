@@ -4,7 +4,10 @@
 // light's setup, a transition cut short, its power request after weeks; the update's install queue, chunked downloads
 // and the confirmation frames after a session; a frame the RMT refuses; the recovery's power cycle on ESPHome's power
 // supply (its keep-on time); auto_retry: the sessions after an install (blind, and from the receivers' versions), its
-// status texts, never with force, never after an abort. Logic only: no ESP-IDF, no timing.
+// status texts, never with force, never after an abort; a Diff-Power port (its pins, a plain light's state sent again
+// once powered, the notice before the enable drops, OTA, the power mode select) and an Ultra line on one (its lights
+// and holds as the port's loads, its replay when powered, Standby in its receivers' entities). Logic only: no ESP-IDF,
+// no timing.
 // Build: python tests/run_ultra_lifecycle_test.py   (uses the ziglang pip package as C/C++ compiler)
 
 #include "../components/dig2analog_ultra/ultra_core.h"
@@ -12,6 +15,7 @@
 #include "../components/dig2analog_ultra/update_retry.h"
 #include "../components/dig2analog_ultra/update_session.h"
 #include "../components/dig2analog_ultra/ultra_telemetry.h"
+#include "../components/diffpower/diffpower_core.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1034,6 +1038,7 @@ static void test_update_lead_in() {
 namespace hub_rw {
 
 #define USE_DIG2ANALOG_ULTRA_TELEMETRY
+#define USE_DIFFPOWER   // (rw_publish_'s standby support warning; the port itself: a stand-in)
 #define IRAM_ATTR
 typedef int rmt_channel_handle_t;
 struct rmt_tx_done_event_data_t {
@@ -1160,7 +1165,18 @@ struct UltraHub {
   uint32_t rw_window_us_{0};
   bool rw_open_{false};
   int64_t rw_t0_us_{0}, rw_end_us_{0}, rw_read_us_{0};
-  bool rw_powered_{true};
+  bool rw_powered_{true}, rw_lock_end_{false};
+  static constexpr uint8_t RX_WOKE = 1, RX_WARNED = 2, RX_SETTLING = 4;
+  std::vector<uint8_t> rx_note_;
+  bool rx_settling(uint16_t receiver) const;   // (hub_rw.inc)
+  bool port_standby() const { return this->port_ != nullptr && !this->powered; }
+  uint32_t woke_ms_{0};
+  struct PortStub {   // (a Diff-Power port: whether there is one, its notice copies out)
+    int sent{0};
+    void notice_sent() { this->sent++; }
+  } *port_{nullptr};
+  bool port_attached_{true};
+  void attach_port_() {}
   uint32_t rw_late_{0}, rw_extra_us_{0};
   rmt_symbol_word_t reset_symbol_{}, rw_reset_symbol_{};
   struct {
@@ -1250,6 +1266,7 @@ static esp_err_t rmt_transmit(int ch, int, const uint8_t *data, size_t n, const 
         d[ULTRA_ST_MEASURED] = ULTRA_ST_M_VBUS;
       } else if (page == ULTRA_PAGE_IDENTITY) {
         d[0] = static_cast<uint8_t>(b + 1);
+        ultra_put32(d + ULTRA_ID_FEATURES, b == 1 ? ULTRA_FEAT_STANDBY : 0u);   // (receiver 1: 0.2.6 standby support)
       } else {
         page = ULTRA_PAGE_UNSUPPORTED;
       }
@@ -1310,8 +1327,11 @@ static void test_telemetry_window() {
   std::vector<std::pair<uint16_t, uint32_t>> calls;
   h.rw_callback_.f.push_back([&](uint16_t r, uint32_t u) { calls.push_back({r, u}); });
   run_us(h, uart, 3000000);
-  // the preamble went out first, the first RW frame at least 1 s after its last frame
-  const int64_t last_dark = rmt.sent.size() > 3 ? rmt.sent[2].at_us : -1;   // the preamble: the first 3 frames
+  // the preamble went out first, the first RW frame at least 1 s after its last frame's end (its header and reset)
+  const int64_t last_dark =
+      rmt.sent.size() > 3 ? rmt.sent[2].at_us + static_cast<int64_t>(rmt.sent[2].frame.size()) * 8 * 1300 / 1000 +
+                                rmt.sent[2].reset_ticks / 80
+                          : -1;   // the preamble: the first 3 frames
   int64_t first_rw = -1;
   for (const Sent &s : rmt.sent) {
     if (is_rw(s) && first_rw < 0)
@@ -1411,6 +1431,16 @@ static void test_telemetry_window() {
   CHECK(gone && !h.poller_.answering(0) &&
             static_cast<size_t>(std::count_if(rmt.sent.begin(), rmt.sent.end(), is_rw)) == rw0,
         "the supply off: the receivers unavailable, no polls");
+  // power back: every receiver's sensors at once (a Diff-Power port's Standby gone; the status follows the answers)
+  calls.clear();
+  h.powered = true;
+  run_us(h, uart, 20000);
+  bool touched0 = false, touched1 = false;
+  for (auto &c : calls) {
+    touched0 |= c.first == 0 && (c.second & TU_AVAILABILITY);
+    touched1 |= c.first == 1 && (c.second & TU_AVAILABILITY);
+  }
+  CHECK(touched0 && touched1, "power back: every receiver's sensors refreshed at once");
   UltraHub::hubs_.clear();
   now_ms = 0;
   std::printf("  telemetry: %d RW frames on a 4-board line, 2 receivers, every window held and read\n", rw_frames);
@@ -1493,7 +1523,116 @@ static void test_several_lines() {
   std::printf("  telemetry: %d lines polling at once, %d samples with overlapping windows\n", N, overlap);
 }
 
+/// A hub on a Diff-Power port (rw_publish_): a receiver without ULTRA_FEAT_STANDBY (0.2.6) is warned about once, one
+/// with it not; without a port nobody is.
+static void test_standby_support() {
+  for (bool on_port : {true, false}) {
+    clock_us = 0;
+    now_ms = 0;
+    rmt = Rmt();
+    answers = Answers();
+    UltraHub::hubs_.clear();
+    Uart uart;
+    Pin pin;
+    UltraHub h;
+    rmt.hub = &h;
+    UltraHub::PortStub port;
+    h.port_ = on_port ? &port : nullptr;
+    h.start(&uart, &pin);
+    h.rx_note_.assign(2, UltraHub::RX_WOKE);   // (as the port's ready callback)
+    run_us(h, uart, 4000000);
+    const bool warned0 = h.rx_note_[0] & UltraHub::RX_WARNED, warned1 = h.rx_note_[1] & UltraHub::RX_WARNED;
+    CHECK(h.poller_.data(0).have_identity && h.poller_.data(1).have_identity && warned0 == on_port && !warned1,
+          "%s: receiver 0 (no standby support) warned %d, receiver 1 (with it) %d", on_port ? "on a port" : "no port",
+          warned0, warned1);
+  }
+  UltraHub::hubs_.clear();
+  now_ms = 0;
+  std::printf("  telemetry: a receiver without standby support warned about once (on a Diff-Power port)\n");
+}
+
+/// After a wake (portmgr-gpt 3): every receiver settling (Waking: no problem) until it answers, or misses enough to be
+/// gone; then its status at once (a callback), and none of it logged as "doesn't answer".
+static void test_wake_settling() {
+  for (bool answer : {true, false}) {
+    clock_us = 0;
+    now_ms = 0;
+    rmt = Rmt();
+    answers = Answers();
+    UltraHub::hubs_.clear();
+    Uart uart;
+    Pin pin;
+    UltraHub h;
+    rmt.hub = &h;
+    UltraHub::PortStub port;
+    h.port_ = &port;
+    h.start(&uart, &pin);
+    run_us(h, uart, 4000000);
+    CHECK(h.poller_.answering(0) && h.poller_.answering(1) && !h.rx_settling(0), "powered: both answer");
+    h.powered = false;   // the port sleeps
+    run_us(h, uart, 1000000);
+    receivers_on = answer;
+    std::vector<uint32_t> after;
+    h.rw_callback_.f.push_back([&](uint16_t i, uint32_t u) {
+      if (h.powered && (u & TU_AVAILABILITY))
+        after.push_back(i);
+    });
+    h.powered = true;   // its wake: the preamble again
+    h.resync();
+    run_us(h, uart, 50000);
+    CHECK(h.rx_settling(0) && h.rx_settling(1) && !h.poller_.answering(0) &&
+              !receiver_status_problem(RS_WAKING) && after.size() == 2,
+          "just woken: both settling (Waking), their status published as such");
+    run_us(h, uart, 12000000);
+    CHECK(!h.rx_settling(0) && !h.rx_settling(1) && h.poller_.answering(0) == answer && after.size() >= 4,
+          "%s: settled (%u status updates)", answer ? "they answer" : "silent: 3 misses, gone",
+          static_cast<unsigned>(after.size()));
+    receivers_on = true;
+  }
+  UltraHub::hubs_.clear();
+  now_ms = 0;
+  std::printf("  telemetry: after a wake the receivers show Waking until they answer or miss 3 polls\n");
+}
+
+/// The lock interval runs from the last lock frame's end (portmgr-gpt 14): 64 boards; and with its frame refused once
+static void test_lock_from_end() {
+  for (bool refuse : {false, true}) {
+    clock_us = 0;
+    now_ms = 0;
+    rmt = Rmt();
+    answers = Answers();
+    UltraHub::hubs_.clear();
+    Uart uart;
+    Pin pin;
+    UltraHub h;
+    h.num_boards_ = 64;
+    rmt.hub = &h;
+    h.start(&uart, &pin);
+    if (refuse) {
+      while (h.preamble_ > 1)
+        run_us(h, uart, 50);
+      rmt.refuse = 1;   // the last preamble frame refused once
+    }
+    run_us(h, uart, 4000000);
+    const Sent &last = rmt.sent[2];   // (the stand-in's preamble: 3 frames)
+    const int64_t end = last.at_us + static_cast<int64_t>(last.frame.size()) * 8 * 1300 / 1000 + last.reset_ticks / 80;
+    int64_t first = -1;
+    for (const Sent &s : rmt.sent) {
+      if (is_rw(s)) {
+        first = s.at_us;
+        break;
+      }
+    }
+    CHECK(first >= end + 1000000, "%s: the first RW frame %lld us after the last preamble frame's end",
+          refuse ? "its last frame refused once" : "64 boards", static_cast<long long>(first - end));
+  }
+  UltraHub::hubs_.clear();
+  now_ms = 0;
+  std::printf("  telemetry: the lock interval from the last preamble frame's end (64 boards, a refusal)\n");
+}
+
 #undef USE_DIG2ANALOG_ULTRA_TELEMETRY
+#undef USE_DIFFPOWER
 #undef IRAM_ATTR
 
 }  // namespace hub_rw
@@ -1539,8 +1678,12 @@ struct BinarySensor {
 struct UltraHub {
   TelemetryPoller p;
   PortMonitor m;
+  bool standby{false};    // its Diff-Power port in standby
+  bool settling{false};   // ... just woken: the receivers not heard yet
   const TelemetryPoller &telemetry() const { return this->p; }
   const PortMonitor &port_monitor() const { return this->m; }
+  bool port_standby() const { return this->standby; }
+  bool rx_settling(uint16_t) const { return this->settling; }
 };
 
 #include "receiver_consts.inc"
@@ -1557,8 +1700,20 @@ struct UltraReceiver {   // as ultra_receiver.h
   void update_(uint32_t updates);
   void value_(uint8_t which, float v);
   void text_(uint8_t which, const std::string &s);
+  void save_energy_(bool now);
   UltraHub *hub_{nullptr};
   uint16_t board_{0};
+  struct {
+    uint64_t v{0};
+    int saves{0};
+    bool save(const uint64_t *p) {
+      this->v = *p;
+      this->saves++;
+      return true;
+    }
+  } energy_pref_;
+  uint64_t energy_saved_{0};
+  uint32_t energy_saved_ms_{0};
   sensor::Sensor *values_[VALUE_COUNT]{};
   text_sensor::TextSensor *texts_[TEXT_COUNT]{};
   binary_sensor::BinarySensor *problem_{nullptr};
@@ -1618,6 +1773,7 @@ static void answer(const uint8_t *s, uint16_t uid, const ReceiverData &model, ui
   } else if (page == ULTRA_PAGE_DIAG && s[ULTRA_POLL_ARG] == 0) {
     d[ULTRA_DG_BC_CAUSE] = 0xFF;
     ultra_put16(d + ULTRA_DG_SUPPLY_Z, model.supply_z_mohm);
+    d[ULTRA_DG_FLASH_PENDING] = model.flash_pending;
   } else if (page == ULTRA_PAGE_DIAG && s[ULTRA_POLL_ARG] == 1) {
     d[ULTRA_DG_TRIP] = model.fm_trip;
     ultra_put16(d + ULTRA_DG_TRIP_LIT_H, model.fm_trip_lit_h);
@@ -1701,6 +1857,7 @@ static void test_receiver_entities() {
   model[1].lt_dips = 2;
   model[1].supply_z_mohm = 95;
   model[1].fm_trip = 1 | 25 << 2;   // a short at 12.5 A, at 1100 lit hours
+  model[1].flash_pending = ULTRA_DG_FP_EXHAUSTED;   // (0.2.6) its lifetime record held
   model[1].fm_trip_lit_h = 1100;
   uint8_t why = 0;
   bool silent0 = false;
@@ -1763,6 +1920,19 @@ static void test_receiver_entities() {
             light_energy.has_state(),
         "a light's estimate: %.2f W, status '%s'", light_power.state, light_status.state.c_str());
   // (Power: unavailable, then V x I from STATUS, then ENERGY's own; STATUS came ~6 times)
+  // (0.2.6) receiver 2's lifetime record held: a note after its Status detail, no problem; receiver 1 none
+  CHECK(texts[1][UltraReceiver::STATUS_DETAIL].state.find("Lifetime record held: the receiver saves less often") !=
+                std::string::npos &&
+            texts[0][UltraReceiver::STATUS_DETAIL].state.find("Lifetime record held") == std::string::npos,
+        "the record held: '%s'", texts[1][UltraReceiver::STATUS_DETAIL].state.c_str());
+  // its Energy total stored at most hourly, and at a reboot (on_shutdown)
+  CHECK(vals[0][UltraReceiver::ENERGY].state == 1234.0f && rx[0].energy_pref_.saves == 0,
+        "Energy %.1f Wh, not stored within the hour", vals[0][UltraReceiver::ENERGY].state);
+  rx[0].save_energy_(true);
+  CHECK(rx[0].energy_pref_.saves == 1 && rx[0].energy_pref_.v == 1234000, "stored at a reboot: %u mWh",
+        static_cast<unsigned>(rx[0].energy_pref_.v));
+  rx[0].save_energy_(true);
+  CHECK(rx[0].energy_pref_.saves == 1, "unchanged: not again");
   CHECK(vals[0][UltraReceiver::UPTIME].publishes == 1 && vals[0][UltraReceiver::POWER].publishes <= 3,
         "the uptime at most once a minute, unchanged values not again (%d, %d)",
         vals[0][UltraReceiver::UPTIME].publishes, vals[0][UltraReceiver::POWER].publishes);
@@ -1820,11 +1990,831 @@ static void test_receiver_entities() {
   run(20000);
   CHECK(texts[0][UltraReceiver::STATUS].state == "OK" && port_receivers.state == "2 of 2 answering",
         "back: '%s', '%s'", texts[0][UltraReceiver::STATUS].state.c_str(), port_receivers.state.c_str());
+
+  // the line's Diff-Power port in standby: the receivers can't answer, and that's no problem (the hub's rw_due_
+  // touches every receiver when the power changes)
+  hub.standby = true;
+  silent0 = true;
+  hub.p.touch_all();
+  run(30000);
+  CHECK(texts[0][UltraReceiver::STATUS].state == "Standby" && !problems[0].state && !problems[1].state &&
+            texts[1][UltraReceiver::STATUS].state == "Standby" && !port_problem.state &&
+            port_texts[UltraTelemetryPort::STATUS].state == "Standby" && light_status.state == "Standby",
+        "port in standby: '%s' / '%s', problems %d %d, port '%s' (%d), light '%s'",
+        texts[0][UltraReceiver::STATUS].state.c_str(), texts[1][UltraReceiver::STATUS].state.c_str(), problems[0].state,
+        problems[1].state, port_texts[UltraTelemetryPort::STATUS].state.c_str(), port_problem.state,
+        light_status.state.c_str());
+  CHECK(vals[1][UltraReceiver::POWER].state == 0.0f && vals[1][UltraReceiver::INPUT_CURRENT].state == 0.0f &&
+            std::isnan(vals[1][UltraReceiver::BUS_VOLTAGE].state) &&
+            std::isnan(vals[1][UltraReceiver::MCU_TEMPERATURE].state) &&
+            !std::isnan(vals[1][UltraReceiver::ENERGY].state) && port_power.state == 0.0f &&
+            port_values[UltraTelemetryPort::CURRENT].state == 0.0f &&
+            std::isnan(port_values[UltraTelemetryPort::LOAD].state) && light_power.state == 0.0f,
+        "port in standby: Power / Current 0 (receiver %.1f W, port %.1f W, light %.1f W), the rest unknown, Energy "
+        "kept (%.1f)",
+        vals[1][UltraReceiver::POWER].state, port_power.state, light_power.state, vals[1][UltraReceiver::ENERGY].state);
+  // just woken, not heard yet: Waking and no problem (receivers, light, port), not No answer (portmgr-gpt 3)
+  hub.standby = false;
+  hub.settling = true;
+  hub.p.touch_all();
+  run(30000);
+  CHECK(texts[0][UltraReceiver::STATUS].state == "Waking" && texts[1][UltraReceiver::STATUS].state == "Waking" &&
+            !problems[0].state && !problems[1].state && !port_problem.state &&
+            port_texts[UltraTelemetryPort::STATUS].state == "Waking" && light_status.state == "Waking",
+        "just woken: '%s' / '%s', problems %d %d, port '%s' (%d), light '%s'",
+        texts[0][UltraReceiver::STATUS].state.c_str(), texts[1][UltraReceiver::STATUS].state.c_str(), problems[0].state,
+        problems[1].state, port_texts[UltraTelemetryPort::STATUS].state.c_str(), port_problem.state,
+        light_status.state.c_str());
+  hub.settling = false;
+  // negative control: powered again (evaluated), silent: No answer and a problem as before
+  hub.p.touch_all();
+  run(30000);
+  CHECK(texts[0][UltraReceiver::STATUS].state == "No answer" && problems[0].state && port_problem.state,
+        "powered and silent: No answer again");
+  silent0 = false;
+  run(20000);
   now_ms = 0;
   std::printf("  receiver entities: Status / Problem / detail, values, the port's summary, a light's estimate\n");
 }
 
 }  // namespace receiver_entities
+
+// ================================================================================================ Diff-Power port
+// components/diffpower/diffpower.cpp's methods (build/lifecycle/diffpower_methods.inc) on the real PortCore: the
+// enable / detect pins, a plain light (any ESPHome light) and its state sent again once the port is powered, the
+// notice's copies asked one at a time and timed from their delivery (a modelled hub), the status texts, the counters
+// (saved, kept apart per port id), the select's restore, and the shutdown hook: 2 ports on and 1 in standby, a port
+// already in its notice, 4 slow transmitters, a quiet port's standby time (review-r8/portmgr-gpt 1, 4, 10, 11, 13).
+namespace port_power {
+#define USE_TEXT_SENSOR
+#define USE_BINARY_SENSOR
+#define USE_SENSOR
+#define USE_SELECT
+using namespace ::esphome::diffpower;
+
+struct Pin {
+  bool level{false};
+  int writes{0};
+  uint32_t changed_at{0};
+  void setup() {}
+  void digital_write(bool v) {
+    if (v != this->level)
+      this->changed_at = now_ms;
+    this->level = v;
+    this->writes++;
+  }
+  bool digital_read() const { return this->level; }
+};
+struct LightState;
+struct LightOutput {
+  int writes{0};
+  void write_state(LightState *) { this->writes++; }
+};
+struct Values {
+  bool on{false};
+  bool is_on() const { return this->on; }
+};
+struct LightState {   // a plain ESPHome light (its output, its target and current values)
+  Values current_values, remote_values;
+  LightOutput out;
+  LightOutput *get_output() { return &this->out; }
+};
+struct TextSensor {
+  std::string state;
+  bool has{false};
+  std::vector<std::string> history;
+  bool has_state() const { return this->has; }
+  void publish_state(const std::string &s) {
+    if (this->history.empty() || this->history.back() != s)
+      this->history.push_back(s);
+    this->state = s;
+    this->has = true;
+  }
+};
+struct BinarySensor {
+  bool state{false};
+  void publish_state(bool v) { this->state = v; }
+};
+struct Sensor {
+  float state{NAN};
+  bool has{false};
+  bool has_state() const { return this->has; }
+  void publish_state(float v) {
+    this->state = v;
+    this->has = true;
+  }
+};
+namespace light {
+using LightState = port_power::LightState;
+}
+namespace text_sensor {
+using TextSensor = port_power::TextSensor;
+}
+namespace binary_sensor {
+using BinarySensor = port_power::BinarySensor;
+}
+namespace sensor {
+using Sensor = port_power::Sensor;
+}
+struct Callbacks {
+  std::vector<std::function<void()>> f;
+  void call() {
+    for (auto &x : this->f)
+      x();
+  }
+  uint16_t size() const { return static_cast<uint16_t>(this->f.size()); }
+};
+struct NoticeCallbacks {
+  std::vector<std::function<void(uint8_t)>> f;
+  void call(uint8_t copy) {
+    for (auto &x : this->f)
+      x(copy);
+  }
+  uint16_t size() const { return static_cast<uint16_t>(this->f.size()); }
+};
+static const char *const TAG = "diffpower";
+static const uint32_t RESEND_MS[] = {300, 1000};
+static constexpr uint32_t MINUTE_MS = 60000;
+static constexpr uint32_t SAVE_STANDBY_S = 600;
+static constexpr uint32_t SHUTDOWN_MAX_MS = 1100;
+// the shutdown's stand-ins: delay() lets the time pass, the watchdog; the preferences (a store by key, its sync)
+static void delay(uint32_t ms) { now_ms += ms; }
+struct AppStub {
+  void feed_wdt() {}
+};
+static AppStub App;
+struct PortStats {
+  uint32_t cycles, standby_s, drops;
+};
+static std::vector<std::pair<uint32_t, PortStats>> stored;   // the ESP32's preferences: key -> counters
+struct StatsPref {
+  uint32_t key{0};
+  PortStats v{};
+  int saves{0};
+  bool load(PortStats *s) {
+    for (const auto &e : stored) {
+      if (e.first == this->key) {
+        *s = e.second;
+        return true;
+      }
+    }
+    return false;
+  }
+  bool save(const PortStats *s) {
+    this->v = *s;
+    this->saves++;
+    for (auto &e : stored) {
+      if (e.first == this->key) {
+        e.second = *s;
+        return true;
+      }
+    }
+    stored.push_back({this->key, *s});
+    return true;
+  }
+};
+struct Prefs {
+  int syncs{0};
+  bool sync() {
+    this->syncs++;
+    return true;
+  }
+  template<typename T> StatsPref make_preference(uint32_t key) {
+    StatsPref p;
+    p.key = key;
+    return p;
+  }
+};
+static Prefs prefs;
+static Prefs *const global_preferences = &prefs;
+static uint32_t fnv1_hash(const std::string &s) {
+  uint32_t h = 2166136261u;
+  for (char c : s) {
+    h *= 16777619u;
+    h ^= static_cast<uint8_t>(c);
+  }
+  return h;
+}
+
+struct DiffPowerPort {
+  struct LoadRef {
+    std::function<bool(uint32_t)> lit;
+    LightState *light;
+    bool resend;
+  };
+  using Stats = PortStats;
+  // the component's (build/lifecycle/diffpower_methods.inc)
+  void setup();
+  void loop();
+  void apply_(uint8_t ev, uint32_t now);
+  void resend_();
+  void save_stats_();
+  void publish_();
+  static void shutdown_all();
+  void wake(uint32_t timeout_ms);
+  bool has_light(LightState *light) const;
+  // as diffpower.h
+  void add_light(LightState *light, uint32_t hold_ms) {
+    this->core_.add_load(hold_ms);
+    this->loads_.push_back(
+        LoadRef{[light](uint32_t) { return light->current_values.is_on() || light->remote_values.is_on(); }, light, true});
+  }
+  void add_on_notice_callback(std::function<void(uint8_t)> &&cb) { this->notice_cb_.f.push_back(std::move(cb)); }
+  void add_on_pump_callback(std::function<void()> &&cb) { this->pump_cb_.f.push_back(std::move(cb)); }
+  void notice_sent() { this->core_.notice_sent(millis()); }
+  bool has_sun() const { return this->sun; }
+  void set_mode(uint8_t mode) { this->core_.set_mode(static_cast<PowerMode>(mode)); }
+  uint8_t get_mode() const { return this->core_.mode(); }
+  // stand-ins
+  bool sun{false};
+  void update_dark_(uint32_t) {}
+  struct Timer {
+    uint32_t at;
+    std::function<void()> f;
+  };
+  std::vector<Timer> timers;
+  void set_timeout(uint32_t ms, std::function<void()> &&f) { this->timers.push_back(Timer{now_ms + ms, std::move(f)}); }
+  void run_timers() {
+    for (size_t i = 0; i < this->timers.size();) {
+      if (static_cast<int32_t>(now_ms - this->timers[i].at) >= 0) {
+        auto f = std::move(this->timers[i].f);
+        this->timers.erase(this->timers.begin() + static_cast<std::ptrdiff_t>(i));
+        f();
+      } else {
+        i++;
+      }
+    }
+  }
+
+  StatsPref stats_pref_;
+  PortCore core_;
+  Pin *enable_pin_{nullptr};
+  Pin *detect_pin_{nullptr};
+  const char *name_{"Port 1"};
+  const char *stats_key_{"port1"};
+  std::vector<LoadRef> loads_;
+  Callbacks ready_cb_, pump_cb_;
+  NoticeCallbacks notice_cb_;
+  uint32_t saved_standby_s_{0}, saved_cycles_{0}, saved_drops_{0}, minute_ms_{0};
+  TextSensor *status_{nullptr};
+  BinarySensor *problem_{nullptr};
+  Sensor *cycles_{nullptr}, *hours_{nullptr}, *drops_{nullptr};
+  static std::vector<DiffPowerPort *> ports_;
+  static bool shut_down_;
+};
+std::vector<DiffPowerPort *> DiffPowerPort::ports_;
+bool DiffPowerPort::shut_down_{false};
+
+struct PowerModeSelect {
+  void setup();
+  uint8_t mode_of_(size_t index) const;
+  size_t index_of_(uint8_t mode) const;
+  void control(size_t index);
+  struct Pref {
+    uint32_t v{0};
+    bool have{false};
+    bool load(uint32_t *p) {
+      if (!this->have)
+        return false;
+      *p = this->v;
+      return true;
+    }
+    bool save(const uint32_t *p) {
+      this->v = *p;
+      this->have = true;
+      return true;
+    }
+  } pref_;
+  template<typename T> Pref make_entity_preference() { return this->pref_; }
+  size_t published{99};
+  void publish_state(size_t i) { this->published = i; }
+  DiffPowerPort *port_{nullptr};
+};
+
+#include "diffpower_methods.inc"
+
+/// An Ultra hub as its port sees it: a copy asked for is queued; it goes out at the hub's next loop, or at a pump
+/// (the shutdown), each costing `cost` ms there (a slow transmitter), and the hub reports it out.
+struct HubModel {
+  DiffPowerPort *port{nullptr};
+  Pin *enable{nullptr};
+  bool queued{false};
+  uint32_t cost{0};
+  std::vector<uint32_t> asked, out;
+  std::vector<uint8_t> index;
+  std::vector<bool> enabled, at_shutdown;   // the enable as each copy went out; out from a pump
+  bool pumping{false};
+  void attach(DiffPowerPort &p, Pin &en) {
+    this->port = &p;
+    this->enable = &en;
+    p.add_on_notice_callback([this](uint8_t c) {
+      this->queued = true;
+      this->asked.push_back(now_ms);
+      this->index.push_back(c);
+    });
+    p.add_on_pump_callback([this]() {
+      this->pumping = true;
+      this->service();
+      this->pumping = false;
+    });
+  }
+  void service() {
+    now_ms += this->cost;
+    if (!this->queued)
+      return;
+    this->queued = false;
+    this->out.push_back(now_ms);
+    this->enabled.push_back(this->enable->level);
+    this->at_shutdown.push_back(this->pumping);
+    this->port->notice_sent();
+  }
+  /// each copy asked 50 ms after the last one went out, all with the enable high, the enable low 100 ms after the third
+  bool well_spaced() const {
+    bool ok = this->out.size() == 3 && this->asked.size() == 3 && this->index == std::vector<uint8_t>{0, 1, 2};
+    for (size_t i = 1; ok && i < 3; i++)
+      ok = this->asked[i] - this->out[i - 1] >= 50;
+    for (bool e : this->enabled)
+      ok = ok && e;
+    return ok && !this->enable->level && this->enable->changed_at - this->out[2] >= 100;
+  }
+};
+
+/// 10 ms steps: the hubs' loops (a queued copy out), then the ports' loops and timers
+static void run(std::vector<DiffPowerPort *> ports, uint32_t ms, std::vector<HubModel *> hubs = {}) {
+  for (uint32_t end = now_ms + ms; static_cast<int32_t>(now_ms - end) < 0; now_ms += 10) {
+    for (auto *h : hubs)
+      h->service();
+    for (auto *p : ports) {
+      p->loop();
+      p->run_timers();
+    }
+  }
+}
+
+static void test_port() {
+  now_ms = 1000;
+  Pin enable, detect;
+  detect.level = true;
+  LightState strip, other;
+  TextSensor status;
+  BinarySensor problem;
+  Sensor cycles, hours, drops;
+  DiffPowerPort p;
+  PortConfig cfg;
+  cfg.standby_after_ms = 60000;   // (floored to min_on_time: 2 min)
+  p.core_.configure(cfg);
+  p.enable_pin_ = &enable;
+  p.detect_pin_ = &detect;
+  p.status_ = &status;
+  p.problem_ = &problem;
+  p.cycles_ = &cycles;
+  p.hours_ = &hours;
+  p.drops_ = &drops;
+  p.add_light(&strip, 0);
+  HubModel hub;
+  hub.attach(p, enable);
+  int readies = 0;
+  p.ready_cb_.f.push_back([&] { readies++; });
+  run({&p}, 1000, {&hub});
+  CHECK(status.state == "Standby" && !enable.level && strip.out.writes == 0, "at rest: Standby, enable low");
+  // the plain light on (its data goes out now, into the dark): the port wakes; once powered, its state again 3 times
+  strip.remote_values.on = strip.current_values.on = true;
+  run({&p}, 1000, {&hub});
+  CHECK(status.state == "Waking" && enable.level && strip.out.writes == 0, "waking: enable high, nothing sent yet");
+  run({&p}, 2000, {&hub});
+  CHECK(status.state == "On" && readies == 1 && strip.out.writes == 3,
+        "on (1.7 s): the light's state sent again at once, +300, +1000 ms (%d)", strip.out.writes);
+  // off: the turn-off period (2 min), the notice's copies (each out at the hub's next loop), the enable low after them
+  strip.remote_values.on = strip.current_values.on = false;
+  const uint32_t off = now_ms;
+  run({&p}, 119000, {&hub});
+  CHECK(enable.level && hub.asked.empty(), "the turn-off period (floored to 2 min): still on");
+  run({&p}, 3000, {&hub});
+  CHECK(hub.well_spaced() && hub.asked[0] - off >= 120000,
+        "the notice: 3 copies, each asked 50 ms after the last one went out, the enable high; low 100 ms after the "
+        "third (%u)",
+        static_cast<unsigned>(hub.out.size()));
+  CHECK(status.state == "Standby" && cycles.state == 1.0f && p.stats_pref_.v.cycles == 1,
+        "then Standby, a standby cycle published and saved");
+  CHECK(status.history.size() >= 5 && status.history[1] == "Waking" && status.history[2] == "On" &&
+            status.history[3] == "Powering off",
+        "the status: Standby, Waking, On, Powering off, Standby");
+  run({&p}, 61000, {&hub});
+  CHECK(hours.state > 0.0f && hours.state < 0.05f, "hours in standby published once a minute (%.2f)", hours.state);
+  CHECK(p.has_light(&strip) && !p.has_light(&other), "has_light");
+
+  // the shutdown hook: p and q on, r in standby
+  Pin en2, det2, en3, det3;
+  det2.level = det3.level = true;
+  DiffPowerPort q, r;
+  q.enable_pin_ = &en2;
+  q.detect_pin_ = &det2;
+  r.enable_pin_ = &en3;
+  r.detect_pin_ = &det3;
+  HubModel hp, hq, hr;
+  hp.attach(p, enable);   // (p's first hub: asked copies only before)
+  hq.attach(q, en2);
+  hr.attach(r, en3);
+  hub.queued = false;
+  DiffPowerPort::ports_ = {&p, &q, &r};
+  p.wake(120000);
+  q.wake(120000);
+  run({&p, &q, &r}, 3000, {&hub, &hp, &hq, &hr});
+  CHECK(enable.level && en2.level && !en3.level && p.core_.ready() && q.core_.ready(), "p and q on, r in standby");
+  const uint32_t t0 = now_ms, cycles0 = p.core_.standby_cycles();
+  DiffPowerPort::shut_down_ = false;
+  DiffPowerPort::shutdown_all();
+  CHECK(hp.well_spaced() && hq.well_spaced() && hr.asked.empty() && hp.at_shutdown[2] && hq.at_shutdown[2],
+        "2 ports on: 3 copies each, out through the pump, well spaced; none for the one in standby");
+  CHECK(!enable.level && !en2.level && !en3.level && now_ms - t0 < 400, "every enable low (%u ms)", now_ms - t0);
+  CHECK(status.state == "Off" && p.core_.standby_cycles() == cycles0 + 1 && prefs.syncs == 1,
+        "Off, the planned power-off counted, the preferences synced");
+  DiffPowerPort::shutdown_all();
+  CHECK(prefs.syncs == 1, "the hook runs once");
+
+  // portmgr-gpt 1: the shutdown 25 ms into a port's own notice: it goes on with its copies and its drop
+  {
+    now_ms = 100000;
+    Pin en, det;
+    det.level = true;
+    DiffPowerPort n;
+    n.enable_pin_ = &en;
+    n.detect_pin_ = &det;
+    HubModel hn;
+    hn.attach(n, en);
+    n.wake(120000);
+    run({&n}, 3000, {&hn});
+    while (hn.out.empty())
+      run({&n}, 10, {&hn});
+    run({&n}, 20, {&hn});   // NOTICE + 25 or so
+    DiffPowerPort::ports_ = {&n};
+    DiffPowerPort::shut_down_ = false;
+    DiffPowerPort::shutdown_all();
+    CHECK(hn.well_spaced() && en.changed_at - hn.asked[0] >= 200,
+          "a shutdown during a notice: 3 copies, the enable low %u ms after it began",
+          en.changed_at - hn.asked[0]);
+  }
+  // portmgr-gpt 4: four slow transmitters (30 ms per pump): each port still 3 well spaced copies
+  {
+    now_ms = 200000;
+    Pin en[4], det[4];
+    DiffPowerPort ps[4];
+    HubModel hs[4];
+    std::vector<DiffPowerPort *> all;
+    std::vector<HubModel *> hubs;
+    for (int i = 0; i < 4; i++) {
+      det[i].level = true;
+      ps[i].enable_pin_ = &en[i];
+      ps[i].detect_pin_ = &det[i];
+      hs[i].attach(ps[i], en[i]);
+      ps[i].wake(120000);
+      all.push_back(&ps[i]);
+      hubs.push_back(&hs[i]);
+    }
+    run(all, 3000, hubs);
+    for (auto &h : hs)
+      h.cost = 30;
+    DiffPowerPort::ports_ = all;
+    DiffPowerPort::shut_down_ = false;
+    const uint32_t start = now_ms;
+    DiffPowerPort::shutdown_all();
+    bool ok = true;
+    for (auto &h : hs)
+      ok = ok && h.well_spaced();
+    CHECK(ok && now_ms - start < 1100, "4 slow transmitters: every port 3 well spaced copies (%u ms in all)",
+          now_ms - start);
+  }
+  // portmgr-gpt 13: nine minutes in standby, then a reboot: that time saved
+  {
+    now_ms = 300000;
+    Pin en, det;
+    det.level = true;
+    DiffPowerPort s;
+    s.enable_pin_ = &en;
+    s.detect_pin_ = &det;
+    run({&s}, 540000);
+    DiffPowerPort::ports_ = {&s};
+    DiffPowerPort::shut_down_ = false;
+    DiffPowerPort::shutdown_all();
+    CHECK(s.core_.standby_s() >= 539 && s.stats_pref_.v.standby_s == s.core_.standby_s(),
+          "a reboot after 9 min of standby: %u s saved of %u", s.stats_pref_.v.standby_s, s.core_.standby_s());
+  }
+  DiffPowerPort::ports_.clear();
+  // portmgr-gpt 10: two ports with one name keep their counters apart (the key: their id)
+  {
+    stored.clear();
+    Pin e1, d1, e2, d2;
+    DiffPowerPort a, b;
+    a.enable_pin_ = &e1;
+    b.enable_pin_ = &e2;
+    a.detect_pin_ = &d1;
+    b.detect_pin_ = &d2;
+    a.name_ = b.name_ = "Port";
+    a.stats_key_ = "port_a";
+    b.stats_key_ = "port_b";
+    a.setup();
+    b.setup();
+    a.core_.set_counters(5, 50, 1);
+    b.core_.set_counters(7, 70, 2);
+    a.save_stats_();
+    b.save_stats_();
+    DiffPowerPort a2;
+    a2.enable_pin_ = &e1;
+    a2.detect_pin_ = &d1;
+    a2.name_ = "Renamed";
+    a2.stats_key_ = "port_a";
+    a2.setup();
+    CHECK(stored.size() == 2 && a2.core_.standby_cycles() == 5 && a2.core_.drops() == 1,
+          "same name, two ids: two records; a new name keeps its id's counters");
+    DiffPowerPort::ports_.clear();
+  }
+  // portmgr-gpt 11: During dark stored, the sun gone from the YAML: the YAML's mode, stored and shown
+  {
+    DiffPowerPort m;
+    m.set_mode(MODE_STANDBY);
+    PowerModeSelect sel;
+    sel.port_ = &m;
+    sel.pref_.have = true;
+    sel.pref_.v = MODE_DURING_DARK;
+    sel.setup();
+    CHECK(m.get_mode() == MODE_STANDBY && sel.pref_.v == MODE_STANDBY && sel.published == 0,
+          "During dark without a sun: the YAML's Standby (mode %u, stored %u, shown %u)", m.get_mode(), sel.pref_.v,
+          static_cast<unsigned>(sel.published));
+    DiffPowerPort s2;
+    s2.sun = true;
+    PowerModeSelect sel2;
+    sel2.port_ = &s2;
+    sel2.pref_.have = true;
+    sel2.pref_.v = MODE_DURING_DARK;
+    sel2.setup();
+    CHECK(s2.get_mode() == MODE_DURING_DARK && sel2.published == 1, "with a sun: During dark restored");
+  }
+
+  // a port without a board: 'No board'; a light on: the enable high (a board plugged in gets power), a problem
+  Pin en4, det4;
+  LightState l4;
+  TextSensor st4;
+  BinarySensor pr4;
+  DiffPowerPort n;
+  n.enable_pin_ = &en4;
+  n.detect_pin_ = &det4;
+  n.status_ = &st4;
+  n.problem_ = &pr4;
+  n.add_light(&l4, 0);
+  run({&n}, 500);
+  CHECK(st4.state == "No board" && !pr4.state, "'%s', no problem", st4.state.c_str());
+  l4.remote_values.on = true;
+  run({&n}, 5000);
+  CHECK(st4.state == "No board" && en4.level && pr4.state && l4.out.writes == 0,
+        "a light on, no board: enabled, a problem, nothing sent");
+  // negative control: a light not on a port is never touched
+  CHECK(other.out.writes == 0, "a light not on the port: untouched");
+  // the power mode select without a sun: Standby, Always on
+  PowerModeSelect sel;
+  sel.port_ = &p;
+  sel.control(1);
+  CHECK(p.get_mode() == MODE_ALWAYS_ON && sel.pref_.v == MODE_ALWAYS_ON && sel.published == 1 &&
+            sel.index_of_(MODE_STANDBY) == 0 && sel.index_of_(MODE_ALWAYS_ON) == 1,
+        "the select without a sun: option 1 is Always on");
+  now_ms = 0;
+  std::printf("  Diff-Power port: wake, a plain light sent again, the notice, the shutdown hook (2 + 1 ports, during a "
+              "notice, slow transmitters, standby time), the counters per id, the select\n");
+}
+
+#undef USE_TEXT_SENSOR
+#undef USE_BINARY_SENSOR
+#undef USE_SENSOR
+#undef USE_SELECT
+}  // namespace port_power
+
+// The hub on a Diff-Power port (dig2analog_ultra.cpp attach_port_, send_power_off_notice, pump_notice_,
+// boards_powered_, has_power_supply, power_cycle, and transmit_ from hub_transmit.inc, on the real Scheduler): its
+// lights (with their own turn-off periods) and its calibration / update holds as the port's loads; powered:
+// everything again; each notice copy in the next frame for every board (IDENTIFY 7, one SEQ per notice, before what
+// is queued and before a preamble), reported once out; the shutdown's pump never waits; a stale copy dropped at the
+// next wake; a recovery's power cycle on the port (review-r8/portmgr-gpt 4, 12).
+namespace hub_port {
+#define USE_DIFFPOWER   // (USE_DIG2ANALOG_ULTRA_UPDATE: defined at the top)
+struct rmt_transmit_config_t {
+  uint32_t loop_count;
+};
+static std::vector<std::vector<uint8_t>> frames;   // what the RMT sent
+static esp_err_t rmt_transmit(int, int, const uint8_t *data, size_t n, const rmt_transmit_config_t *) {
+  frames.emplace_back(data, data + n);
+  return ESP_OK;
+}
+/// the RMT busy: the wait's timeout passes
+static esp_err_t rmt_tx_wait_all_done(int, int timeout_ms) {
+  if (rmt_idle)
+    return ESP_OK;
+  now_ms += static_cast<uint32_t>(timeout_ms);
+  return -1;
+}
+struct LightState {};
+struct Light {
+  bool lit{false};
+  uint32_t hold{0};
+  LightState state;
+  bool is_lit(uint32_t) const { return this->lit; }
+  uint32_t get_standby_after() const { return this->hold; }
+  LightState *get_state() { return &this->state; }
+};
+namespace diffpower {
+struct DiffPowerPort {   // what the hub uses of it
+  struct Load {
+    uint32_t hold;
+    std::function<bool(uint32_t)> lit;
+    LightState *light;
+  };
+  std::vector<Load> loads;
+  std::vector<std::function<void()>> ready, pump;
+  std::vector<std::function<void(uint8_t)>> notice;
+  bool is_ready_{false};
+  int sent{0}, cycles{0};
+  void add_load(uint32_t hold, std::function<bool(uint32_t)> &&lit, LightState *light = nullptr) {
+    this->loads.push_back(Load{hold, std::move(lit), light});
+  }
+  void add_on_ready_callback(std::function<void()> &&f) { this->ready.push_back(std::move(f)); }
+  void add_on_notice_callback(std::function<void(uint8_t)> &&f) { this->notice.push_back(std::move(f)); }
+  void add_on_pump_callback(std::function<void()> &&f) { this->pump.push_back(std::move(f)); }
+  bool is_ready() const { return this->is_ready_; }
+  void notice_sent() { this->sent++; }
+  void power_cycle() { this->cycles++; }
+};
+}  // namespace diffpower
+struct UltraHub {
+  enum UpdateState : uint8_t { UPD_IDLE = 0, UPD_RUNNING, UPD_FINISHED };
+  enum PowerCycle : uint8_t { CYCLE_NONE = 0, CYCLE_WAIT_OFF, CYCLE_OFF, CYCLE_DONE, CYCLE_FAILED };
+  UltraHub() {
+    this->sched_.init(this->num_boards_, 5, 3);
+    this->buf_.assign(this->sched_.frame_bytes(), 0);
+    this->tx_buf_ = this->buf_.data();
+  }
+  void attach_port_();
+  void send_power_off_notice(uint8_t copy);
+  void pump_notice_();
+  bool boards_powered_() const;
+  bool has_power_supply() const;
+  void power_cycle();
+  void transmit_();   // (hub_transmit.inc)
+  // stand-ins
+  void resync(bool) { this->resyncs++; }
+  void wake_() { this->wakes++; }
+  bool is_failed() const { return false; }
+  static int64_t now_us_() { return now_ms * 1000LL; }
+  bool status_has_warning() const { return false; }
+  void status_set_warning() {}
+  void status_clear_warning() {}
+  std::vector<Light *> lights_;
+  diffpower::DiffPowerPort *port_{nullptr};
+  bool port_attached_{false}, cal_power_hold_{false}, upd_power_hold_{false};
+  uint32_t notices_{0};
+  uint8_t pin_{16};
+  int resyncs{0}, wakes{0};
+  std::atomic<uint8_t> upd_state_{UPD_IDLE};
+  PowerCycle cycle_{CYCLE_NONE};
+  uint32_t cycle_ms_{0};
+  // the line (transmit_)
+  Scheduler sched_;
+  uint16_t num_boards_{3};
+  std::vector<uint8_t> buf_;
+  uint8_t *tx_buf_{nullptr};
+  bool tx_prepared_{false}, tx_normal_{true}, tx_preamble_end_{false};
+  size_t tx_bytes_{0};
+  uint16_t preamble_{0}, ping_left_{0};
+  uint8_t dark_tail_{0};
+  uint8_t switch_frame_{ULTRA_SWITCH_WS_FRAMES};
+  bool preamble_full_{true}, synced_once_{false}, has_sent_{false};
+  uint32_t last_frame_ms_{0}, frames_{0}, build_peak_us_{0};
+  int channel_{0}, encoder_{0};
+};
+#include "hub_port.inc"
+#include "hub_transmit.inc"
+
+/// The boards whose slot in frame f has IDENTIFY 7 (argument 0, CRC ok); seq: their SEQs
+static int notice_slots(const std::vector<uint8_t> &f, uint16_t boards, std::vector<uint8_t> *seq = nullptr) {
+  int n = 0;
+  for (uint16_t b = 0; b < boards; b++) {
+    const uint8_t *s = f.data() + ULTRA_SLOT_BYTES * b;
+    if (s[0] == ULTRA_IDENTIFY && (s[1] >> 4) == ULTRA_LIGHT_BOARD && s[ULTRA_PAYLOAD] == ULTRA_IDENT_POWER_OFF &&
+        s[ULTRA_PAYLOAD + 1] == 0 && ultra_slot_check(s) == 0) {
+      n++;
+      if (seq != nullptr)
+        seq->push_back(s[2]);
+    }
+  }
+  return n;
+}
+/// a preamble frame: DARK slots (all zero)
+static bool is_dark(const std::vector<uint8_t> &f) {
+  return std::all_of(f.begin(), f.begin() + ULTRA_SLOT_BYTES, [](uint8_t v) { return v == 0; });
+}
+
+static void test_hub_port() {
+  Light a, b;
+  b.hold = 1800000;
+  diffpower::DiffPowerPort port;
+  UltraHub h;
+  h.lights_ = {&a, &b};
+  h.port_ = &port;
+  h.attach_port_();
+  CHECK(port.loads.size() == 3 && port.loads[0].hold == 0 && port.loads[1].hold == 1800000 &&
+            port.loads[1].light == b.get_state() && port.loads[2].hold == 1,
+        "the hub's lights (their own turn-off periods) and its holds: the port's loads");
+  CHECK(!port.loads[0].lit(0) && !port.loads[2].lit(0), "nothing lit, nothing held");
+  a.lit = true;
+  h.upd_power_hold_ = true;
+  CHECK(port.loads[0].lit(0) && !port.loads[1].lit(0) && port.loads[2].lit(0), "a light on, an update session held");
+  CHECK(!h.boards_powered_(), "the port not ready: no polls, no calibration");
+  port.is_ready_ = true;
+  for (auto &f : port.ready)
+    f();
+  CHECK(h.boards_powered_() && h.resyncs == 1, "powered: everything sent again");
+  // the notice: each copy asked (copy 0, 1, 2) in the next frame for every board, before board 1's queued IDENTIFY;
+  // one SEQ per notice; each copy's frame reported out once
+  h.sched_.identify(1, true);
+  now_ms = 5000;
+  frames.clear();
+  std::vector<uint8_t> seqs;
+  int with_notice = 0;
+  for (uint8_t c = 0; c < 3; c++) {
+    for (auto &f : port.notice)
+      f(c);
+    h.transmit_();
+    with_notice += notice_slots(frames.back(), 3, &seqs);
+  }
+  h.transmit_();
+  bool one_seq = seqs.size() == 9;
+  for (size_t i = 0; one_seq && i < 9; i++)
+    one_seq = seqs[i] == seqs[i % 3];
+  const uint8_t *b1 = frames[3].data() + ULTRA_SLOT_BYTES;
+  CHECK(h.notices_ == 1 && frames.size() == 4 && with_notice == 9 && one_seq && notice_slots(frames[3], 3) == 0 &&
+            port.sent == 3,
+        "3 copies: IDENTIFY 7 in every slot, one SEQ per board, counted once, each reported out once (%d)", port.sent);
+  CHECK(b1[0] == ULTRA_IDENTIFY && b1[ULTRA_PAYLOAD] == ULTRA_IDENT_ON, "board 1's queued IDENTIFY after them");
+  std::vector<uint8_t> seqs2;
+  for (auto &f : port.notice)
+    f(0);
+  h.transmit_();
+  notice_slots(frames.back(), 3, &seqs2);
+  CHECK(seqs2.size() == 3 && seqs2[0] != seqs[0] && h.notices_ == 2, "the next notice: a new SEQ");
+  // a copy goes ahead of a preamble (a resync's): the preamble waits one frame
+  h.preamble_ = 2;
+  for (auto &f : port.notice)
+    f(1);
+  frames.clear();
+  h.transmit_();
+  CHECK(notice_slots(frames[0], 3) == 3 && !is_dark(frames[0]) && h.preamble_ == 2, "a copy ahead of the preamble");
+  h.transmit_();
+  CHECK(is_dark(frames[1]) && h.preamble_ == 1, "then the preamble");
+  h.preamble_ = 0;
+  // the shutdown's pump: the RMT busy: nothing, and no waiting; free: the copy out and reported
+  for (auto &f : port.notice)
+    f(2);
+  frames.clear();
+  rmt_idle = false;
+  const uint32_t t1 = now_ms;
+  const int sent0 = port.sent;
+  for (auto &f : port.pump)
+    f();
+  CHECK(frames.empty() && now_ms == t1 && port.sent == sent0, "the RMT busy: the pump returns at once, nothing sent");
+  rmt_idle = true;
+  for (auto &f : port.pump)
+    f();
+  CHECK(frames.size() == 1 && notice_slots(frames[0], 3) == 3 && port.sent == sent0 + 1, "free: the copy out, reported");
+  for (auto &f : port.pump)
+    f();
+  CHECK(frames.size() == 1, "nothing queued: the pump sends nothing");
+  // negative control: an update session owns the line
+  for (auto &f : port.notice)
+    f(0);
+  h.upd_state_ = UltraHub::UPD_RUNNING;
+  frames.clear();
+  for (auto &f : port.pump)
+    f();
+  CHECK(frames.empty(), "an update session running: the pump leaves the line alone");
+  h.upd_state_ = UltraHub::UPD_IDLE;
+  // a copy not sent before the port woke again: dropped at the wake (a 0.2.6 board would hold dark)
+  CHECK(h.sched_.power_off_left() == 3, "a copy queued");
+  for (auto &f : port.ready)
+    f();
+  CHECK(h.sched_.power_off_left() == 0, "the wake: the stale copy dropped");
+  // a recovery's power cycle on the port (portmgr-gpt 12)
+  CHECK(h.has_power_supply(), "a port counts as a supply the hub switches");
+  h.power_cycle();
+  CHECK(port.cycles == 1 && h.cycle_ == UltraHub::CYCLE_OFF, "power_cycle(): the port's cycle");
+  for (auto &f : port.ready)
+    f();
+  CHECK(h.cycle_ == UltraHub::CYCLE_DONE, "powered again: done");
+  UltraHub plain;
+  CHECK(!plain.has_power_supply(), "no port, no supply: none (negative control)");
+  now_ms = 0;
+  std::printf("  an Ultra line on a Diff-Power port: its loads, the replay, the notice's copies (ahead of a preamble, "
+              "the shutdown's pump, stale ones dropped), a recovery's power cycle\n");
+}
+
+#undef USE_DIFFPOWER
+}  // namespace hub_port
 
 }  // namespace esphome::dig2analog_ultra
 
@@ -2124,8 +3114,13 @@ int main() {
   hub_update::test_update_lead_in();
   hub_rw::test_telemetry_window();
   hub_rw::test_several_lines();
+  hub_rw::test_standby_support();
+  hub_rw::test_wake_settling();
+  hub_rw::test_lock_from_end();
   receiver_entities::test_receiver_entities();
   update_retry::test_auto_retry();
+  port_power::test_port();
+  hub_port::test_hub_port();
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "ALL ULTRA LIFECYCLE TESTS PASSED", failures);
   return failures ? 1 : 0;
 }

@@ -72,7 +72,7 @@ def main() -> int:
     if vectors.exists():
         known = {v["name"]: v["hex"] for v in json.loads(vectors.read_text(encoding="utf-8"))["vectors"]}
         src = (HERE / "ultra_host_test.cpp").read_text(encoding="utf-8")
-        for name, hexstr in re.findall(r'VEC_([A-Z0-9_]+) = "([0-9a-f]+)"', src):
+        for name, hexstr in re.findall(r'VEC_([A-Z0-9_]+) =\s*"([0-9a-f]+)"', src):
             if known.get(name.lower()) != hexstr:
                 print(f"FAIL: test vector {name.lower()} differs from {vectors}")
                 return 1

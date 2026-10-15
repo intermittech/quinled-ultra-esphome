@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
  * Copyright (C) 2026 QuinLED
  *
- * QuinLED dig2analog Ultra protocol 0.2 (wire VERSION 2), this file: release 0.2.5 (CHANGELOG.md). Shared by the
+ * QuinLED dig2analog Ultra protocol 0.2 (wire VERSION 2), this file: release 0.2.6 (CHANGELOG.md). Shared by the
  * board firmware (C) and the controllers (C / C++).
  * Master: include/ultra_protocol.h in https://github.com/intermittech/quinled-ultra-protocol (spec in its wiki).
  * Every copy (board firmware, ESPHome component, other controllers) must be byte-identical to one tagged release
@@ -431,6 +431,10 @@ enum {
 #define ULTRA_DG_FP_SCENE         0x04u
 #define ULTRA_DG_FP_LIFETIME      0x08u  /* a regular write is due (it waits for the outputs to go dark) */
 #define ULTRA_DG_FP_EFFECTS       0x10u  /* the power-on effects */
+#define ULTRA_DG_FP_EXHAUSTED     0x80u  /* (0.2.6) not a record: the lifetime record's flash-wear allowance is used up
+                                            (the receiver: 32,768 writes + one per 3 h powered); it is written again
+                                            once a run earns a write (one per 3 h powered in one run; shorter runs
+                                            don't add up). Its counts since the last write are lost at a power cut */
 #define ULTRA_DG_SW_NONE          0u     /* nothing pending */
 #define ULTRA_DG_SW_DEBOUNCE      1u     /* the last change is under 2 s old */
 #define ULTRA_DG_SW_DARK          2u     /* the outputs are bright and this hour's write while bright is used */
@@ -473,7 +477,8 @@ enum {
 #define ULTRA_FEAT_DIAG           0x00040000u  /* DIAG page (0.2.5) */
 #define ULTRA_FEAT_RETRY          0x00080000u  /* CONFIG 24: the trips' retry policy (0.2.5) */
 #define ULTRA_FEAT_LOSS_SCENE     0x00100000u  /* CONFIG 8 value 3: signal loss fades to the power-on scene (0.2.5) */
-/*      0x00200000-0x00800000     future official features (e.g. broadcast slots, an EXT extension);
+#define ULTRA_FEAT_STANDBY        0x00200000u  /* IDENTIFY 7: the planned power-off notice (0.2.6) */
+/*      0x00400000-0x00800000     future official features (e.g. broadcast slots, an EXT extension);
  *      0x01000000-0x80000000     hardware-specific */
 
 /* SET flags (low nibble of byte 1; the other slot types send FLAGS 0) */
@@ -802,20 +807,37 @@ static inline void ultra_slot_config(uint8_t *s, uint8_t seq, const uint8_t *ids
  * ULTRA_IDENT_VERSION (0.2.1): the board blinks its firmware version once on its feedback channel (3 fast, then
  * major, minor and patch as value codes, then alpha / beta / rc as 1 / 2 / 3 short), then shows its outputs again.
  * Firmware from before 0.2.1 ignores it (reserved value): no blink means older firmware.
- * Values 6-255 and CAL arguments 1-4 / 101-255 are reserved: a board ignores the slot. STOP / ON / RELEASE / VERSION
- * send argument 0. */
+ * ULTRA_IDENT_POWER_OFF (0.2.6, ultra_slot_power_off): a planned power-off notice. The hub sends it in the slot of every
+ * board of a line, 3 copies with the same SEQ (applied once) at 0, 50 and 100 ms, and cuts the line's power at 200 ms;
+ * once sent it always cuts (no take-back: a command after it waits for the power to be off, then wakes the line). A
+ * board that knows it (the QuinLED Diff-Power ultra receiver, ULTRA_FEAT_STANDBY) fades to dark (0.3 s) and takes the
+ * coming cut as planned: no supply dip, and the lifetime record written only if there is something worth storing (a
+ * board doesn't write its record for every standby cycle). After 2 s without the cut it forgets the notice. Its next
+ * start is a power-up as any: such a receiver stays dark after every power-up until the first valid frame or 1.5 s,
+ * then shows its power-on scene. Other boards ignore it (a reserved value before 0.2.6).
+ * Values 6 and 8-255 and CAL arguments 1-4 / 101-255 are reserved: a board ignores the slot. STOP / ON / RELEASE /
+ * VERSION / POWER_OFF send argument 0. */
 #define ULTRA_IDENT_STOP 0u
 #define ULTRA_IDENT_ON   1u
 #define ULTRA_IDENT_CAL  2u
 #define ULTRA_IDENT_DARK 3u
 #define ULTRA_IDENT_RELEASE 4u
 #define ULTRA_IDENT_VERSION 5u         /* 0.2.1 */
+#define ULTRA_IDENT_POWER_OFF 7u       /* 0.2.6 (6: reserved) */
 #define ULTRA_IDENT_CAL_MIN 5u         /* CAL argument: 0 = the standard test, else MIN..MAX % */
 #define ULTRA_IDENT_CAL_MAX 100u
 static inline void ultra_slot_identify(uint8_t *s, uint8_t seq, uint8_t on)
 {
     ultra_slot_begin(s, ULTRA_IDENTIFY, ULTRA_LIGHT_BOARD, 0, seq);
     s[ULTRA_PAYLOAD] = (on <= ULTRA_IDENT_RELEASE || on == ULTRA_IDENT_VERSION) ? on : (uint8_t)ULTRA_IDENT_STOP;
+    ultra_slot_seal(s);
+}
+
+/* (0.2.6) the planned power-off notice (ULTRA_IDENT_POWER_OFF above) */
+static inline void ultra_slot_power_off(uint8_t *s, uint8_t seq)
+{
+    ultra_slot_begin(s, ULTRA_IDENTIFY, ULTRA_LIGHT_BOARD, 0, seq);
+    s[ULTRA_PAYLOAD] = ULTRA_IDENT_POWER_OFF;
     ultra_slot_seal(s);
 }
 
@@ -926,7 +948,7 @@ static inline int ultra_poll_valid(const uint8_t *s)
 /* the slot pitch and the window W for a rate, us (host: next frame >= W + ULTRA_RW_HOLDOFF_US after the frame end).
  * The pitch: the burst's 33 bytes (the lead byte and the answer, 330 bit times) + 130 us for EARLY / LATE / START /
  * GUARD and the gap to the next slot */
-static inline uint32_t ultra_rw_slot_us(uint8_t rate) { return (330u << rate) + 130u; }
+static inline uint32_t ultra_rw_slot_us(uint8_t rate) { return ((uint32_t)330u << rate) + 130u; }   /* (0.2.6: 32-bit) */
 static inline uint32_t ultra_rw_window_us(uint8_t slots, uint8_t rate)
 {
     return ULTRA_RW_FIRST_US + ultra_rw_slot_us(rate) * slots;
@@ -944,7 +966,7 @@ static inline uint16_t ultra_config_crc(uint32_t valid, const uint16_t *values)
     uint8_t b[ULTRA_CFG_COUNT * 3u];
     uint32_t id, n = 0;
     for (id = 0; id < ULTRA_CFG_COUNT; id++) {
-        if (valid & (1u << id)) {
+        if (valid & ((uint32_t)1u << id)) {   /* (0.2.6: 32-bit: ids >= 16 on a 16-bit int target) */
             b[n] = (uint8_t)id;
             ultra_put16(b + n + 1u, values[id]);
             n += 3u;

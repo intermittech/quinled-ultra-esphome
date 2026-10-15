@@ -13,6 +13,7 @@ other board on the line.
 |---|---|
 | `dig2analog_ultra` | The data line (hub), the `dig2analog_ultra` light platform with board effects, board settings, current calibration and board firmware updates |
 | `dig2analog_ultra_strip` | ESPHome's addressable effects (rainbow, scan, twinkle, ...) across Ultra lights, one light per pixel |
+| `diffpower` | QuinLED Diff-Power sender ports: 55 V only while a light on the port needs it (standby at 4.5 V, board detection, pre-wake, the dark window), for any ESPHome light |
 
 ## Install
 
@@ -79,6 +80,7 @@ See the **[wiki](https://github.com/intermittech/quinled-ultra-esphome/wiki)**:
 |---|---|
 | [Ultra mode](https://github.com/intermittech/quinled-ultra-esphome/wiki/Ultra-Mode) | Lights, board effects, board settings, line options, firmware updates, how it works |
 | [Ultra strip effects](https://github.com/intermittech/quinled-ultra-esphome/wiki/Ultra-Strip) | `dig2analog_ultra_strip`: ESPHome's addressable effects across Ultra lights |
+| [Diff-Power ports](https://github.com/intermittech/quinled-ultra-esphome/wiki/Diff-Power-Ports) | `diffpower`: a Diff-Power sender's ports in standby, waking, the power modes, pre-wake |
 | [Installation](https://github.com/intermittech/quinled-ultra-esphome/wiki/Installation) | Adding the components, pinning a version |
 | [Bench plan](https://github.com/intermittech/quinled-ultra-esphome/wiki/Bench-Plan) | What still needs checking on hardware |
 | [Development](https://github.com/intermittech/quinled-ultra-esphome/wiki/Development) | Tests and layout |

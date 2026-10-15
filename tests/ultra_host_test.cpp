@@ -1414,6 +1414,82 @@ static void test_diagnostics_counts() {
   CHECK(v.count == 2, "underruns count broken frames, not late refills (%u)", static_cast<unsigned>(v.count));
 }
 
+/// The Diff-Power port's power-off notice (protocol 0.2.6): each copy (its port times them: 0 / 50 / 100 ms) is
+/// IDENTIFY 7 POWER_OFF, argument 0, in the board's slot of the next frame, before its queued commands (they follow,
+/// nothing lost); the first copy takes a new SEQ, the others repeat it; an IDENTIFY after it has a SEQ of its own.
+static const char *const VEC_SLOT_IDENTIFY_POWER_OFF =
+    "06f059070000000000000000000000000000000000000000000000000000e97b";
+
+static void test_power_off_notice() {
+  const uint16_t one[5] = {65535, 65535, 65535, 65535, 65535};
+  {
+    // the protocol's test vector (SEQ 0x59): the scheduler's notice slot, byte for byte
+    Scheduler v;
+    v.init(1, 1, 3);
+    std::vector<uint8_t> fv(v.frame_bytes());
+    for (int i = 0; v.pending() && i < 100; i++)
+      v.build_frame(i * 20000, fv.data());
+    int guard = 0;
+    for (; guard < 256; guard++) {   // (the next IDENTIFY SEQ from its seed: step to 0x59)
+      v.power_off(0, true);
+      v.build_frame(5000000 + guard * 20000, fv.data());
+      if (slot_of(fv, 0)[2] == 0x59)
+        break;
+    }
+    CHECK(guard < 256 && from_hex(VEC_SLOT_IDENTIFY_POWER_OFF) ==
+                             std::vector<uint8_t>(slot_of(fv, 0), slot_of(fv, 0) + ULTRA_SLOT_BYTES),
+          "the notice slot (SEQ 0x59) is the protocol's slot_identify_power_off vector");
+  }
+  Scheduler s;
+  s.init(3, 21, 3);
+  std::vector<uint8_t> f(s.frame_bytes());
+  for (int i = 0; s.pending() && i < 1000; i++)
+    s.build_frame(i * 20000, f.data());
+  s.light_set(0, 0, 0, 1234, one, one, 0, 0);   // queued for board 0 before the notice
+  s.identify(1, true);                          // board 1: no notice, its IDENTIFY as usual
+  const size_t waited = s.waiting(0);
+  uint8_t seq[3] = {0, 0, 0};
+  for (int k = 0; k < 3; k++) {
+    s.power_off(0, k == 0);
+    s.power_off(2, k == 0);
+    s.power_off(3, k == 0);   // (no such board)
+    CHECK(s.pending() && s.power_off_left() == 2 && (k > 0 || s.waiting(0) == waited + 1),
+          "copy %d: a frame waiting for it (board 0: %u)", k, static_cast<unsigned>(s.waiting(0)));
+    s.build_frame(1000000 + k * 50000, f.data());
+    CHECK(frame_ok(f, 3) && s.power_off_left() == 0 && s.take_power_off_sent() && !s.take_power_off_sent(),
+          "frame CRCs, the copy out, its frame flagged once (the hub reports it out)");
+    for (int b : {0, 2}) {
+      const uint8_t *sl = slot_of(f, b);
+      CHECK(sl[0] == ULTRA_IDENTIFY && (sl[1] >> 4) == ULTRA_LIGHT_BOARD && (sl[1] & 0x0F) == 0 &&
+                sl[ULTRA_PAYLOAD] == ULTRA_IDENT_POWER_OFF && sl[ULTRA_PAYLOAD + 1] == 0 && ultra_slot_check(sl) == 0 &&
+                (k == 0 || sl[2] == seq[b]),
+            "copy %d, board %d: IDENTIFY 7, argument 0, one SEQ (type %u, value %u, seq %u)", k, b, sl[0],
+            sl[ULTRA_PAYLOAD], sl[2]);
+      seq[b] = sl[2];
+    }
+    if (k == 0) {
+      const uint8_t *b1 = slot_of(f, 1);
+      CHECK(b1[0] == ULTRA_IDENTIFY && b1[ULTRA_PAYLOAD] == ULTRA_IDENT_ON, "board 1: its own IDENTIFY, not delayed");
+      s.build_frame(1010000, f.data());
+      CHECK(slot_of(f, 0)[0] == ULTRA_SET && ultra_get16(slot_of(f, 0) + ULTRA_PAYLOAD) == 1234 &&
+                !(slot_of(f, 2)[0] == ULTRA_IDENTIFY && slot_of(f, 2)[ULTRA_PAYLOAD] == ULTRA_IDENT_POWER_OFF),
+            "between the copies: board 0's queued SET (not lost), no extra copy");
+    }
+  }
+  // a copy queued and not sent before the port woke again: dropped; no frame flagged (negative control)
+  s.power_off(0, false);
+  s.cancel_power_off();
+  s.build_frame(1100000, f.data());
+  CHECK(s.power_off_left() == 0 && !s.take_power_off_sent() &&
+            !(slot_of(f, 0)[0] == ULTRA_IDENTIFY && slot_of(f, 0)[ULTRA_PAYLOAD] == ULTRA_IDENT_POWER_OFF),
+        "a cancelled copy: not sent");
+  s.identify(2, true);
+  s.build_frame(1200000, f.data());
+  CHECK(slot_of(f, 2)[0] == ULTRA_IDENTIFY && slot_of(f, 2)[ULTRA_PAYLOAD] == ULTRA_IDENT_ON &&
+            slot_of(f, 2)[2] != seq[2],
+        "an IDENTIFY after the notice: its own SEQ");
+}
+
 #ifdef WITH_ENGINE
 /// One frame to the board on slot `slot`, whose clock ticks with the host's (50 us per tick, + tick_offset).
 static void feed(ultra_t &u, const std::vector<uint8_t> &f, int slot, int64_t frame_end_us, uint32_t tick_offset = 0) {
@@ -1662,6 +1738,7 @@ int main() {
   test_stream_turns();
   test_group_start();
   test_diagnostics_counts();
+  test_power_off_notice();
 #ifdef WITH_ENGINE
   test_config_frames();
   test_scene_path();

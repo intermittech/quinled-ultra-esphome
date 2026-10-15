@@ -125,8 +125,8 @@ struct ReceiverData {
   // ENERGY
   bool have_energy{false};
   uint32_t boot_mwh{0}, total_wh{0}, power_mw{0}, saved_age_s{0xFFFFFF};
-  uint32_t energy_wh{0};   // total_wh, never lower than before on this board (a restart loses the Wh since its last
-                           // save): the Energy sensor (total_increasing)
+  double energy_wh{0};     // the hub's total for this receiver (TelemetryPoller: only grows; persisted by its entity):
+                           // the Energy sensor (total_increasing)
   uint16_t vb_10mv{0xFFFF};  // (0.2.5) the LED supply after the buck; 0xFFFF = not measured
   uint16_t peak_ma{0};       // (0.2.5) the input current's highest ~100 ms average since the ENERGY answer before
   // LIFETIME (0.2.5): the odometer, kept across power cuts
@@ -250,7 +250,6 @@ inline void decode_receiver_page(ReceiverData &d, uint8_t page, const uint8_t *p
     case ULTRA_PAGE_ENERGY:
       d.boot_mwh = ultra_get32(p + ULTRA_EN_BOOT_MWH);
       d.total_wh = ultra_get32(p + ULTRA_EN_TOTAL_WH);
-      d.energy_wh = d.total_wh > d.energy_wh ? d.total_wh : d.energy_wh;
       d.power_mw = ultra_get32(p + ULTRA_EN_POWER_MW);
       d.saved_age_s = ultra_get24(p + ULTRA_EN_SAVED_AGE);
       d.vb_10mv = static_cast<uint16_t>(ultra_get16(p + ULTRA_EN_VB));
@@ -441,6 +440,14 @@ inline std::string telemetry_exception(uint8_t mcause) {
   if (mcause < 8)
     s += std::string(" (") + NAMES[mcause] + ")";
   return s;
+}
+
+/// Notes after the Status detail that are no problem: (0.2.6) the receiver's lifetime record held (its flash-wear
+/// allowance used up: it is written less often).
+inline std::string receiver_status_notes(const ReceiverData &d) {
+  if (d.have_diag && (d.flash_pending & ULTRA_DG_FP_EXHAUSTED))
+    return " Lifetime record held: the receiver saves less often to protect its flash.";
+  return "";
 }
 
 /// The Last reset text: this start's cause; with DIAG (0.2.5) what the run before left ("software; the run before:
@@ -671,6 +678,11 @@ class TelemetryPoller {
     this->lock_ms_ = now_ms;
   }
   /// The boards lost their supply (or the line stopped): every receiver unavailable; they restart.
+  /// Every receiver's sensors again (take_updates: TU_AVAILABILITY): their status changed with the line's power
+  void touch_all() {
+    for (auto &r : this->rx_)
+      r.updated |= TU_AVAILABILITY;
+  }
   void unpowered() {
     this->locked_ = false;
     for (auto &r : this->rx_) {
@@ -678,6 +690,12 @@ class TelemetryPoller {
       r.misses = 0;
       r.ack_due = false;
     }
+  }
+  /// Energy: the hub's total for receiver i (mWh), and the stored one at the hub's start (its entity's preferences)
+  uint64_t energy_mwh(uint16_t i) const { return i < this->rx_.size() ? this->rx_[i].energy_mwh : 0; }
+  void seed_energy(uint16_t i, uint64_t mwh) {
+    if (i < this->rx_.size() && mwh > this->rx_[i].energy_mwh)
+      this->rx_[i].energy_mwh = mwh;
   }
 
   /// An RW frame should go out now: the chain is locked, the spacing allows one, and a receiver it can hear has a
@@ -872,6 +890,11 @@ class TelemetryPoller {
     bool outputs{false};       // OUTPUTS is read too (a receiver with several lights: their power, why they're dim)
     uint32_t polls{0}, missed{0};   // POLLs that asked it for an answer, and the ones without one
     uint32_t updated{0};
+    // Energy: the hub's total (mWh), the receiver's count since its power-up at its last ENERGY answer
+    uint64_t energy_mwh{0};
+    uint32_t energy_boot{0};
+    bool energy_seen{false};     // an ENERGY answer since the hub started
+    bool energy_rebase{false};   // another board at its position: its count is the base, nothing added
   };
   struct Asked {
     uint16_t rx;
@@ -955,6 +978,7 @@ class TelemetryPoller {
       r.d = ReceiverData{};
       r.unsupported = 0;
       r.updated |= (1u << TP_COUNT) - 1;   // every value unknown again
+      r.energy_rebase = true;   // (Energy goes on from the hub's total: another board's count is no news)
     }
     r.need_identity = true;
     r.next[TP_IDENTITY] = now_ms;
@@ -1048,6 +1072,9 @@ class TelemetryPoller {
         }
         break;
       }
+      case TP_ENERGY:
+        this->energy_(r);
+        break;
       case TP_POWER:
         if (d.pw_latched != 0) {
           // shown now (the sensors), acknowledged with the next POWER poll: exactly these counts
@@ -1062,6 +1089,30 @@ class TelemetryPoller {
       default:
         break;
     }
+  }
+
+  /// Energy never goes back (Home Assistant takes a lower total_increasing value for a reset: it would count the whole
+  /// total again). The hub adds the receiver's mWh since its power-up as it grows; a count that went back (a restart, a
+  /// wake: what the board hadn't stored is lost there) started again from 0, so all of it is new, and the total never
+  /// drops. (A power-off is never a reason by itself: a supply that stayed on would count its session twice.) The
+  /// first answer since the hub started: at least the receiver's own stored lifetime (what it used while the hub was
+  /// off); another board at its position: its count only the base.
+  static void energy_(Receiver &r) {
+    ReceiverData &d = r.d;
+    if (!r.energy_seen) {
+      const uint64_t lifetime = static_cast<uint64_t>(d.total_wh) * 1000u;
+      r.energy_mwh = lifetime > r.energy_mwh ? lifetime : r.energy_mwh;
+      r.energy_seen = true;
+    } else if (r.energy_rebase) {
+      // (nothing added: another board's count)
+    } else if (d.boot_mwh < r.energy_boot) {
+      r.energy_mwh += d.boot_mwh;
+    } else {
+      r.energy_mwh += d.boot_mwh - r.energy_boot;
+    }
+    r.energy_rebase = false;
+    r.energy_boot = d.boot_mwh;
+    d.energy_wh = static_cast<double>(r.energy_mwh) / 1000.0;
   }
 
   std::vector<Receiver> rx_;
@@ -1093,6 +1144,8 @@ enum ReceiverStatus : uint8_t {
   RS_HELD_DARK,
   RS_BLINKING,
   RS_OK,
+  RS_STANDBY,   // its Diff-Power port isn't on (diffpower): not powered, not polled; never a problem, never the worst
+  RS_WAKING,    // its line's power just came back: not heard yet, not missed enough to count as gone (as Standby)
   RS_COUNT,
 };
 static constexpr int16_t TOO_HOT_C10 = 850;          // a board before 0.2.5 (no hot flag): the MCU at 85 C or more
@@ -1104,7 +1157,8 @@ inline const char *receiver_status_name(ReceiverStatus s) {
                                               "Too hot",     "Signal loss", "Supply dips",
                                               "Calibration suggested",      "Limiting",
                                               "Calibrating", "Soft start",  "Held dark",
-                                              "Blinking",    "OK"};
+                                              "Blinking",    "OK",          "Standby",
+                                              "Waking"};
   return s < RS_COUNT ? NAMES[s] : "OK";
 }
 inline bool receiver_status_problem(ReceiverStatus s) { return s <= RS_CAL_SUGGESTED; }
@@ -1291,6 +1345,10 @@ inline std::string receiver_status_detail(const ReceiverData &d, ReceiverStatus 
       return "Held dark by the hub: a current calibration on its line.";
     case RS_BLINKING:
       return "Showing a blink pattern: identify, a firmware update's answer, its version or a fault code.";
+    case RS_STANDBY:
+      return "The port is in standby (4.5 V); the receiver is off and wakes with its lights.";
+    case RS_WAKING:
+      return "Its port just woke: waiting for its first answer.";
     default:
       return "OK.";
   }

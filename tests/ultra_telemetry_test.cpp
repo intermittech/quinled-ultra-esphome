@@ -1677,6 +1677,36 @@ static void test_pacing() {
   CHECK(!pace_moved(PACE_POWER, 203.0f, 200.0f, true) && pace_moved(PACE_POWER, 204.0f, 200.0f, true) &&
             !pace_moved(PACE_POWER, 10.4f, 10.0f, true) && pace_moved(PACE_POWER, 10.5f, 10.0f, true),
         "power's deadband: 0.5 W or 2 %%, the larger");
+  // the live twins (round 11): 0.2 W or 1 %, the larger; and what that saves on a steady load with its noise (a
+  // random walk of +-0.3 % a second around 20 / 60 / 120 W, an hour at 1 s)
+  CHECK(!pace_moved(PACE_LIVE_W, 100.9f, 100.0f, true) && pace_moved(PACE_LIVE_W, 101.0f, 100.0f, true) &&
+            !pace_moved(PACE_LIVE_W, 10.15f, 10.0f, true) && pace_moved(PACE_LIVE_W, 10.25f, 10.0f, true),
+        "live power's deadband: 0.2 W or 1 %%, the larger");
+  for (float base : {20.0f, 60.0f, 120.0f}) {
+    uint32_t seed = 99;
+    float x = base, last_old = NAN, last_new = NAN;
+    bool have_old = false, have_new = false;
+    int sent_old = 0, sent_new = 0;
+    const Pace old_live{0.2f, 0.0f, 0};
+    for (int s = 0; s < 3600; s++) {
+      seed = seed * 1103515245u + 12345u;
+      x += base * 0.003f * (static_cast<float>((seed >> 8) % 2001) / 1000.0f - 1.0f);
+      x += (base - x) * 0.05f;   // (drawn back to the load)
+      if (pace_moved(old_live, x, last_old, have_old)) {
+        last_old = x;
+        have_old = true;
+        sent_old++;
+      }
+      if (pace_moved(PACE_LIVE_W, x, last_new, have_new)) {
+        last_new = x;
+        have_new = true;
+        sent_new++;
+      }
+    }
+    std::printf("  live power at %.0f W with +-0.3 %% noise, an hour at 1 s: %d states sent (0.2 W alone: %d)\n", base,
+                sent_new, sent_old);
+    CHECK(sent_new <= sent_old, "the live deadband never sends more (%d, %d)", sent_new, sent_old);
+  }
   // a fade: live at 1 s (0.2 W), recorded as the 10 s mean; their energy the same
   MeanPaced mean;
   Paced live;

@@ -19,8 +19,9 @@ struct Pace {
   uint32_t min_ms;
 };
 
-/// The defaults (R12): power-like at the update rate (the live twins), recorded powers as 10 s means
-static constexpr Pace PACE_LIVE_W{0.2f, 0.0f, 0};            // (min_ms: the update rate, set per line)
+/// The defaults (R12): power-like at the update rate (the live twins: 0.2 W or 1 %, the larger), recorded powers as
+/// 10 s means
+static constexpr Pace PACE_LIVE_W{0.2f, 0.01f, 0};           // 0.2 W or 1 % (min_ms: the update rate, per line)
 static constexpr Pace PACE_POWER{0.5f, 0.02f, 10000};        // a 10 s mean, 0.5 W or 2 %
 static constexpr Pace PACE_CURRENT{0.02f, 0.0f, 10000};
 static constexpr Pace PACE_LOAD{1.0f, 0.0f, 10000};          // (%, integer)

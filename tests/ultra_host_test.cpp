@@ -1227,7 +1227,10 @@ static void test_refresh_rotation() {
   const size_t with = rounds[0][0].size(), without = rounds[0][3].size();
   std::printf("  a 1-light board's SET every %zu idle frames in the first rounds, %zu after (at 200 ms: %.1f s -> "
               "%.1f s; 3 of 4 rounds)\n", with, without, with * 0.2, without * 0.2);
-  // set_lights: board 0 to 2 lights (the clears from round 0 again, for 2-4); the others go on (rounds 20-29)
+  // set_lights: board 0 to 2 lights mid-round (the clears from round 0 again, for 2-4); the others go on (20-29)
+  uint8_t drop[ULTRA_SLOT_BYTES];
+  uint16_t drop_pos;
+  s.next(0, drop, &drop_pos);   // (one more slot of the round in progress, not counted: the reset drops that round)
   rot_lights(s, 0, 1, 2);
   lights[0] = 2;
   const size_t m0 = rounds[0].size();
@@ -1240,7 +1243,9 @@ static void test_refresh_rotation() {
   for (uint16_t b = 1; b < 3; b++)
     for (size_t r = 20; r < 30; r++)
       line("set_lights", b, r, r);
-  // resync: every board from round 0 again
+  // resync, mid-round: every board from round 0 again
+  for (uint16_t b = 0; b < 3; b++)
+    s.next(b, drop, &drop_pos);
   s.replay(0);
   size_t m[3];
   for (uint16_t b = 0; b < 3; b++) {

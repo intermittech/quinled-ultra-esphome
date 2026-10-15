@@ -560,7 +560,7 @@ class LedgerKeeper {
       x.have_uid = true;
     }
     if ((updates & (1u << TP_ENERGY)) && d.have_energy && x.pending < PENDING)   // (dated by the next STATUS)
-      x.reading[x.pending++] = Reading{d.boot_mwh, receiver_counters(d).mwh, now_ms, d.power_mw};
+      x.reading[x.pending++] = Reading{d.boot_mwh, d.total_wh, now_ms, d.power_mw};
     if (!d.have_identity)
       return ev;
     const bool life = (updates & (1u << TP_LIFETIME)) && d.have_lifetime;
@@ -727,34 +727,37 @@ class LedgerKeeper {
   static constexpr uint64_t ENERGY_MS_PER_MWH = 3600000;   // mW x ms / this = mWh
   struct Reading {
     uint32_t boot;   // its count since power-up (mWh)
-    uint64_t exact;  // its lifetime then (mWh)
+    uint32_t wh;     // its lifetime then (TOTAL_WH)
     uint32_t ms;     // when it was read
     uint32_t mw;     // its power then
+    /// its lifetime then, mWh (TOTAL_WH and the mWh of this power-up's last Wh)
+    uint64_t exact() const { return static_cast<uint64_t>(this->wh) * 1000u + this->boot % 1000u; }
   };
-  struct Rx {
+  struct Rx {   // (the fields in size order: no padding)
+    uint64_t energy_mwh{0};
+    LedgerEntry *entry{nullptr};
     Reading reading[PENDING]{};   // ENERGY readings waiting for the next STATUS
-    uint8_t pending{0};
     uint32_t boot_last{0};        // the count of the last reading counted (this power-up)
-    bool have_boot{false};        // ... known (since the hub started, for this board)
-    bool restart_due{false};      // a power-up seen: its first reading not counted yet
+    uint32_t count_ms{0};         // its powered time counted up to here (counting; the hub's clock)
+    uint32_t start_ms{0};         // when it started (its uptime): its readings dated against it
+    uint32_t boot_base{0};        // its first reading counts from this (UINT32_MAX: from that reading on)
+    uint32_t on_ms{0};            // the line's power-on (on_known)
+    uint32_t en_ms{0}, mw{0};     // its last ENERGY reading counted this session (en_counted); its power (mW, latest)
+    uint32_t lit_ms{0};           // lit since (lit_on)
+    uint32_t lit_pend{0};         // lit time before its entry was known (ms)
+    uint32_t last_sync_ms{0};
     uint8_t uid[12]{};            // the board whose session this is (its full UID)
+    uint8_t pending{0};
+    bool have_boot{false};        // boot_last known (since the hub started, for this board)
+    bool restart_due{false};      // a power-up seen: its first reading not counted yet
     bool have_uid{false};
     bool life_fresh{false};       // its LIFETIME read in this session (its power-ups count: which session)
     bool sess_started{false};     // this session's start counted (its first STATUS)
-    bool counting{false};         // ... its powered time counted up to count_ms (the hub's clock)
-    uint32_t count_ms{0};
-    uint32_t start_ms{0};         // when it started (its uptime): its readings dated against it
-    uint32_t boot_base{0};        // its first reading counts from this (UINT32_MAX: from that reading on)
+    bool counting{false};         // ... its powered time counted up to count_ms
     bool on_known{false};         // the line's power-on seen: the next session starts at on_ms
-    uint32_t on_ms{0};
     bool adopt_due{false};        // first contact: its powered / lit time and power-ups from its next LIFETIME
-    bool en_counted{false};       // an ENERGY reading counted this session: when (en_ms); its power (mW, the latest)
-    uint32_t en_ms{0}, mw{0};
-    bool lit_on{false};           // its lights as last told (lit_tick): lit since lit_ms
-    uint32_t lit_ms{0};
-    uint32_t lit_pend{0};         // lit time before its entry was known (ms)
-    LedgerEntry *entry{nullptr};
-    uint64_t energy_mwh{0};
+    bool en_counted{false};       // an ENERGY reading counted this session
+    bool lit_on{false};           // its lights as last told (lit_tick)
     bool have_energy{false};
     bool lt_read{false}, en_read{false};   // read since this power-up (or the sync before)
     bool energy_seen{false};               // its ENERGY read since this power-up / since the hub started
@@ -765,7 +768,6 @@ class LedgerKeeper {
     bool attention{false};
     bool final_wait{false};
     uint8_t result{0xFF};
-    uint32_t last_sync_ms{0};
   };
 
   /// a power-up or another board: what it says now, then maybe a sync
@@ -870,9 +872,9 @@ class LedgerKeeper {
       }
       this->ledger_->add_energy(e, add);
       if (x.adopted && !x.energy_seen)
-        this->ledger_->take_energy(e, r.exact, true);    // (first contact: its lifetime)
+        this->ledger_->take_energy(e, r.exact(), true);    // (first contact: its lifetime)
       else if (first)
-        this->ledger_->take_energy(e, r.exact, false);   // (a session's start: what the hub didn't see)
+        this->ledger_->take_energy(e, r.exact(), false);   // (a session's start: what the hub didn't see)
       x.boot_last = r.boot;
       x.have_boot = true;
       x.energy_seen = true;

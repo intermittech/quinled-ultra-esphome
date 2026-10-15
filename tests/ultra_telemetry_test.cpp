@@ -14,6 +14,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <chrono>
 #include <cstdio>
 #include <random>
 #include <set>
@@ -2002,8 +2003,83 @@ static void test_wraps() {
         p.stats().restarts);
 }
 
+/// due()'s memo ("nothing due" for the rest of that millisecond) against the scan itself: a long run where the loop asks
+/// several times per millisecond, with every kind of change in between (windows, OUTPUTS on / off, a page asked now,
+/// a sync, the lock, the supply off): the two always agree. Then what it saves per call (host ns, 50 receivers).
+static void test_due_memo() {
+  for (uint16_t n : {1, 16, 50}) {
+    Chain c(n);
+    c.junk = false;
+    for (auto &m : c.rx)
+      m.set025();
+    TelemetryIntervals iv;
+    iv.status_ms = 1000;
+    TelemetryPoller p = started(c, n, ULTRA_RW_RATE_1M, iv);
+    uint32_t seed = 12345u + n;
+    auto rnd = [&seed]() {
+      seed = seed * 1103515245u + 12345u;
+      return seed >> 8;
+    };
+    int wrong = 0, checks = 0, windows = 0;
+    for (int step = 0; step < 300000; step++) {
+      const uint32_t r = rnd() % 1000;
+      if (r < 600) {
+        // (the loop asks again within the same millisecond)
+      } else if (r < 930) {
+        c.now_ms += 1 + rnd() % 4;
+      } else if (r < 970) {
+        if (p.due(c.now_ms)) {
+          c.window(p);
+          windows++;
+        }
+      } else if (r < 980) {
+        p.set_outputs(static_cast<uint16_t>(rnd() % n), (rnd() & 1) != 0);
+      } else if (r < 990) {
+        p.read_now(static_cast<uint16_t>(rnd() % n), static_cast<uint8_t>(rnd() % TP_COUNT), c.now_ms);
+      } else if (r < 994) {
+        uint8_t args[32]{};
+        p.request_sync(static_cast<uint16_t>(rnd() % n), args, c.now_ms);
+      } else if (rnd() % 64 == 0) {   // (rare: the lock interval starts again after each)
+        if (r < 997)
+          p.locked(c.now_ms);
+        else
+          p.unpowered();
+      } else if (r >= 997) {
+        p.locked(c.now_ms);   // (the line locked again after a supply cut: soon)
+      }
+      const bool memo = p.due(c.now_ms), scan = p.due_scan(c.now_ms);
+      wrong += memo != scan;
+      checks++;
+    }
+    CHECK(wrong == 0 && windows > 100, "%u receivers: due() with its memo = the scan in %d of %d checks (%d windows)", n,
+          checks - wrong, checks, windows);
+  }
+  Chain c(50);
+  c.junk = false;
+  TelemetryIntervals iv;
+  iv.status_ms = 1000;
+  TelemetryPoller p = started(c, 50, ULTRA_RW_RATE_1M, iv);
+  c.run(p, 60000);
+  while (!p.due(c.now_ms))
+    c.now_ms++;
+  c.window(p);
+  const uint32_t now = c.now_ms + 1;
+  volatile uint32_t sink = 0;
+  auto ns = [&](bool memo) {
+    const auto a = std::chrono::steady_clock::now();
+    for (int i = 0; i < 200000; i++)
+      sink = sink + (memo ? p.due(now) : p.due_scan(now));
+    return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - a).count() / 200000;
+  };
+  const double scan = ns(false), memo = ns(true);
+  CHECK(!p.due(now), "nothing due just after a window");
+  std::printf("  due() with nothing due, 50 receivers (host): %.1f ns the scan, %.1f ns the memo within a millisecond\n",
+              scan, memo);
+}
+
 int main() {
   std::printf("ultra telemetry test (the return channel's hub side)\n");
+  test_due_memo();
   test_basic();
   test_parser();
   test_missing();

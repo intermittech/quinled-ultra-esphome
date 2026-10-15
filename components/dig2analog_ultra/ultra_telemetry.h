@@ -716,6 +716,7 @@ class TelemetryPoller {
 
   /// receivers: the first boards of the line (1..64); rate ULTRA_RW_RATE_*
   void init(uint16_t receivers, uint8_t rate, const TelemetryIntervals &iv, uint8_t seed = 0x5A) {
+    this->idle_ = false;
     this->rx_.assign(receivers, Receiver{});
     this->rate_ = rate < ULTRA_RW_RATES ? rate : ULTRA_RW_RATE_1M;
     this->iv_ = iv;
@@ -732,6 +733,7 @@ class TelemetryPoller {
 
   /// The chain took a preamble (it locks again): no RW frame before ULTRA_RW_LOCK_MS of headers after it.
   void locked(uint32_t now_ms) {
+    this->idle_ = false;
     this->locked_ = true;
     this->lock_ms_ = now_ms;
     this->lock_wait_ = true;
@@ -743,6 +745,7 @@ class TelemetryPoller {
       r.updated |= TU_AVAILABILITY;
   }
   void unpowered() {
+    this->idle_ = false;
     this->locked_ = false;
     for (auto &r : this->rx_) {
       this->unavailable_(r);
@@ -755,6 +758,7 @@ class TelemetryPoller {
     if (i >= this->rx_.size())
       return;
     Receiver &r = this->rx_[i];
+    this->idle_ = false;
     std::memcpy(r.sync_args, args, sizeof(r.sync_args));
     r.sync_due = true;
     r.next[TP_SYNC] = now_ms - 60000;   // (before every other page)
@@ -762,13 +766,26 @@ class TelemetryPoller {
   bool sync_pending(uint16_t i) const { return i < this->rx_.size() && this->rx_[i].sync_due; }
   /// A page of receiver i due now (the ledger's reads)
   void read_now(uint16_t i, uint8_t tp, uint32_t now_ms) {
-    if (i < this->rx_.size() && tp < TP_COUNT)
+    if (i < this->rx_.size() && tp < TP_COUNT) {
       this->rx_[i].next[tp] = now_ms;
+      this->idle_ = false;
+    }
   }
 
   /// An RW frame should go out now: the chain is locked, the spacing allows one, and a receiver it can hear has a
-  /// page due.
+  /// page due. "Nothing due" is remembered for the rest of that millisecond (the loop asks many times in one while
+  /// it runs fast); every change of the poller's state forgets it.
   bool due(uint32_t now_ms) const {
+    if (this->idle_ && now_ms == this->idle_ms_)
+      return false;
+    if (this->due_scan(now_ms))
+      return true;
+    this->idle_ = true;
+    this->idle_ms_ = now_ms;
+    return false;
+  }
+  /// due() without the memo (the scan itself; tests compare the two)
+  bool due_scan(uint32_t now_ms) const {
     if (!this->locked_ || this->rx_.empty())
       return false;
     // the lock interval after a preamble (> in whole ms: at least ULTRA_RW_LOCK_MS whatever the phase of millis());
@@ -790,6 +807,7 @@ class TelemetryPoller {
   /// The RW frame's POLL slots for boards 0..n-1 into slots (n x ULTRA_SLOT_BYTES; boards behind them take normal
   /// slots); returns n (0: nothing to poll). window_us: W, the window after the frame's last bit.
   uint16_t build(uint32_t now_ms, uint8_t *slots, uint32_t *window_us) {
+    this->idle_ = false;
     // what is over is forgotten (compared to an old time half a millis() wrap later, it would look new again)
     if (this->lock_wait_ && static_cast<int32_t>(now_ms - this->lock_ms_) > (int32_t) ULTRA_RW_LOCK_MS)
       this->lock_wait_ = false;
@@ -874,6 +892,7 @@ class TelemetryPoller {
   /// The window of the last build() is over: bytes = what the hub's UART received since the frame went out (junk,
   /// breaks, lead bytes and the answers, in any amount). Matches the answers, decodes them, reschedules.
   void finish(uint32_t now_ms, const uint8_t *bytes, size_t n) {
+    this->idle_ = false;
     for (size_t i = 0; i + ULTRA_SLOT_BYTES <= n;) {
       if (bytes[i] == ULTRA_RSP_SYNC && ultra_answer_check(bytes + i) == 0) {
         // a 0xA5 inside an answer's DATA is not a start; junk that passed the CRC by chance (1 in 65,536) but
@@ -924,6 +943,7 @@ class TelemetryPoller {
   void set_outputs(uint16_t i, bool on) {
     if (i < this->rx_.size())
       this->rx_[i].outputs = on;
+    this->idle_ = false;
   }
   /// The receiver that keeps missing and cuts off the ones behind it (-1: none).
   int cut_at(uint32_t now_ms) const {
@@ -1186,9 +1206,11 @@ class TelemetryPoller {
   uint8_t rate_{ULTRA_RW_RATE_1M};
   bool locked_{false};
   bool lock_wait_{false};   // the lock interval not waited out yet (build() forgets it after)
+  mutable bool idle_{false};   // due(): nothing due at idle_ms_ (every change forgets it)
   uint32_t lock_ms_{0};
   bool sent_any_{false};
   uint32_t last_ms_{0};
+  mutable uint32_t idle_ms_{0};
   Stats stats_{};
 };
 

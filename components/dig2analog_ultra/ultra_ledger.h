@@ -564,7 +564,7 @@ class LedgerKeeper {
       x.have_uid = true;
     }
     if ((updates & (1u << TP_ENERGY)) && d.have_energy && x.pending < PENDING)   // (dated by the next STATUS)
-      x.reading[x.pending++] = Reading{d.boot_mwh, d.total_wh, now_ms, d.power_mw};
+      x.reading[x.pending++] = Reading{d.boot_mwh, d.total_wh, now_ms, d.power_mw, x.lit_epoch};
     if (!d.have_identity)
       return ev;
     const bool life = (updates & (1u << TP_LIFETIME)) && d.have_lifetime;
@@ -684,16 +684,21 @@ class LedgerKeeper {
       return;
     for (auto &x : this->rx_) {
       this->lit_end_(x, at_ms);
-      x.lit_on = false;   // (dark from here, whatever the lights say)
+      const uint32_t epoch = x.lit_epoch;   // (its lights up to the cut)
+      if (x.lit_on) {   // (dark from here, whatever the lights say)
+        x.lit_on = false;
+        x.lit_epoch++;
+      }
       if (x.counting && x.entry != nullptr) {
         LedgerEntry &e = *x.entry;
         this->readings_(x, e);
         const uint32_t ms = at_ms - x.count_ms;
         this->ledger_->add_time(e, false, ms);
         e.sess_up += ms / 1000;
-        if (x.en_counted && x.mw_dark) {
-          // its power read while dark (its lights off since): that draw up to the cut, never more (a power read
-          // while lit, or lit since, can't say what it drew after: none); below a mWh kept for the next cut
+        if (x.en_counted && (x.en_epoch & 1u) == 0 && x.en_epoch == epoch) {
+          // its last reading read while dark, its lights unchanged since (whenever it was counted): that power up to
+          // the cut, never more (one read while lit, or with a light change since, can't say what it drew after:
+          // none); below a mWh kept for the next cut
           const uint32_t tail = at_ms - x.en_ms;
           const uint64_t mw_ms = e.en_rem + static_cast<uint64_t>(x.mw) * (tail < CUT_TAIL_MS ? tail : CUT_TAIL_MS);
           this->ledger_->add_energy(e, mw_ms / ENERGY_MS_PER_MWH);
@@ -713,7 +718,7 @@ class LedgerKeeper {
     Rx &x = this->rx_[i];
     this->lit_end_(x, now_ms);
     if (lit != x.lit_on)
-      x.mw_dark = false;   // (its lights changed since its power was read)
+      x.lit_epoch++;   // (a change: a reading from before it can't stand for after it)
     x.lit_on = lit;
   }
   /// The position's Energy (Wh; NAN until its board's ENERGY was read once)
@@ -737,6 +742,7 @@ class LedgerKeeper {
     uint32_t wh;     // its lifetime then (TOTAL_WH)
     uint32_t ms;     // when it was read
     uint32_t mw;     // its power then
+    uint32_t epoch;  // its lights then (Rx::lit_epoch: even = dark)
     /// its lifetime then, mWh (TOTAL_WH and the mWh of this power-up's last Wh)
     uint64_t exact() const { return static_cast<uint64_t>(this->wh) * 1000u + this->boot % 1000u; }
   };
@@ -749,7 +755,9 @@ class LedgerKeeper {
     uint32_t start_ms{0};         // when it started (its uptime): its readings dated against it
     uint32_t boot_base{0};        // its first reading counts from this (UINT32_MAX: from that reading on)
     uint32_t on_ms{0};            // the line's power-on (on_known)
-    uint32_t en_ms{0}, mw{0};     // its last ENERGY reading counted this session (en_counted); its power (mW, latest)
+    uint32_t en_ms{0}, mw{0};     // its last ENERGY reading counted this session (en_counted): when, its power (mW)
+    uint32_t en_epoch{1};         // ... its lights then (lit_epoch)
+    uint32_t lit_epoch{0};        // its lights' changes so far (lit_tick, a cut): even = dark
     uint32_t lit_ms{0};           // lit since (lit_on)
     uint32_t lit_pend{0};         // lit time before its entry was known (ms)
     uint32_t last_sync_ms{0};
@@ -764,7 +772,6 @@ class LedgerKeeper {
     bool on_known{false};         // the line's power-on seen: the next session starts at on_ms
     bool adopt_due{false};        // first contact: its powered / lit time and power-ups from its next LIFETIME
     bool en_counted{false};       // an ENERGY reading counted this session
-    bool mw_dark{false};          // ... its power (mw) read while dark, and dark since (the cut's tail from it)
     bool lit_on{false};           // its lights as last told (lit_tick)
     bool rebooted{false};         // the poller saw its uptime fall (a power-up) since its last session started
     bool fresh{false};            // this session a new one (a power-up): what it counted elsewhere taken at its start
@@ -812,11 +819,6 @@ class LedgerKeeper {
     x.counting = true;
     x.count_ms = now_ms;
     e.sess_up = d.uptime_s;
-    const float w = telemetry_value(d, TV_INPUT_POWER);
-    if (!std::isnan(w)) {
-      x.mw = w > 0.0f ? static_cast<uint32_t>(w * 1000.0f) : 0;
-      x.mw_dark = !x.lit_on;
-    }
     this->readings_(x, e);
   }
 
@@ -895,7 +897,7 @@ class LedgerKeeper {
         x.en_counted = true;
         x.en_ms = r.ms;
         x.mw = r.mw;
-        x.mw_dark = !x.lit_on;
+        x.en_epoch = r.epoch;
       }
     }
     if (x.pending != 0)

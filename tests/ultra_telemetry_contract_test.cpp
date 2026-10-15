@@ -2115,6 +2115,56 @@ static void ledger_lit_tail() {
   CHECK(e != nullptr && over <= 0.0, "a cut after a lit power read, dark since: no tail from it (%+.1f mWh)", over);
 }
 
+/// An ENERGY reading read while lit, its lights off after it, then counted later: with a STATUS read in the dark
+/// (LIT_THEN_STATUS: its power from that reading's cache), or only at the cut (LIT_AT_CUT). Ten wakes, the cut 60 s
+/// after the lights went off at 0.6 W: no tail from the lit reading (it would count 30 W for the dark seconds); the
+/// energy never above the truth. The control (DARK): a reading read in the dark before the cut still gives its tail
+/// (the dark seconds counted: short of the truth by about a mWh a cut, not by 10).
+enum LitReading { LIT_THEN_STATUS, LIT_AT_CUT, DARK };
+static void ledger_lit_reading(LitReading how) {
+  MonthRx b;
+  b.init(used_board());
+  ProbeHub h;
+  uint32_t now = 1000;
+  h.init(now);
+  for (int w = 0; w < 10; w++) {
+    const uint32_t on = now;
+    h.k.power_on(on);
+    b.power_up(on);
+    now += 1000;
+    h.sample(b, now, true);
+    b.set_lit(true, now);
+    h.k.lit_tick(0, true, now);
+    now += 30000;
+    h.sample(b, now);
+    now += 1000;
+    h.page(b, TP_ENERGY, now);   // (read while lit: counted at the next STATUS)
+    now += 1000;
+    b.set_lit(false, now);
+    h.k.lit_tick(0, false, now);
+    if (how == DARK) {
+      now += 1000;
+      h.page(b, TP_ENERGY, now);   // (read in the dark)
+    }
+    if (how != LIT_AT_CUT) {
+      now += 1000;
+      h.page(b, TP_STATUS, now);   // (it counts the reading now, in the dark)
+    }
+    now += 60000;
+    b.notice(now);
+    b.cut(now, on);
+    h.k.cut(now);
+    now += 10000;
+  }
+  const LedgerEntry *e = h.l.find(b.uid);
+  const double over = e != nullptr ? static_cast<double>(e->c.mwh) - static_cast<double>(b.t_uj) / 3600000.0 : 0.0;
+  static const char *const WHAT[] = {"read lit, counted with a STATUS in the dark", "read lit, counted at the cut",
+                                      "read in the dark (control)"};
+  CHECK(e != nullptr && over <= 0.0 && (how != DARK || over > -20.0),
+        "ten cuts after a reading %s: %s (%+.1f mWh against the truth)", WHAT[how],
+        how == DARK ? "its tail counted" : "no tail from it", over);
+}
+
 static void sc_ledger_truth() {
   std::printf("ledger truth: a fixed load against an independent truth, a lost sync reply, two hubs\n");
   ledger_truth(365, false);
@@ -2123,6 +2173,9 @@ static void sc_ledger_truth() {
   ledger_lost_reply(true);
   ledger_two_hubs();
   ledger_lit_tail();
+  ledger_lit_reading(LIT_THEN_STATUS);
+  ledger_lit_reading(LIT_AT_CUT);
+  ledger_lit_reading(DARK);
 }
 
 int main(int argc, char **argv) {

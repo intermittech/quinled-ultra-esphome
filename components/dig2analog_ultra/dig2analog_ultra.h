@@ -283,6 +283,7 @@ class UltraHub final : public Component {
   bool on_parlio() const { return false; }
 #endif
   void wake_();
+  void loop_fast_();
   void add_light(UltraLight *light) { this->lights_.push_back(light); }
 
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY

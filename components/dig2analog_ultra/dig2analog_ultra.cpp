@@ -677,9 +677,15 @@ void UltraHub::switch_boards_to_ultra(uint8_t boot_protocol) {
   this->resync();
 }
 
-// Something to send: frames back to back until the queues are empty.
+// Something to send: frames back to back until the queues are empty (and BUSY_HOLD_MS after the last).
 void UltraHub::wake_() {
   this->last_busy_ms_ = millis();
+  this->loop_fast_();
+}
+
+// The loop at full speed until the next idle check, without the busy hold: a response window (its read is timed),
+// so the controller isn't held fast for 250 ms after every poll.
+void UltraHub::loop_fast_() {
   if (!this->high_freq_active_) {
     this->high_freq_.start();
     this->high_freq_active_ = true;
@@ -1452,7 +1458,7 @@ void UltraHub::transmit_() {
     if (this->rw_dir_pin_ != nullptr)
       this->rw_driving_ = false;   // (the RMT's interrupt lets go of the line)
     this->tx_rw_ = false;
-    this->wake_();
+    this->loop_fast_();   // (fast while the window is open: not the busy hold)
   }
 #endif
   this->tx_prepared_ = false;

@@ -227,6 +227,7 @@ struct UltraHub {
   } high_freq_;
   void service_calibration_() {}
   void wake_() {}
+  void loop_fast_() {}
   void arm_ping_burst_() {}
   uint32_t update_frame_us() const { return 500; }
   int64_t stream_lead_us_() const { return this->start_delay_us_ >= 0 ? this->start_delay_us_ : this->lead_us(1); }

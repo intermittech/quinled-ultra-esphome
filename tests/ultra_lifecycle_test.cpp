@@ -1135,13 +1135,17 @@ struct UltraHub {
   void rw_publish_();
   static bool rw_done_isr_(rmt_channel_handle_t, const rmt_tx_done_event_data_t *, void *arg);
   static int64_t now_us_() { return clock_us; }
+  void wake_();                       // (hub_wake.inc)
+  void loop_fast_();
   // stand-ins
   struct {
-    void stop() {}
+    int starts{0}, stops{0};
+    void start() { this->starts++; }
+    void stop() { this->stops++; }
   } high_freq_;
+  void enable_loop() {}
   void service_calibration_() {}
   void resync() { this->preamble_ = 3; }
-  void wake_() { this->wakes++; }
   bool boards_powered_() const { return this->powered; }
   bool status_has_warning() const { return this->warning_; }
   void status_set_warning() { this->warning_ = true; }
@@ -1250,6 +1254,7 @@ uint32_t UltraHub::rw_wait_seq_ = 0;
 static constexpr uint32_t RW_WAIT_STALE_MS = 100;
 
 #include "hub_loop.inc"
+#include "hub_wake.inc"
 #include "hub_line.inc"
 #include "hub_transmit.inc"
 #include "hub_rw.inc"
@@ -1345,6 +1350,49 @@ static bool is_rw(const Sent &s) {
 /// nothing else on the wire until the window's end, a command right after it; the UART flushed before the frame and
 /// read after the window; the sensors' callback; a refused RW frame sent again as one; a late release counted; the
 /// supply off: the receivers unavailable; finish_window_(true) (an update session starting) waits for the window.
+/// The loop's high-frequency share with polls only (no commands): fast while a response window is open, not held
+/// for BUSY_HOLD_MS after every RW frame. The control: the busy hold at every RW frame (as before), 25 % and more.
+static double rw_fast_share(bool hold_at_rw, double *rw_per_s = nullptr) {
+  clock_us = 0;
+  now_ms = 0;
+  rmt = Rmt();
+  answers = Answers();
+  UltraHub::hubs_.clear();
+  Uart uart;
+  Pin pin;
+  UltraHub h;
+  rmt.hub = &h;
+  h.start(&uart, &pin);
+  run_us(h, uart, 5000000);   // (the preamble, the first answers, the busy hold after them)
+  int64_t fast = 0, steps = 0, rws = 0;
+  size_t sent = rmt.sent.size();
+  const int64_t end = clock_us + 60000000;
+  while (clock_us < end) {
+    run_us(h, uart, 50);
+    if (rmt.sent.size() != sent && is_rw(rmt.sent.back())) {
+      rws++;
+      if (hold_at_rw)
+        h.wake_();   // (the control: the RW frame's wake_() with its busy hold)
+    }
+    sent = rmt.sent.size();
+    fast += h.high_freq_active_;
+    steps++;
+  }
+  if (rw_per_s != nullptr)
+    *rw_per_s = static_cast<double>(rws) / 60.0;
+  return 100.0 * static_cast<double>(fast) / static_cast<double>(steps);
+}
+
+static void test_rw_fast_share() {
+  double rate = 0;
+  const double now = rw_fast_share(false, &rate), control = rw_fast_share(true);
+  // the control: about 250 ms per RW frame (the windows overlap nothing here)
+  CHECK(rate > 0.2 && now < 1.0 && control > 0.8 * 25.0 * rate,
+        "the loop fast %.1f %% of the time at %.2f RW frames / s (busy hold at every poll: %.1f %%)", now, rate, control);
+  std::printf("  the loop's high-frequency share, polls only: %.2f %% at %.2f RW frames / s (with the busy hold at every "
+              "poll: %.1f %%)\n", now, rate, control);
+}
+
 static void test_telemetry_window() {
   clock_us = 0;
   now_ms = 0;
@@ -3994,6 +4042,7 @@ int main() {
   hub_update::test_update_task();
   hub_update::test_update_lead_in();
   hub_rw::test_telemetry_window();
+  hub_rw::test_rw_fast_share();
   hub_rw::test_several_lines();
   hub_rw::test_tied_shared_uart();
   hub_rw::test_standby_support();

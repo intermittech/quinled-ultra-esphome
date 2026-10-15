@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 #include "ultra_protocol.h"
@@ -94,6 +95,12 @@ inline uint32_t ledger_key(const char *s) {
 }
 
 class LifetimeLedger;
+// A keeper owns this hook; the ledger holds only weak references. Deferred lit time is materialized before a
+// read, save or accounting decision. Destruction/re-attachment never leaves a callable dangling keeper pointer.
+struct LedgerLitFlush {
+  void *context;
+  void (*flush)(void *);
+};
 /// the ESP32's one ledger (every line's receivers) and their count (each line adds its own at its setup: its receivers,
 /// its port, its lights' estimates)
 inline LifetimeLedger &ultra_ledger();
@@ -104,8 +111,40 @@ inline size_t &ledger_receivers() {
 
 class LifetimeLedger {
  public:
-  /// room for `entries` boards and `positions` slots (the blob's size follows)
+  LifetimeLedger() = default;
+  ~LifetimeLedger() { this->flush_lit(); }
+  LifetimeLedger(const LifetimeLedger &other) { *this = other; }
+  LifetimeLedger &operator=(const LifetimeLedger &other) {
+    if (this != &other) {
+      this->flush_lit();
+      other.flush_lit();
+      this->entries_ = other.entries_;
+      this->positions_ = other.positions_;
+      this->day_ = other.day_;
+      this->dirty_ = other.dirty_;
+      this->lit_flushers_.clear();   // a snapshot has no live keepers of its own
+    }
+    return *this;
+  }
+  void watch_lit(const std::shared_ptr<LedgerLitFlush> &hook) {
+    // Re-attached/destroyed keepers disappear, without keeping their state alive or growing this list forever.
+    for (auto it = this->lit_flushers_.begin(); it != this->lit_flushers_.end();) {
+      if (it->expired())
+        it = this->lit_flushers_.erase(it);
+      else
+        ++it;
+    }
+    this->lit_flushers_.push_back(hook);
+  }
+  void flush_lit() const {
+    for (const auto &weak : this->lit_flushers_) {
+      if (auto hook = weak.lock())
+        hook->flush(hook->context);
+    }
+  }
+  /// room for `entries` boards and `positions` slots (only occupied rows are stored)
   void init(size_t entries, size_t positions) {
+    this->flush_lit();
     this->entries_.assign(entries, LedgerEntry{});
     this->positions_.assign(positions, LedgerPosition{});
   }
@@ -128,6 +167,7 @@ class LifetimeLedger {
   uint32_t day() const { return this->day_; }
   /// a hub day passed: boards not seen for LEDGER_AGE_DAYS that no position holds go
   void set_day(uint32_t day) {
+    this->flush_lit();
     this->day_ = day;
     for (auto &e : this->entries_) {
       if (e.used && day - e.last_day >= LEDGER_AGE_DAYS && !this->held_(e)) {
@@ -136,10 +176,17 @@ class LifetimeLedger {
       }
     }
   }
-  bool dirty() const { return this->dirty_; }
-  void clear_dirty() { this->dirty_ = false; }
+  bool dirty() const {
+    this->flush_lit();
+    return this->dirty_;
+  }
+  void clear_dirty() {
+    this->flush_lit();
+    this->dirty_ = false;
+  }
 
   LedgerEntry *find(const uint8_t *uid) {
+    this->flush_lit();
     for (auto &e : this->entries_) {
       if (e.used && std::memcmp(e.uid, uid, 12) == 0)
         return &e;
@@ -202,8 +249,10 @@ class LifetimeLedger {
     if (total >= UNIT_MS) {
       units += static_cast<uint32_t>(total / UNIT_MS);
       this->dirty_ = true;
+      rem = static_cast<uint32_t>(total % UNIT_MS);
+    } else {
+      rem = static_cast<uint32_t>(total);
     }
-    rem = static_cast<uint32_t>(total % UNIT_MS);
   }
   /// A power-up the hub made or saw (a new session)
   void add_power_up(LedgerEntry &e) {
@@ -299,14 +348,19 @@ class LifetimeLedger {
   }
 
   // ---- the stored form (two copies alternate: the newer valid one is loaded; a cut during a write keeps the other)
-  size_t blob_size() const { return HDR + ENTRY * this->entries_.size() + POS * this->positions_.size() + 2; }
+  size_t blob_size() const { return HDR + ENTRY * this->used_entries_() + POS * this->used_positions_() + 2; }
   void save(uint8_t *out, uint32_t generation) const {
-    std::memset(out, 0, this->blob_size());
+    this->flush_lit();
+    // LDG3 already stores row counts and loads occupied rows into the runtime allocation. Omit free rows,
+    // preserving every occupied historical board/position and the existing reader in either direction.
+    const size_t ne = this->used_entries_(), np = this->used_positions_();
+    const size_t n = HDR + ENTRY * ne + POS * np + 2;
+    std::memset(out, 0, n);
     ultra_put32(out, LEDGER_MAGIC);
     ultra_put32(out + 4, generation);
     ultra_put32(out + 8, this->day_);
-    ultra_put16(out + 12, static_cast<uint16_t>(this->entries_.size()));
-    ultra_put16(out + 14, static_cast<uint16_t>(this->positions_.size()));
+    ultra_put16(out + 12, static_cast<uint16_t>(ne));
+    ultra_put16(out + 14, static_cast<uint16_t>(np));
     uint8_t *b = out + HDR;
     for (const auto &e : this->entries_) {
       if (e.used) {
@@ -328,8 +382,8 @@ class LifetimeLedger {
         ultra_put32(b + 64, e.pow_rem);
         ultra_put32(b + 68, e.lit_rem);
         ultra_put32(b + 72, e.en_rem);
+        b += ENTRY;
       }
-      b += ENTRY;
     }
     for (const auto &p : this->positions_) {
       if (p.used) {
@@ -338,10 +392,10 @@ class LifetimeLedger {
         std::memcpy(b + 5, p.uid, 12);
         put64_(b + 17, static_cast<uint64_t>(p.offset_mwh));
         put64_(b + 25, p.value_mwh);
+        b += POS;
       }
-      b += POS;
     }
-    ultra_put16(out + this->blob_size() - 2, ultra_crc16(out, static_cast<uint32_t>(this->blob_size() - 2)));
+    ultra_put16(out + n - 2, ultra_crc16(out, static_cast<uint32_t>(n - 2)));
   }
   /// A stored copy: valid (magic, size, CRC)? Its generation and how many entries / positions it uses (the
   /// allocation it needs: a copy stored with more or fewer receivers loads too).
@@ -364,6 +418,7 @@ class LifetimeLedger {
     size_t ne, np;
     if (!valid_(in, n, &ne, &np))
       return false;
+    this->flush_lit();
     for (auto &e : this->entries_)
       e = LedgerEntry{};
     for (auto &p : this->positions_)
@@ -415,6 +470,18 @@ class LifetimeLedger {
 
  protected:
   static constexpr size_t HDR = 16, ENTRY = 76, POS = 33;
+  size_t used_entries_() const {
+    size_t n = 0;
+    for (const auto &e : this->entries_)
+      n += e.used;
+    return n;
+  }
+  size_t used_positions_() const {
+    size_t n = 0;
+    for (const auto &p : this->positions_)
+      n += p.used;
+    return n;
+  }
   static bool valid_(const uint8_t *in, size_t n, size_t *ne, size_t *np) {
     if (n < HDR + 2 || ultra_get32(in) != LEDGER_MAGIC || ultra_get16(in + n - 2) != ultra_crc16(in, static_cast<uint32_t>(n - 2)))
       return false;
@@ -490,6 +557,7 @@ class LifetimeLedger {
   std::vector<LedgerPosition> positions_;
   uint32_t day_{0};
   bool dirty_{false};
+  std::vector<std::weak_ptr<LedgerLitFlush>> lit_flushers_;
 };
 
 inline LifetimeLedger &ultra_ledger() {
@@ -522,12 +590,35 @@ inline LifetimeLedger &ultra_ledger() {
 /// (first contact) only what comes after.
 class LedgerKeeper {
  public:
+  LedgerKeeper() = default;
+  LedgerKeeper(const LedgerKeeper &other) { *this = other; }
+  LedgerKeeper &operator=(const LedgerKeeper &other) {
+    if (this != &other) {
+      this->flush_lit_();
+      other.flush_lit_();
+      this->lit_hook_.reset();
+      this->ledger_ = other.ledger_;
+      this->key_base_ = other.key_base_;
+      this->rx_ = other.rx_;
+      this->up_ms_ = other.up_ms_;
+      this->last_ms_ = other.last_ms_;
+      this->lit_now_ms_ = other.lit_now_ms_;
+      this->lit_tick_ms_ = other.lit_tick_ms_;
+      this->lit_pending_ = false;
+    }
+    return *this;
+  }
+  ~LedgerKeeper() { this->flush_lit_(); }
   /// what on_updates() saw (the hub logs it)
   enum Event : uint8_t { EV_NONE = 0, EV_NEW_BOARD = 1, EV_RESTORE = 2, EV_ATTENTION = 4, EV_SYNCED = 8 };
 
   /// key_base: the line's (its id's hash, low 16 bits clear: the receiver's index goes there; 0xFFFF: its port's
   /// counter); boot_ms: millis() when the ESP32 started (0; the tests: their hub's start)
   void attach(LifetimeLedger *ledger, uint32_t key_base, uint16_t receivers, uint32_t boot_ms = 0) {
+    this->flush_lit_();
+    this->lit_hook_.reset();
+    this->lit_pending_ = false;
+    this->lit_now_ms_ = this->lit_tick_ms_ = boot_ms;
     this->ledger_ = ledger;
     this->key_base_ = key_base & 0xFFFF0000u;
     this->rx_.assign(receivers, Rx{});
@@ -539,6 +630,7 @@ class LedgerKeeper {
 
   /// A receiver's news (TelemetryPoller::take_updates bits): merge, sync, the position. Returns Event bits.
   uint8_t on_updates(TelemetryPoller &p, uint16_t i, uint32_t updates, uint32_t now_ms) {
+    this->flush_lit_();   // the last observed loop, before identity/session changes or sync decisions
     if (this->ledger_ == nullptr || i >= this->rx_.size())
       return EV_NONE;
     Rx &x = this->rx_[i];
@@ -670,6 +762,7 @@ class LedgerKeeper {
   /// clock): every board on it starts a new session there (one that answers with a longer uptime didn't: its
   /// checkpoint decides).
   void power_on(uint32_t on_ms) {
+    this->flush_lit_();
     for (auto &x : this->rx_) {
       session_reset_(x);
       x.pending = 0;   // (the session before: counted at its cut)
@@ -680,6 +773,7 @@ class LedgerKeeper {
   /// The line's power went at at_ms (the port's enable or detect dropped: a planned power-off's end, a cut): each
   /// session's powered time, its waiting readings and its last power read up to then; its lit time ends.
   void cut(uint32_t at_ms) {
+    this->flush_lit_();
     if (this->ledger_ == nullptr)
       return;
     for (auto &x : this->rx_) {
@@ -721,12 +815,29 @@ class LedgerKeeper {
       x.lit_epoch++;   // (a change: a reading from before it can't stand for after it)
     x.lit_on = lit;
   }
+  /// Called each hub loop, even when the 50 ms periodic tick is skipped. Light changes must still call lit_tick
+  /// immediately; reads/saves flush to this observation time, never to a later wall clock.
+  bool lit_due(uint32_t now_ms) {
+    if (!this->lit_hook_ && this->ledger_ != nullptr) {
+      this->lit_hook_ = std::make_shared<LedgerLitFlush>(LedgerLitFlush{this, [](void *p) {
+        static_cast<LedgerKeeper *>(p)->flush_lit_();
+      }});
+      this->ledger_->watch_lit(this->lit_hook_);
+    }
+    this->lit_now_ms_ = now_ms;
+    this->lit_pending_ = true;
+    if (now_ms - this->lit_tick_ms_ < 50)
+      return false;
+    this->lit_tick_ms_ = now_ms;
+    return true;
+  }
   /// The position's Energy (Wh; NAN until its board's ENERGY was read once)
   double energy_wh(uint16_t i) const {
     return i < this->rx_.size() && this->rx_[i].have_energy ? this->rx_[i].energy_mwh / 1000.0 : -1.0;
   }
   /// The ledger's counters of the board at receiver i (nullptr: not known yet)
   const LifeCounters *counters(uint16_t i) const {
+    this->flush_lit_();
     return i < this->rx_.size() && this->rx_[i].entry != nullptr ? &this->rx_[i].entry->c : nullptr;
   }
   bool attention(uint16_t i) const { return i < this->rx_.size() && this->rx_[i].attention; }
@@ -906,7 +1017,7 @@ class LedgerKeeper {
   }
 
   /// Its lit time up to now_ms (lit since the last lit_tick that said so); before its entry is known, held
-  void lit_end_(Rx &x, uint32_t now_ms) {
+  void lit_end_(Rx &x, uint32_t now_ms) const {
     if (x.lit_on) {
       const uint32_t ms = now_ms - x.lit_ms;
       if (x.entry != nullptr && this->ledger_ != nullptr)
@@ -915,6 +1026,14 @@ class LedgerKeeper {
         x.lit_pend += ms;
     }
     x.lit_ms = now_ms;
+  }
+
+  void flush_lit_() const {
+    if (!this->lit_pending_)
+      return;
+    this->lit_pending_ = false;
+    for (auto &x : this->rx_)
+      this->lit_end_(x, this->lit_now_ms_);
   }
 
   uint8_t sync_result_(TelemetryPoller &p, uint16_t i, const ReceiverData &d, uint32_t now_ms) {
@@ -950,9 +1069,12 @@ class LedgerKeeper {
 
   LifetimeLedger *ledger_{nullptr};
   uint32_t key_base_{0};
-  std::vector<Rx> rx_;
+  mutable std::vector<Rx> rx_;
   uint64_t up_ms_{0};
   uint32_t last_ms_{0};
+  std::shared_ptr<LedgerLitFlush> lit_hook_;
+  uint32_t lit_now_ms_{0}, lit_tick_ms_{0};
+  mutable bool lit_pending_{false};
 };
 
 }  // namespace esphome::dig2analog_ultra

@@ -3429,11 +3429,14 @@ static void test_ledger_resize() {
   ultra_ledger().position_energy(5u << 16, *e, &swapped);
   h.ledger_save_(true);
   const size_t small = ultra_ledger().blob_size();
+  const size_t small_capacity = ultra_ledger().capacity();
   reboot(22);
   h.ledger_service_();
   e = ultra_ledger().find(uid);
-  const bool grown = e != nullptr && e->c.mwh == 150000 && ultra_ledger().blob_size() > small;
-  CHECK(grown, "21 -> 22 receivers (%u -> %u B): the stored ledger kept (%llu mWh)", static_cast<unsigned>(small),
+  const bool grown = e != nullptr && e->c.mwh == 150000 && ultra_ledger().capacity() > small_capacity &&
+                     ultra_ledger().blob_size() == small;
+  CHECK(grown, "21 -> 22 receivers (%u -> %u B, same occupied rows): the stored ledger kept (%llu mWh)",
+        static_cast<unsigned>(small),
         static_cast<unsigned>(ultra_ledger().blob_size()), static_cast<unsigned long long>(e ? e->c.mwh : 0));
   if (e == nullptr)
     return;
@@ -3461,6 +3464,8 @@ static void test_ledger_resize() {
   h.ledger_service_();
   e = ultra_ledger().find(uid);
   ultra_ledger().add_energy(*e, 10000);
+  uint8_t extra_uid[12] = {0x43};
+  ultra_ledger().touch(extra_uid, &made);   // compact size grows with occupancy, not reserved capacity
   cut_after = 1;          // (180 Wh: the copy written, its size record not)
   h.ledger_save_(true);
   cut_after = -1;
@@ -3600,6 +3605,7 @@ struct Light {
   bool is_lit(uint32_t) const { return this->on; }
 };
 struct Keeper {   // what the hub tells the ledger
+  bool lit_due(uint32_t) const { return true; }   // the differential ledger suite tests the real cadence
   std::vector<std::string> calls;
   std::vector<int> lit;
   void power_on(uint32_t ms) { this->calls.push_back("on " + std::to_string(ms)); }

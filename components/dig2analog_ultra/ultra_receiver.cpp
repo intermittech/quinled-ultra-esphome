@@ -120,7 +120,7 @@ void UltraReceiver::update_(uint32_t updates) {
   };
 
   // the status: worst first, with its plain line and the Problem (just woken, not heard yet: Waking)
-  const ReceiverStatus st = standby                                 ? RS_STANDBY
+  const ReceiverStatus st = standby                                 ? (this->hub_->port_off() ? RS_PORT_OFF : RS_STANDBY)
                             : this->hub_->rx_settling(this->board_) ? RS_WAKING
                                                                     : receiver_status(d, answering);
   // (a text is built only for its entity: a level the YAML leaves out costs nothing at run time)
@@ -128,7 +128,7 @@ void UltraReceiver::update_(uint32_t updates) {
   this->text_(STATUS, receiver_status_name(st));
   if (has(STATUS_DETAIL)) {
     this->text_(STATUS_DETAIL, receiver_status_detail(d, st, this->board_, p.cut_at(millis())) +
-                                   (st == RS_STANDBY || st == RS_WAKING ? std::string() : receiver_status_notes(d)));
+                                   (st >= RS_STANDBY ? std::string() : receiver_status_notes(d)));
   }
   if (this->problem_ != nullptr)
     this->problem_->publish_state(receiver_status_problem(st));   // (binary_sensor publishes changes only)
@@ -283,10 +283,13 @@ void UltraTelemetryPort::update_() {
   if (this->problem_ != nullptr)
     this->problem_->publish_state(problem);
   text(RECEIVERS, std::to_string(answering) + " of " + std::to_string(p.receivers()) + " answering");
-  text(STATUS, standby ? std::string("Standby") : waking ? std::string("Waking") : port_status(m, p));
-  text(STATUS_DETAIL, standby  ? std::string("The port is in standby (4.5 V).")
-                      : waking ? std::string("The port just woke: waiting for its receivers' first answers.")
-                               : port_status_detail(m));
+  const bool off = standby && this->hub_->port_off();
+  text(STATUS, off ? std::string("Off") : standby ? std::string("Standby") : waking ? std::string("Waking")
+                                                                                     : port_status(m, p));
+  text(STATUS_DETAIL, off       ? std::string("The port's power mode is Off: no 55 V until another mode is chosen.")
+                      : standby ? std::string("The port is in standby (4.5 V).")
+                      : waking  ? std::string("The port just woke: waiting for its receivers' first answers.")
+                                : port_status_detail(m));
 }
 
 void UltraTelemetryPort::on_shutdown() {
@@ -338,9 +341,10 @@ void UltraLightTelemetry::update_(uint32_t updates) {
     this->port_->publish_state(std::string(this->hub_->telemetry_name()) + " \xC2\xB7 receiver " +
                                std::to_string(this->board_ + 1));
   if (this->status_ != nullptr) {
-    const std::string s = receiver_status_name(this->hub_->port_standby()           ? RS_STANDBY
-                                               : this->hub_->rx_settling(this->board_) ? RS_WAKING
-                                                   : light_status(d, answering, this->mask_));
+    const std::string s = receiver_status_name(
+        this->hub_->port_standby()             ? (this->hub_->port_off() ? RS_PORT_OFF : RS_STANDBY)
+        : this->hub_->rx_settling(this->board_) ? RS_WAKING
+                                                : light_status(d, answering, this->mask_));
     if (!this->status_->has_state() || this->status_->state != s)
       this->status_->publish_state(s);
   }

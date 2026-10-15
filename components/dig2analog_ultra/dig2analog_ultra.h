@@ -117,6 +117,14 @@ class UltraHub final : public Component {
     return false;
 #endif
   }
+  /// on a Diff-Power port in the power mode Off (never powered: calibrations and updates don't run)
+  bool port_off() const {
+#ifdef USE_DIFFPOWER
+    return this->port_ != nullptr && this->port_->is_off();
+#else
+    return false;
+#endif
+  }
 
   // Board settings (ULTRA_CFG_* ids), board -1 = all boards. Before setup they are the YAML defaults.
   void set_board_config(int board, uint8_t id, uint16_t value);

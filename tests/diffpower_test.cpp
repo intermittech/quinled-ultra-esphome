@@ -9,8 +9,9 @@
 // loop, a slow or dead transmitter), a pre-wake masked for 25 days, dark offsets up to 12 h (against a brute-force
 // search of the elevation), a shutdown during a notice, a deliberate power cycle. "During dark" from Home Assistant:
 // its ISO-8601 times, the stateless rule against the elevation (a year at 0 / 52 / 65 N, polar day and night), the
-// source (fresh, stale, missing, disconnected; the sun as the backup). Negative controls alongside: what
-// must NOT wake or drop the port.
+// source (fresh, stale, missing, disconnected; the sun as the backup). The power mode Off (round 12): off now from ON,
+// WAKING and FAULT, never powered whatever is lit, nothing left over once it ends (randomized too). Negative controls
+// alongside: what must NOT wake or drop the port.
 //
 // Build and run: python tests/run_diffpower_test.py
 
@@ -931,6 +932,204 @@ static void test_long_notice() {
   CHECK(n0 != 0 && low - n0 == 1500, "copies on time: the enable low at 1500 ms (%u)", low - n0);
 }
 
+// ------------------------------------------------------------------------------------- the power mode Off (round 12)
+static std::string off_text(const PortCore &p) {
+  char b[32];
+  return port_state_text(p.state(), p.drops(), b, sizeof(b), p.off());
+}
+
+/// Every enable change high after `from` (a power-up)
+static size_t rises_after(const Sim &s, uint32_t from) {
+  size_t n = 0;
+  for (size_t i = 0; i < s.enable_at.size(); i++)
+    n += s.enable_to[i] && static_cast<int32_t>(s.enable_at[i] - from) >= 0;
+  return n;
+}
+
+static void test_off_mode() {
+  std::printf("the power mode Off: off now, never powered whatever is lit, nothing left over once it ends\n");
+  // ON, a light lit: the planned power-off at once (no min_on_time), the notice, the enable low, "Off"
+  Sim s(1);
+  s.lit[0] = true;
+  s.run(3000);
+  CHECK(s.p.state() == PS_ON, "on");
+  const uint32_t t0 = s.now;
+  s.p.set_mode(MODE_OFF);
+  s.run(2000);
+  CHECK(s.copy_at.size() == 3 && s.copy_at[0] - t0 <= 10 && s.enable_at.back() - s.copy_at[0] == 200 &&
+            !s.p.enable() && s.p.standby_cycles() == 1,
+        "Off while on and lit: the notice at once (%u ms), the enable low 200 ms after it, a standby cycle",
+        s.copy_at.empty() ? 0 : s.copy_at[0] - t0);
+  CHECK(s.p.state() == PS_STANDBY && off_text(s.p) == "Off" && !s.p.problem(), "at rest: 'Off' (%s)",
+        off_text(s.p).c_str());
+  // an hour of everything that would power it: lights on and off, pre-wakes, Always on's leftovers, power cycles,
+  // detect flaps, a board unplugged and back
+  const uint32_t rest = s.now;
+  for (int i = 0; i < 60; i++) {
+    s.lit[0] = (i % 3) != 0;
+    s.p.prewake(s.now, 10 * MIN);
+    CHECK(s.p.power_cycle(s.now) == 0, "a power cycle while Off: nothing");
+    s.detect = (i % 7) != 3;
+    s.run(MIN);
+  }
+  s.detect = true;
+  s.run(MIN);
+  CHECK(rises_after(s, rest) == 0 && !s.p.enable() && s.ready == 1 && s.copy_at.size() == 3,
+        "an hour of lights, pre-wakes, power cycles and detect flaps while Off: never powered (%zu rises)",
+        rises_after(s, rest));
+  // Off ends with a light lit: powered (it follows its lights from then on), as a light turned on in Standby
+  s.lit[0] = true;
+  s.run(1000);
+  const uint32_t t1 = s.now;
+  s.p.set_mode(MODE_STANDBY);
+  CHECK(s.run_until(5000, [&] { return s.p.ready(); }) && s.ready_at - t1 <= 1720,
+        "Standby again, the light lit: on (%u ms)", s.ready_at - t1);
+  // Off ends with nothing lit: nothing from before powers it (a light turned off while Off, a pre-wake, the
+  // turn-off period of a light turned off just before Off, Always on's turn-off period)
+  Sim q(2);
+  q.p.set_mode(MODE_ALWAYS_ON);
+  q.lit[0] = true;
+  q.run(3 * MIN);
+  q.lit[0] = false;   // (its 10 min turn-off period starts)
+  q.run(1000);
+  q.p.set_mode(MODE_OFF);
+  q.run(3000);
+  q.lit[1] = true;    // on and off again while Off
+  q.run(MIN);
+  q.lit[1] = false;
+  q.run(1000);
+  q.p.prewake(q.now, 20 * MIN);
+  q.run(1000);
+  const uint32_t t2 = q.now;
+  q.p.set_mode(MODE_STANDBY);
+  q.run(30 * MIN);
+  CHECK(rises_after(q, t2) == 0 && q.p.state() == PS_STANDBY && off_text(q.p) == "Standby",
+        "Standby again, nothing lit: stays in standby (%zu rises, '%s')", rises_after(q, t2), off_text(q.p).c_str());
+  // negative control: the same without Off powers the port (the light's turn-off period, the pre-wake)
+  Sim c(2);
+  c.p.set_mode(MODE_ALWAYS_ON);
+  c.lit[0] = true;
+  c.run(3 * MIN);
+  c.lit[0] = false;
+  c.run(1000);
+  c.p.set_mode(MODE_STANDBY);
+  c.run(5 * MIN);
+  CHECK(c.p.state() == PS_ON, "control: Standby keeps the turn-off period (on)");
+  // Off while waking: the enable low at once, no notice, never ready
+  Sim w(1);
+  w.lit[0] = true;
+  w.run(800);
+  CHECK(w.p.state() == PS_WAKING && w.p.enable(), "waking");
+  const uint32_t t3 = w.now;
+  w.p.set_mode(MODE_OFF);
+  w.step();
+  CHECK(!w.p.enable() && w.enable_at.back() == t3 && w.copy_at.empty(), "Off while waking: the enable low now");
+  w.run(10 * MIN);
+  CHECK(w.ready == 0 && w.copy_at.empty() && off_text(w.p) == "Off" && rises_after(w, t3) == 0,
+        "... never ready, no notice, 'Off'");
+  // Off with a connection lost (FAULT): at rest, no problem; the board's return wakes nothing
+  Sim f(1);
+  f.lit[0] = true;
+  f.run(3000);
+  f.detect = false;
+  f.run(1000);
+  CHECK(f.p.state() == PS_FAULT && f.p.problem(), "FAULT");
+  f.p.set_mode(MODE_OFF);
+  f.run(1000);
+  CHECK(f.p.state() == PS_NO_BOARD && !f.p.problem() && !f.p.enable() && off_text(f.p) == "Off (no board)",
+        "Off: 'Off (no board)', no problem (%s)", off_text(f.p).c_str());
+  const uint32_t t4 = f.now;
+  f.detect = true;
+  f.run(5 * MIN);
+  CHECK(rises_after(f, t4) == 0 && off_text(f.p) == "Off", "the board back: 'Off', not powered");
+  // no board, a light lit, Off: the enable stays low (Standby raises it so a board plugged in gets power)
+  Sim n(1);
+  n.detect = false;
+  n.p.set_mode(MODE_OFF);
+  n.lit[0] = true;
+  n.run(5000);
+  CHECK(!n.p.enable() && !n.p.problem() && n.enable_at.empty(), "no board, a light, Off: enable low, no problem");
+  n.detect = true;
+  n.run(5000);
+  CHECK(n.enable_at.empty() && n.p.state() == PS_STANDBY, "a board plugged in: not powered");
+  // a request during the notice, then Off: no wake after the off-hold
+  Sim r(1);
+  r.lit[0] = true;
+  r.run(3000);
+  r.lit[0] = false;
+  r.run_until(11 * MIN, [&] { return !r.copy_at.empty(); });
+  r.lit[0] = true;   // (during the notice: a wake after min_off_time)
+  r.step();
+  r.p.set_mode(MODE_OFF);
+  const uint32_t t5 = r.now;
+  r.run(5 * MIN);
+  CHECK(rises_after(r, t5) == 0 && r.ready == 1, "a wake asked for during the notice, then Off: no wake");
+  // boot in Off (restored before the first update): never powered
+  Sim b(1);
+  b.p.set_mode(MODE_OFF);
+  b.lit[0] = true;
+  b.p.prewake(b.now, 5 * MIN);
+  b.run(10 * MIN);
+  CHECK(b.enable_at.empty() && off_text(b.p) == "Off", "boot in Off, a light lit: never powered");
+  // the mode's values (stored by the select)
+  CHECK(MODE_OFF == 3 && MODE_COUNT == 4, "Off is mode 3 (stored values 0-2 unchanged)");
+}
+
+/// A random hour per seed: lights, pre-wakes, detect flaps, power cycles, mode changes; while Off the enable never
+/// goes high, and at the moment Off is chosen it goes low within the notice's time (ON) or at once (otherwise)
+static void test_off_random() {
+  std::printf("the power mode Off, randomized: never powered while Off\n");
+  uint32_t seed = 12345, bad = 0, offs = 0;
+  auto rnd = [&seed](uint32_t n) {
+    seed = seed * 1664525u + 1013904223u;
+    return (seed >> 8) % n;
+  };
+  for (int run = 0; run < 200; run++) {
+    Sim s(2);
+    bool off = false;
+    uint32_t off_since = 0;
+    for (int i = 0; i < 400; i++) {
+      switch (rnd(8)) {
+        case 0:
+          s.lit[rnd(2)] = rnd(2) != 0;
+          break;
+        case 1:
+          s.p.prewake(s.now, (1 + rnd(20)) * MIN);
+          break;
+        case 2:
+          s.detect = rnd(6) != 0;
+          break;
+        case 3:
+          s.p.power_cycle(s.now);
+          break;
+        case 4: {
+          const PowerMode m = static_cast<PowerMode>(rnd(MODE_COUNT));
+          s.p.set_mode(m);
+          s.p.set_dark(rnd(2) != 0);
+          if ((m == MODE_OFF) != off) {
+            off = m == MODE_OFF;
+            off_since = s.now;
+            offs += off;
+          }
+          break;
+        }
+        default:
+          break;
+      }
+      const uint32_t step = 10 * (1 + rnd(500));
+      for (uint32_t end = s.now + step; static_cast<int32_t>(s.now - end) < 0;) {
+        s.step();
+        // (Off since: the notice of a port that was ON may still run: 1 s at most, then the enable is low)
+        if (off && s.p.enable() && s.now - off_since > s.p.config().notice_max_ms + 20)
+          bad++;
+        if (off && s.p.enable() && s.p.state() != PS_NOTICE && s.p.state() != PS_ON)
+          bad++;
+      }
+    }
+  }
+  CHECK(bad == 0 && offs > 1000, "200 random hours, %u Off periods: %u steps powered while Off", offs, bad);
+}
+
 int main() {
   std::printf("diffpower test (the port power manager's core)\n");
   test_cycle();
@@ -956,6 +1155,8 @@ int main() {
   test_power_cycle();
   test_prewake_at_expiry();
   test_long_notice();
+  test_off_mode();
+  test_off_random();
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "ALL DIFFPOWER TESTS PASSED", failures);
   return failures ? 1 : 0;
 }

@@ -308,6 +308,11 @@ void UltraFirmwareUpdate::perform(bool force) {
     ESP_LOGW(TAG, "'%s': an install already runs", this->get_name().c_str());
     return;
   }
+  if (this->hub_->port_off()) {
+    ESP_LOGW(TAG, "'%s': its Diff-Power port's power mode is Off: no install", this->get_name().c_str());
+    this->set_status_("failed: its Diff-Power port's power mode is Off");
+    return;
+  }
   if (!this->have_release_) {
     ESP_LOGW(TAG, "'%s': no release known yet (check first)", this->get_name().c_str());
     this->set_status_("failed: no release known yet (the last check failed?)");
@@ -340,6 +345,11 @@ void UltraFirmwareUpdate::recover(uint32_t lead_in_ms, bool power_cycle) {
     ESP_LOGW(TAG, "'%s': recover needs a known release and no install running", this->get_name().c_str());
     return;
   }
+  if (this->hub_->port_off()) {
+    ESP_LOGW(TAG, "'%s': its Diff-Power port's power mode is Off: no recovery", this->get_name().c_str());
+    this->set_status_("failed: its Diff-Power port's power mode is Off");
+    return;
+  }
   this->force_ = true;
   this->recover_ = true;
   this->retry_.begin(0, false);   // (forced: no retries)
@@ -359,6 +369,7 @@ void UltraFirmwareUpdate::start_install_() {
   this->job_version_ = this->latest_;
   this->dl_abort_.store(false);
   this->dl_bytes_.store(0);
+  this->off_stop_ = false;
   this->phase_ = QUEUED;
   this->phase_ms_ = millis();
   this->state_ = update::UPDATE_STATE_INSTALLING;
@@ -577,6 +588,17 @@ void UltraFirmwareUpdate::abort() {
 void UltraFirmwareUpdate::loop() {
   const uint32_t now = millis();
   image_cache.service(now, entities_ > 1 ? IMAGE_HOLD_MS : 0);
+  // its Diff-Power port set to Off meanwhile: the install stops (the port powers nothing for it)
+  if (this->phase_ != IDLE && !this->off_stop_ && this->hub_->port_off()) {
+    this->off_stop_ = true;
+    ESP_LOGW(TAG, "'%s': its Diff-Power port's power mode is now Off: the install stops", this->get_name().c_str());
+    if (this->phase_ == DOWNLOADING || this->phase_ == SENDING) {
+      this->abort();   // (it ends once its task stops)
+    } else {
+      this->finish_("aborted: its Diff-Power port's power mode is Off", false);
+      return;
+    }
+  }
   switch (this->phase_) {
     case QUEUED: {
       if (active_ != nullptr && active_ != this)

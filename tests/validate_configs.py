@@ -991,6 +991,9 @@ CASES = [
     ("diffpower notice_time 2 s", DP_PORT + "    notice_time: 2s\n", False, "notice_time"),
     ("diffpower notice_time 1 s", DP_PORT + "    notice_time: 1s\n", True, None),
     ("diffpower power mode bogus", DP_PORT + "    power_mode: sometimes\n", False, "power_mode"),
+    # the power mode Off (round 12): quoted, or bare (YAML's false)
+    ("diffpower power mode off", DP_PORT + '    power_mode: "off"\n', True, None),
+    ("diffpower power mode off, bare", DP_PORT + "    power_mode: off\n", True, None),
     ("diffpower turn-off period too long", DP_PORT + "    standby_after: 2d\n", False, "standby_after"),
     ("diffpower unknown light", DP_PORT + "    lights: [nope]\n", False, "Couldn't find ID 'nope'"),
     # the off time at least 1 s; a light's turn-off period at most 24 h; wake targets on a port

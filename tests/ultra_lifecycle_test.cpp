@@ -432,6 +432,7 @@ struct UltraFirmwareUpdate {
   uint32_t phase_ms_{0}, latest_{0}, job_version_{0};
   std::atomic<bool> dl_abort_{false};
   std::atomic<uint32_t> dl_bytes_{0};
+  bool off_stop_{false};
   FwImageInfo image_, job_image_;
   std::string image_url_, job_url_;
   uint8_t hw_rev_{3};
@@ -1938,6 +1939,7 @@ struct UltraHub {
     this->keeper.attach(&this->led, 5u << 16, 2);
   }
   bool standby{false};    // its Diff-Power port in standby
+  bool off{false};        // ... its power mode Off
   bool settling{false};   // ... just woken: the receivers not heard yet
   uint32_t rate{1000};    // the update rate
   double port_wh{-1.0};
@@ -1954,6 +1956,7 @@ struct UltraHub {
   const TelemetryPoller &telemetry() const { return this->p; }
   const PortMonitor &port_monitor() const { return this->m; }
   bool port_standby() const { return this->standby; }
+  bool port_off() const { return this->off; }
   bool rx_settling(uint16_t) const { return this->settling; }
 };
 
@@ -2509,6 +2512,19 @@ static void test_receiver_entities() {
         "port in standby: Power / Current 0 (receiver %.1f W, port %.1f W, light %.1f W), the rest unknown, Energy "
         "kept (%.1f)",
         vals[1][UltraReceiver::POWER].state, port_power.state, light_power.state, vals[1][UltraReceiver::ENERGY].state);
+  // ... its power mode Off (round 12): "Port off" / "Off", as Standby otherwise (no problem, Power 0)
+  hub.off = true;
+  hub.p.touch_all();
+  run(30000);
+  CHECK(texts[0][UltraReceiver::STATUS].state == "Port off" && texts[1][UltraReceiver::STATUS].state == "Port off" &&
+            texts[0][UltraReceiver::STATUS_DETAIL].state.find("power mode is Off") != std::string::npos &&
+            !problems[0].state && !problems[1].state && !port_problem.state &&
+            port_texts[UltraTelemetryPort::STATUS].state == "Off" && light_status.state == "Port off" &&
+            vals[1][UltraReceiver::POWER].state == 0.0f && port_power.state == 0.0f,
+        "port Off: '%s' ('%s'), port '%s', light '%s'", texts[0][UltraReceiver::STATUS].state.c_str(),
+        texts[0][UltraReceiver::STATUS_DETAIL].state.c_str(), port_texts[UltraTelemetryPort::STATUS].state.c_str(),
+        light_status.state.c_str());
+  hub.off = false;
   // just woken, not heard yet: Waking and no problem (receivers, light, port), not No answer (design review, round 8)
   hub.standby = false;
   hub.settling = true;
@@ -2768,6 +2784,7 @@ struct DiffPowerPort {
   uint32_t saved_standby_s_{0}, saved_cycles_{0}, saved_drops_{0}, minute_ms_{0};
   uint32_t detect_ms_{0};
   bool detect_raw_{true}, detect_read_{false};
+  bool off_seen_{false};
   TextSensor *status_{nullptr};
   BinarySensor *problem_{nullptr};
   Sensor *cycles_{nullptr}, *hours_{nullptr}, *drops_{nullptr};
@@ -3164,6 +3181,45 @@ static void test_port() {
   CHECK(p.get_mode() == MODE_ALWAYS_ON && sel.pref_.v == MODE_ALWAYS_ON && sel.published == 1 &&
             sel.index_of_(MODE_STANDBY) == 0 && sel.index_of_(MODE_ALWAYS_ON) == 1,
         "the select without a dark source: option 1 is Always on");
+  // the power mode Off (round 12): option 2 without a dark source, on flash at once (a sync; other modes: the usual
+  // flash_write_interval), restored at boot before the port's first update
+  {
+    Pin en6, det6;
+    det6.level = true;
+    LightState l6;
+    TextSensor st6;
+    DiffPowerPort o;
+    o.enable_pin_ = &en6;
+    o.detect_pin_ = &det6;
+    o.status_ = &st6;
+    o.add_light(&l6, 0);
+    PowerModeSelect os;
+    os.port_ = &o;
+    l6.remote_values.on = true;
+    run({&o}, 5000);
+    const bool lit_on = en6.level && st6.state == "On";
+    const int syncs = prefs.syncs;
+    os.control(2);
+    run({&o}, 3000);
+    CHECK(lit_on && o.get_mode() == MODE_OFF && os.pref_.v == MODE_OFF && prefs.syncs == syncs + 1 &&
+              os.index_of_(MODE_OFF) == 2 && !en6.level && st6.state == "Off",
+          "Off chosen with a light lit: the enable low, 'Off' (%s), on flash now (%d syncs)", st6.state.c_str(),
+          prefs.syncs - syncs);
+    run({&o}, 30 * 60000);
+    const bool stayed = !en6.level && st6.state == "Off";
+    os.control(0);
+    run({&o}, 5000);
+    CHECK(stayed && prefs.syncs == syncs + 1 && en6.level && st6.state == "On",
+          "Off for 30 min with the light on: never powered; Standby again (no sync): on ('%s')", st6.state.c_str());
+    DiffPowerPort b;
+    b.set_mode(MODE_ALWAYS_ON);
+    PowerModeSelect bs;
+    bs.port_ = &b;
+    bs.pref_.have = true;
+    bs.pref_.v = MODE_OFF;
+    bs.setup();
+    CHECK(b.get_mode() == MODE_OFF && bs.published == 2, "Off restored at boot over the YAML's Always on");
+  }
   now_ms = 0;
   std::printf("  Diff-Power port: wake, a plain light sent again, the notice, the shutdown hook (2 + 1 ports, during a "
               "notice, slow transmitters, standby time), the counters per id, the select\n");
@@ -3913,6 +3969,8 @@ struct UltraHub {
   bool has_telemetry() const { return this->with_telemetry; }
   const TelemetryPoller &telemetry() const { return this->p; }
   bool has_power_supply() const { return false; }
+  bool port_off() const { return this->off; }
+  bool off{false};   // (its Diff-Power port's power mode Off)
   void power_cycle() {}
   uint32_t power_cycle_ms() const { return 0; }
   PowerCycle power_cycle_state() const { return CYCLE_NONE; }
@@ -3960,7 +4018,7 @@ struct UltraFirmwareUpdate {
   UltraHub *hub_{nullptr};
   Phase phase_{IDLE};
   uint8_t state_{0};
-  bool have_release_{true}, force_{false}, recover_{false}, power_cycle_{false};
+  bool have_release_{true}, force_{false}, recover_{false}, power_cycle_{false}, off_stop_{false};
   uint8_t passes_{3}, auto_retry_{2};
   AutoRetry retry_;
   uint32_t installed_{0x000608FF}, latest_{0x000609FF}, job_version_{0}, lead_in_ms_{500}, phase_ms_{0};
@@ -4053,6 +4111,21 @@ static void test_auto_retry() {
               u.texts.back() == std::string("done: 0.6.9 sent to the 3 boards of this line in 3 sessions. ") +
                                     BLINK_LEGEND,
           "blind: 3 sessions, never forced, then done: '%s'", u.texts.back().c_str());
+  }
+  // its Diff-Power port Off (round 12): no install, no recovery (the port would never power the boards)
+  {
+    UltraHub h;
+    h.off = true;
+    UltraFirmwareUpdate u;
+    u.hub_ = &h;
+    u.perform(false);
+    const bool no_install = u.phase_ == UltraFirmwareUpdate::IDLE && h.sessions == 0 && !u.texts.empty() &&
+                            u.texts.back() == "failed: its Diff-Power port's power mode is Off";
+    u.perform(true);
+    h.off = false;   // negative control: the same install once the port isn't Off
+    u.perform(false);
+    CHECK(no_install && u.phase_ == UltraFirmwareUpdate::QUEUED, "port Off: no install ('%s'); not Off: queued",
+          u.texts.empty() ? "" : u.texts.back().c_str());
   }
   // force_update / recover: no retry
   {

@@ -82,7 +82,7 @@ check({"strip", "part", "outer", "u1"} <= on and "u2" not in on, f"wake targets:
 
 # "During dark"'s source in each configuration: Home Assistant's sun times (api: and a clock), ESPHome's sun (sun_id),
 # both (the sun the backup), or none (the select without "During dark"); the clock: time_id, the sun's, the only time
-ALL3, TWO = dp.MODE_OPTIONS, [dp.MODE_OPTIONS[0], dp.MODE_OPTIONS[2]]
+ALL3, TWO = dp.MODE_OPTIONS, ["Standby", "Always on", "Off"]   # (TWO: without During dark)
 SUN = {"id": ID("s"), "latitude": 52.1, "longitude": 5.1, "time_id": ID("t_sun")}
 
 
@@ -112,6 +112,21 @@ for what, args, want in [
 ]:
     got = dark(**args)
     check(got == want, f"{what}: {got}")
+
+# the power mode Off (round 12): the 4th option, mode 3 (diffpower_core.h's PowerMode), "off" quoted or bare (YAML reads
+# a bare off as false)
+core = (HERE.parent / "components" / "diffpower" / "diffpower_core.h").read_text(encoding="utf-8")
+check(dp.MODE_OPTIONS == ["Standby", "During dark", "Always on", "Off"] and
+      list(dp.POWER_MODES.values()) == [0, 1, 2, 3] and
+      "MODE_STANDBY = 0, MODE_DURING_DARK, MODE_ALWAYS_ON, MODE_OFF, MODE_COUNT" in core,
+      "Off: option 4, mode 3, in the core's order")
+check(dp._power_mode("off") == "off" and dp._power_mode(False) == "off" and dp._power_mode("Always_On") == "always_on",
+      "power_mode: off, a bare off (false), any case")
+try:
+    dp._power_mode(True)
+    check(False, "power_mode: a bare on: refused")
+except Exception as e:  # cv.Invalid
+    check(True, f"power_mode: a bare on: refused ('{e}')")
 
 # power_mode: during_dark without a source: refused, with what is missing
 for what, args, needle in [

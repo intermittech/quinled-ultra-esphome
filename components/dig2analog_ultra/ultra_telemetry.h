@@ -1238,6 +1238,7 @@ enum ReceiverStatus : uint8_t {
   RS_OK,
   RS_STANDBY,   // its Diff-Power port isn't on (diffpower): not powered, not polled; never a problem, never the worst
   RS_WAKING,    // its line's power just came back: not heard yet, not missed enough to count as gone (as Standby)
+  RS_PORT_OFF,  // its Diff-Power port's power mode is Off (as Standby: never powered until another mode is chosen)
   RS_COUNT,
 };
 static constexpr int16_t TOO_HOT_C10 = 850;          // a board before 0.2.5 (no hot flag): the MCU at 85 C or more
@@ -1250,7 +1251,7 @@ inline const char *receiver_status_name(ReceiverStatus s) {
                                               "Calibration suggested",      "Limiting",
                                               "Calibrating", "Soft start",  "Held dark",
                                               "Blinking",    "OK",          "Standby",
-                                              "Waking"};
+                                              "Waking",      "Port off"};
   return s < RS_COUNT ? NAMES[s] : "OK";
 }
 inline bool receiver_status_problem(ReceiverStatus s) { return s <= RS_CAL_SUGGESTED; }
@@ -1442,6 +1443,8 @@ inline std::string receiver_status_detail(const ReceiverData &d, ReceiverStatus 
       return "The port is in standby (4.5 V); the receiver is off and wakes with its lights.";
     case RS_WAKING:
       return "Its port just woke: waiting for its first answer.";
+    case RS_PORT_OFF:
+      return "Its port's power mode is Off: no 55 V until another mode is chosen.";
     default:
       return "OK.";
   }

@@ -726,6 +726,10 @@ void UltraHub::calibrate_boards(const std::vector<uint16_t> &boards, uint8_t dut
     ESP_LOGW(TAG, "Current calibration on GPIO%u: already running, request ignored", this->pin_);
     return;
   }
+  if (this->port_off()) {
+    ESP_LOGW(TAG, "Current calibration on GPIO%u skipped: its Diff-Power port's power mode is Off", this->pin_);
+    return;
+  }
   this->cal_req_boards_ = boards;
   this->cal_req_duty_ = duty_pct;
   this->cal_pending_ = true;  // starts in service_calibration_() once the boards have power and Ultra
@@ -765,6 +769,10 @@ void UltraHub::service_calibration_() {
     return;
   }
 #endif
+  if (this->port_off() && this->calibration_running()) {
+    ESP_LOGW(TAG, "Current calibration on GPIO%u: its Diff-Power port's power mode is now Off", this->pin_);
+    this->cancel_calibration();   // (the port powers off; nothing would reach the boards)
+  }
   // automatic runs (off unless configured)
   const bool boot_due = this->cal_on_boot_ && !this->cal_boot_done_ && now >= CAL_BOOT_DELAY_MS;
   const bool interval_due = this->cal_interval_ms_ != 0 && now - this->cal_last_ms_ >= this->cal_interval_ms_;

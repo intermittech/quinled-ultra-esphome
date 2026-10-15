@@ -28,6 +28,12 @@
 // pre-wake; the mode Always on, or During dark inside the dark window (no valid time: unknown_on decides), and the
 // port's turn-off period after either ends. Every timer is retired at every update, whatever else wants power.
 //
+// The power mode Off (working on the strips): never wanted, whatever is lit. Choosing it powers the port off now (ON:
+// the planned power-off without min_on_ms; WAKING: the enable low at once, no notice: the boards had no frame yet;
+// FAULT: at rest, no problem any more) and forgets every turn-off period, pre-wake and wake request; pre-wakes and
+// power cycles meanwhile are dropped. The lights keep their state: once another mode is chosen, the port follows
+// that mode and the lights lit then (as a light turned on in Standby would), and nothing from before Off.
+//
 // Counters for the wrapper to persist (EV_COUNTERS): standby cycles (planned power-offs), detect drops (power
 // interruptions while ON), seconds in standby (STANDBY and OFF_HOLD).
 
@@ -38,7 +44,7 @@
 
 namespace esphome::diffpower {
 
-enum PowerMode : uint8_t { MODE_STANDBY = 0, MODE_DURING_DARK, MODE_ALWAYS_ON, MODE_COUNT };
+enum PowerMode : uint8_t { MODE_STANDBY = 0, MODE_DURING_DARK, MODE_ALWAYS_ON, MODE_OFF, MODE_COUNT };
 enum PortState : uint8_t {
   PS_NO_BOARD = 0,
   PS_STANDBY,
@@ -239,12 +245,18 @@ class PortCore {
     Load &l = this->loads_[i];
     if (l.lit && !lit) {
       l.off_ms = now_ms;
-      l.held = true;   // its turn-off period runs from now
+      l.held = this->mode_ != MODE_OFF;   // its turn-off period runs from now (Off: none)
     }
     l.lit = lit;
   }
-  void set_mode(PowerMode m) { this->mode_ = m < MODE_COUNT ? m : MODE_STANDBY; }
+  /// The power mode (Off: never powered, and nothing from before powers it once another mode is chosen)
+  void set_mode(PowerMode m) {
+    this->mode_ = m < MODE_COUNT ? m : MODE_STANDBY;
+    if (this->mode_ == MODE_OFF)
+      this->forget_();
+  }
   PowerMode mode() const { return this->mode_; }
+  bool off() const { return this->mode_ == MODE_OFF; }
   /// The dark window now (known: the controller has a valid time)
   void set_dark(bool dark, bool known = true) {
     this->dark_ = dark;
@@ -253,6 +265,8 @@ class PortCore {
   bool dark() const { return this->dark_; }
   /// Pre-wake (motion): wanted for timeout_ms (min_on_ms to 24 h; longer if a light turns on meanwhile)
   void prewake(uint32_t now_ms, uint32_t timeout_ms) {
+    if (this->mode_ == MODE_OFF)
+      return;   // (dropped, not kept for later)
     timeout_ms = timeout_ms < this->cfg_.min_on_ms ? this->cfg_.min_on_ms : timeout_ms;
     timeout_ms = timeout_ms > MAX_HOLD_MS ? MAX_HOLD_MS : timeout_ms;
     // (a start and a length, compared as elapsed time: right even with updates days apart; one that ran out before
@@ -292,6 +306,10 @@ class PortCore {
   /// Whether the port should be powered now; retires every finished timer first (whatever else wants power: a
   /// timer left alone for 24.8 days would come back to life)
   bool want_power(uint32_t now_ms) {
+    if (this->mode_ == MODE_OFF) {
+      this->forget_();
+      return false;
+    }
     const bool mode_on = this->mode_ == MODE_ALWAYS_ON ||
                          (this->mode_ == MODE_DURING_DARK && (this->dark_known_ ? this->dark_ : this->cfg_.unknown_on));
     if (mode_on) {
@@ -348,6 +366,11 @@ class PortCore {
           this->problem_ = this->rewake_ || want;
           this->rewake_ = false;
           this->enable_on_(want, now_ms);
+        } else if (this->mode_ == MODE_OFF) {
+          // Off: the enable low now (no notice: the boards had no frame yet; ones that booted see a power cut)
+          this->enable_ = false;
+          this->rewake_ = false;
+          this->hold_off_(now_ms, this->cfg_.min_off_ms);
         } else if (this->powered_(now_ms)) {
           this->state_ = PS_ON;
           this->on_ms_ = now_ms;
@@ -369,7 +392,7 @@ class PortCore {
             this->state_ = PS_WAKING;   // powered again hotplug + boot after its return
             this->rewake_ = true;
           }
-        } else if (!want && now_ms - this->on_ms_ >= this->cfg_.min_on_ms) {
+        } else if (!want && (this->mode_ == MODE_OFF || now_ms - this->on_ms_ >= this->cfg_.min_on_ms)) {
           // (its hubs read the receivers' counters once more first: prepare_max_ms at most)
           if (this->cfg_.prepare_max_ms == 0 ||
               (this->preparing_ && (this->notice_ready_ || now_ms - this->prep_ms_ >= this->cfg_.prepare_max_ms))) {
@@ -414,6 +437,10 @@ class PortCore {
         }
         break;
       case PS_FAULT:
+        if (this->mode_ == MODE_OFF) {   // (Off: at rest, not a problem any more; its return wakes nothing)
+          this->rest_(now_ms);
+          break;
+        }
         this->enable_on_(want, now_ms);
         if (this->board_) {
           if (want)
@@ -453,8 +480,8 @@ class PortCore {
   uint8_t power_cycle(uint32_t now_ms) {
     const PortState was = this->state_;
     const bool enable_was = this->enable_;
-    if (this->state_ == PS_OFF)
-      return 0;
+    if (this->state_ == PS_OFF || this->mode_ == MODE_OFF)
+      return 0;   // (Off: the port stays without power)
     this->enable_ = false;
     this->pending_ = false;
     this->problem_ = false;
@@ -531,6 +558,14 @@ class PortCore {
     bool lit, held;
     uint32_t off_ms;
   };
+  /// Off: no turn-off period, pre-wake or wake request left (none powers the port once another mode is chosen)
+  void forget_() {
+    this->mode_on_ = this->mode_held_ = false;
+    this->prewake_ = false;
+    this->wake_pending_ = false;
+    for (Load &l : this->loads_)
+      l.held = false;
+  }
   /// a turn-off period (0: the port's), min_on_ms to 24 h
   uint32_t hold_(uint32_t hold_ms) const {
     uint32_t h = hold_ms != 0 ? hold_ms : this->cfg_.standby_after_ms;
@@ -624,8 +659,10 @@ class PortCore {
 };
 
 /// The port's status text: "No board", "Standby", "Waking", "On", "Powering off", "Connection lost (N drops)", "Off"
-/// (buf: for the drops)
-inline const char *port_state_text(PortState s, uint32_t drops, char *buf, size_t n) {
+/// (buf: for the drops); in the power mode Off at rest: "Off", "Off (no board)"
+inline const char *port_state_text(PortState s, uint32_t drops, char *buf, size_t n, bool off = false) {
+  if (off && (s == PS_STANDBY || s == PS_NO_BOARD))
+    return s == PS_STANDBY ? "Off" : "Off (no board)";
   switch (s) {
     case PS_NO_BOARD:
       return "No board";

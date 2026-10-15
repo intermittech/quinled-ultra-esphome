@@ -87,7 +87,7 @@ void DiffPowerPort::ha_value_(const char *s, size_t n, uint8_t bit) {
 
 void DiffPowerPort::dump_config() {
   const PortConfig &c = this->core_.config();
-  static const char *const MODES[MODE_COUNT] = {"Standby", "During dark", "Always on"};
+  static const char *const MODES[MODE_COUNT] = {"Standby", "During dark", "Always on", "Off"};
   ESP_LOGCONFIG(TAG,
                 "Diff-Power port '%s':\n"
                 "  Power mode: %s, turn-off period %" PRIu32 " s, on at least %" PRIu32 " s\n"
@@ -179,6 +179,16 @@ void DiffPowerPort::loop() {
     this->core_.set_notice_ready(ready);
   }
   this->apply_(this->core_.update(now), now);
+  if (this->core_.off() != this->off_seen_) {   // the power mode Off chosen or left (also restored at boot)
+    this->off_seen_ = this->core_.off();
+    if (this->off_seen_) {
+      ESP_LOGI(TAG, "Port '%s': power mode Off: no 55 V, whatever its lights do, until another mode is chosen",
+               this->name_);
+    } else {
+      ESP_LOGI(TAG, "Port '%s': power mode Off ended: powered when its mode or a light on it wants it", this->name_);
+    }
+    this->publish_();
+  }
   if (now - this->minute_ms_ >= MINUTE_MS) {   // the hours in standby
     this->minute_ms_ = now;
     if (this->core_.standby_s() - this->saved_standby_s_ >= SAVE_STANDBY_S)
@@ -220,7 +230,7 @@ void DiffPowerPort::apply_(uint8_t ev, uint32_t now) {
     if (ev & EV_STATE) {
       char buf[32];
       ESP_LOGD(TAG, "Port '%s': %s", this->name_,
-               port_state_text(this->core_.state(), this->core_.drops(), buf, sizeof(buf)));
+               port_state_text(this->core_.state(), this->core_.drops(), buf, sizeof(buf), this->core_.off()));
     }
     this->publish_();
   }
@@ -246,7 +256,8 @@ void DiffPowerPort::publish_() {
 #ifdef USE_TEXT_SENSOR
   if (this->status_ != nullptr) {
     char buf[32];
-    const std::string s = port_state_text(this->core_.state(), this->core_.drops(), buf, sizeof(buf));
+    const std::string s =
+        port_state_text(this->core_.state(), this->core_.drops(), buf, sizeof(buf), this->core_.off());
     if (!this->status_->has_state() || this->status_->state != s)
       this->status_->publish_state(s);
   }
@@ -350,6 +361,8 @@ void PowerModeSelect::control(size_t index) {
   const uint8_t mode = this->mode_of_(index);
   uint32_t stored = mode;
   this->pref_.save(&stored);
+  if (mode == MODE_OFF)
+    global_preferences->sync();   // (Off on flash now, not at the next flash_write_interval: a power cut keeps it)
   this->port_->set_mode(mode);
   this->publish_state(index);
 }

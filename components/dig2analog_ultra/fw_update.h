@@ -134,6 +134,7 @@ class UltraFirmwareUpdate final : public update::UpdateEntity, public PollingCom
   bool force_{false};
   bool recover_{false};
   bool power_cycle_{false};
+  bool off_stop_{false};   // its Diff-Power port set to Off during this install: stopped once
   uint32_t lead_in_ms_{500};
   uint32_t phase_ms_{0};
   uint32_t last_publish_ms_{0};

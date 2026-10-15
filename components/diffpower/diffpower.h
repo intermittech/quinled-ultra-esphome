@@ -71,11 +71,14 @@ class DiffPowerPort final : public Component {
     c.unknown_on = on;
     this->core_.configure(c);
   }
+  /// Standby, During dark, Always on, or Off (never powered: diffpower_core.h)
   void set_mode(uint8_t mode) {
     this->core_.set_mode(static_cast<PowerMode>(mode));
     this->dark_checked_ = false;   // (the dark window again now)
   }
   uint8_t get_mode() const { return this->core_.mode(); }
+  /// the power mode Off: the port stays without 55 V (a hub's calibration / update refuse to run)
+  bool is_off() const { return this->core_.off(); }
 #ifdef USE_DIFFPOWER_DARK
   /// "During dark": the time now from clock; from before_s before sunset to after_s after sunrise
   void set_dark(time::RealTimeClock *clock, uint32_t before_s, uint32_t after_s) {
@@ -208,6 +211,7 @@ class DiffPowerPort final : public Component {
   uint32_t saved_standby_s_{0}, saved_cycles_{0}, saved_drops_{0}, minute_ms_{0};
   uint32_t detect_ms_{0};      // the detect input's last read (every DETECT_READ_MS)
   bool detect_raw_{true}, detect_read_{false};
+  bool off_seen_{false};       // the power mode Off, as last logged / published
 #ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *status_{nullptr};
 #endif
@@ -222,12 +226,13 @@ class DiffPowerPort final : public Component {
 };
 
 #ifdef USE_SELECT
-/// The port's power mode (Standby / During dark / Always on), restored on the ESP32 (restore_value); the YAML's
-/// power_mode first
+/// The port's power mode (Standby / During dark / Always on / Off), restored on the ESP32 (restore_value); the YAML's
+/// power_mode first. Off is written to flash at once (a power cut right after it keeps the port Off).
 class PowerModeSelect final : public select::Select, public Component {
  public:
   void setup() override;
-  float get_setup_priority() const override { return setup_priority::HARDWARE; }
+  /// before its port's first update: a port restored Off never gets power at boot
+  float get_setup_priority() const override { return setup_priority::HARDWARE + 1.0f; }
   void set_port(DiffPowerPort *port) { this->port_ = port; }
 
  protected:

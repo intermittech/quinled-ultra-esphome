@@ -66,9 +66,9 @@ CONF_POWER_MODE_SELECT = "power_mode_select"
 CONF_WAKE = "wake"
 CONF_WAKE_TIMEOUT = "wake_timeout"
 
-# PowerMode (diffpower_core.h), and the select's options in that order
-POWER_MODES = {"standby": 0, "during_dark": 1, "always_on": 2}
-MODE_OPTIONS = ["Standby", "During dark", "Always on"]
+# PowerMode (diffpower_core.h), and the select's options in that order. Off: never powered (working on the strips)
+POWER_MODES = {"standby": 0, "during_dark": 1, "always_on": 2, "off": 3}
+MODE_OPTIONS = ["Standby", "During dark", "Always on", "Off"]
 # During dark without sun times (no valid time yet; Home Assistant's missing or stale and no sun_id)
 TIME_UNKNOWN = {"always_on": True, "standby": False}
 
@@ -91,7 +91,8 @@ def _light_entry(value):
 
 # the port's entities: key -> (kind, its name after the port's, schema)
 PORT_ENTITIES = {
-    # "No board", "Standby", "Waking", "On", "Powering off", "Connection lost (N drops)"
+    # "No board", "Standby", "Waking", "On", "Powering off", "Connection lost (N drops)"; the power mode Off: "Off",
+    # "Off (no board)"
     CONF_STATUS: ("text", "power state", text_sensor.text_sensor_schema(icon="mdi:power-plug-outline")),
     # on while the board's detect is gone after it went away powered (unplugged, a cable fault, the supply gone), or
     # while a light wants a port without a board
@@ -135,7 +136,8 @@ PORT_ENTITIES = {
             entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
         ),
     ),
-    # Standby / During dark / Always on (restored on the ESP32; the YAML's power_mode first)
+    # Standby / During dark / Always on / Off (restored on the ESP32; the YAML's power_mode first). A config entity:
+    # on the port's device page, not on the default dashboards
     CONF_POWER_MODE_SELECT: (
         "select",
         "power mode",
@@ -196,7 +198,12 @@ def _dark_plan(config, full):
 def _mode_options(config, full):
     """The power mode select's options: "During dark" with a dark source."""
     _clock, ha, sun_conf = _dark_plan(config, full)
-    return MODE_OPTIONS if ha or sun_conf is not None else [MODE_OPTIONS[0], MODE_OPTIONS[2]]
+    return MODE_OPTIONS if ha or sun_conf is not None else [m for m in MODE_OPTIONS if m != "During dark"]
+
+
+def _power_mode(value):
+    """standby, during_dark, always_on, or off (YAML reads a bare off as false)."""
+    return cv.one_of(*POWER_MODES, lower=True)("off" if value is False else value)
 
 
 def _validate_dark(config, full):
@@ -230,8 +237,8 @@ PORT_SCHEMA = cv.All(
             cv.Optional(CONF_DETECT_PIN): pins.gpio_input_pin_schema,
             # standby (sleep after the turn-off period, wake on a command or a pre-wake), during_dark (also powered
             # from dark_before before sunset to dark_after after sunrise: Home Assistant's sun times, or the sun_id's),
-            # always_on; the select changes it
-            cv.Optional(CONF_POWER_MODE, default="standby"): cv.one_of(*POWER_MODES, lower=True),
+            # always_on, off (never powered: a port not in use); the select changes it
+            cv.Optional(CONF_POWER_MODE, default="standby"): _power_mode,
             # the turn-off period: powered this long after its last light went off (a light may set its own; at least
             # min_on_time)
             cv.Optional(CONF_STANDBY_AFTER, default="10min"): HOLD,

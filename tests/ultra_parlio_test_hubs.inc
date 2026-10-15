@@ -189,6 +189,7 @@ struct DiffPowerPort {
   uint32_t minute_ms_{0}, saved_standby_s_{0}, saved_cycles_{0}, saved_drops_{0};
   uint32_t detect_ms_{0};
   bool detect_raw_{true}, detect_read_{false};
+  bool off_seen_{false};
   static std::vector<DiffPowerPort *> ports_;
   static bool shut_down_;
 };

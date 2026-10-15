@@ -373,12 +373,16 @@ struct Chain {
     }
   }
   /// one RW frame from the poller and its window; returns the POLLed boards
+  uint64_t frame_hash{1469598103934665603ull};   // (FNV-1a of every build(): its slots, W, the boards)
   uint16_t window(TelemetryPoller &p) {
     std::vector<uint8_t> slots(ULTRA_SLOT_BYTES * (rx.size() + 1), 0);
     uint32_t w = 0;
     const uint16_t n = p.build(now_ms, slots.data(), &w);
     if (n == 0)
       return 0;
+    for (size_t b = 0; b < ULTRA_SLOT_BYTES * static_cast<size_t>(n); b++)
+      frame_hash = (frame_hash ^ slots[b]) * 1099511628211ull;
+    frame_hash = (frame_hash ^ w ^ (static_cast<uint64_t>(n) << 32)) * 1099511628211ull;
     frames++;
     rw_ms.push_back(now_ms);
     // the plan: every slot a valid POLL, one R and one rate, unique rising indices, W from them

@@ -713,11 +713,12 @@ class TelemetryPoller {
   // a page's time further ahead than any interval (24 h at most, and its backoff): from over half a millis() wrap
   // ago (a receiver not heard for that long, a line in standby for weeks): overdue
   static constexpr int32_t STALE_MS = 25 * 3600000;
+  static constexpr size_t MAX_RECEIVERS = 64;   // per line (the schema's limit)
 
   /// receivers: the first boards of the line (1..64); rate ULTRA_RW_RATE_*
   void init(uint16_t receivers, uint8_t rate, const TelemetryIntervals &iv, uint8_t seed = 0x5A) {
     this->idle_ = false;
-    this->rx_.assign(receivers, Receiver{});
+    this->rx_.assign(receivers < MAX_RECEIVERS ? receivers : MAX_RECEIVERS, Receiver{});
     this->rate_ = rate < ULTRA_RW_RATES ? rate : ULTRA_RW_RATE_1M;
     this->iv_ = iv;
     for (size_t i = 0; i < this->rx_.size(); i++)
@@ -820,39 +821,42 @@ class TelemetryPoller {
     if (reach == 0)
       return 0;
     // who answers: every receiver it can hear (so a missing answer shows which one broke the chain), the 16 most
-    // overdue of a longer chain
-    std::vector<uint16_t> answer;
-    for (size_t i = 0; i < reach; i++)
-      answer.push_back(static_cast<uint16_t>(i));
-    if (answer.size() > ULTRA_RW_MAX_SLOTS) {
-      std::vector<int32_t> over(reach);
+    // overdue of a longer chain (on the stack: no heap per window)
+    uint16_t answer[ULTRA_RW_MAX_SLOTS];
+    size_t na = 0;
+    if (reach <= ULTRA_RW_MAX_SLOTS) {
       for (size_t i = 0; i < reach; i++)
+        answer[na++] = static_cast<uint16_t>(i);
+    } else {
+      int32_t over[MAX_RECEIVERS];
+      uint16_t by[MAX_RECEIVERS];
+      for (size_t i = 0; i < reach; i++) {
         this->pick_(this->rx_[i], now_ms, &over[i]);
-      std::vector<uint16_t> by = answer;
-      for (size_t i = 1; i < by.size(); i++) {   // insertion sort: most overdue first, chain order on ties
+        by[i] = static_cast<uint16_t>(i);
+      }
+      for (size_t i = 1; i < reach; i++) {   // insertion sort: most overdue first, chain order on ties
         const uint16_t v = by[i];
         size_t j = i;
         for (; j > 0 && over[by[j - 1]] < over[v]; j--)
           by[j] = by[j - 1];
         by[j] = v;
       }
-      std::vector<bool> chosen(reach, false);
+      bool chosen[MAX_RECEIVERS]{};
       for (size_t i = 0; i < ULTRA_RW_MAX_SLOTS; i++)
         chosen[by[i]] = true;
-      answer.clear();
       for (size_t i = 0; i < reach; i++) {
         if (chosen[i])
-          answer.push_back(static_cast<uint16_t>(i));   // indices rise along the chain
+          answer[na++] = static_cast<uint16_t>(i);   // indices rise along the chain
       }
     }
-    const uint8_t slots_r = static_cast<uint8_t>(answer.size());
-    const uint16_t last = answer.back();
+    const uint8_t slots_r = static_cast<uint8_t>(na);
+    const uint16_t last = answer[na - 1];
     size_t k = 0;
     for (uint16_t b = 0; b <= last; b++) {
       Receiver &r = this->rx_[b];
       uint8_t *s = slots + ULTRA_SLOT_BYTES * b;
       r.seq++;
-      if (k < answer.size() && answer[k] == b) {
+      if (k < na && answer[k] == b) {
         int32_t overdue;
         uint8_t tp = this->pick_(r, now_ms, &overdue);
         if (tp >= TP_COUNT)
@@ -1530,8 +1534,10 @@ class PortMonitor {
     if (this->drop_.size() != n) {
       this->drop_.assign(n, NAN);
       this->res_.assign(n, NAN);
+      this->v_.assign(n, NAN);
+      this->i_.assign(n, NAN);
     }
-    std::vector<float> v(n, NAN), i(n, NAN);
+    std::vector<float> &v = this->v_, &i = this->i_;   // (every one written below: no heap per window)
     float total = 0.0f, rx_power = 0.0f, peak = 0.0f;
     bool any = false, any_power = false, any_peak = false;
     this->complete_ = true;
@@ -1633,6 +1639,7 @@ class PortMonitor {
   bool high_{false}, sustained_{false};
   uint32_t high_since_{0};
   std::vector<float> drop_, res_;
+  std::vector<float> v_, i_;   // (update(): the window's voltages and currents, kept: no heap per window)
 };
 
 /// A load in 5 % steps (the texts: they change only with a step, not with every reading)

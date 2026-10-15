@@ -913,7 +913,9 @@ void UltraHub::setup() {
   if (this->rw_uart_ != nullptr) {
     this->keeper_.attach(&ultra_ledger(), this->tel_key_, this->poller_.receivers());
     ledger_receivers() += this->poller_.receivers() + 1u;   // (its receivers' positions, its port's energy)
-    this->rw_slots_.assign(static_cast<size_t>(ULTRA_SLOT_BYTES) * this->num_boards_, 0);
+    // the POLL slots: the receivers only (the boards behind them take normal slots); the answers' buffer at once
+    this->rw_slots_.assign(static_cast<size_t>(ULTRA_SLOT_BYTES) * this->poller_.receivers(), 0);
+    this->rw_rx_.reserve(1024);
     this->rw_extra_us_ = this->poller_.max_window_us() + ULTRA_RW_HOLDOFF_US;
     if (this->rw_dir_pin_ != nullptr) {
       this->rw_dir_pin_->setup();         // the hub drives the line

@@ -276,17 +276,18 @@ class Scheduler {
     if (board >= this->boards_.size() || id == ULTRA_CFG_NONE || id >= ULTRA_CFG_COUNT)
       return;
     Board &b = this->boards_[board];
-    if (b.cfg_have[id] && b.cfg[id] == value)
+    if ((b.cfg_have & (1u << id)) && b.cfg[id] == value)
       return;
     b.cfg[id] = value;
-    b.cfg_have[id] = true;
+    b.cfg_have |= 1u << id;
     b.cfg_dirty = true;
   }
   uint16_t get_config(uint16_t board, uint8_t id) const {
     return board < this->boards_.size() && id < ULTRA_CFG_COUNT ? this->boards_[board].cfg[id] : 0;
   }
   bool has_config(uint16_t board, uint8_t id) const {
-    return board < this->boards_.size() && id < ULTRA_CFG_COUNT && this->boards_[board].cfg_have[id];
+    return board < this->boards_.size() && id < ULTRA_CFG_COUNT &&
+           (this->boards_[board].cfg_have & (1u << id)) != 0;
   }
   /// Queue the changed settings (all of them in 3 CONFIG slots of up to 9 values).
   void flush_config() {
@@ -299,7 +300,7 @@ class Scheduler {
         uint16_t vals[9];
         uint32_t n = 0;
         for (uint8_t id = 1 + page * 9; id < ULTRA_CFG_COUNT && id < 1 + (page + 1) * 9; id++) {
-          if (b.cfg_have[id]) {
+          if (b.cfg_have & (1u << id)) {
             ids[n] = id;
             vals[n++] = b.cfg[id];
           }
@@ -762,6 +763,7 @@ class Scheduler {
   /// Per board ~410 B, + ~430 B per light in use (allocated with its first command): 50 boards with one light each
   /// take ~42 KB of the ESP32's heap (wiki: Ultra line options). The queue holds keys (12 B per command) and is freed whenever
   /// it empties.
+  static_assert(ULTRA_CFG_COUNT <= 32, "Board::cfg_have holds a bit per CONFIG id");
   struct Board {   // (the slots first: no padding)
     Item config[CONFIG_PAGES];
     Item identify;  // the last IDENTIFY (identify, version, dark, release, calibrate)
@@ -769,7 +771,7 @@ class Scheduler {
     std::unique_ptr<LightItems> light[ULTRA_LIGHTS];
     uint16_t cfg[ULTRA_CFG_COUNT]{};
     uint16_t rr{0};
-    bool cfg_have[ULTRA_CFG_COUNT]{};
+    uint32_t cfg_have{0};   // the CONFIG ids set (bit per id)
     bool cfg_dirty{false};
     uint8_t seq[ULTRA_LIGHTS + 1][ULTRA_TYPES]{};
     uint8_t urgent_run{0};   // queued commands sent in a row (build_frame: every 16th slot a refresh)

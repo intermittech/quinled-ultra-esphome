@@ -123,9 +123,13 @@ void UltraReceiver::update_(uint32_t updates) {
   const ReceiverStatus st = standby                                 ? RS_STANDBY
                             : this->hub_->rx_settling(this->board_) ? RS_WAKING
                                                                     : receiver_status(d, answering);
+  // (a text is built only for its entity: a level the YAML leaves out costs nothing at run time)
+  auto has = [this](uint8_t which) { return this->texts_[which] != nullptr; };
   this->text_(STATUS, receiver_status_name(st));
-  this->text_(STATUS_DETAIL, receiver_status_detail(d, st, this->board_, p.cut_at(millis())) +
-                                 (st == RS_STANDBY || st == RS_WAKING ? std::string() : receiver_status_notes(d)));
+  if (has(STATUS_DETAIL)) {
+    this->text_(STATUS_DETAIL, receiver_status_detail(d, st, this->board_, p.cut_at(millis())) +
+                                   (st == RS_STANDBY || st == RS_WAKING ? std::string() : receiver_status_notes(d)));
+  }
   if (this->problem_ != nullptr)
     this->problem_->publish_state(receiver_status_problem(st));   // (binary_sensor publishes changes only)
 
@@ -173,18 +177,21 @@ void UltraReceiver::update_(uint32_t updates) {
   this->value_(MISSED_POLLS, polls && !standby ? 100.0f * static_cast<float>(p.missed(this->board_)) / polls : NAN, all);
   if (!answering)
     return;   // the texts keep what they last said
-  if (from(PG_IDENTITY | PG_STATUS))
+  if (has(FIRMWARE) && from(PG_IDENTITY | PG_STATUS))
     this->text_(FIRMWARE, telemetry_firmware_text(d));
-  // (0.2.5: DIAG's breadcrumbs and fault memory, across power cuts)
-  if (from(PG_STATUS | PG_DIAG | PG_FAULTS))
+#ifdef USE_DIG2ANALOG_ULTRA_DIAG_TEXTS
+  // (0.2.5: DIAG's breadcrumbs and fault memory, across power cuts; their builders are compiled only when a receiver
+  // has one of these texts: diagnostics: full, or the entity given)
+  if (has(LAST_RESET) && from(PG_STATUS | PG_DIAG | PG_FAULTS))
     this->text_(LAST_RESET, telemetry_last_reset(d));
-  if (from(PG_POWER | PG_FAULTS))
+  if (has(LAST_TRIP) && from(PG_POWER | PG_FAULTS))
     this->text_(LAST_TRIP, telemetry_last_trip(d));
-  if (from(PG_SUPPLY | PG_FAULTS))
+  if (has(LAST_DIP) && from(PG_SUPPLY | PG_FAULTS))
     this->text_(LAST_DIP, telemetry_last_dip(d));
-  if (from(PG_HEALTH | PG_FAULTS | PG_IDENTITY))
+  if (has(CHANNEL_HEALTH) && from(PG_HEALTH | PG_FAULTS | PG_IDENTITY))
     this->text_(CHANNEL_HEALTH, telemetry_health_text(d));
-  if (all && p.has_uid(this->board_)) {
+#endif
+  if (has(LINK) && all && p.has_uid(this->board_)) {
     char b[24];
     snprintf(b, sizeof(b), "%u \xC2\xB7 UID %04X", static_cast<unsigned>(this->board_ + 1),
              static_cast<unsigned>(p.uid16(this->board_)));

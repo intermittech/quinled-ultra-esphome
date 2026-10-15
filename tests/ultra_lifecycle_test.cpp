@@ -1931,6 +1931,7 @@ struct UltraLightTelemetry {   // as ultra_receiver.h
   Paced power_paced_, energy_paced_;
 };
 
+#define USE_DIG2ANALOG_ULTRA_DIAG_TEXTS   // (diagnostics: full: the fault texts are built)
 #include "receiver_methods.inc"
 
 /// a receiver's answer to a POLL slot (index from the slot), for the stand-in line below

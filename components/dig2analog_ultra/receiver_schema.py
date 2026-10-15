@@ -73,6 +73,8 @@ RW_RX_BUFFER_MIN = 1024
 # none: Power, Energy, Status (+ its detail), Problem; basic: + the shown diagnostics; full (default): + the hidden ones
 # (disabled in Home Assistant until enabled; ~0.8 KB of the ESP32's RAM per receiver)
 DIAG_LEVELS = ["none", "basic", "full"]
+# the receiver texts whose builders are compiled only when a receiver has one (USE_DIG2ANALOG_ULTRA_DIAG_TEXTS)
+DIAG_TEXTS = ("last_reset", "last_trip", "last_dip", "channel_health")
 
 
 def _value(unit, decimals, device_class=None, state_class=STATE_CLASS_MEASUREMENT, icon=None, diagnostic=True):
@@ -526,6 +528,8 @@ async def telemetry_to_code(hub, config):
                     cg.add(var.set_unpaced(index))   # (the user's own filters replace the pacing)
             elif kind == "text":
                 cg.add(var.set_text(index, ent))
+                if key in DIAG_TEXTS:
+                    cg.add_define("USE_DIG2ANALOG_ULTRA_DIAG_TEXTS")   # (their builders: only when one is there)
             elif kind == "button":
                 cg.add(ent.set_hub(hub))
                 cg.add(ent.set_board(k))

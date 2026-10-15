@@ -75,10 +75,11 @@ def main() -> int:
     with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
         list(pool.map(lambda j: run(j[0]), jobs))
     exe = BUILD / ("ultra_telemetry_contract_test.exe" if sys.platform == "win32" else "ultra_telemetry_contract_test")
-    run(ZIG + ["c++", *CXX_FLAGS, f"-I{HERE}", str(HERE / "ultra_telemetry_contract_test.cpp"),
-               *[str(j[1]) for j in jobs], "-o", str(exe)])
+    # (the month scenario calls src/core/energy.c itself: its header and what it includes)
+    run(ZIG + ["c++", *CXX_FLAGS, f"-I{HERE}", f"-I{fw / 'src' / 'core'}", f"-I{fw / 'test' / 'soak'}",
+               str(HERE / "ultra_telemetry_contract_test.cpp"), *[str(j[1]) for j in jobs], "-o", str(exe)])
     sys.stdout.flush()
-    return subprocess.run([str(exe)]).returncode
+    return subprocess.run([str(exe), *sys.argv[1:]]).returncode
 
 
 if __name__ == "__main__":

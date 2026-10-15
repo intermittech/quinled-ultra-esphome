@@ -40,6 +40,9 @@
 #include "../components/dig2analog_ultra/ultra_telemetry.h"
 #include "../components/dig2analog_ultra/update_session.h"
 #include "ultra_telemetry_receiver.h"
+extern "C" {
+#include "energy.h"   // (the firmware's src/core: its lifetime record and the LIFE_SYNC merge, for the month)
+}
 
 #include <chrono>
 #include <cmath>
@@ -366,6 +369,8 @@ struct Fake {
 
 // --------------------------------------------------------------------------------------------------- the bench
 /// The hub (its TelemetryPoller, the RW frames, the UART), the receiver at chain position k and the fakes around it.
+static bool hub_lit = false;   // the hub's lights on (lights_on): the ledger's lit time (LedgerKeeper::lit_tick)
+
 struct Bench {
   const char *name;
   TelemetryPoller p;
@@ -404,7 +409,7 @@ struct Bench {
   LedgerKeeper keeper;
   double last_position{-1};
 
-  explicit Bench(const char *nm) : name(nm) {}
+  explicit Bench(const char *nm) : name(nm) { hub_lit = false; }
 
   void power_up(int keep_flash, uint32_t reset_flags) {
     ucrx_power_up(keep_flash, reset_flags);
@@ -634,6 +639,7 @@ struct Bench {
     // what the poller made of it
     this->updates = this->p.take_updates(this->k);
     this->upd_all |= this->updates;
+    this->keeper.lit_tick(this->k, hub_lit, ucrx_hub_ms());   // (as UltraHub::ledger_line_)
     for (uint16_t b = 0; b < this->n; b++)   // (as UltraHub::rw_publish_: every receiver's news to the ledger)
       this->keeper.on_updates(this->p, b, b == this->k ? this->updates : this->p.take_updates(b), ucrx_hub_ms());
     const double pos = this->keeper.energy_wh(this->k);
@@ -734,6 +740,7 @@ static TelemetryIntervals intervals(uint32_t status, uint32_t power, uint32_t sl
 static void lights_on(uint16_t m) {
   ucrx_cmd_def(0, 0, 3, 1000);   // RGB on CH1-3: 3 x 1.5 A at full
   ucrx_cmd_set(0, m, 0);
+  hub_lit = m != 0;
 }
 
 // ---------------------------------------------------------------------------------------------------- scenarios
@@ -1423,9 +1430,426 @@ static void sc_update_repeat() {
   }
 }
 
-int main() {
+// --------------------------------------------------------- a month of short wakes (review r9, Fable C items 1-2)
+/// The poller fed straight from a receiver model's pages (no wire: 3,000 power-ups in seconds): its own page choice
+/// (pick_, read_now, the sync's arguments), decoding and restart detection, as an answer on the wire takes them.
+struct FeedPoller : TelemetryPoller {
+  /// the page receiver 0 is asked for now (TP_COUNT: none due)
+  uint8_t due_page(uint32_t now_ms) const {
+    int32_t over = 0;
+    const uint8_t tp = this->pick_(this->rx_[0], now_ms, &over);
+    return tp < TP_COUNT && over >= 0 ? tp : TP_COUNT;
+  }
+  /// its answer (DATA) to page tp (answer_'s path after the slot's checks)
+  void answer(uint8_t tp, const uint8_t *data, uint16_t uid16, uint32_t now_ms) {
+    Receiver &r = this->rx_[0];
+    if (r.have_uid && uid16 != r.uid16)
+      this->restarted_(r, now_ms, true);
+    r.have_uid = true;
+    r.uid16 = uid16;
+    r.misses = 0;
+    if (!r.answering) {
+      r.answering = true;
+      r.reported = false;
+      r.updated |= TU_AVAILABILITY;
+    }
+    r.next[tp] = now_ms + this->interval_(tp);
+    this->decode_(r, tp, data, now_ms);
+  }
+  const uint8_t *sync_args() const { return this->rx_[0].sync_args; }
+};
+
+static constexpr uint32_t MONTH_LIT_MW = 30000, MONTH_DARK_MW = 600;   // its input power lit / dark
+static constexpr uint64_t UJ_PER_WH = 3600000000ull;
+
+/// A Diff-Power ultra receiver's lifetime record as the firmware keeps it: src/core/energy.c itself (energy_init,
+/// energy_second, energy_due / energy_pack / energy_saved: its writes, energy_page, energy_sync: the merge); its
+/// supply, lights and power-ups as the scenario says. Every ms of power counted (energy_ms's job, in spans). The
+/// truth: what it would count if it lost nothing (powered: the port's on-time, the hub's clock).
+struct MonthRx {
+  energy_t e{};
+  life_rec_t flash{};   // the newest stored record (its RAM starts from it at every power-up)
+  uint8_t uid[12]{};
+  uint16_t uid16{0};
+  uint32_t boot{0}, at{0}, secs{0}, mw{0};   // its power-up, how far it ran (hub ms), its uptime (s), its power
+  bool lit{false};
+  uint32_t writes{0};
+  uint64_t t_on_ms{0}, t_lit_ms{0}, t_uj{0};
+  uint32_t t_ups{0};
+
+  void init(const life_rec_t &rec) {
+    for (int k = 0; k < 12; k++)
+      this->uid[k] = static_cast<uint8_t>(0x51 + 7 * k);
+    this->uid16 = ultra_crc16(this->uid, 12);
+    this->flash = rec;
+    this->t_on_ms = rec.on_s * 1000ull;
+    this->t_lit_ms = rec.lit_s * 1000ull;
+    this->t_uj = rec.wh * UJ_PER_WH;
+    this->t_ups = rec.ups;
+  }
+  void store() {
+    energy_pack(&this->e);
+    this->flash = this->e.lt;
+    energy_saved(&this->e, this->secs);
+    this->writes++;
+  }
+  void power_up(uint32_t now) {
+    this->e.lt = this->flash;
+    energy_init(&this->e, 1, 0, 0, 0);
+    this->e.ev_save = 1;   // (main.c: the receiver's)
+    this->boot = this->at = now;
+    this->secs = 0;
+    this->lit = false;
+    this->mw = MONTH_DARK_MW;
+    this->t_ups++;
+  }
+  /// its milliseconds up to now: energy (whole mWh into boot_mwh), lit, and each second energy_second and a write
+  /// if one is due
+  void run_to(uint32_t now) {
+    while (static_cast<int32_t>(now - this->at) > 0) {
+      const uint32_t tick = this->boot + (this->secs + 1) * 1000u;
+      const uint32_t to = static_cast<int32_t>(tick - now) <= 0 ? tick : now;
+      const uint32_t ms = to - this->at;
+      this->e.uj += this->mw * ms;   // (mW x ms = uJ; < 2^32 for a second at 30 W)
+      while (this->e.uj >= ENERGY_UJ_PER_MWH) {
+        this->e.uj -= ENERGY_UJ_PER_MWH;
+        this->e.boot_mwh++;
+      }
+      this->t_uj += static_cast<uint64_t>(this->mw) * ms;
+      if (this->lit) {
+        this->e.lit_ms = to - 1 - this->boot;   // (its last lit ms)
+        this->e.lit_new = 1;
+      }
+      this->at = to;
+      if (to == tick) {
+        this->secs++;
+        energy_second(&this->e, to - this->boot, this->secs, 0, 0, 0);
+        if (energy_due(&this->e, to - this->boot, 0, ENERGY_DUE_SAVE | ENERGY_DUE_DIP) != ENERGY_DUE_NONE)
+          this->store();
+      }
+    }
+  }
+  void set_lit(bool on, uint32_t now) {
+    this->run_to(now);
+    this->lit = on;
+    this->mw = on ? MONTH_LIT_MW : MONTH_DARK_MW;
+  }
+  /// the planned power-off's notice: dark; a write only for something worth storing (ENERGY_PLANNED)
+  void notice(uint32_t now) {
+    this->set_lit(false, now);
+    if (energy_due(&this->e, now - this->boot, 0, ENERGY_DUE_SAVE | ENERGY_DUE_DIP | ENERGY_PLANNED) !=
+        ENERGY_DUE_NONE)
+      this->store();
+  }
+  /// the cut: what isn't stored is gone (the next power-up starts from the flash)
+  void cut(uint32_t now, uint32_t on_ms) {
+    this->run_to(now);
+    this->t_on_ms += now - on_ms;
+  }
+  /// LIFETIME bytes 0..15 (main.c's page)
+  void lifetime16(uint8_t *d) const {
+    const life_rec_t &r = this->e.lt;
+    ultra_put24(d + ULTRA_LT_POWERED, r.on_s / 360u);
+    ultra_put24(d + ULTRA_LT_LIT, r.lit_s / 360u);
+    ultra_put24(d + ULTRA_LT_POWER_UPS, r.ups);
+    ultra_put16(d + ULTRA_LT_OVERLOAD_TRIPS, r.trips[0]);
+    ultra_put16(d + ULTRA_LT_SHORT_TRIPS, r.trips[1]);
+    ultra_put24(d + ULTRA_LT_DIPS, r.dips);
+  }
+  /// its answer to page tp now
+  void page(uint8_t tp, uint32_t now, uint8_t *d) {
+    this->run_to(now);
+    std::memset(d, 0, 24);
+    switch (tp) {
+      case TP_IDENTITY:
+        std::memcpy(d, this->uid, 12);
+        ultra_put32(d + ULTRA_ID_FEATURES,
+                    ULTRA_FEAT_ENERGY | ULTRA_FEAT_LIFETIME | ULTRA_FEAT_LIFE_SYNC | ULTRA_FEAT_STANDBY);
+        break;
+      case TP_STATUS:
+        ultra_put24(d + ULTRA_ST_UPTIME, this->secs);
+        ultra_put16(d + ULTRA_ST_VBUS, 0xFFFF);
+        break;
+      case TP_ENERGY:
+        energy_page(&this->e, this->secs, this->mw, d);
+        break;
+      case TP_LIFETIME:
+        this->lifetime16(d);
+        ultra_put24(d + ULTRA_LT_RECORDS, this->e.lt.writes);
+        break;
+      default:
+        break;
+    }
+  }
+  /// a LIFE_SYNC POLL: energy_sync, then its answer (main.c's: LIFETIME 0..15, the Wh, result and applied, RECORDS)
+  uint8_t sync(const uint8_t *args, uint32_t now, uint8_t *d) {
+    this->run_to(now);
+    const uint32_t res = energy_sync(&this->e, args, this->uid16);
+    std::memset(d, 0, 24);
+    this->lifetime16(d);
+    ultra_put32(d + ULTRA_LS_A_TOTAL_WH, energy_total_wh(&this->e));
+    d[ULTRA_LS_A_RESULT] = static_cast<uint8_t>(res >> 8);
+    d[ULTRA_LS_A_APPLIED] = static_cast<uint8_t>(res);
+    ultra_put16(d + ULTRA_LS_A_RECORDS, static_cast<uint16_t>(this->e.lt.writes));
+    return static_cast<uint8_t>(res >> 8);
+  }
+};
+
+/// what the board shows after the month (its counters in the wire's units) against the truth
+struct MonthEnd {
+  int64_t d_pow, d_lit, d_ups, d_wh;      // board - truth
+  int64_t h_pow, h_lit, h_ups, h_wh;      // the hub's ledger - truth (the keeper only)
+  double truth_h, board_h, truth_lit_h, board_lit_h, truth_wh, board_wh;
+  uint32_t truth_ups, board_ups, writes, syncs, applied;
+  uint32_t results[8];   // the syncs' results (ULTRA_LS_R_*)
+  bool attention;
+  bool within(int64_t a, int64_t b, int64_t c, int64_t d) const {
+    return std::llabs(a) <= 1 && std::llabs(b) <= 1 && std::llabs(c) <= 1 && std::llabs(d) <= 1;
+  }
+  bool board_ok() const { return within(d_pow, d_lit, d_ups, d_wh); }
+  bool hub_ok() const { return within(h_pow, h_lit, h_ups, h_wh); }
+};
+
+/// One port, one receiver: `wakes` power-ups (Fable's: a light 60 s at 30 W, its turn-off period of 170 s dark, the
+/// hub's last reads, the notice, the cut, ~10 min off; every 10th wake lit 10 min when `long_tenth`: those store their
+/// record). The hub: the component's keeper (power_on / lit_tick / prepare / cut, the poller fed the board's pages,
+/// the ESP32 restarted twice in between), or (echo) a naive hub that keeps the highest of its LIFETIME / ENERGY reads
+/// and syncs those back.
+static MonthEnd month_run(const life_rec_t &rec, int wakes, bool long_tenth, bool echo, uint32_t seed) {
+  std::mt19937 rng(seed);
+  MonthRx b;
+  b.init(rec);
+  LifetimeLedger led;
+  led.init(8, 4);
+  TelemetryIntervals iv;   // (the defaults: STATUS 3 s, ENERGY 60 s, LIFETIME 5 min)
+  FeedPoller p;
+  LedgerKeeper k;
+  uint32_t now = 1000 + rng() % 1000, syncs = 0, applied = 0, results[8]{};
+  auto sync = [&](const uint8_t *args, uint8_t *d) {
+    const uint8_t res = b.sync(args, now, d);
+    syncs++;
+    applied += res == ULTRA_LS_R_APPLIED;
+    results[res < 7 ? res : 7]++;
+  };
+  auto start_hub = [&]() {
+    p = FeedPoller{};
+    p.init(1, ULTRA_RW_RATE_1M, iv);
+    k = LedgerKeeper{};
+    k.attach(&led, 7u << 16, 1, now);
+  };
+  start_hub();
+  // the echo hub: one entry, the highest of each counter it read
+  LedgerEntry ec;
+  bool echo_known = false;
+  auto echo_read = [&](bool back) {
+    uint8_t d[24];
+    ReceiverData rd;
+    b.page(TP_LIFETIME, now, d);
+    decode_receiver_page(rd, ULTRA_PAGE_LIFETIME, d);
+    b.page(TP_ENERGY, now, d);
+    decode_receiver_page(rd, ULTRA_PAGE_ENERGY, d);
+    const LifeCounters rc = receiver_counters(rd);
+    if (!echo_known)
+      ec.c = rc;
+    echo_known = true;
+    ec.c.powered = std::max(ec.c.powered, rc.powered);
+    ec.c.lit = std::max(ec.c.lit, rc.lit);
+    ec.c.ups = std::max(ec.c.ups, rc.ups);
+    ec.c.mwh = std::max(ec.c.mwh, rc.mwh);
+    ec.records = rd.lt_records;
+    if (back && LifetimeLedger::ahead(ec, rc)) {
+      uint8_t args[LifetimeLedger::LS_ARGS];
+      LifetimeLedger::sync_args(ec, rc, b.uid16, args);
+      sync(args, d);
+    }
+  };
+  auto poll = [&]() {
+    const uint8_t tp = p.due_page(now);
+    if (tp >= TP_COUNT)
+      return;
+    uint8_t d[24];
+    if (tp == TP_SYNC) {
+      sync(p.sync_args(), d);
+    } else {
+      b.page(tp, now, d);
+    }
+    p.answer(tp, d, b.uid16, now);
+    k.on_updates(p, 0, p.take_updates(0), now);
+  };
+  constexpr uint32_t STEP = 250, BOOT_MS = 40, READY_MS = 1200, HOLD_MS = 170000, NOTICE_MS = 1500;
+  // the port on (enable and detect), the board's boot, the port ready (the receivers Waking)
+  auto power_on = [&]() {
+    const uint32_t on = now;
+    if (!echo)
+      k.power_on(on);
+    b.power_up(on + BOOT_MS);
+    now = on + READY_MS;
+    if (!echo)
+      p.touch_all();
+    return on;
+  };
+  for (int w = 0; w < wakes; w++) {
+    if (!echo && (w == wakes / 3 || w == 2 * wakes / 3)) {
+      // the ESP32 restarts (the port off meanwhile): its ledger as stored, a new poller and keeper
+      std::vector<uint8_t> blob(led.blob_size());
+      led.save(blob.data(), static_cast<uint32_t>(w));
+      LifetimeLedger back;
+      back.init(8, 4);
+      uint32_t gen = 0;
+      CHECK(back.load(blob.data(), blob.size(), &gen) && gen == static_cast<uint32_t>(w),
+            "month: the ledger's stored copy loads (LDG3)");
+      led = back;
+      start_hub();
+    }
+    const uint32_t lit_ms = long_tenth && w % 10 == 9 ? 600000 : 60000;
+    const uint32_t on = power_on();
+    b.set_lit(true, now);
+    b.t_lit_ms += lit_ms;
+    if (!echo)
+      k.lit_tick(0, true, now);
+    const uint32_t t_dark = now + lit_ms, t_prep = t_dark + HOLD_MS;
+    bool dark = false, prepping = false, echoed = false;
+    uint32_t prep_ms = 0;
+    for (;; now += STEP) {
+      if (!dark && static_cast<int32_t>(now - t_dark) >= 0) {
+        b.set_lit(false, t_dark);
+        if (!echo)
+          k.lit_tick(0, false, t_dark);
+        dark = true;
+      }
+      if (echo) {
+        if (!echoed && now - on >= READY_MS + 2000) {
+          echo_read(true);   // (after its power-up: read, the highest kept, synced back where ahead)
+          echoed = true;
+        }
+        if (static_cast<int32_t>(now - t_prep) >= 0) {
+          echo_read(false);   // (its last reads before the power-off)
+          break;
+        }
+        continue;
+      }
+      if (!prepping && static_cast<int32_t>(now - t_prep) >= 0) {
+        prepping = true;
+        prep_ms = now;
+        if (k.prepare(p, now, true))
+          break;
+      } else if (prepping && (k.prepare(p, now, false) || now - prep_ms >= 3000)) {
+        break;
+      }
+      poll();
+    }
+    // the notice (the port no longer ready), then the cut
+    if (!echo)
+      p.unpowered();
+    b.notice(now);
+    const uint32_t cut = now + NOTICE_MS;
+    b.cut(cut, on);
+    if (!echo)
+      k.cut(cut);
+    now = cut + 590000 + rng() % 20000;
+  }
+  // its next power-up: the hub's counters back, then what it shows
+  const uint32_t on = power_on();
+  if (echo) {
+    now += 2000;
+    echo_read(true);
+  } else {
+    for (uint32_t end = now + 30000; static_cast<int32_t>(now - end) < 0; now += STEP)
+      poll();
+  }
+  b.run_to(now);
+  const uint64_t t_on = b.t_on_ms + (now - on);
+  MonthEnd r{};
+  r.truth_h = t_on / 3600000.0;
+  r.board_h = b.e.lt.on_s / 3600.0;
+  r.truth_lit_h = b.t_lit_ms / 3600000.0;
+  r.board_lit_h = b.e.lt.lit_s / 3600.0;
+  r.truth_wh = static_cast<double>(b.t_uj) / UJ_PER_WH;
+  r.board_wh = energy_total_wh(&b.e) + (b.e.boot_mwh - b.e.mwh_seen) % 1000u / 1000.0;
+  r.truth_ups = b.t_ups;
+  r.board_ups = b.e.lt.ups;
+  r.writes = b.writes;
+  r.syncs = syncs;
+  r.applied = applied;
+  std::memcpy(r.results, results, sizeof(results));
+  r.attention = !echo && k.attention(0);
+  const int64_t tp = static_cast<int64_t>(t_on / UNIT_MS), tl = static_cast<int64_t>(b.t_lit_ms / UNIT_MS),
+                tw = static_cast<int64_t>(b.t_uj / UJ_PER_WH);
+  r.d_pow = static_cast<int64_t>(b.e.lt.on_s / 360u) - tp;
+  r.d_lit = static_cast<int64_t>(b.e.lt.lit_s / 360u) - tl;
+  r.d_ups = static_cast<int64_t>(b.e.lt.ups) - b.t_ups;
+  r.d_wh = static_cast<int64_t>(energy_total_wh(&b.e)) - tw;
+  const LifeCounters *c = echo ? nullptr : k.counters(0);
+  if (c != nullptr) {
+    r.h_pow = static_cast<int64_t>(c->powered) - tp;
+    r.h_lit = static_cast<int64_t>(c->lit) - tl;
+    r.h_ups = static_cast<int64_t>(c->ups) - b.t_ups;
+    r.h_wh = static_cast<int64_t>(c->mwh / 1000) - tw;
+  }
+  return r;
+}
+
+static void month_print(const char *what, const MonthEnd &r) {
+  std::printf("  %s: powered %.1f of %.1f h, lit %.1f of %.1f h, power-ups %u of %u, %.1f of %.1f Wh (%u writes, "
+              "%u syncs: %u applied, %u once, %u records, %u no-op, %u capped)\n",
+              what, r.board_h, r.truth_h, r.board_lit_h, r.truth_lit_h, r.board_ups, r.truth_ups, r.board_wh,
+              r.truth_wh, r.writes, r.syncs, r.applied, r.results[ULTRA_LS_R_ONCE], r.results[ULTRA_LS_R_RECORDS],
+              r.results[ULTRA_LS_R_NOOP], r.results[ULTRA_LS_R_CAPPED]);
+}
+
+/// review r9, Fable C 1-2: a receiver merges the hub's counters in whole wire units and loses its own time and energy
+/// below a unit at every cut, so the ledger must be the hub's own accounting. 30 days x 100 short wakes of a standby
+/// port (nothing stored on the board): after its next power-up every counter within one unit of the truth, on the
+/// board (energy_sync's merge) and in the hub's ledger; the same with every tenth wake long enough to be stored (the
+/// board's own remainders ride on the hub's units: never counted twice). The negative control: a hub that echoes the
+/// highest of its reads gives back almost nothing (a record without remainders), or runs ahead (one with them).
+static void sc_month() {
+  std::printf("month: 30 days x 100 short wakes of a standby port, the hub's own ledger against the receiver's merge\n");
+  life_rec_t used{};   // a used board: 500 h powered (and 300 s), 200 h lit (and 350 s), 2 kWh
+  used.on_s = 360u * 5000u + 300u;
+  used.lit_s = 360u * 2000u + 350u;
+  used.ups = 900;
+  used.wh = 2000;
+  used.writes = 40;
+  used.magic = LIFE_MAGIC;
+  const MonthEnd a = month_run(used, 3000, false, false, 11);
+  month_print("hub ledger, nothing stored", a);
+  CHECK(a.board_ok() && a.hub_ok() && a.writes == 0 && !a.attention && a.results[ULTRA_LS_R_UID] == 0,
+        "month: every counter back within a unit (board - truth: powered %lld, lit %lld, power-ups %lld, %lld Wh; "
+        "ledger: %lld, %lld, %lld, %lld; %u writes)",
+        (long long) a.d_pow, (long long) a.d_lit, (long long) a.d_ups, (long long) a.d_wh, (long long) a.h_pow,
+        (long long) a.h_lit, (long long) a.h_ups, (long long) a.h_wh, a.writes);
+  const MonthEnd s = month_run(used, 3000, true, false, 12);
+  month_print("hub ledger, every 10th stored", s);
+  CHECK(s.board_ok() && s.hub_ok() && s.writes >= 250 && !s.attention && s.results[ULTRA_LS_R_UID] == 0,
+        "month, every tenth wake stored: within a unit (board - truth: %lld, %lld, %lld, %lld Wh; ledger: %lld, %lld, "
+        "%lld, %lld; %u writes)",
+        (long long) s.d_pow, (long long) s.d_lit, (long long) s.d_ups, (long long) s.d_wh, (long long) s.h_pow,
+        (long long) s.h_lit, (long long) s.h_ups, (long long) s.h_wh, s.writes);
+  life_rec_t clean = used;   // (no remainders)
+  clean.on_s = 360u * 5000u;
+  clean.lit_s = 360u * 2000u;
+  const MonthEnd e = month_run(clean, 3000, false, true, 11);
+  month_print("echo hub (control)", e);
+  const double gained = e.board_h - 500.0, due = e.truth_h - 500.0;
+  CHECK(gained < 0.1 * due && e.board_lit_h - 200.0 < 0.1 * (e.truth_lit_h - 200.0) &&
+            e.board_ups - 900u < (e.truth_ups - 900u) / 10 && e.board_wh - 2000.0 < 0.1 * (e.truth_wh - 2000.0),
+        "month, echo control: almost nothing back (%.1f of %.1f h powered)", gained, due);
+  const MonthEnd f = month_run(used, 3000, false, true, 11);
+  month_print("echo hub, remainders (control)", f);
+  CHECK(f.board_h - f.truth_h > 0.25 * (f.truth_h - 500.0),
+        "month, echo control with remainders: it runs ahead (%.1f h for %.1f)", f.board_h, f.truth_h);
+}
+
+int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   const auto t0 = std::chrono::steady_clock::now();
+  if (argc > 1 && std::strcmp(argv[1], "month") == 0) {   // (that one alone)
+    sc_month();
+    std::printf("ultra telemetry contract test (month): %s (%d failures), %.1f s\n", failures ? "FAILED" : "passed",
+                failures, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    return failures ? 1 : 0;
+  }
   ucrx_init();
   sc_pages();
   sc_soft_start();
@@ -1437,6 +1861,7 @@ int main() {
   sc_life_sync();
   sc_retry();
   sc_update_repeat();
+  sc_month();
   const int soak = ucrx_soak_failures();
   CHECK(soak == 0, "the firmware model's own checks: %d failures", soak);
   const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

@@ -296,6 +296,7 @@ struct UltraHub {
   float port_power_w() const { return this->port_standby() ? 0.0f : this->port_monitor_.power_w(); }
   const char *tel_name_{"Port"};
   void ledger_service_() {}
+  void ledger_line_() {}
   static void ledger_save_(bool) {}
   std::vector<uint8_t> rw_slots_, rw_rx_;
   bool rw_next_{false}, tx_rw_{false};

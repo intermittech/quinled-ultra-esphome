@@ -69,6 +69,8 @@ PIECES = {
         ["// The ESP32's one lifetime ledger (every line's", "void UltraHub::ledger_service_(",
          "void UltraHub::ledger_save_("],
     ),
+    # ... and its own counts of a line's receivers: the port's power-on / cut, their lit time (review r9, Fable C)
+    "hub_ledger_line.inc": ("dig2analog_ultra.cpp", ["void UltraHub::ledger_line_("]),
     "hub_port.inc": (
         "dig2analog_ultra.cpp",
         ["void UltraHub::attach_port_(", "void UltraHub::send_power_off_notice(", "void UltraHub::pump_notice_(",

@@ -412,6 +412,9 @@ class UltraHub final : public Component {
   CallbackManager<void()> shutdown_callback_;
   void ledger_service_();                 // (the ESP32's one ledger: loaded at the first loop, stored as it changes)
   static void ledger_save_(bool now);
+  void ledger_line_();                    // the ledger's own counts: the port's power-on / cut, each receiver lit
+  bool line_on_{false};                   // ... the port's line powered, as last told to the keeper
+  std::vector<uint8_t> lit_rx_;           // ... per receiver: any of its lights lit
   std::vector<uint8_t> rw_slots_;         // the POLL slots of the next RW frame
   std::vector<uint8_t> rw_rx_;            // the window's UART bytes
   bool rw_next_{false};                   // transmit_(): this frame is an RW frame

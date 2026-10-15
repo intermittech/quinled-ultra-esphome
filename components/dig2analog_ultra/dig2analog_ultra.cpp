@@ -1099,11 +1099,44 @@ void UltraHub::ledger_save_(bool now) {
   }
   g_ledger_saved_ms = millis();
 }
+
+// The ledger counts this line's receivers itself (ultra_ledger.h; review r9, Fable C): a Diff-Power port's power-on
+// and cut (its enable AND detect, as the port timed them: every board's session from there, its powered time to
+// there), and each receiver's lit time (any of its lights lit while the boards are ready).
+void UltraHub::ledger_line_() {
+  if (this->rw_uart_ == nullptr)
+    return;
+  const uint32_t now = millis();
+#ifdef USE_DIFFPOWER
+  if (this->port_ != nullptr && this->port_->core().line_on() != this->line_on_) {
+    this->line_on_ = !this->line_on_;
+    if (this->line_on_)
+      this->keeper_.power_on(this->port_->core().line_ms());
+    else
+      this->keeper_.cut(this->port_->core().line_ms());
+  }
+#endif
+  this->lit_rx_.assign(this->poller_.receivers(), 0);
+  if (this->boards_powered_()) {
+    for (auto *l : this->lights_) {
+      if (l->get_board() < this->lit_rx_.size() && l->is_lit(now))
+        this->lit_rx_[l->get_board()] = 1;
+    }
+  }
+  for (uint16_t i = 0; i < this->lit_rx_.size(); i++)
+    this->keeper_.lit_tick(i, this->lit_rx_[i] != 0, now);
+}
 #endif
 
 void UltraHub::on_shutdown() {
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   this->shutdown_callback_.call();   // (the energies one last time)
+#ifdef USE_DIFFPOWER
+  if (this->line_on_) {   // (the port powers the line down now: its boards' sessions end)
+    this->line_on_ = false;
+    this->keeper_.cut(millis());
+  }
+#endif
   ledger_save_(true);
 #endif
 }
@@ -1213,6 +1246,7 @@ void UltraHub::loop() {
 #endif
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   this->ledger_service_();
+  this->ledger_line_();
 #endif
   this->service_calibration_();
 #ifdef USE_POWER_SUPPLY

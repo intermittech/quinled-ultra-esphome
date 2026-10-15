@@ -1,14 +1,16 @@
 #pragma once
 
 // The receivers' lifetime ledger (protocol 0.2.6 LIFE_SYNC; review-r8/fable-sync §4): the hub keeps each board's
-// lifetime counters by its full 12-byte UID, as the highest it has seen (the board may lose what it hadn't stored at a
-// power cut; the hub doesn't), and gives them back to the board once per power-up when it is ahead. The Home Assistant
+// lifetime counters by its full 12-byte UID, counted by the hub itself (the board loses what it hadn't stored at a
+// power cut, and every cut its time and energy below a wire unit; the hub doesn't), and gives them back to the board
+// once per power-up when it is ahead. The Home Assistant
 // Energy of a position (a line's receiver slot) is the board's ledger energy plus the position's offset: it continues
 // over a replaced board, a restart, a wake and a restart of the ESP32 itself, never down. It also keeps the counters
 // that belong to no board (a port's energy at the sender, a light's estimated energy): only up. Positions and
 // counters are keyed by the line's id (not its pin: a moved line keeps them) or the light's. Pure logic: the host
 // tests run it (tests/ultra_telemetry_test.cpp); dig2analog_ultra.cpp keeps it on the ESP32.
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -18,7 +20,9 @@
 
 namespace esphome::dig2analog_ultra {
 
-static constexpr uint32_t LEDGER_MAGIC = 0x4C444732;    // "LDG2" (with each board's session checkpoint)
+static constexpr uint32_t LEDGER_MAGIC = 0x4C444733;    // "LDG3" (each board's session checkpoint, its time below 0.1 h)
+static constexpr uint32_t UNIT_MS = 360000;             // the wire's 0.1 h
+static constexpr uint32_t CUT_TAIL_MS = 60000;          // a cut: the last power read counts this long at most
 static constexpr uint32_t SESS_UPS_UNKNOWN = 0xFFFFFFFFu;
 static constexpr uint32_t LEDGER_AGE_DAYS = 90;         // a board not seen this many hub days: its entry may go
 static constexpr uint32_t LEDGER_SAVE_MS = 15 * 60000;  // saved at most this often while on (and at a planned cut)
@@ -58,6 +62,8 @@ struct LedgerEntry {
   // on from that count, so nothing is lost and nothing counted twice
   uint32_t sess_boot{0}, sess_up{0}, sess_ups{SESS_UPS_UNKNOWN};
   bool sess{false};
+  // the hub's powered and lit time below a wire unit (ms): kept, so whole units add up over any number of short runs
+  uint32_t pow_rem{0}, lit_rem{0};
   bool used{false};
 };
 
@@ -154,15 +160,46 @@ class LifetimeLedger {
     e->last_day = this->day_;
     return e;
   }
-  /// LIFETIME's counters: the highest per field (in the wire's units: a change is one unit or more)
+  /// LIFETIME's events only the board sees (supply dips, trips): the highest per field
   void merge(LedgerEntry &e, const LifeCounters &rx) {
-    int up = raise_(e.c.powered, rx.powered);
-    up += raise_(e.c.lit, rx.lit);
-    up += raise_(e.c.ups, rx.ups);
-    up += raise_(e.c.dips, rx.dips);
+    int up = raise_(e.c.dips, rx.dips);
     up += raise_(e.c.ovl, rx.ovl);
     up += raise_(e.c.shorts, rx.shorts);
     this->dirty_ |= up != 0;
+  }
+  /// What the hub didn't see (its powered and lit time, its power-ups): the board's counts where they are higher.
+  /// margin: in units the board must be ahead by (its time: the board's own remainder rides on the hub's units after a
+  /// sync, so it may read up to one more without any time of its own); the hub's remainder goes with a raise.
+  void take(LedgerEntry &e, const LifeCounters &rx, uint32_t margin) {
+    int up = 0;
+    if (rx.powered >= e.c.powered + margin + 1) {
+      e.c.powered = rx.powered - margin;
+      e.pow_rem = 0;
+      up++;
+    }
+    if (rx.lit >= e.c.lit + margin + 1) {
+      e.c.lit = rx.lit - margin;
+      e.lit_rem = 0;
+      up++;
+    }
+    up += raise_(e.c.ups, rx.ups);
+    this->dirty_ |= up != 0;
+  }
+  /// The hub's own powered (lit: lit) time, ms: into the wire's units, the remainder kept (dirty from a unit)
+  void add_time(LedgerEntry &e, bool lit, uint64_t ms) {
+    uint32_t &units = lit ? e.c.lit : e.c.powered;
+    uint32_t &rem = lit ? e.lit_rem : e.pow_rem;
+    const uint64_t total = static_cast<uint64_t>(rem) + ms;
+    if (total >= UNIT_MS) {
+      units += static_cast<uint32_t>(total / UNIT_MS);
+      this->dirty_ = true;
+    }
+    rem = static_cast<uint32_t>(total % UNIT_MS);
+  }
+  /// A power-up the hub made or saw (a new session)
+  void add_power_up(LedgerEntry &e) {
+    e.c.ups++;
+    this->dirty_ = true;
   }
   /// Energy: the board's use since the last reading (add, from its count since power-up) on top, never below what the
   /// board says it has (exact): the sub-Wh a board drops at each cut stay here.
@@ -271,6 +308,8 @@ class LifetimeLedger {
         ultra_put32(b + 52, e.sess_up);
         ultra_put32(b + 56, e.sess_ups);
         b[60] = e.sess ? 1 : 0;
+        ultra_put32(b + 64, e.pow_rem);
+        ultra_put32(b + 68, e.lit_rem);
       }
       b += ENTRY;
     }
@@ -334,6 +373,8 @@ class LifetimeLedger {
       e.sess_up = ultra_get32(b + 52);
       e.sess_ups = ultra_get32(b + 56);
       e.sess = (b[60] & 1) != 0;
+      e.pow_rem = ultra_get32(b + 64) % UNIT_MS;
+      e.lit_rem = ultra_get32(b + 68) % UNIT_MS;
     }
     to = 0;
     for (size_t i = 0; i < np; i++, b += POS) {
@@ -354,7 +395,7 @@ class LifetimeLedger {
   static constexpr uint8_t LS_ARGS = 23;   // (the POLL's arguments: ULTRA_LS_RECORDS + 1)
 
  protected:
-  static constexpr size_t HDR = 16, ENTRY = 64, POS = 33;
+  static constexpr size_t HDR = 16, ENTRY = 72, POS = 33;
   static bool valid_(const uint8_t *in, size_t n, size_t *ne, size_t *np) {
     if (n < HDR + 2 || ultra_get32(in) != LEDGER_MAGIC || ultra_get16(in + n - 2) != ultra_crc16(in, static_cast<uint32_t>(n - 2)))
       return false;
@@ -432,20 +473,28 @@ inline LifetimeLedger &ultra_ledger() {
   return l;
 }
 
-/// One line's side of the ledger (its receivers): every LIFETIME answer merged (the highest per counter); first
-/// contact adopts; after a board's power-up (or once a day on a long run) the ledger given back when it is ahead (one
-/// LIFE_SYNC POLL; the result: applied / no-op / capped: done for this power-up; refused: read again, once more, then
-/// "needs attention"); before a planned power-off a final read and that sync (prepare()). The positions' Energy.
+/// One line's side of the ledger (its receivers): first contact adopts the board's counters; after a board's power-up
+/// (or once a day on a long run) the ledger given back when it is ahead (one LIFE_SYNC POLL; the result: applied /
+/// no-op / capped: done for this power-up; refused: read again, once more, then "needs attention"); before a planned
+/// power-off a final read and that sync (prepare()). The positions' Energy.
+///
+/// The ledger is the hub's own fine accounting, never the board's reads echoed (review r9, Fable C 1-2: the receiver
+/// merges whole units and loses its time and energy below a unit at every cut, so an echo gives back nothing of short
+/// runs): powered time on the hub's clock from the line's power-on (power_on(): a Diff-Power port's) or else from the
+/// board's uptime as first read, to the cut (cut()) or its last STATUS; lit time on the hub's clock from its own lights
+/// (lit_tick()); each new session one power-up, counted before its sync (the one the hub just made or saw). The board's
+/// own counts only for what the hub didn't see: at first contact, and at a session's start where it is ahead (its time
+/// by more than a unit: it ran elsewhere). Its dips and trips (only it sees them): the highest read.
 ///
 /// Energy: each ENERGY reading adds the board's use since the one before (its count since power-up, which a sync
-/// never moves), never below its own lifetime. The readings wait for the next STATUS: its uptime dates a power-up, so
-/// a reading of the new one starts its count and one of the old one goes on (whatever order the pages came in); the
-/// 32-bit count may wrap within a power-up. A session's first reading at a position (after a power-up, the ESP32's
-/// restart, another board here): the board's session checkpoint in the ledger decides, by its UID wherever it was
-/// read last (its power-ups count, else its uptime): the same session goes on from the count it was last counted at
-/// (the ESP32 restarted under it, a powered board moved or back), a new one counts all of it, a board whose entry was
-/// just made from its lifetime (first contact) only what comes after. A power-off alone never counts as a restart (a
-/// supply that stayed on: its use isn't counted twice).
+/// never moves), never below its own lifetime; at a cut, its last power read up to the cut. The readings wait for the
+/// next STATUS: its uptime dates a power-up, so a reading of the new one starts its count and one of the old one goes
+/// on (whatever order the pages came in); the 32-bit count may wrap within a power-up. A session's start at a position
+/// (after a power-up, the ESP32's restart, another board here): after the line's power-on the hub saw, a new session;
+/// else the board's session checkpoint in the ledger decides, by its UID wherever it was read last (its power-ups
+/// count and its uptime): the same session goes on from where it was last counted (the ESP32 restarted under it, a
+/// powered board moved or back), a new one counts all of it, a board whose entry was just made from its lifetime
+/// (first contact) only what comes after.
 class LedgerKeeper {
  public:
   /// what on_updates() saw (the hub logs it)
@@ -487,8 +536,8 @@ class LedgerKeeper {
       std::memcpy(x.uid, d.uid, 12);
       x.have_uid = true;
     }
-    if ((updates & (1u << TP_ENERGY)) && d.have_energy && x.pending < PENDING)
-      x.reading[x.pending++] = Reading{d.boot_mwh, receiver_counters(d).mwh, now_ms};   // (dated by the next STATUS)
+    if ((updates & (1u << TP_ENERGY)) && d.have_energy && x.pending < PENDING)   // (dated by the next STATUS)
+      x.reading[x.pending++] = Reading{d.boot_mwh, receiver_counters(d).mwh, now_ms, d.power_mw};
     if (!d.have_identity)
       return ev;
     const bool life = (updates & (1u << TP_LIFETIME)) && d.have_lifetime;
@@ -503,22 +552,31 @@ class LedgerKeeper {
     x.entry = e;
     if (created) {
       x.adopted = true;   // first contact: its own counters, never a sync this power-up
+      x.adopt_due = true;
+      x.lit_pend = 0;     // (its own count has it)
       x.phase = DONE;
       x.last_sync_ms = now_ms == 0 ? 1 : now_ms;
+    }
+    if (x.lit_pend != 0) {   // (lit before its entry was known)
+      this->ledger_->add_time(*e, true, x.lit_pend);
+      x.lit_pend = 0;
     }
     const LifeCounters rc = receiver_counters(d);
     if (life || sync) {
       if (e->records != 0 && d.lt_records < e->records && !created)
         ev |= EV_RESTORE;   // its record went back (erased): the ledger gives it back over its next power-ups
       e->records = d.lt_records;
-    }
-    if (life || sync)
+      if (x.adopt_due) {
+        this->ledger_->take(*e, rc, 0);
+        x.adopt_due = false;
+      }
       this->ledger_->merge(*e, rc);
+    }
     x.life_fresh |= life || sync;
-    // the readings in, dated by this STATUS; a new session's first ones once its LIFETIME was read (its power-ups
-    // count tells a session the ledger knows from a new one; at most PENDING readings long)
-    const bool wait_life = (x.restart_due || !x.have_boot) && (d.features & ULTRA_FEAT_LIFETIME) && !x.life_fresh &&
-                           x.pending < PENDING;
+    // the session's start and the readings in, dated by this STATUS; a new session's once its LIFETIME was read (its
+    // power-ups count tells a session the ledger knows from a new one; at most PENDING readings long)
+    const bool wait_life =
+        !x.sess_started && (d.features & ULTRA_FEAT_LIFETIME) && !x.life_fresh && x.pending < PENDING;
     if (status && !wait_life)
       this->energy_(x, *e, d, now_ms, up);
     x.lt_read |= life || !(d.features & ULTRA_FEAT_LIFETIME);
@@ -533,7 +591,7 @@ class LedgerKeeper {
       if (swapped)
         ev |= EV_NEW_BOARD;
     }
-    // a sync when the ledger is ahead, once both pages were read since this power-up
+    // a sync when the ledger is ahead, once both pages were read since this power-up (and its power-up counted)
     const bool daily = x.phase == DONE && !x.merged && x.last_sync_ms != 0 && now_ms - x.last_sync_ms >= SYNC_DAILY_MS;
     if (daily) {
       x.phase = WAIT;
@@ -541,9 +599,10 @@ class LedgerKeeper {
       p.read_now(i, TP_LIFETIME, now_ms);
       p.read_now(i, TP_ENERGY, now_ms);
     }
-    if (x.phase == WAIT && x.lt_read && x.en_read) {
+    if (x.phase == WAIT && x.lt_read && x.en_read && x.sess_started) {
       x.last_sync_ms = now_ms == 0 ? 1 : now_ms;
-      if ((d.features & ULTRA_FEAT_LIFE_SYNC) && LifetimeLedger::ahead(*e, rc)) {
+      // (one merge a power-up: after an applied one the board refuses (ONCE); prepare()'s reads then only count)
+      if ((d.features & ULTRA_FEAT_LIFE_SYNC) && !x.merged && LifetimeLedger::ahead(*e, rc)) {
         uint8_t args[LifetimeLedger::LS_ARGS];
         LifetimeLedger::sync_args(*e, rc, p.uid16(i), args);
         p.request_sync(i, args, now_ms);
@@ -580,6 +639,51 @@ class LedgerKeeper {
     }
     return true;
   }
+  /// The line's power came on at on_ms (a Diff-Power port's 55 V: hotplug_ms after its enable and detect; the hub's
+  /// clock): every board on it starts a new session there (one that answers with a longer uptime didn't: its
+  /// checkpoint decides).
+  void power_on(uint32_t on_ms) {
+    for (auto &x : this->rx_) {
+      session_reset_(x);
+      x.pending = 0;   // (the session before: counted at its cut)
+      x.on_known = true;
+      x.on_ms = on_ms;
+    }
+  }
+  /// The line's power went at at_ms (the port's enable or detect dropped: a planned power-off's end, a cut): each
+  /// session's powered time, its waiting readings and its last power read up to then; its lit time ends.
+  void cut(uint32_t at_ms) {
+    if (this->ledger_ == nullptr)
+      return;
+    for (auto &x : this->rx_) {
+      this->lit_end_(x, at_ms);
+      x.lit_on = false;   // (dark from here, whatever the lights say)
+      if (x.counting && x.entry != nullptr) {
+        LedgerEntry &e = *x.entry;
+        this->readings_(x, e);
+        const uint32_t ms = at_ms - x.count_ms;
+        this->ledger_->add_time(e, false, ms);
+        e.sess_up += ms / 1000;
+        if (x.en_counted) {   // (rounded, and half a mWh more: its count is whole mWh, on average half a mWh short)
+          const uint32_t tail = at_ms - x.en_ms;
+          const uint64_t mw_ms = static_cast<uint64_t>(x.mw) * (tail < CUT_TAIL_MS ? tail : CUT_TAIL_MS);
+          this->ledger_->add_energy(e, (mw_ms + ENERGY_MS_PER_MWH) / ENERGY_MS_PER_MWH, 0);
+        }
+      }
+      session_reset_(x);
+      x.pending = 0;
+      x.on_known = false;
+    }
+  }
+  /// Receiver i lit now (any of its lights on, its line ready), the hub's clock: its lit time between two calls that
+  /// said lit (call it every loop, or at every change)
+  void lit_tick(uint16_t i, bool lit, uint32_t now_ms) {
+    if (i >= this->rx_.size())
+      return;
+    Rx &x = this->rx_[i];
+    this->lit_end_(x, now_ms);
+    x.lit_on = lit;
+  }
   /// The position's Energy (Wh; NAN until its board's ENERGY was read once)
   double energy_wh(uint16_t i) const {
     return i < this->rx_.size() && this->rx_[i].have_energy ? this->rx_[i].energy_mwh / 1000.0 : -1.0;
@@ -595,10 +699,12 @@ class LedgerKeeper {
  protected:
   enum Phase : uint8_t { DONE = 0, WAIT, SENT };
   static constexpr uint8_t PENDING = 4;
+  static constexpr uint64_t ENERGY_MS_PER_MWH = 3600000;   // mW x ms / this = mWh
   struct Reading {
     uint32_t boot;   // its count since power-up (mWh)
     uint64_t exact;  // its lifetime then (mWh)
     uint32_t ms;     // when it was read
+    uint32_t mw;     // its power then
   };
   struct Rx {
     Reading reading[PENDING]{};   // ENERGY readings waiting for the next STATUS
@@ -609,6 +715,19 @@ class LedgerKeeper {
     uint8_t uid[12]{};            // the board whose session this is (its full UID)
     bool have_uid{false};
     bool life_fresh{false};       // its LIFETIME read in this session (its power-ups count: which session)
+    bool sess_started{false};     // this session's start counted (its first STATUS)
+    bool counting{false};         // ... its powered time counted up to count_ms (the hub's clock)
+    uint32_t count_ms{0};
+    uint32_t start_ms{0};         // when it started (its uptime): its readings dated against it
+    uint32_t boot_base{0};        // its first reading counts from this (UINT32_MAX: from that reading on)
+    bool on_known{false};         // the line's power-on seen: the next session starts at on_ms
+    uint32_t on_ms{0};
+    bool adopt_due{false};        // first contact: its powered / lit time and power-ups from its next LIFETIME
+    bool en_counted{false};       // an ENERGY reading counted this session: when (en_ms); its power (mW, the latest)
+    uint32_t en_ms{0}, mw{0};
+    bool lit_on{false};           // its lights as last told (lit_tick): lit since lit_ms
+    uint32_t lit_ms{0};
+    uint32_t lit_pend{0};         // lit time before its entry was known (ms)
     LedgerEntry *entry{nullptr};
     uint64_t energy_mwh{0};
     bool have_energy{false};
@@ -626,6 +745,8 @@ class LedgerKeeper {
 
   /// a power-up or another board: what it says now, then maybe a sync
   static void session_reset_(Rx &x) {
+    x.sess_started = x.counting = x.en_counted = false;   // (the session before: its last readings still go on)
+    x.adopt_due = false;
     x.life_fresh = false;
     x.lt_read = x.en_read = false;
     x.phase = WAIT;
@@ -644,33 +765,70 @@ class LedgerKeeper {
     return this->up_ms_;
   }
 
-  /// The waiting readings into the ledger (a STATUS was just read: a power-up since is known and dated)
+  /// A STATUS was just read: this session's start (its first), its powered time on the hub's clock since the last one,
+  /// the waiting readings into the ledger (a power-up since is known and dated)
   void energy_(Rx &x, LedgerEntry &e, const ReceiverData &d, uint32_t now_ms, uint64_t up) {
-    if (!x.have_boot)
-      x.restart_due = true;   // the first since the hub started (or since this board came here): its session dated
-    uint32_t start_ms = 0, base = 0;
-    if (x.restart_due) {
-      start_ms = now_ms - d.uptime_s * 1000u;
-      if (x.adopted) {
-        base = UINT32_MAX;   // (its entry just made from its lifetime: from its first reading on)
-      } else if (e.sess) {
-        // the session the ledger last counted (its UID's, at any position): still the same one (its power-ups count
-        // unchanged; without LIFETIME: its uptime not less) -> on from that count; else a new one: all of it new
-        const bool same = (d.features & ULTRA_FEAT_LIFETIME) && d.have_lifetime && e.sess_ups != SESS_UPS_UNKNOWN
-                              ? d.lt_power_ups == e.sess_ups
-                              : d.uptime_s >= e.sess_up;
-        base = same ? e.sess_boot : 0;
-      } else {
-        // (no session known: all of it new when it came on after the hub, else from its first reading)
-        base = static_cast<uint64_t>(d.uptime_s) * 1000u <= up + BOOT_SLACK_MS ? 0 : UINT32_MAX;
-      }
+    if (!x.sess_started)
+      this->start_(x, e, d, now_ms, up);
+    else if (x.counting)
+      this->ledger_->add_time(e, false, now_ms - x.count_ms);
+    x.counting = true;
+    x.count_ms = now_ms;
+    e.sess_up = d.uptime_s;
+    const float w = telemetry_value(d, TV_INPUT_POWER);
+    if (!std::isnan(w))
+      x.mw = w > 0.0f ? static_cast<uint32_t>(w * 1000.0f) : 0;
+    this->readings_(x, e);
+  }
+
+  /// This session's start: one power-up more when it is a new one (before its sync), its powered time so far; then
+  /// what the board counted that the hub didn't see
+  void start_(Rx &x, LedgerEntry &e, const ReceiverData &d, uint32_t now_ms, uint64_t up) {
+    const uint64_t up_ms = static_cast<uint64_t>(d.uptime_s) * 1000u;
+    const bool life = (d.features & ULTRA_FEAT_LIFETIME) && d.have_lifetime;
+    bool fresh = false;   // a new session (a power-up the ledger hasn't counted)
+    uint64_t part = 0;    // its powered time before now not counted yet (ms)
+    x.boot_base = UINT32_MAX;
+    if (x.adopted) {
+      // (its entry just made from its lifetime: from now on)
+    } else if (x.on_known && up_ms <= static_cast<uint32_t>(now_ms - x.on_ms) + BOOT_SLACK_MS) {
+      fresh = true;   // (the line's power-on the hub made or saw: its time from there, on the hub's clock)
+      part = static_cast<uint32_t>(now_ms - x.on_ms);
+      x.boot_base = 0;
+    } else if (e.sess) {
+      // the session the ledger last counted (its UID's, at any position): still the same one (its power-ups count
+      // unchanged, its uptime not less) -> on from where it was counted; else a new one: all of it
+      const bool same = (!life || e.sess_ups == SESS_UPS_UNKNOWN || d.lt_power_ups == e.sess_ups) &&
+                        d.uptime_s >= e.sess_up;
+      fresh = !same;
+      part = same ? static_cast<uint64_t>(d.uptime_s - e.sess_up) * 1000u : up_ms;
+      x.boot_base = same ? e.sess_boot : 0;
+    } else if (up_ms <= up + BOOT_SLACK_MS) {
+      fresh = true;   // (no session known: it came on after the hub)
+      part = up_ms;
+      x.boot_base = 0;
     }
+    x.on_known = false;
+    x.sess_started = true;
+    x.restart_due = true;   // (its first reading dated against its start)
+    x.start_ms = now_ms - d.uptime_s * 1000u;
+    if (fresh)
+      this->ledger_->add_power_up(e);
+    this->ledger_->add_time(e, false, part);
+    if (life && x.life_fresh && !x.adopted)
+      this->ledger_->take(e, receiver_counters(d), 1);   // (its time elsewhere; its power-ups this one included)
+    e.sess_ups = life ? d.lt_power_ups : SESS_UPS_UNKNOWN;
+    e.sess = true;
+  }
+
+  /// The waiting readings into the ledger (dated by the STATUS read last)
+  void readings_(Rx &x, LedgerEntry &e) {
     for (uint8_t k = 0; k < x.pending; k++) {
       const Reading &r = x.reading[k];
       // this session's first reading: read after it started (its uptime is whole seconds: or its count went back)
       if (x.restart_due &&
-          (static_cast<int32_t>(r.ms - start_ms) >= 0 || (x.have_boot && r.boot < x.boot_last))) {
-        x.boot_last = base == UINT32_MAX ? r.boot : base;
+          (static_cast<int32_t>(r.ms - x.start_ms) >= 0 || (x.have_boot && r.boot < x.boot_last))) {
+        x.boot_last = x.boot_base == UINT32_MAX ? r.boot : x.boot_base;
         x.have_boot = true;
         x.restart_due = false;
       }
@@ -687,16 +845,28 @@ class LedgerKeeper {
       x.boot_last = r.boot;
       x.have_boot = true;
       x.energy_seen = true;
-      if (!x.restart_due) {   // (the session it is counted in now: its checkpoint)
+      if (!x.restart_due) {   // (the session it is counted in now: its checkpoint, its power to a cut)
         e.sess_boot = r.boot;
-        e.sess_up = d.uptime_s;
-        e.sess_ups = (d.features & ULTRA_FEAT_LIFETIME) && d.have_lifetime ? d.lt_power_ups : SESS_UPS_UNKNOWN;
-        e.sess = true;
+        x.en_counted = true;
+        x.en_ms = r.ms;
+        x.mw = r.mw;
       }
     }
     if (x.pending != 0)
       x.en_read = true;
     x.pending = 0;
+  }
+
+  /// Its lit time up to now_ms (lit since the last lit_tick that said so); before its entry is known, held
+  void lit_end_(Rx &x, uint32_t now_ms) {
+    if (x.lit_on) {
+      const uint32_t ms = now_ms - x.lit_ms;
+      if (x.entry != nullptr && this->ledger_ != nullptr)
+        this->ledger_->add_time(*x.entry, true, ms);
+      else
+        x.lit_pend += ms;
+    }
+    x.lit_ms = now_ms;
   }
 
   uint8_t sync_result_(TelemetryPoller &p, uint16_t i, const ReceiverData &d, uint32_t now_ms) {

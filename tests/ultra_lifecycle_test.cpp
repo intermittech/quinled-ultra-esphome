@@ -1178,6 +1178,7 @@ struct UltraHub {
   LedgerKeeper keeper_;   // (not attached here: tests/ultra_telemetry_test.cpp runs it)
   const char *tel_name_{"Port"};
   void ledger_service_() {}
+  void ledger_line_() {}
   std::vector<uint8_t> rw_slots_, rw_rx_;
   bool rw_next_{false}, tx_rw_{false};
   uint32_t rw_window_us_{0};
@@ -3273,6 +3274,119 @@ static void test_ledger_flush_failure() {
 }
 }  // namespace ledger_store
 
+// ================================================================================================ ledger line
+// The hub's side of the ledger's own counts (dig2analog_ultra.cpp ledger_line_, cut into
+// build/lifecycle/hub_ledger_line.inc; review r9, Fable C 1-2): a Diff-Power port's power-on and cut as the port timed
+// them (PortCore::line_on / line_ms: the 55 V hotplug_ms after enable AND detect, until either drops), each receiver
+// lit while the boards are ready, by its own lights only.
+namespace ledger_line {
+#define USE_DIFFPOWER
+using ::esphome::diffpower::PortConfig;
+using ::esphome::diffpower::PortCore;
+struct Light {
+  uint16_t board;
+  bool on;
+  uint16_t get_board() const { return this->board; }
+  bool is_lit(uint32_t) const { return this->on; }
+};
+struct Keeper {   // what the hub tells the ledger
+  std::vector<std::string> calls;
+  std::vector<int> lit;
+  void power_on(uint32_t ms) { this->calls.push_back("on " + std::to_string(ms)); }
+  void cut(uint32_t ms) { this->calls.push_back("cut " + std::to_string(ms)); }
+  const char *last() const { return this->calls.empty() ? "none" : this->calls.back().c_str(); }
+  void lit_tick(uint16_t i, bool on, uint32_t) {
+    if (this->lit.size() <= i)
+      this->lit.resize(i + 1, 0);
+    this->lit[i] = on;
+  }
+};
+struct Port {
+  PortCore c;
+  const PortCore &core() const { return this->c; }
+};
+struct UltraHub {
+  int *rw_uart_{nullptr};
+  Port *port_{nullptr};
+  Keeper keeper_;
+  struct {
+    uint16_t receivers() const { return 3; }
+  } poller_;
+  std::vector<Light *> lights_;
+  bool ready{false};
+  bool boards_powered_() const { return this->ready; }
+  bool line_on_{false};
+  std::vector<uint8_t> lit_rx_;
+  void ledger_line_();
+};
+#include "hub_ledger_line.inc"
+
+static void test_ledger_line() {
+  int uart = 0;
+  Port port;
+  PortConfig cfg;
+  port.c.configure(cfg);
+  const uint16_t load = port.c.add_load(0);
+  Light a{0, false}, b{2, false}, far{7, true};   // (board 7: no receiver there)
+  UltraHub h;
+  h.port_ = &port;
+  h.lights_ = {&a, &b, &far};
+  now_ms = 1000;
+  port.c.set_detect(true, now_ms);
+  port.c.update(now_ms);   // (standby)
+  h.ledger_line_();
+  CHECK(h.keeper_.calls.empty() && h.keeper_.lit.empty(), "ledger line: nothing without the return channel");
+  h.rw_uart_ = &uart;
+  // a light wants the port: enable at 2000; the 55 V from 2000 + hotplug_ms (seen at the next update)
+  now_ms = 2000;
+  a.on = true;
+  port.c.set_lit(load, true, now_ms);
+  port.c.update(now_ms);
+  h.ledger_line_();
+  now_ms = 2000 + cfg.hotplug_ms + 37;
+  port.c.update(now_ms);
+  h.ledger_line_();
+  CHECK(h.keeper_.calls.size() == 1 && h.keeper_.calls[0] == "on " + std::to_string(2000 + cfg.hotplug_ms) &&
+            h.keeper_.lit == std::vector<int>({0, 0, 0}),
+        "ledger line: the power-on at the 55 V's start (%s), not lit before the boards are ready",
+        h.keeper_.last());
+  h.ready = true;
+  b.on = true;
+  h.ledger_line_();
+  CHECK(h.keeper_.lit == std::vector<int>({1, 0, 1}), "ledger line: receivers 0 and 2 lit by their own lights");
+  a.on = false;
+  h.ledger_line_();
+  CHECK(h.keeper_.lit == std::vector<int>({0, 0, 1}), "ledger line: receiver 0 dark again");
+  // a dropout (the detect gone: the 55 V cut at once), then back
+  now_ms = 9000;
+  port.c.set_detect(false, now_ms);
+  h.ready = false;
+  now_ms = 9012;
+  h.ledger_line_();
+  CHECK(h.keeper_.calls.size() == 2 && h.keeper_.calls[1] == "cut 9000" && h.keeper_.lit == std::vector<int>({0, 0, 0}),
+        "ledger line: the cut when the detect dropped (%s), nothing lit", h.keeper_.last());
+  now_ms = 9500;
+  port.c.set_detect(true, now_ms);
+  port.c.update(now_ms);
+  h.ledger_line_();
+  now_ms = 9500 + cfg.hotplug_ms;
+  port.c.update(now_ms);
+  h.ledger_line_();
+  CHECK(h.keeper_.calls.size() == 3 && h.keeper_.calls[2] == "on " + std::to_string(9500 + cfg.hotplug_ms),
+        "ledger line: powered again from the detect's return + hotplug_ms (%s)", h.keeper_.last());
+  // the power cycle (a recovery): the enable low now
+  now_ms = 20000;
+  port.c.power_cycle(now_ms);
+  now_ms = 20005;
+  h.ledger_line_();
+  CHECK(h.keeper_.calls.size() == 4 && h.keeper_.calls[3] == "cut 20000", "ledger line: a power cycle's cut (%s)",
+        h.keeper_.last());
+  now_ms = 0;
+  std::printf("  ledger line: the port's power-on and cut as it timed them, each receiver's lit time\n");
+}
+#undef USE_DIFFPOWER
+}  // namespace ledger_line
+
 }  // namespace esphome::dig2analog_ultra
 
 using namespace esphome::dig2analog_ultra;
@@ -3579,6 +3693,7 @@ int main() {
   update_retry::test_auto_retry();
   ledger_store::test_ledger_resize();
   ledger_store::test_ledger_flush_failure();
+  ledger_line::test_ledger_line();
   port_power::test_port();
   port_power::test_port_prepare();
   hub_port::test_hub_port();

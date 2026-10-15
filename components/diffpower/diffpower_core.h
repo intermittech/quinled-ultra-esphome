@@ -185,6 +185,7 @@ class PortCore {
       this->detect_change_ms_ = now_ms;
       if (raw && this->enable_)
         this->conj_ms_ = now_ms;
+      this->line_note_(now_ms);
       return;
     }
     if (raw != this->raw_) {
@@ -194,6 +195,7 @@ class PortCore {
         this->raw_lost_ = true;
       else if (this->enable_)
         this->conj_ms_ = now_ms;   // the hot-plug delay from here
+      this->line_note_(now_ms);
     }
     if (raw != this->board_ && now_ms - this->detect_change_ms_ >= this->cfg_.debounce_ms)
       this->board_ = raw;
@@ -336,6 +338,7 @@ class PortCore {
         break;
     }
     this->raw_lost_ = false;
+    this->line_note_(now_ms);
     if (this->state_ != was || this->problem_ != problem_was)
       ev |= EV_STATE;
     if (this->enable_ != enable_was)
@@ -371,6 +374,7 @@ class PortCore {
     this->hold_off_(now_ms, this->cfg_.cycle_off_ms > this->cfg_.min_off_ms ? this->cfg_.cycle_off_ms
                                                                             : this->cfg_.min_off_ms);
     this->wake_pending_ = true;
+    this->line_note_(now_ms);
     return (this->state_ != was ? EV_STATE : 0) | (enable_was ? EV_ENABLE : 0);
   }
   /// How long a power cycle takes until the boards have power again
@@ -403,6 +407,7 @@ class PortCore {
     if (this->state_ != PS_OFF)
       ev |= EV_STATE;
     this->state_ = PS_OFF;
+    this->line_note_(now_ms);
     return ev;
   }
 
@@ -410,6 +415,10 @@ class PortCore {
   bool enable() const { return this->enable_; }
   /// powered and the wake over: the lights' data reaches the boards
   bool ready() const { return this->state_ == PS_ON; }
+  /// the line's 55 V (hotplug_ms after enable AND detect, until either drops: update() sees it come) and since when
+  /// (ms: its power-on, its cut): the hubs' lifetime ledger counts the boards' powered time by it
+  bool line_on() const { return this->line_; }
+  uint32_t line_ms() const { return this->line_ms_; }
   /// a board detected (debounced)
   bool board() const { return this->board_; }
   /// FAULT (detect lost while ON, until it is back), or no board while a light wants the port
@@ -485,6 +494,14 @@ class PortCore {
     this->pending_ = true;
     return EV_NOTICE;
   }
+  /// the line's 55 V changed: timed (on: the hot-plug delay after enable AND detect)
+  void line_note_(uint32_t now_ms) {
+    const bool on = this->enable_ && this->raw_ && now_ms - this->conj_ms_ >= this->cfg_.hotplug_ms;
+    if (on != this->line_) {
+      this->line_ = on;
+      this->line_ms_ = on ? this->conj_ms_ + this->cfg_.hotplug_ms : now_ms;
+    }
+  }
   /// time in standby
   void account_(uint32_t now_ms) {
     if (this->state_ != PS_STANDBY && this->state_ != PS_OFF_HOLD)
@@ -507,6 +524,8 @@ class PortCore {
   uint32_t detect_change_ms_{0}, conj_ms_{0};
   PortState state_{PS_OFF};
   bool enable_{false};
+  bool line_{false};
+  uint32_t line_ms_{0};
   uint32_t on_ms_{0}, notice_ms_{0}, last_out_ms_{0}, off_ms_{0}, off_hold_ms_{0};
   uint8_t delivered_{0};
   bool pending_{false}, wake_pending_{false}, shutting_down_{false}, rewake_{false};

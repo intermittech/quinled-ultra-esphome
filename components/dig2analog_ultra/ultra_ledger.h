@@ -52,31 +52,32 @@ inline LifeCounters receiver_counters(const ReceiverData &d) {
   return c;
 }
 
+// (the fields in size order: no padding but at the end; the stored form is written field by field)
 struct LedgerEntry {
-  uint8_t uid[12]{};
   LifeCounters c;
+  uint8_t uid[12]{};
   uint32_t records{0};    // the board's RECORDS (u24) as last read: its low 8 bits are the sync's compare-and-swap
   uint32_t last_day{0};   // the hub day it was last seen
   // its session as last counted (stored with the energy it is part of): its count since power-up then, its uptime
   // and its power-ups count; the same session later (an ESP32 restart under it, the board moved while powered) goes
   // on from that count, so nothing is lost and nothing counted twice
   uint32_t sess_boot{0}, sess_up{0}, sess_ups{SESS_UPS_UNKNOWN};
-  bool sess{false};
   // the hub's powered and lit time below a wire unit (ms): kept, so whole units add up over any number of short runs
   uint32_t pow_rem{0}, lit_rem{0};
   uint32_t en_rem{0};   // ... and its energy at the cuts below a mWh (mW x ms)
+  bool sess{false};     // (its session above known)
   bool used{false};
 };
 
 /// A line's receiver slot: the board there and its Energy (the board's ledger energy + offset); or (counter) a value of
 /// its own that only goes up (a port's energy, a light's).
-struct LedgerPosition {
+struct LedgerPosition {   // (the fields in size order)
+  int64_t offset_mwh{0};
+  uint64_t value_mwh{0};  // its Energy as last computed (the base when its board changes); a counter's value
   uint32_t key{0};        // the line (its id's hash) and the receiver index; a counter's own key
   uint8_t uid[12]{};
   bool have_uid{false};
   bool counter{false};
-  int64_t offset_mwh{0};
-  uint64_t value_mwh{0};  // its Energy as last computed (the base when its board changes); a counter's value
   bool used{false};
 };
 

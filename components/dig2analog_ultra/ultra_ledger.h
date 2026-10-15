@@ -20,7 +20,7 @@
 
 namespace esphome::dig2analog_ultra {
 
-static constexpr uint32_t LEDGER_MAGIC = 0x4C444733;    // "LDG3" (each board's session checkpoint, its time below 0.1 h)
+static constexpr uint32_t LEDGER_MAGIC = 0x4C444733;    // "LDG3" (each board's session checkpoint, its sub-units)
 static constexpr uint32_t UNIT_MS = 360000;             // the wire's 0.1 h
 static constexpr uint32_t CUT_TAIL_MS = 60000;          // a cut: the last power read counts this long at most
 static constexpr uint32_t SESS_UPS_UNKNOWN = 0xFFFFFFFFu;
@@ -64,6 +64,7 @@ struct LedgerEntry {
   bool sess{false};
   // the hub's powered and lit time below a wire unit (ms): kept, so whole units add up over any number of short runs
   uint32_t pow_rem{0}, lit_rem{0};
+  uint32_t en_rem{0};   // ... and its energy at the cuts below a mWh (mW x ms)
   bool used{false};
 };
 
@@ -310,6 +311,7 @@ class LifetimeLedger {
         b[60] = e.sess ? 1 : 0;
         ultra_put32(b + 64, e.pow_rem);
         ultra_put32(b + 68, e.lit_rem);
+        ultra_put32(b + 72, e.en_rem);
       }
       b += ENTRY;
     }
@@ -375,6 +377,7 @@ class LifetimeLedger {
       e.sess = (b[60] & 1) != 0;
       e.pow_rem = ultra_get32(b + 64) % UNIT_MS;
       e.lit_rem = ultra_get32(b + 68) % UNIT_MS;
+      e.en_rem = ultra_get32(b + 72) % 3600000u;
     }
     to = 0;
     for (size_t i = 0; i < np; i++, b += POS) {
@@ -395,7 +398,7 @@ class LifetimeLedger {
   static constexpr uint8_t LS_ARGS = 23;   // (the POLL's arguments: ULTRA_LS_RECORDS + 1)
 
  protected:
-  static constexpr size_t HDR = 16, ENTRY = 72, POS = 33;
+  static constexpr size_t HDR = 16, ENTRY = 76, POS = 33;
   static bool valid_(const uint8_t *in, size_t n, size_t *ne, size_t *np) {
     if (n < HDR + 2 || ultra_get32(in) != LEDGER_MAGIC || ultra_get16(in + n - 2) != ultra_crc16(in, static_cast<uint32_t>(n - 2)))
       return false;
@@ -664,10 +667,12 @@ class LedgerKeeper {
         const uint32_t ms = at_ms - x.count_ms;
         this->ledger_->add_time(e, false, ms);
         e.sess_up += ms / 1000;
-        if (x.en_counted) {   // (rounded, and half a mWh more: its count is whole mWh, on average half a mWh short)
+        if (x.en_counted) {   // (and half a mWh: its count is whole mWh, on average half a mWh short; below a mWh kept)
           const uint32_t tail = at_ms - x.en_ms;
-          const uint64_t mw_ms = static_cast<uint64_t>(x.mw) * (tail < CUT_TAIL_MS ? tail : CUT_TAIL_MS);
-          this->ledger_->add_energy(e, (mw_ms + ENERGY_MS_PER_MWH) / ENERGY_MS_PER_MWH, 0);
+          const uint64_t mw_ms = e.en_rem + static_cast<uint64_t>(x.mw) * (tail < CUT_TAIL_MS ? tail : CUT_TAIL_MS) +
+                                 ENERGY_MS_PER_MWH / 2;
+          this->ledger_->add_energy(e, mw_ms / ENERGY_MS_PER_MWH, 0);
+          e.en_rem = static_cast<uint32_t>(mw_ms % ENERGY_MS_PER_MWH);
         }
       }
       session_reset_(x);

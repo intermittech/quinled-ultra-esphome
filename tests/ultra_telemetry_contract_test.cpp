@@ -1826,6 +1826,16 @@ static void sc_month() {
         "%lld, %lld; %u writes)",
         (long long) s.d_pow, (long long) s.d_lit, (long long) s.d_ups, (long long) s.d_wh, (long long) s.h_pow,
         (long long) s.h_lit, (long long) s.h_ups, (long long) s.h_wh, s.writes);
+  // a year of it (review r9, GPT R9-R1: a hub that takes the board's rounded value back during sessions it saw adopts
+  // the board's own remainder, ~6 h a year): the truth is summed apart from the ledger (the port's on-times, the lit
+  // spans, the integrated power, the boots), so a slow drift shows
+  const MonthEnd y = month_run(used, 36500, true, false, 13);
+  month_print("hub ledger, a year, every 10th stored", y);
+  CHECK(y.board_ok() && y.hub_ok() && !y.attention && y.results[ULTRA_LS_R_UID] == 0,
+        "a year, every tenth wake stored: within a unit, no drift (board - truth: %lld, %lld, %lld, %lld Wh; ledger: "
+        "%lld, %lld, %lld, %lld; %u writes)",
+        (long long) y.d_pow, (long long) y.d_lit, (long long) y.d_ups, (long long) y.d_wh, (long long) y.h_pow,
+        (long long) y.h_lit, (long long) y.h_ups, (long long) y.h_wh, y.writes);
   life_rec_t clean = used;   // (no remainders)
   clean.on_s = 360u * 5000u;
   clean.lit_s = 360u * 2000u;

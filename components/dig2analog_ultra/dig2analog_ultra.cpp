@@ -1015,8 +1015,9 @@ bool UltraHub::setup_rmt_() {
 // The ESP32's one lifetime ledger (every line's receivers: a board moved between lines keeps its entry). Two stored
 // copies alternate: the newer valid one loads (a cut while one is written keeps the other). Each has its size stored
 // beside it (written after it): a copy stored with more or fewer receivers loads too. Stored at most every 15 min
-// while it changes by a wire unit, at a planned power-off (the notice) and at a reboot; its stored form is built only
-// for a save (no copy of it kept in RAM).
+// while it changes by a wire unit, and at a reboot (not at every planned power-off: a port waking 100 times a day
+// would write it 100 times; a power loss of the ESP32 loses at most those minutes, counted less, never more); its
+// stored form is built only for a save (no copy of it kept in RAM).
 namespace {
 const char *const LEDGER_KEYS[2] = {"ultra_ledger_a", "ultra_ledger_b"};
 const char *const LEDGER_SIZE_KEYS[2] = {"ultra_ledger_a_size", "ultra_ledger_b_size"};
@@ -1197,9 +1198,6 @@ void UltraHub::send_power_off_notice(uint8_t copy) {
   if (copy == 0) {
     this->notices_++;
     ESP_LOGD(TAG, "GPIO%u: the planned power-off notice to %u board(s)", this->pin_, this->num_boards_);
-#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
-    ledger_save_(true);   // (the planned cut: the ledger as it is now)
-#endif
   }
   this->wake_();
 }

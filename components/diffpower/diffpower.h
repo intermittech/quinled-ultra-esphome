@@ -206,6 +206,8 @@ class DiffPowerPort final : public Component {
   static bool any_sun_;
   ESPPreferenceObject stats_pref_;
   uint32_t saved_standby_s_{0}, saved_cycles_{0}, saved_drops_{0}, minute_ms_{0};
+  uint32_t detect_ms_{0};      // the detect input's last read (every DETECT_READ_MS)
+  bool detect_raw_{true}, detect_read_{false};
 #ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *status_{nullptr};
 #endif

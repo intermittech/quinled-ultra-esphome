@@ -18,6 +18,9 @@ static constexpr uint32_t DARK_CHECK_MS = 60000;   // the dark window, once a mi
 static constexpr uint32_t MINUTE_MS = 60000;       // the hours in standby: published once a minute
 static constexpr uint32_t SAVE_STANDBY_S = 600;    // ... stored every 10 min of standby (cycles, drops: each change)
 static constexpr uint32_t SHUTDOWN_MARGIN_MS = 100;   // the shutdown's notices: the longest notice_max_ms + this
+// the detect input read this often (not every loop: on an I2C expander each read is a bus transfer, and the loop runs
+// back to back while fast); the core gets the last reading every loop (its debounce, the 55 V's dropouts)
+static constexpr uint32_t DETECT_READ_MS = 5;
 // the lights' state again after the port is powered: at once, then twice more (boards still booting)
 static const uint32_t RESEND_MS[] = {300, 1000};
 
@@ -159,7 +162,12 @@ void DiffPowerPort::update_dark_(uint32_t now) {
 
 void DiffPowerPort::loop() {
   const uint32_t now = millis();
-  this->core_.set_detect(this->detect_pin_ == nullptr || this->detect_pin_->digital_read(), now);
+  if (this->detect_pin_ != nullptr && (!this->detect_read_ || now - this->detect_ms_ >= DETECT_READ_MS)) {
+    this->detect_raw_ = this->detect_pin_->digital_read();
+    this->detect_ms_ = now;
+    this->detect_read_ = true;
+  }
+  this->core_.set_detect(this->detect_raw_, now);   // (no detect pin: a board assumed)
   for (uint16_t i = 0; i < this->loads_.size(); i++)
     this->core_.set_lit(i, this->loads_[i].lit(now), now);
   this->update_dark_(now);

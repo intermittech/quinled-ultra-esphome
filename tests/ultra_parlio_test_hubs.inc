@@ -124,6 +124,7 @@ static PrefsStub *const global_preferences = &prefs_stub;
 static constexpr uint32_t MINUTE_MS = 60000;
 static constexpr uint32_t SAVE_STANDBY_S = 600;
 static constexpr uint32_t SHUTDOWN_MARGIN_MS = 100;   // (diffpower.cpp: the longest notice_max_ms + this)
+static constexpr uint32_t DETECT_READ_MS = 5;         // (diffpower.cpp: the detect input read this often)
 static const uint32_t RESEND_MS[] = {300, 1000};
 
 /// a light of the line, as its port sees it (UltraLight: its turn-off period, lit)
@@ -186,6 +187,8 @@ struct DiffPowerPort {
   bool prepare_first_{false};
   static constexpr uint32_t PREPARE_MAX_MS = 3000;
   uint32_t minute_ms_{0}, saved_standby_s_{0}, saved_cycles_{0}, saved_drops_{0};
+  uint32_t detect_ms_{0};
+  bool detect_raw_{true}, detect_read_{false};
   static std::vector<DiffPowerPort *> ports_;
   static bool shut_down_;
 };

@@ -2559,7 +2559,11 @@ struct Pin {
     this->level = v;
     this->writes++;
   }
-  bool digital_read() const { return this->level; }
+  bool digital_read() const {
+    this->reads++;
+    return this->level;
+  }
+  mutable int reads{0};
 };
 struct LightState;
 struct LightOutput {
@@ -2632,6 +2636,7 @@ static const char *const TAG = "diffpower";
 static const uint32_t RESEND_MS[] = {300, 1000};
 static constexpr uint32_t MINUTE_MS = 60000;
 static constexpr uint32_t SAVE_STANDBY_S = 600;
+static constexpr uint32_t DETECT_READ_MS = 5;
 static constexpr uint32_t SHUTDOWN_MARGIN_MS = 100;
 // the shutdown's stand-ins: delay() lets the time pass, the watchdog; the preferences (a store by key, its sync)
 static void delay(uint32_t ms) { now_ms += ms; }
@@ -2761,6 +2766,8 @@ struct DiffPowerPort {
   bool prepare_first_{false};
   static constexpr uint32_t PREPARE_MAX_MS = 3000;
   uint32_t saved_standby_s_{0}, saved_cycles_{0}, saved_drops_{0}, minute_ms_{0};
+  uint32_t detect_ms_{0};
+  bool detect_raw_{true}, detect_read_{false};
   TextSensor *status_{nullptr};
   BinarySensor *problem_{nullptr};
   Sensor *cycles_{nullptr}, *hours_{nullptr}, *drops_{nullptr};
@@ -2854,6 +2861,37 @@ static void run(std::vector<DiffPowerPort *> ports, uint32_t ms, std::vector<Hub
       p->run_timers();
     }
   }
+}
+
+/// The detect input is read every 5 ms, not every loop (an expander pin: a bus transfer each), whatever the loop's
+/// pace: a second of 1 ms loops reads it ~200 times; a 20 ms dropout while powered is still a drop (the 55 V cut).
+static void test_detect_rate() {
+  now_ms = 1000;
+  Pin enable, detect;
+  detect.level = true;
+  LightState strip;
+  DiffPowerPort p;
+  p.enable_pin_ = &enable;
+  p.detect_pin_ = &detect;
+  p.add_light(&strip, 0);
+  strip.remote_values.on = strip.current_values.on = true;
+  run({&p}, 5000);   // (powered: On)
+  const int r0 = detect.reads;
+  for (int ms = 0; ms < 1000; ms++, now_ms++) {
+    p.loop();
+    p.run_timers();
+  }
+  const int reads = detect.reads - r0;
+  const uint32_t drops0 = p.core_.drops();
+  detect.level = false;
+  for (int ms = 0; ms < 20; ms++, now_ms++)
+    p.loop();
+  detect.level = true;
+  for (int ms = 0; ms < 100; ms++, now_ms++)
+    p.loop();
+  CHECK(reads >= 195 && reads <= 201 && p.core_.drops() == drops0 + 1,
+        "detect read %d times in a second of 1 ms loops (every 5 ms); a 20 ms dropout counted (%u drops)", reads,
+        p.core_.drops());
 }
 
 static void test_port() {
@@ -4142,6 +4180,7 @@ int main() {
   ledger_store::test_ledger_resize_failures();
   ledger_line::test_ledger_line();
   port_power::test_port();
+  port_power::test_detect_rate();
   port_power::test_port_prepare();
   hub_port::test_hub_port();
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "ALL ULTRA LIFECYCLE TESTS PASSED", failures);

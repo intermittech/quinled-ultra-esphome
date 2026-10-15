@@ -1261,9 +1261,9 @@ static void test_refresh_rotation() {
       line("resync", b, m[b] + r, r);
   }
   CHECK(again, "resync: every board's clearing slots from round 0 again");
-  // the cross-check trace: ULTRA_ROTATION_TRACE names the file (compared with the sender library's)
+  // the cross-check trace: ULTRA_ROTATION_TRACE names the file (compared with the sender library's; LF lines)
   const char *trace_file = std::getenv("ULTRA_ROTATION_TRACE");
-  if (FILE *f = trace_file != nullptr ? std::fopen(trace_file, "w") : nullptr) {
+  if (FILE *f = trace_file != nullptr ? std::fopen(trace_file, "wb") : nullptr) {
     for (const auto &l : trace)
       std::fprintf(f, "%s\n", l.c_str());
     std::fclose(f);

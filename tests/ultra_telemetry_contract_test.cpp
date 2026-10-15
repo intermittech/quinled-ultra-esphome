@@ -1366,7 +1366,7 @@ static void sc_update_repeat() {
       ucrx_cmd_config(ULTRA_CFG_FEEDBACK, static_cast<uint16_t>(feedback));
       lights_on(40000);
       ucrx_run_ms(3000);   // (the soft start over: steady)
-      ucrx_update_info(2, UPD_HW_ID_D2A_ULTRA_5CH, UPD_REV_D2A_R04, VERSION);
+      ucrx_update_info(2, UPD_HW_ID_DP_ULTRA_RX, 0, VERSION);   // (its own bootloader: a receiver's, revision 0)
       ucrx_truth_t t0, t;
       ucrx_truth(&t0);
       // the image: the descriptor the app checks (the body isn't looked at by a board that doesn't take it)
@@ -1374,8 +1374,8 @@ static void sc_update_repeat() {
       std::memset(img, 0, sizeof(img));
       std::memcpy(img, "QDU5", 4);
       img[UPD_D_DESC_VERSION] = UPD_DESC_VERSION;
-      img[UPD_D_HW_ID] = other ? 9 : UPD_HW_ID_D2A_ULTRA_5CH;
-      upd_put16(img + UPD_D_HW_REV_MASK, 1u << UPD_REV_D2A_R04);
+      img[UPD_D_HW_ID] = other ? 9 : UPD_HW_ID_DP_ULTRA_RX;
+      upd_put16(img + UPD_D_HW_REV_MASK, 1u << 0);
       upd_put32(img + UPD_D_FW_VERSION, VERSION);
       upd_put32(img + UPD_D_BODY_LEN, 1024);
       upd_put32(img + UPD_D_BODY_CRC, upd_crc32_words(0xFFFFFFFFu, img + UPD_DESC_BYTES, 256));
@@ -1813,7 +1813,8 @@ static void month_print(const char *what, const MonthEnd &r) {
 /// port (nothing stored on the board): after its next power-up every counter within one unit of the truth, on the
 /// board (energy_sync's merge) and in the hub's ledger; the same with every tenth wake long enough to be stored (the
 /// board's own remainders ride on the hub's units: never counted twice). The negative control: a hub that echoes the
-/// highest of its reads gives back almost nothing (a record without remainders), or runs ahead (one with them).
+/// highest of its reads gives back almost nothing (a record without remainders), or misses the truth by far (one with
+/// them: ahead, or behind once the receiver writes the merges it takes).
 static void sc_month() {
   std::printf("month: 30 days x 100 short wakes of a standby port, the hub's own ledger against the receiver's merge\n");
   life_rec_t used{};   // a used board: 500 h powered (and 300 s), 200 h lit (and 350 s), 2 kWh
@@ -1825,7 +1826,8 @@ static void sc_month() {
   used.magic = LIFE_MAGIC;
   const MonthEnd a = month_run(used, 3000, false, false, 11);
   month_print("hub ledger, nothing stored", a);
-  CHECK(a.board_ok() && a.hub_ok() && a.writes == 0 && !a.attention && a.results[ULTRA_LS_R_UID] == 0,
+  // (no wake stores; the receiver writes only when a merge raises its powered time by a day or more: a few)
+  CHECK(a.board_ok() && a.hub_ok() && a.writes <= 15 && !a.attention && a.results[ULTRA_LS_R_UID] == 0,
         "month: every counter back within a unit, energy never above (board - truth: powered %lld, lit %lld, "
         "power-ups %lld, %.0f mWh; ledger: %lld, %lld, %lld, %.0f mWh; %u writes)",
         (long long) a.d_pow, (long long) a.d_lit, (long long) a.d_ups, a.e_board, (long long) a.h_pow,
@@ -1890,8 +1892,10 @@ static void sc_month() {
         "month, echo control: almost nothing back (%.1f of %.1f h powered)", gained, due);
   const MonthEnd f = month_run(used, 3000, false, true, 11);
   month_print("echo hub, remainders (control)", f);
-  CHECK(f.board_h - f.truth_h > 0.25 * (f.truth_h - 500.0),
-        "month, echo control with remainders: it runs ahead (%.1f h for %.1f)", f.board_h, f.truth_h);
+  CHECK(std::fabs(f.board_h - f.truth_h) > 0.25 * (f.truth_h - 500.0),
+        "month, echo control with remainders: far off the truth (%.1f h for %.1f: ahead with receivers that ratchet "
+        "its remainders, behind with ones that write the merges they take)",
+        f.board_h, f.truth_h);
 }
 
 // ---------------------------------------------- the ledger against an independent truth (design review, round 9)

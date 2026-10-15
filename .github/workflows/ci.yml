@@ -22,20 +22,20 @@ jobs:
     name: Host and schema tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: quinled-ultra-esphome
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: intermittech/quinled-ultra-firmware
           ref: ${{ env.FIRMWARE_REF }}
           path: quinled-ultra-firmware
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: intermittech/quinled-ultra-protocol
           ref: ${{ env.PROTOCOL_REF }}
           path: quinled-ultra-protocol
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install ESPHome and zig
@@ -84,11 +84,11 @@ jobs:
     env:
       ESPHOME_ESP_IDF_PREFIX: /home/runner/esphome-idf   # ESPHome's ESP-IDF install, kept between runs
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: /home/runner/esphome-idf
           key: esp-idf-esphome-${{ env.ESPHOME_VERSION }}

@@ -43,6 +43,7 @@ void operator delete[](void *p) noexcept { std::free(p); }
 #define USE_DIG2ANALOG_ULTRA_UPDATE
 #define ESP_LOGE(...) ((void) 0)
 #define ESP_LOGD(...) ((void) 0)
+#define ESP_LOGV(...) ((void) 0)
 #define ESP_LOGI(...) ((void) 0)
 #define ESP_LOGW(...) ((void) 0)
 

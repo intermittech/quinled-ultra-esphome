@@ -603,7 +603,7 @@ void UltraHub::rw_publish_() {
     const ReceiverData &d = this->poller_.data(i);
     if ((u & TU_AVAILABILITY) && (this->port_standby() || (note & RX_SETTLING))) {
       // (its line's power switched on purpose: off, or just back and not evaluated yet)
-      ESP_LOGD(TAG, "Receiver %u on GPIO%u: %s", i, this->pin_, this->port_standby() ? "standby" : "waking");
+      ESP_LOGV(TAG, "Receiver %u on GPIO%u: %s", i, this->pin_, this->port_standby() ? "standby" : "waking");
     } else if (u & TU_AVAILABILITY) {
       if (this->poller_.answering(i)) {
         ESP_LOGI(TAG, "Receiver %u on GPIO%u answers", i, this->pin_);
@@ -618,7 +618,7 @@ void UltraHub::rw_publish_() {
     }
     if (u & TU_RESTART) {
       if ((note & RX_WOKE) && millis() - this->woke_ms_ < 60000) {   // (its port's wake: expected)
-        ESP_LOGD(TAG, "Receiver %u on GPIO%u restarted (its port woke)", i, this->pin_);
+        ESP_LOGV(TAG, "Receiver %u on GPIO%u restarted (its port woke)", i, this->pin_);
       } else {
         ESP_LOGI(TAG, "Receiver %u on GPIO%u restarted or was replaced", i, this->pin_);
       }
@@ -655,7 +655,7 @@ void UltraHub::rw_publish_() {
                "own counts)", this->tel_name_, i + 1);
     }
     if (lev & LedgerKeeper::EV_SYNCED) {
-      ESP_LOGD(TAG, "%s \xC2\xB7 Receiver %u: its lifetime counters synced from the hub", this->tel_name_, i + 1);
+      ESP_LOGV(TAG, "%s \xC2\xB7 Receiver %u: its lifetime counters synced from the hub", this->tel_name_, i + 1);
     }
     this->rw_callback_.call(i, u);
   }

@@ -1,6 +1,7 @@
 """Build and run tests/ultra_contract_test.cpp with the zig C/C++ compiler (pip install ziglang): the component's
 scheduler against the board firmware's receive path (frame_rx.c, proto.c) and light engine (ultra.c). Needs the board
-firmware: ULTRA_FIRMWARE=<firmware dir>, else a checkout next to this repository (see run_ultra_host_test.py)."""
+firmware: ULTRA_FIRMWARE=<firmware dir>, else a checkout next to this repository (see run_ultra_host_test.py). Without
+it the test is skipped; with ULTRA_REQUIRE_DEPS=1 (CI) a missing firmware is a failure."""
 
 import os
 from pathlib import Path
@@ -26,6 +27,9 @@ def firmware_dir() -> Path:
 def main() -> int:
     core = firmware_dir() / "src" / "core"
     if not (core / "ultra.c").exists():
+        if os.environ.get("ULTRA_REQUIRE_DEPS") == "1":
+            print(f"FAIL: the board firmware is missing ({core}; ULTRA_REQUIRE_DEPS=1)")
+            return 1
         print(f"board firmware not found ({core}): contract test skipped")
         return 0
     BUILD.mkdir(exist_ok=True)

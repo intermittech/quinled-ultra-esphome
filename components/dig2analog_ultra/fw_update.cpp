@@ -25,8 +25,8 @@ static constexpr uint32_t POWER_TIMEOUT_MS = 30000;
 static constexpr float DOWNLOAD_SHARE = 15.0f;           // progress: download 0-15 %, session 15-100 %
 
 static const char *const BLINK_LEGEND =
-    "Red blinks: 3 fast + N = updated (N = minor version + 1), 1 short = had it already, 1 long = rejected "
-    "(other hardware / older), slow 1 Hz = waiting in recovery for the next install";
+    "Blinks: 3 fast + N = updated (N = minor + 1), 1 short = had it, 1 long = rejected (on the status LED from "
+    "0.6.9), slow 1 Hz = waiting in recovery";
 
 UltraFirmwareUpdate *UltraFirmwareUpdate::active_ = nullptr;
 uint8_t UltraFirmwareUpdate::entities_ = 0;
@@ -90,10 +90,12 @@ void UltraFirmwareUpdate::dump_config() {
                 "  Channel: %s, manifest %s\n"
                 "  Signature: %s (%u public keys)\n"
                 "  Boards: hardware %u revision %u, %u passes\n"
+                "  Auto retry: %u (%s)\n"
                 "  Installed on this line: %s",
                 this->get_name().c_str(), fw_channel_name(this->channel_),
                 fw_manifest_url(this->source_, this->channel_).c_str(), this->verify_ ? "checked" : "NOT checked",
-                static_cast<unsigned>(this->nkeys_), this->hw_id_, this->hw_rev_, this->passes_,
+                static_cast<unsigned>(this->nkeys_), this->hw_id_, this->hw_rev_, this->passes_, this->auto_retry_,
+                this->line_answers_() ? "while a receiver isn't on the release" : "blind: a one-way line",
                 this->installed_text_().c_str());
   if (this->verify_ && this->nkeys_ == 0)
     ESP_LOGW(TAG, "  No public keys: no release can be installed (production keys come with the firmware repo)");
@@ -103,7 +105,9 @@ std::string UltraFirmwareUpdate::installed_text_() const {
   return this->installed_ ? format_fw_version(this->installed_) : std::string("unknown");
 }
 
-void UltraFirmwareUpdate::set_status_(const std::string &text) {
+void UltraFirmwareUpdate::set_status_(const std::string &status) {
+  // (Home Assistant takes up to 255 characters)
+  const std::string text = status.size() > 255 ? status.substr(0, 252) + "..." : status;
   if (text == this->status_text_)
     return;
   this->status_text_ = text;
@@ -312,7 +316,17 @@ void UltraFirmwareUpdate::perform(bool force) {
   this->recover_ = false;
   this->power_cycle_ = false;
   this->lead_in_ms_ = 500;
+  this->retry_.begin(force ? 0 : this->auto_retry_, this->line_answers_());   // never with FORCE
   this->start_install_();
+}
+
+// Every board of the line answers (Diff-Power receivers with telemetry): the retries check their versions.
+bool UltraFirmwareUpdate::line_answers_() const {
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  return this->hub_->has_telemetry() && this->hub_->telemetry().receivers() >= this->hub_->get_num_boards();
+#else
+  return false;
+#endif
 }
 
 void UltraFirmwareUpdate::recover(uint32_t lead_in_ms, bool power_cycle) {
@@ -322,6 +336,7 @@ void UltraFirmwareUpdate::recover(uint32_t lead_in_ms, bool power_cycle) {
   }
   this->force_ = true;
   this->recover_ = true;
+  this->retry_.begin(0, false);   // (forced: no retries)
   this->power_cycle_ = power_cycle && this->hub_->has_power_supply();
   this->lead_in_ms_ = std::max<uint32_t>(lead_in_ms, 500);
   // the boards come back power_cycle_ms() after the cycle starts (the supply's keep_on_time, 1.5 s off): the ANNOUNCE
@@ -451,7 +466,32 @@ void UltraFirmwareUpdate::start_session_() {
     this->set_status_("recovery: power-cycle the boards on this line now (ANNOUNCE for " +
                       std::to_string(this->lead_in_ms_ / 1000) + " s)");
   } else {
-    this->set_status_("sending");
+    this->set_status_(this->retry_.used() != 0 ? this->retry_.retry_text(this->job_version_) : "sending");
+  }
+}
+
+// A session's result is in (its PING burst is out, the new firmware confirmed): the same session again (blind), the
+// receivers' check (telemetry), or the end. The image and the supply stay held until the end.
+void UltraFirmwareUpdate::session_done_() {
+  const uint32_t now = millis();
+  switch (this->retry_.session_done(now)) {
+    case AutoRetry::RETRY:
+      ESP_LOGI(TAG, "'%s': %s", this->get_name().c_str(), this->retry_.retry_text(this->job_version_).c_str());
+      this->start_session_();
+      break;
+    case AutoRetry::CHECK:
+      this->phase_ = CHECKING;
+      this->phase_ms_ = now;
+      this->set_status_(this->retry_.checking_text(this->hub_->get_num_boards()));
+      break;
+    default: {
+      std::string s = "done: " + format_fw_version(this->job_version_) + " sent to the " +
+                      std::to_string(this->hub_->get_num_boards()) + " boards of this line";
+      if (this->retry_.used() != 0)
+        s += " in " + std::to_string(this->retry_.used() + 1) + " sessions";
+      this->finish_(s + ". " + BLINK_LEGEND, true);
+      break;
+    }
   }
 }
 
@@ -520,6 +560,9 @@ void UltraFirmwareUpdate::abort() {
     case SENDING:
       this->hub_->abort_update();   // its result ends the install
       break;
+    case CHECKING:
+      this->finish_("aborted: no retry (boards that installed it keep it)", false);
+      break;
     default:
       break;
   }
@@ -569,9 +612,7 @@ void UltraFirmwareUpdate::loop() {
     case SENDING: {
       const auto res = this->hub_->take_update_result();
       if (res == UltraHub::UPD_DONE) {
-        this->finish_("done: " + format_fw_version(this->job_version_) + " sent to the " +
-                          std::to_string(this->hub_->get_num_boards()) + " boards of this line. " + BLINK_LEGEND,
-                      true);
+        this->session_done_();
       } else if (res == UltraHub::UPD_ABORTED) {
         this->finish_("aborted: boards that had started erasing wait in their bootloader (slow red blink) for the "
                       "next install",
@@ -581,13 +622,30 @@ void UltraFirmwareUpdate::loop() {
       } else if (now - this->last_publish_ms_ >= PUBLISH_MS && this->hub_->update_running()) {
         const float p = this->hub_->update_progress();
         if (!this->recover_ || now - this->phase_ms_ > this->lead_in_ms_) {
-          this->set_status_("sending: pass " + std::to_string(this->hub_->update_pass() + 1) + " of " +
-                            std::to_string(this->passes_) + ", " + std::to_string(static_cast<int>(p * 100.0f)) + " %");
+          this->set_status_(this->retry_.prefix() + "sending: pass " + std::to_string(this->hub_->update_pass() + 1) +
+                            " of " + std::to_string(this->passes_) + ", " +
+                            std::to_string(static_cast<int>(p * 100.0f)) + " %");
         } else if (this->power_cycle_ && this->hub_->power_cycle_state() == UltraHub::CYCLE_FAILED) {
           this->set_status_("recovery: the supply stayed on - power-cycle the boards by hand now");
         }
         this->publish_progress_(DOWNLOAD_SHARE + (100.0f - DOWNLOAD_SHARE) * p, false);
       }
+      break;
+    }
+    case CHECKING: {   // the receivers' versions after a session (telemetry): done, or the session again
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+      const UpdateTarget t{this->job_version_, this->job_image_.hw_id, this->job_image_.hw_rev_mask,
+                           this->job_image_.min_bootloader};
+      const auto step = this->retry_.check(now, this->hub_->telemetry(), t);
+      if (step == AutoRetry::RETRY) {
+        ESP_LOGI(TAG, "'%s': %s", this->get_name().c_str(), this->retry_.retry_text(this->job_version_).c_str());
+        this->start_session_();
+      } else if (step == AutoRetry::FINISH) {
+        this->finish_("done: " + this->retry_.result_text(this->job_version_), this->retry_.installed());
+      }
+#else
+      this->finish_("done", true);
+#endif
       break;
     }
     default:

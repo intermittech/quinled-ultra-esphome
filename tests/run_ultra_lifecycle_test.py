@@ -29,6 +29,12 @@ PIECES = {
         ["bool UltraFirmwareUpdate::fetch_(", "void UltraFirmwareUpdate::start_install_(",
          "bool UltraFirmwareUpdate::take_shared_image_("],
     ),
+    "update_retry_methods.inc": (
+        "fw_update.cpp",
+        ["void UltraFirmwareUpdate::perform(", "bool UltraFirmwareUpdate::line_answers_(",
+         "void UltraFirmwareUpdate::start_install_(", "void UltraFirmwareUpdate::start_session_(",
+         "void UltraFirmwareUpdate::session_done_(", "void UltraFirmwareUpdate::abort("],
+    ),
     "hub_loop.inc": ("dig2analog_ultra.cpp", ["void UltraHub::loop("]),
     "hub_transmit.inc": ("dig2analog_ultra.cpp", ["void UltraHub::transmit_("]),
     "hub_power.inc": ("dig2analog_ultra.cpp", ["void UltraHub::power_cycle(", "void UltraHub::service_power_("]),
@@ -39,6 +45,16 @@ PIECES = {
     "hub_update.inc": (
         "dig2analog_ultra.cpp",
         ["uint32_t UltraHub::update_frame_us(", "uint32_t UltraHub::update_frame_min_us(", "void UltraHub::update_task_("],
+    ),
+    "hub_rw.inc": (
+        "dig2analog_ultra.cpp",
+        ["bool UltraHub::rw_due_(", "bool IRAM_ATTR UltraHub::rw_done_isr_(", "void UltraHub::finish_window_(",
+         "void UltraHub::rw_publish_("],
+    ),
+    "receiver_methods.inc": (
+        "ultra_receiver.cpp",
+        ["void UltraReceiver::value_(", "void UltraReceiver::text_(", "void UltraReceiver::update_(",
+         "void UltraTelemetryPort::update_(", "void UltraLightTelemetry::update_("],
     ),
 }
 # classes: the definition, then its ;
@@ -69,6 +85,13 @@ def main() -> int:
     loop = definition((COMP / "fw_update.cpp").read_text(encoding="utf-8"), "void UltraFirmwareUpdate::loop(")
     (BUILD / "update_queued.inc").write_text(loop[loop.index("    case QUEUED:"):loop.index("    case DOWNLOADING:")],
                                              encoding="utf-8")
+    # ... its SENDING and CHECKING cases (a session's result, auto_retry), up to the default
+    (BUILD / "update_sending.inc").write_text(loop[loop.index("    case SENDING: {"):loop.rindex("    default:")],
+                                              encoding="utf-8")
+    # the receiver entities' constants (the pages each value comes from)
+    rx = (COMP / "ultra_receiver.cpp").read_text(encoding="utf-8")
+    first, last = "static constexpr uint32_t ALL_NEW", "static constexpr uint32_t SLOW_MS = 60000;\n"
+    (BUILD / "receiver_consts.inc").write_text(rx[rx.index(first):rx.index(last) + len(last)], encoding="utf-8")
     exe = BUILD / ("ultra_lifecycle_test.exe" if sys.platform == "win32" else "ultra_lifecycle_test")
     cmd = ZIG + ["c++", "-std=c++17", "-O1", "-Wall", "-Wno-unused-variable", "-Wno-unused-function",
                  "-Wno-nullability-completeness", "-fsanitize=undefined", "-fno-sanitize-recover=all", f"-I{BUILD}",

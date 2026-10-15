@@ -1,7 +1,8 @@
 """Build and run tests/ultra_stream_host_test.cpp with the zig C/C++ compiler (pip install ziglang).
 
 With the QuinLED dig2analog-ultra-5ch firmware next to this repo (quinled-ultra-firmware, or
-ULTRA_FIRMWARE=<firmware dir>), the board's light engine is compiled in and the glide test runs on it too.
+ULTRA_FIRMWARE=<firmware dir>), the board's light engine is compiled in and the glide test runs on it too. Without
+it that part is skipped; with ULTRA_REQUIRE_DEPS=1 (CI) a missing firmware is a failure.
 """
 
 import os
@@ -43,6 +44,11 @@ def main() -> int:
             objs.append(str(obj))
         cmd += ["-DWITH_ENGINE", f"-I{core}"]
         print(f"board engine: {core}")
+    elif os.environ.get("ULTRA_REQUIRE_DEPS") == "1":
+        print(f"FAIL: the board firmware is missing ({core}; ULTRA_REQUIRE_DEPS=1)")
+        return 1
+    else:
+        print(f"board firmware not found ({core}): the engine part skipped")
     cmd += [str(HERE / "ultra_stream_host_test.cpp"), *objs, "-o", str(exe)]
     subprocess.run(cmd, check=True)
     return subprocess.run([str(exe)]).returncode

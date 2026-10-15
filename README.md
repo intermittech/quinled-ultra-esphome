@@ -63,9 +63,10 @@ light:
 | Effects | streamed from ESPHome, frame by frame | on the board (pulse, strobe, flicker, random, candle, breathe, colour loop, sunrise, sunset); ESPHome's own effects glide |
 | Also | | power-on scene and effect, dim to warm, board current sense and calibration (on the board: protection, limits, automatic dimming), firmware updates over the data line |
 
-**Reporting back** (currents, temperature, voltages, calibration results, firmware versions to ESPHome and Home
-Assistant) is for **QuinLED Diff-Power ultra receivers only**. The QuinLED dig2analog-ultra-5ch's data line is
-one-way: it measures for itself and never reports back.
+**Reporting back** (voltage, current, power, energy, temperature, power events and why a light is dim or off, to
+ESPHome and Home Assistant) is for **QuinLED Diff-Power ultra receivers only**: the line's `telemetry:` (wiki: Ultra
+Mode, Diff-Power telemetry). The QuinLED dig2analog-ultra-5ch's data line is one-way: it measures for itself and never
+reports back.
 
 The QuinLED dig2analog-ultra-5ch can also run in WS2805 / WS2915 mode with the
 [`ws2915`](https://github.com/intermittech/esphome-ws2915-ws2805) component (then it already has its own PWM).

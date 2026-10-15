@@ -25,6 +25,11 @@
 #include <freertos/task.h>
 #endif
 
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+#include "esphome/components/uart/uart_component.h"
+#include "ultra_telemetry.h"
+#endif
+
 namespace esphome::dig2analog_ultra {
 
 class UltraLight;
@@ -94,11 +99,18 @@ class UltraHub final : public Component {
   /// 0 off, 1 fixed (thirds of a period), 2 fixed + spread-spectrum PWM, 3 adaptive (least LED_+ ripple for the
   /// current colour mix), 4 adaptive + spread spectrum
   void set_stagger(int board, uint8_t mode) { this->set_board_config(board, ULTRA_CFG_STAGGER, mode > 4 ? 4 : mode); }
-  void set_signal_loss(int board, uint8_t mode) { this->set_board_config(board, ULTRA_CFG_LOSS, mode); }
+  /// 0 hold, 1 off, 2 fade off, 3 (0.2.5) fade to the light's power-on scene / effect (a light without one holds)
+  void set_signal_loss(int board, uint8_t mode) { this->set_board_config(board, ULTRA_CFG_LOSS, mode > 3 ? 3 : mode); }
   void set_signal_loss_timeout(int board, uint32_t ms) {
     this->set_board_config(board, ULTRA_CFG_LOSS_TIMEOUT, clamp_u16_(ms / 100.0f + 0.5f, 5, 600));
   }
   void set_feedback_channel(int board, uint8_t mode) { this->set_board_config(board, ULTRA_CFG_FEEDBACK, mode); }
+  /// (0.2.5, stored on the board) the trips' retry policy: count 0 never, 1-254, 255 forever; 1-255 s apart. After the
+  /// last retry the outputs stay off until a new command or a power cycle; 60 s without a trip starts the count again.
+  void set_trip_retries(int board, uint8_t count, uint8_t interval_s) {
+    this->set_board_config(board, ULTRA_CFG_RETRY,
+                           static_cast<uint16_t>(count | (interval_s == 0 ? 1u : interval_s) << 8));
+  }
   /// Protocol mode after power-up, stored on the board (written only when it differs): 0 auto, 1 WS2915, 2 WS2805,
   /// 3 Ultra. Auto / Ultra apply at once; WS2915 / WS2805 from the board's next power-up on (it then ignores Ultra).
   void set_boot_protocol(int board, uint8_t mode) {
@@ -230,6 +242,39 @@ class UltraHub final : public Component {
   void wake_();
   void add_light(UltraLight *light) { this->lights_.push_back(light); }
 
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  // Diff-Power receiver telemetry (the return channel, ultra_telemetry.h; wiki: Ultra Mode, Diff-Power telemetry).
+  /// uart: the UART with the hub's RS-485 receiver output on its RX (8N1 at the rate: ULTRA_RW_RATE_*); the first
+  /// `receivers` boards of the line are receivers; how often each page is read.
+  void set_telemetry(uart::UARTComponent *uart, uint16_t receivers, uint8_t rate, uint32_t status_ms,
+                     uint32_t power_ms, uint32_t energy_ms, uint32_t supply_ms, uint32_t health_ms,
+                     uint32_t lifetime_ms, uint32_t diag_ms) {
+    this->rw_uart_ = uart;
+    this->poller_.init(receivers, rate,
+                       TelemetryIntervals{status_ms, power_ms, energy_ms, supply_ms, health_ms, lifetime_ms, diag_ms});
+  }
+  /// The hub's RS-485 driver enable (high: it drives the line). Low within ~10 us of an RW frame's last bit (the
+  /// RMT's interrupt), high again before the next frame. Without it the hardware must let go of the line itself.
+  void set_telemetry_direction_pin(InternalGPIOPin *pin) { this->rw_dir_pin_ = pin; }
+  /// receiver k has several lights: read its OUTPUTS too (their estimated power, why they're dim)
+  void set_telemetry_outputs(uint16_t k, bool on) { this->poller_.set_outputs(k, on); }
+  /// the sender port: its current limit (A), its voltage (V, NAN: learned), the load's warning / problem (%) and how
+  /// long the problem load must last (ms; 100 % at once)
+  void set_telemetry_port(float limit_a, float supply_v, float warning_pct, float problem_pct, uint32_t problem_ms) {
+    this->port_monitor_.configure(PortMonitor::Config{limit_a, supply_v, warning_pct, problem_pct, problem_ms});
+  }
+  const PortMonitor &port_monitor() const { return this->port_monitor_; }
+  bool has_telemetry() const { return this->rw_uart_ != nullptr; }
+  const TelemetryPoller &telemetry() const { return this->poller_; }
+  /// After each response window: (receiver, what changed: ultra_telemetry.h take_updates() bits), for the receivers
+  /// whose data changed.
+  void add_on_telemetry_callback(std::function<void(uint16_t, uint32_t)> &&callback) {
+    this->rw_callback_.add(std::move(callback));
+  }
+  /// once after each response window (and when the receivers lose their supply): the port's summary
+  void add_on_window_callback(std::function<void()> &&callback) { this->rw_window_callback_.add(std::move(callback)); }
+#endif
+
   // Diagnostics (sensor platform dig2analog_ultra)
   struct Diagnostics {
     size_t queue_peak;    // the most commands queued for one board, since the last call
@@ -255,6 +300,33 @@ class UltraHub final : public Component {
   void service_power_();
   void service_calibration_();
   bool any_lit_(uint32_t now) const;
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  bool rw_due_(bool urgent);
+  void finish_window_(bool wait);
+  void rw_publish_();
+  static bool rw_done_isr_(rmt_channel_handle_t channel, const rmt_tx_done_event_data_t *edata, void *arg);
+  uart::UARTComponent *rw_uart_{nullptr};
+  InternalGPIOPin *rw_dir_pin_{nullptr};
+  ISRInternalGPIOPin rw_dir_isr_;
+  bool rw_driving_{true};                 // the direction pin is high (the hub drives the line)
+  volatile bool rw_release_{false};       // the RMT's done interrupt lets go of the line (an RW frame is on the wire)
+  volatile int64_t rw_released_us_{0};
+  TelemetryPoller poller_;
+  PortMonitor port_monitor_;              // the port's load and cable, after each window
+  std::vector<uint8_t> rw_slots_;         // the POLL slots of the next RW frame
+  std::vector<uint8_t> rw_rx_;            // the window's UART bytes
+  bool rw_next_{false};                   // transmit_(): this frame is an RW frame
+  bool tx_rw_{false};                     // tx_buf_ holds an RW frame
+  uint32_t rw_window_us_{0};              // its window W
+  bool rw_open_{false};                   // a window: nothing goes out before rw_end_us_, the UART is read at rw_read_us_
+  int64_t rw_t0_us_{0}, rw_end_us_{0}, rw_read_us_{0};
+  bool rw_powered_{true};
+  uint32_t rw_late_{0};                   // windows where the line was let go of later than ULTRA_RW_RELEASE_US
+  uint32_t rw_extra_us_{0};               // a command queued at a window's start waits this much longer (lead_us)
+  rmt_symbol_word_t reset_symbol_{}, rw_reset_symbol_{};
+  CallbackManager<void(uint16_t, uint32_t)> rw_callback_;
+  CallbackManager<void()> rw_window_callback_;
+#endif
 
   uint8_t pin_{0};
   bool inverted_{false};

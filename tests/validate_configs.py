@@ -17,6 +17,13 @@ ESPHOME = [sys.executable, "-m", "esphome"]
 BASE = """\
 esphome:
   name: t
+  devices:
+    - id: r1
+      name: Port 1 R1
+    - id: r2
+      name: Port 1 R2
+    - id: shelf_1
+      name: Shelf 1
 esp32:
   board: {board}
   framework:
@@ -128,6 +135,37 @@ PARTITION = """\
         from: 0
         to: 1
 """
+
+
+# Diff-Power receiver telemetry (the return channel): a UART for the answers, the line's telemetry
+RX_UART = """\
+uart:
+  - id: rx
+    rx_pin: GPIO17
+    baud_rate: 1000000
+    rx_buffer_size: 1024
+"""
+
+TELEMETRY = "  telemetry:\n    uart_id: rx\n"
+
+RX_LIST = "    name: Port 1\n    receivers:\n      - device_id: r1\n      - device_id: r2\n"
+
+
+def tel_lines(n, uarts=None, names=None, devices=None, extra=""):
+    """n lines with telemetry (hubs on GPIO16, 18, 19, 21), each on its own uart (rx pins 22, 23, 25, 26) unless
+    uarts says which (an index per line); port names Port 1..n unless names; a port device per line if devices."""
+    hub_pins, rx_pins = [16, 18, 19, 21], [22, 23, 25, 26]
+    out = "uart:\n"
+    for i in range(n):
+        out += f"  - id: rx{i}\n    rx_pin: GPIO{rx_pins[i]}\n    baud_rate: 1000000\n    rx_buffer_size: 1024\n"
+    out += "dig2analog_ultra:\n"
+    for i in range(n):
+        out += (f"  - id: u{i}\n    pin: GPIO{hub_pins[i]}\n    num_boards: 1\n{extra}    telemetry:\n"
+                f"      uart_id: rx{uarts[i] if uarts else i}\n      name: {names[i] if names else f'Port {i + 1}'}\n"
+                f"      receivers: 1\n")
+        if devices:
+            out += f"      device_id: {devices[i]}\n"
+    return out
 
 
 def lines(n, symbols=None):
@@ -247,6 +285,22 @@ CASES = [
     ("ultra stagger adaptive_spread", ULTRA + "  stagger: adaptive_spread\n", True, None),
     ("ultra stagger spread", ULTRA + "  stagger: spread\n", True, None),
     ("ultra stagger fixed_spread", ULTRA + "  stagger: fixed_spread\n", True, None),
+    # protocol 0.2.5: signal loss to the power-on scene; the trips' retry policy (CONFIG 24)
+    ("ultra signal_loss scene", ULTRA + "  signal_loss: scene\n", True, None),
+    (
+        "ultra signal_loss scene with a slow refresh",
+        ULTRA + "  refresh_interval: 2s\n  signal_loss: scene\n  signal_loss_timeout: 500ms\n",
+        False,
+        "with signal_loss: scene",
+    ),
+    ("ultra trip retries", ULTRA + "  trip_retries: 3\n  trip_retry_interval: 5s\n", True, None),
+    ("ultra trip retries forever", ULTRA + "  trip_retries: forever\n", True, None),
+    ("ultra trip retries never", ULTRA + "  trip_retries: 0\n", True, None),
+    ("ultra trip retry interval alone", ULTRA + "  trip_retry_interval: 30s\n", True, None),
+    ("ultra trip retries 255", ULTRA + "  trip_retries: 255\n", False, "254"),
+    ("ultra trip retries bogus", ULTRA + "  trip_retries: always_on\n", False, "trip_retries"),
+    ("ultra trip retry interval 0", ULTRA + "  trip_retry_interval: 0s\n", False, "trip_retry_interval"),
+    ("ultra trip retry interval 5 min", ULTRA + "  trip_retry_interval: 5min\n", False, "trip_retry_interval"),
     ("ultra stagger true", ULTRA + "  stagger: true\n", True, None),
     ("ultra stagger bogus", ULTRA + "  stagger: sideways\n", False, "Unknown value"),
     (
@@ -691,7 +745,7 @@ CASES = [
         "ultra update all options",
         ULTRA + UPD_NET + UPD
         + "    source: quinled/some-firmware\n    channel: beta\n    public_keys: test\n    board_revision: 2\n"
-        "    passes: 2\n    update_interval: 1h\n    channel_select:\n      name: fw channel\n"
+        "    passes: 2\n    auto_retry: 3\n    update_interval: 1h\n    channel_select:\n      name: fw channel\n"
         "    status:\n      name: fw status\n",
         True,
         None,
@@ -709,6 +763,9 @@ CASES = [
         "only with your own source",
     ),
     ("ultra update bad source", ULTRA + UPD_NET + UPD + "    source: not a repo\n", False, "OWNER/REPO on GitHub"),
+    # auto_retry: sessions again for boards that missed one (0: off)
+    ("ultra update auto_retry off", ULTRA + UPD_NET + UPD + "    auto_retry: 0\n", True, None),
+    ("ultra update auto_retry 6", ULTRA + UPD_NET + UPD + "    auto_retry: 6\n", False, "auto_retry"),
     ("ultra update channel bogus", ULTRA + UPD_NET + UPD + "    channel: nightly\n", False, "Unknown value"),
     ("ultra update two per line", ULTRA + UPD_NET + UPD + UPD.replace("id: fw", "id: fw2").replace("name: fw", "name: fw2").replace("update:\n", ""), False, "one per line"),
     # the line is quiet for a second after an update session: signal_loss off / fade_off must outlast it
@@ -751,6 +808,165 @@ CASES = [
         "value must be at most 10min",
     ),
     ("ultra esp32-c2 rejected (no RMT)", ULTRA, False, "RMT", "esp32-c2-devkitm-1"),
+    # Diff-Power receiver telemetry
+    ("ultra telemetry minimal (receivers: every board, on the hub's device)", ULTRA + TELEMETRY + RX_UART, True, None),
+    # several lines with telemetry: a UART, a port name and a port device each
+    ("ultra telemetry on 2 lines, a UART each", tel_lines(2), True, None),
+    ("ultra telemetry 2 lines on one UART", tel_lines(2, uarts=[0, 0]), False, "use the same uart 'rx0'"),
+    # (ESPHome's own check: entity names unique per device)
+    ("ultra telemetry 2 lines, one port name", tel_lines(2, names=["Port 1", "port 1"]), False, "Duplicate"),
+    ("ultra telemetry 2 lines, one port device", tel_lines(2, devices=["r1", "r1"]), False, "on device 'r1'"),
+    ("ultra telemetry 2 lines, a port device each", tel_lines(2, devices=["r1", "r2"]), True, None),
+    (
+        "ultra telemetry on 4 lines of an esp32-p4 (3 x 48 symbols + 1 with DMA)",
+        tel_lines(4, extra="    rmt_symbols: 48\n").replace(
+            "  - id: u3\n    pin: GPIO21\n    num_boards: 1\n    rmt_symbols: 48\n",
+            "  - id: u3\n    pin: GPIO21\n    num_boards: 1\n    use_dma: true\n",
+        ),
+        True,
+        None,
+        "esp32-p4_r3",
+    ),
+    ("ultra telemetry on 4 lines of an esp32-p4 at 192 symbols", tel_lines(4), False, "the RMT of the ESP32P4", "esp32-p4_r3"),
+    # the DMA line takes one channel, the others their blocks: 2 x 48 + 1 x 96 + DMA = 5 of 4
+    (
+        "ultra telemetry on 4 lines of an esp32-p4, one at 96 symbols + 1 with DMA",
+        tel_lines(4, extra="    rmt_symbols: 48\n")
+        .replace("  - id: u2\n    pin: GPIO19\n    num_boards: 1\n    rmt_symbols: 48\n",
+                 "  - id: u2\n    pin: GPIO19\n    num_boards: 1\n    rmt_symbols: 96\n")
+        .replace("  - id: u3\n    pin: GPIO21\n    num_boards: 1\n    rmt_symbols: 48\n",
+                 "  - id: u3\n    pin: GPIO21\n    num_boards: 1\n    use_dma: true\n"),
+        False,
+        "need 5 x 48",
+        "esp32-p4_r3",
+    ),
+    (
+        "ultra 2 lines with DMA on an esp32-p4",
+        tel_lines(2, extra="    use_dma: true\n"),
+        False,
+        "only one RMT transmitter of the ESP32P4 can use DMA",
+        "esp32-p4_r3",
+    ),
+    (
+        "ultra telemetry full: a device per receiver, renames, lights on devices",
+        ULTRA + TELEMETRY + RX_LIST + "        power:\n          name: Power in\n    direction_pin: GPIO4\n"
+        "    diagnostics: full\n    poll_intervals:\n      status: 2s\n      energy: 5min\n" + RX_UART
+        + "light:\n  - platform: dig2analog_ultra\n    name: l1\n    board: 1\n    channel: 1\n    device_id: shelf_1\n"
+        "  - platform: dig2analog_ultra\n    name: l2\n    board: 1\n    channel: 2\n",
+        True,
+        None,
+    ),
+    (
+        "ultra telemetry receivers as device ids",
+        ULTRA + TELEMETRY + "    receivers: [r1, r2]\n" + RX_UART,
+        True,
+        None,
+    ),
+    ("ultra telemetry 500 kbaud", ULTRA + TELEMETRY + RX_UART.replace("1000000", "500000"), True, None),
+    (
+        "ultra telemetry baud rate",
+        ULTRA + TELEMETRY + RX_UART.replace("1000000", "115200"),
+        False,
+        "isn't a rate the receivers answer at",
+    ),
+    (
+        "ultra telemetry rx buffer",
+        ULTRA + TELEMETRY + RX_UART.replace("1024", "256"),
+        False,
+        "rx_buffer_size must be at least 1024",
+    ),
+    (
+        "ultra telemetry uart without rx",
+        ULTRA + TELEMETRY + RX_UART.replace("rx_pin: GPIO17", "tx_pin: GPIO17"),
+        False,
+        "needs an rx_pin",
+    ),
+    (
+        "ultra telemetry parity",
+        ULTRA + TELEMETRY + RX_UART + "    parity: EVEN\n",
+        False,
+        "the answers are 8N1",
+    ),
+    (
+        "ultra telemetry receivers > num_boards",
+        ULTRA + TELEMETRY + "    receivers: 3\n" + RX_UART,
+        False,
+        "3 receivers can't be more than num_boards (2)",
+    ),
+    (
+        "ultra telemetry status interval",
+        ULTRA + TELEMETRY + "    poll_intervals:\n      status: 100ms\n" + RX_UART,
+        False,
+        "status",
+    ),
+    (
+        "ultra telemetry 0.2.5: lifetime / diag intervals, its entities renamed",
+        ULTRA + TELEMETRY + RX_LIST + "        led_supply:\n          name: LED volts\n        lit_hours:\n"
+        "          name: Burn time\n    port_peak_load:\n      name: Port 1 peaks\n    poll_intervals:\n"
+        "      lifetime: 1h\n      diag: 2min\n" + RX_UART,
+        True,
+        None,
+    ),
+    (
+        "ultra telemetry diag interval",
+        ULTRA + TELEMETRY + "    poll_intervals:\n      diag: 10s\n" + RX_UART,
+        False,
+        "diag",
+    ),
+    (
+        "ultra telemetry diagnostics bogus",
+        ULTRA + TELEMETRY + "    diagnostics: some\n" + RX_UART,
+        False,
+        "diagnostics",
+    ),
+    (
+        "ultra telemetry unknown device",
+        ULTRA + TELEMETRY + "    receivers:\n      - device_id: nowhere\n" + RX_UART,
+        False,
+        "nowhere",
+    ),
+    (
+        "ultra telemetry two ports with the same name, no devices",
+        "dig2analog_ultra:\n  - id: a\n    pin: GPIO16\n    num_boards: 1\n    telemetry:\n      uart_id: rx\n"
+        "  - id: b\n    pin: GPIO17\n    num_boards: 1\n    telemetry:\n      uart_id: rx\n"
+        + RX_UART.replace("GPIO17", "GPIO18"),
+        False,
+        "Duplicate",
+    ),
+    (
+        "ultra telemetry two ports with names",
+        "dig2analog_ultra:\n  - id: a\n    pin: GPIO16\n    num_boards: 1\n    telemetry:\n      uart_id: rx\n"
+        "      name: Port 1\n  - id: b\n    pin: GPIO17\n    num_boards: 1\n    telemetry:\n      uart_id: rx2\n"
+        "      name: Port 2\n" + RX_UART.replace("GPIO17", "GPIO18")
+        + "  - id: rx2\n    rx_pin: GPIO19\n    baud_rate: 1000000\n    rx_buffer_size: 1024\n",
+        True,
+        None,
+    ),
+    (
+        "ultra telemetry port load options",
+        ULTRA + TELEMETRY + "    supply_voltage: 55V\n    port_limit: 2.25A\n    load_warning: 85%\n"
+        "    load_problem: 95%\n    load_problem_time: 1min\n" + RX_UART,
+        True,
+        None,
+    ),
+    (
+        "ultra telemetry supply voltage too high",
+        ULTRA + TELEMETRY + "    supply_voltage: 70V\n" + RX_UART,
+        False,
+        "supply_voltage",
+    ),
+    (
+        "ultra telemetry port limit too low",
+        ULTRA + TELEMETRY + "    port_limit: 50mA\n" + RX_UART,
+        False,
+        "port_limit",
+    ),
+    (
+        "ultra diagnostics sensors (the line)",
+        ULTRA + "sensor:\n  - platform: dig2analog_ultra\n    queue_peak:\n      name: q\n",
+        True,
+        None,
+    ),
 ]
 
 

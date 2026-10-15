@@ -2,7 +2,9 @@
 a few test-only additions (boot protocol, power-on scene and effects, dim to warm, the switch_boards_to_ultra button,
 calibration, the version display, the board firmware update with a power supply on the line), so one compile covers
 the hub's code. Also tests/build/ultra/ultra-strip.yaml: the dig2analog_ultra_strip example with a partition, effect_glide modes
-and the downlight notification pattern. The examples themselves: tests/local_examples.py.
+and the downlight notification pattern; tests/build/ultra/ultra-telemetry.yaml: ultra-example with Diff-Power receiver
+telemetry (the UART, the direction pin, every receiver sensor and text). The examples themselves:
+tests/local_examples.py.
 
 Usage: .venv/Scripts/python tests/make_ultra_compile_config.py
 then (PowerShell, ESP-IDF refuses Git Bash):
@@ -250,6 +252,104 @@ def strip_config() -> str:
         + "\nscript:\n" + STRIP_EXTRA.split("\nscript:\n", 1)[1]
 
 
+TELEMETRY_DEVICES = """  areas:
+    - id: living_room
+      name: Living room
+    - id: hallway
+      name: Hallway
+  devices:                                # each receiver a device; each light of a multi-light receiver too
+    - id: p1_r1
+      name: Port 1 · Receiver 1
+      area_id: living_room
+    - id: p1_r2
+      name: Port 1 · Receiver 2
+    - id: cabinet
+      name: Cabinet
+      area_id: living_room
+    - id: shelf_1
+      name: Shelf 1
+      area_id: living_room
+    - id: shelf_2
+      name: Shelf 2
+      area_id: living_room
+    - id: shelf_3
+      name: Shelf 3
+      area_id: hallway
+"""
+
+TELEMETRY_HUB = """  trip_retries: 5                       # (0.2.5) the retry policy, stored on the boards
+  trip_retry_interval: 2s
+  telemetry:
+    uart_id: rs485_rx
+    name: Port 1
+    direction_pin: GPIO4
+    diagnostics: full
+    supply_voltage: 48V                   # the sender (else learned)
+    port_limit: 2.25A
+    load_problem: 95%
+    receivers:
+      - device_id: p1_r1                  # RGBCCT: one light, on this device
+      - device_id: p1_r2                  # four lights, each on its own device
+        power:
+          name: Power in
+    poll_intervals:
+      status: 2s
+      lifetime: 10min
+"""
+
+TELEMETRY_EXTRA = """
+uart:
+  - id: rs485_rx
+    rx_pin: GPIO17
+    baud_rate: 1000000
+    rx_buffer_size: 2048
+"""
+
+
+def p4_telemetry_config() -> str:
+    """tests/build/ultra/ultra-p4-telemetry.yaml: a larger sender on an ESP32-P4: 4 data lines, each with telemetry on
+    a UART of its own (2 receivers each, devices per receiver), within the P4's RMT (3 lines of 48 symbols and one with
+    DMA: 4 transmit channels) and its UARTs (5; the log on USB Serial/JTAG)."""
+    devices, uarts, hubs, lights = "", "", "", ""
+    for k in range(1, 5):
+        devices += (f"    - id: p{k}_r1\n      name: Port {k} receiver 1\n"
+                    f"    - id: p{k}_r2\n      name: Port {k} receiver 2\n")
+        uarts += (f"  - id: rs485_rx{k}\n    rx_pin: GPIO{25 + k}\n    baud_rate: 1000000\n"
+                  f"    rx_buffer_size: 1024\n")
+        rmt = "    use_dma: true\n" if k == 4 else "    rmt_symbols: 48\n"
+        hubs += (f"  - id: port{k}\n    pin: GPIO{19 + k}\n    num_boards: 2\n{rmt}    telemetry:\n"
+                 f"      uart_id: rs485_rx{k}\n      name: Port {k}\n      direction_pin: GPIO{29 + k}\n"
+                 f"      receivers:\n        - device_id: p{k}_r1\n        - device_id: p{k}_r2\n")
+        lights += (f"  - platform: dig2analog_ultra\n    dig2analog_ultra_id: port{k}\n    name: Port {k} RGBCCT\n"
+                   f"    device_id: p{k}_r1\n    board: 0\n    red: 1\n    green: 2\n    blue: 3\n"
+                   f"    cold_white: 4\n    warm_white: 5\n")
+        for ch in (1, 2):
+            lights += (f"  - platform: dig2analog_ultra\n    dig2analog_ultra_id: port{k}\n"
+                       f"    name: Port {k} shelf {ch}\n    board: 1\n    channel: {ch}\n")
+    return ("esphome:\n  name: d2a-ultra-p4\n  devices:\n" + devices +
+            "\nesp32:\n  board: esp32-p4_r3\n  framework:\n    type: esp-idf\n\n"
+            "external_components:\n  - source:\n      type: local\n      path: ../../../components\n"
+            "    components: [dig2analog_ultra]\n\nlogger:\n\nuart:\n" + uarts +
+            "\ndig2analog_ultra:\n" + hubs + "\nlight:\n" + lights)
+
+
+def telemetry_config(example: str) -> str:
+    """tests/build/ultra/ultra-telemetry.yaml: ultra-example with Diff-Power receiver telemetry on its line: a
+    device per receiver, the four lights of board 1 on their own devices (their estimates)."""
+    src = example.replace("  name: d2a-ultra\n", "  name: d2a-ultra-telemetry\n", 1)
+    assert "d2a-ultra-telemetry" in src
+    src = src.replace("  friendly_name: ${friendly_name}\n", "  friendly_name: ${friendly_name}\n" + TELEMETRY_DEVICES, 1)
+    src = src.replace("dig2analog_ultra:\n  id: ultra\n", "dig2analog_ultra:\n  id: ultra\n" + TELEMETRY_HUB, 1)
+    src = src.replace("  signal_loss: hold ", "  signal_loss: scene", 1)   # (0.2.5: to the power-on scene)
+    assert "  telemetry:\n" in src and "  devices:" in src and "  signal_loss: scene" in src
+    for light, device in (("RGBCCT", "p1_r1"), ("Cabinet CCT", "cabinet"), ("Shelf 1", "shelf_1"),
+                          ("Shelf 2", "shelf_2"), ("Shelf 3", "shelf_3")):
+        old = f"    name: {light}\n    board:"
+        assert src.count(old) == 1, light
+        src = src.replace(old, f"    name: {light}\n    device_id: {device}\n    board:")
+    return src.rstrip("\n") + "\n" + TELEMETRY_EXTRA
+
+
 def main() -> None:
     src = (ROOT / "examples" / "quinled-dig2analog-ultra-rgbcct.yaml").read_text(encoding="utf-8")
     src = src.replace(
@@ -297,10 +397,13 @@ def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "ultra-example.yaml").write_text(src, encoding="utf-8")
     (OUT / "ultra-strip.yaml").write_text(strip_config(), encoding="utf-8")
+    (OUT / "ultra-telemetry.yaml").write_text(telemetry_config(src), encoding="utf-8")
+    (OUT / "ultra-p4-telemetry.yaml").write_text(p4_telemetry_config(), encoding="utf-8")
     secrets = OUT / "secrets.yaml"
     if not secrets.exists():
         secrets.write_text('wifi_ssid: "test"\nwifi_password: "testtest"\n', encoding="utf-8")
-    print(f"written {OUT / 'ultra-example.yaml'}, {OUT / 'ultra-strip.yaml'}")
+    print(f"written {OUT / 'ultra-example.yaml'}, {OUT / 'ultra-strip.yaml'}, {OUT / 'ultra-telemetry.yaml'}, "
+          f"{OUT / 'ultra-p4-telemetry.yaml'}")
 
 
 if __name__ == "__main__":

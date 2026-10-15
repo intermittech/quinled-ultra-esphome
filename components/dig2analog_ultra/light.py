@@ -55,6 +55,7 @@ from esphome.const import (
 from esphome.core import CORE
 from esphome.types import ConfigType
 
+from .receiver_schema import light_telemetry_to_code
 from . import (
     CHANNEL_KEYS,
     CONF_DIG2ANALOG_ULTRA_ID,
@@ -467,6 +468,8 @@ async def to_code(config: ConfigType) -> None:
         kind = _TYPES[frozenset(k for k in ROLE_KEYS if k in config)]
         effect = await cg.get_variable(_find_effect(config, poe[CONF_EFFECT])[CONF_TYPE_ID])
         cg.add(var.set_power_on_effect(effect, _power_on_values(config, kind)))
+    # a light on a Diff-Power receiver with several lights: its estimated power / energy and status
+    await light_telemetry_to_code(var, config, sum(1 << config[k] for k in ROLE_KEYS if k in config))
 
 
 # ------------------------------------------------------------------------------------------- effects (on the board)

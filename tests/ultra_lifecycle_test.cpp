@@ -3,18 +3,22 @@
 // *.inc, and this file compiles them with small stand-ins for ESPHome, the RMT driver and the HTTP client. Covers the
 // light's setup, a transition cut short, its power request after weeks; the update's install queue, chunked downloads
 // and the confirmation frames after a session; a frame the RMT refuses; the recovery's power cycle on ESPHome's power
-// supply (its keep-on time). Logic only: no ESP-IDF, no timing.
+// supply (its keep-on time); auto_retry: the sessions after an install (blind, and from the receivers' versions), its
+// status texts, never with force, never after an abort. Logic only: no ESP-IDF, no timing.
 // Build: python tests/run_ultra_lifecycle_test.py   (uses the ziglang pip package as C/C++ compiler)
 
 #include "../components/dig2analog_ultra/ultra_core.h"
 #include "../components/dig2analog_ultra/fw_manifest.h"
+#include "../components/dig2analog_ultra/update_retry.h"
 #include "../components/dig2analog_ultra/update_session.h"
+#include "../components/dig2analog_ultra/ultra_telemetry.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <set>
 #include <string>
@@ -1022,9 +1026,1088 @@ static void test_update_lead_in() {
 
 }  // namespace hub_update
 
+// ================================================================================================ hub: telemetry
+// The hub's loop() and transmit_() again, now with the return channel (USE_DIG2ANALOG_ULTRA_TELEMETRY), and its window
+// functions (build/lifecycle/hub_rw.inc), on the real Scheduler and TelemetryPoller: a line of 4 boards, the first 2
+// Diff-Power receivers, a direction pin, a UART; the RMT and the receivers modelled with a clock in us. Then several
+// lines at once, each with its own RMT channel, UART, direction pin and receivers.
+namespace hub_rw {
+
+#define USE_DIG2ANALOG_ULTRA_TELEMETRY
+#define IRAM_ATTR
+typedef int rmt_channel_handle_t;
+struct rmt_tx_done_event_data_t {
+  size_t num_symbols;
+};
+struct rmt_transmit_config_t {
+  uint32_t loop_count;
+};
+struct rmt_symbol_word_t {
+  uint32_t duration0 : 15;
+  uint32_t level0 : 1;
+  uint32_t duration1 : 15;
+  uint32_t level1 : 1;
+};
+static int64_t clock_us = 0;
+static void advance(int64_t us) {
+  clock_us += us;
+  now_ms = static_cast<uint32_t>(clock_us / 1000);
+}
+static int64_t esp_timer_get_time() { return clock_us; }
+static void delayMicroseconds(uint32_t us) { advance(us); }
+static const char *esp_err_to_name(esp_err_t) { return "refused"; }
+
+struct Pin {   // the direction pin (and its ISR twin)
+  bool level{false};
+  void setup() {}
+  void digital_write(bool v) { this->level = v; }
+};
+struct IsrPin {
+  Pin *pin{nullptr};
+  void digital_write(bool v) { this->pin->level = v; }
+};
+struct Uart {
+  std::vector<uint8_t> rx;
+  size_t available() const { return this->rx.size(); }
+  bool read_array(uint8_t *d, size_t n) {
+    if (n > this->rx.size())
+      return false;
+    std::memcpy(d, this->rx.data(), n);
+    this->rx.erase(this->rx.begin(), this->rx.begin() + static_cast<std::ptrdiff_t>(n));
+    return true;
+  }
+};
+
+struct UltraHub;
+/// The RMT: one frame at a time, done after its bits and its reset symbol (80 MHz ticks); then its interrupt.
+struct Sent {
+  std::vector<uint8_t> frame;
+  int64_t at_us;
+  uint32_t reset_ticks;
+  bool pin_high;   // the direction pin as the frame started
+};
+struct Rmt {
+  bool busy{false};
+  int64_t done_us{0};
+  int refuse{0};
+  bool isr{true};   // its done interrupt runs (false: held up)
+  std::vector<Sent> sent;
+  UltraHub *hub{nullptr};
+};
+static Rmt rmts[4];         // per RMT channel (a line's channel_)
+static Rmt &rmt = rmts[0];
+static esp_err_t rmt_tx_wait_all_done(int ch, int) { return rmts[ch].busy ? -1 : ESP_OK; }
+static esp_err_t rmt_transmit(int, int, const uint8_t *data, size_t n, const rmt_transmit_config_t *);
+
+struct UltraHub {
+  enum UpdateResult : uint8_t { UPD_NONE = 0, UPD_DONE, UPD_ABORTED, UPD_FAILED };
+  enum UpdateState : uint8_t { UPD_IDLE = 0, UPD_RUNNING, UPD_FINISHED };
+  void loop();                        // the component's (hub_loop.inc)
+  void transmit_();                   // (hub_transmit.inc)
+  bool rw_due_(bool urgent);          // (hub_rw.inc)
+  void finish_window_(bool wait);
+  void rw_publish_();
+  static bool rw_done_isr_(rmt_channel_handle_t, const rmt_tx_done_event_data_t *, void *arg);
+  static int64_t now_us_() { return clock_us; }
+  // stand-ins
+  struct {
+    void stop() {}
+  } high_freq_;
+  void service_calibration_() {}
+  void resync() { this->preamble_ = 3; }
+  void wake_() { this->wakes++; }
+  bool boards_powered_() const { return this->powered; }
+  bool status_has_warning() const { return this->warning_; }
+  void status_set_warning() { this->warning_ = true; }
+  void status_clear_warning() { this->warning_ = false; }
+
+  // the line
+  std::atomic<uint8_t> upd_state_{UPD_IDLE};
+  std::atomic<uint8_t> upd_result_{UPD_NONE};
+  void *upd_task_{nullptr};
+  bool upd_quiet_{false}, upd_resync_pending_{false};
+  uint32_t upd_quiet_ms_{0}, upd_confirm_ms_{0};
+  UpdateResult upd_done_{UPD_NONE};
+  uint16_t ping_left_{0};
+  uint8_t dark_tail_{0};
+  uint16_t preamble_{0};
+  bool preamble_full_{true}, tx_preamble_end_{false}, synced_once_{false};
+  uint8_t switch_frame_{ULTRA_SWITCH_WS_FRAMES};
+  Scheduler sched_;
+  uint16_t num_boards_{4};
+  std::vector<uint8_t> buf_;
+  uint8_t *tx_buf_{nullptr};
+  size_t tx_bytes_{0};
+  bool tx_prepared_{false}, tx_normal_{true};
+  uint32_t build_peak_us_{0}, frames_{0}, last_busy_ms_{0}, last_frame_ms_{0}, refresh_interval_ms_{200};
+  bool high_freq_active_{false}, has_sent_{false}, started_{true}, powered{true}, warning_{false};
+  int channel_{0}, encoder_{0}, wakes{0};
+  struct {
+    FrameSymbols<rmt_symbol_word_t> symbols;
+  } enc_;
+  uint8_t pin_{16};
+  // the return channel
+  Uart *rw_uart_{nullptr};
+  Pin *rw_dir_pin_{nullptr};
+  IsrPin rw_dir_isr_;
+  bool rw_driving_{true};
+  volatile bool rw_release_{false};
+  volatile int64_t rw_released_us_{0};
+  TelemetryPoller poller_;
+  PortMonitor port_monitor_;
+  std::vector<uint8_t> rw_slots_, rw_rx_;
+  bool rw_next_{false}, tx_rw_{false};
+  uint32_t rw_window_us_{0};
+  bool rw_open_{false};
+  int64_t rw_t0_us_{0}, rw_end_us_{0}, rw_read_us_{0};
+  bool rw_powered_{true};
+  uint32_t rw_late_{0}, rw_extra_us_{0};
+  rmt_symbol_word_t reset_symbol_{}, rw_reset_symbol_{};
+  struct {
+    std::vector<std::function<void(uint16_t, uint32_t)>> f;
+    void call(uint16_t a, uint32_t b) {
+      for (auto &x : this->f)
+        x(a, b);
+    }
+  } rw_callback_;
+  struct {
+    int calls{0};
+    void call() { this->calls++; }
+  } rw_window_callback_;
+  static std::vector<UltraHub *> hubs_;
+
+  /// as setup() with telemetry: 2 receivers at 1 Mbaud, the direction pin high, the reset symbols
+  void start(Uart *uart, Pin *pin) {
+    this->sched_.init(this->num_boards_, 7, 3);
+    this->buf_.assign(this->sched_.frame_bytes(), 0);
+    this->tx_buf_ = this->buf_.data();
+    rmt_symbol_word_t rst{}, rw{};
+    rst.duration0 = rst.duration1 = 12000;   // 300 us at 80 MHz
+    rw.duration0 = rw.duration1 = 80;        // 2 us
+    this->enc_.symbols.reset = rst;
+    this->reset_symbol_ = rst;
+    this->rw_reset_symbol_ = pin != nullptr ? rw : rst;
+    this->rw_uart_ = uart;
+    this->rw_dir_pin_ = pin;
+    if (pin != nullptr) {
+      pin->level = true;
+      this->rw_dir_isr_.pin = pin;
+    }
+    this->poller_.init(2, ULTRA_RW_RATE_1M, TelemetryIntervals{});
+    this->rw_slots_.assign(ULTRA_SLOT_BYTES * this->num_boards_, 0);
+    this->rw_extra_us_ = this->poller_.max_window_us() + ULTRA_RW_HOLDOFF_US;
+    this->preamble_ = 3;   // the start-up preamble
+    hubs_.push_back(this);
+  }
+};
+std::vector<UltraHub *> UltraHub::hubs_;
+
+#include "hub_loop.inc"
+#include "hub_transmit.inc"
+#include "hub_rw.inc"
+
+/// The receivers: they answer an RW frame's POLLs in their slots (a STATUS with 24.00 V, IDENTITY without the optional
+/// pages, OUTPUTS unsupported), the bytes in the UART from 1 ms after the frame's last bit.
+struct Answers {
+  std::vector<uint8_t> bytes;
+  int64_t at_us{0};
+  bool pending{false};
+};
+static Answers answers_of[4];   // per line (its RMT channel): its receivers' answers, for its UART
+static Answers &answers = answers_of[0];
+static bool receivers_on_of[4] = {true, true, true, true};
+static bool &receivers_on = receivers_on_of[0];
+
+static esp_err_t rmt_transmit(int ch, int, const uint8_t *data, size_t n, const rmt_transmit_config_t *) {
+  Rmt &rmt = rmts[ch];
+  Answers &answers = answers_of[ch];
+  if (rmt.refuse > 0) {
+    rmt.refuse--;
+    return -1;
+  }
+  UltraHub *h = rmt.hub;
+  const uint32_t ticks = h->enc_.symbols.reset.duration0 + h->enc_.symbols.reset.duration1;
+  rmt.sent.push_back(Sent{std::vector<uint8_t>(data, data + n), clock_us, ticks,
+                          h->rw_dir_pin_ == nullptr || h->rw_dir_pin_->level});
+  const int64_t bits_us = static_cast<int64_t>(n) * 8 * 1300 / 1000;
+  rmt.busy = true;
+  rmt.done_us = clock_us + bits_us + ticks / 80;
+  const uint8_t *hd = data + n - ULTRA_HDR_BYTES;
+  if (n == h->sched_.frame_bytes() && (ultra_header_flags(hd) & ULTRA_HDR_RW) && receivers_on_of[ch]) {
+    answers.bytes.clear();
+    answers.bytes.push_back(0x00);   // the turnaround checks' junk
+    for (uint16_t b = 0; b < h->num_boards_; b++) {
+      const uint8_t *s = data + ULTRA_SLOT_BYTES * b;
+      if (ultra_poll_valid(s) != 0 || s[ULTRA_POLL_INDEX] == ULTRA_POLL_RELAY_ONLY)
+        continue;
+      uint8_t a[32]{}, d[24]{};
+      uint8_t page = s[ULTRA_POLL_PAGE];
+      if (page == ULTRA_PAGE_STATUS) {
+        ultra_put24(d + ULTRA_ST_FW_VERSION, 0x000608);
+        ultra_put24(d + ULTRA_ST_UPTIME, static_cast<uint32_t>(clock_us / 1000000));
+        ultra_put16(d + ULTRA_ST_VBUS, static_cast<uint16_t>(2400 + 1200 * ch));   // line k: 24 V + 12 V x k
+        ultra_put16(d + ULTRA_ST_MCU_TEMP, ULTRA_ST_NA);
+        d[ULTRA_ST_MEASURED] = ULTRA_ST_M_VBUS;
+      } else if (page == ULTRA_PAGE_IDENTITY) {
+        d[0] = static_cast<uint8_t>(b + 1);
+      } else {
+        page = ULTRA_PAGE_UNSUPPORTED;
+      }
+      a[0] = ULTRA_RSP_SYNC;
+      a[1] = page;
+      a[2] = static_cast<uint8_t>(s[ULTRA_POLL_INDEX] << 4);
+      a[3] = s[2];
+      ultra_put16(a + 4, static_cast<uint16_t>(0x1000 + 0x100 * ch + b));
+      std::memcpy(a + ULTRA_RSP_DATA, d, 24);
+      ultra_put16(a + 30, ultra_crc16(a, 30));
+      answers.bytes.push_back(ULTRA_RSP_LEAD);
+      answers.bytes.insert(answers.bytes.end(), a, a + 32);
+    }
+    answers.at_us = rmt.done_us + 1000;
+    answers.pending = true;
+  }
+  return ESP_OK;
+}
+
+/// time passes in steps of 50 us: frames end (their interrupt), the answers arrive, the hub's loop runs
+static void run_us(UltraHub &h, Uart &uart, int64_t us) {
+  const int64_t end = clock_us + us;
+  while (clock_us < end) {
+    advance(50);
+    if (rmt.busy && clock_us >= rmt.done_us) {
+      rmt.busy = false;
+      if (rmt.isr)
+        UltraHub::rw_done_isr_(0, nullptr, &h);
+    }
+    if (answers.pending && clock_us >= answers.at_us) {
+      uart.rx.insert(uart.rx.end(), answers.bytes.begin(), answers.bytes.end());
+      answers.pending = false;
+    }
+    h.loop();
+  }
+}
+
+static bool is_rw(const Sent &s) {
+  return s.frame.size() >= ULTRA_HDR_BYTES && (ultra_header_flags(s.frame.data() + s.frame.size() - ULTRA_HDR_BYTES) & ULTRA_HDR_RW);
+}
+
+/// The hub with telemetry: RW frames only 1 s after the preamble and while nothing is queued; the frame itself (POLLs
+/// for the receivers, the header's RW, the short reset and the direction pin let go of by the RMT's interrupt);
+/// nothing else on the wire until the window's end, a command right after it; the UART flushed before the frame and
+/// read after the window; the sensors' callback; a refused RW frame sent again as one; a late release counted; the
+/// supply off: the receivers unavailable; finish_window_(true) (an update session starting) waits for the window.
+static void test_telemetry_window() {
+  clock_us = 0;
+  now_ms = 0;
+  rmt = Rmt();
+  answers = Answers();
+  UltraHub::hubs_.clear();
+  Uart uart;
+  Pin pin;
+  UltraHub h;
+  rmt.hub = &h;
+  h.start(&uart, &pin);
+  std::vector<std::pair<uint16_t, uint32_t>> calls;
+  h.rw_callback_.f.push_back([&](uint16_t r, uint32_t u) { calls.push_back({r, u}); });
+  run_us(h, uart, 3000000);
+  // the preamble went out first, the first RW frame at least 1 s after its last frame
+  const int64_t last_dark = rmt.sent.size() > 3 ? rmt.sent[2].at_us : -1;   // the preamble: the first 3 frames
+  int64_t first_rw = -1;
+  for (const Sent &s : rmt.sent) {
+    if (is_rw(s) && first_rw < 0)
+      first_rw = s.at_us;
+  }
+  CHECK(last_dark >= 0 && first_rw >= last_dark + 1000000, "the first RW frame %lld us after the preamble's last",
+        static_cast<long long>(first_rw - last_dark));
+  // the RW frames: POLLs for boards 0 and 1, the other boards' slots not; the short reset; the pin low after each
+  bool frames_ok = true, pin_ok = true, hold_ok = true;
+  int rw_frames = 0;
+  for (size_t i = 0; i < rmt.sent.size(); i++) {
+    const Sent &s = rmt.sent[i];
+    if (!s.pin_high)
+      pin_ok = false;   // every frame starts with the hub driving
+    if (!is_rw(s)) {
+      frames_ok &= s.reset_ticks == 24000;
+      continue;
+    }
+    rw_frames++;
+    frames_ok &= s.reset_ticks == 160 && ultra_poll_valid(s.frame.data()) == 0 &&
+                 ultra_poll_valid(s.frame.data() + 32) == 0 && ultra_poll_valid(s.frame.data() + 64) != 0 &&
+                 ultra_poll_valid(s.frame.data() + 96) != 0;
+    // the next frame no earlier than the window's end: 1000 + 2 x 460 + 200 us after this frame's last bit
+    if (i + 1 < rmt.sent.size()) {
+      const int64_t last_bit = s.at_us + static_cast<int64_t>(s.frame.size()) * 8 * 1300 / 1000;
+      hold_ok &= rmt.sent[i + 1].at_us >= last_bit + 2120 - 60;   // (the frame's TIME is an estimate: +-60 us)
+    }
+  }
+  CHECK(rw_frames >= 2 && frames_ok, "%d RW frames: POLLs for the receivers only, the RW reset short, others full",
+        rw_frames);
+  CHECK(pin_ok, "every frame goes out with the direction pin high (raised again after each window)");
+  CHECK(hold_ok, "nothing goes out before an RW frame's window ends");
+  CHECK(h.poller_.answering(0) && h.poller_.answering(1) && h.poller_.data(1).have_status &&
+            std::fabs(telemetry_value(h.poller_.data(0), TV_SUPPLY_VOLTAGE) - 24.0f) < 1e-3f,
+        "the answers read from the UART after the window: both receivers decoded");
+  bool called0 = false, called1 = false;
+  for (auto &c : calls) {
+    called0 |= c.first == 0 && (c.second & TU_AVAILABILITY);
+    called1 |= c.first == 1 && (c.second & (1u << TP_STATUS));
+  }
+  CHECK(called0 && called1, "the sensors' callback per receiver (%u calls)", static_cast<unsigned>(calls.size()));
+
+  // a command queued: it goes before any RW frame; one queued while a window is open waits for its end
+  size_t n0 = rmt.sent.size();
+  while (!h.rw_open_)
+    run_us(h, uart, 50);
+  const int64_t end = h.rw_end_us_;
+  CHECK(pin.level, "the direction pin high while the RW frame is on the wire");
+  while (rmt.busy)
+    run_us(h, uart, 50);
+  CHECK(!pin.level, "the RMT's interrupt let go of the line after the RW frame");
+  h.sched_.identify(3, true);
+  n0 = rmt.sent.size();
+  run_us(h, uart, 20000);
+  CHECK(rmt.sent.size() > n0 && rmt.sent[n0].at_us >= end && !is_rw(rmt.sent[n0]),
+        "the command waited for the window's end, then went out first");
+  h.sched_.identify(3, false);
+
+  // junk in the UART before an RW frame is dropped; a refused RW frame goes out again as one
+  uart.rx.assign(40, ULTRA_RSP_SYNC);
+  rmt.refuse = 1;
+  const uint32_t bad0 = h.poller_.stats().bad_crc;
+  n0 = rmt.sent.size();
+  while (!h.rw_open_)
+    run_us(h, uart, 50);
+  CHECK(is_rw(rmt.sent.back()) && h.poller_.stats().bad_crc == bad0, "a refused RW frame sent again as one; the junk "
+        "before it flushed");
+  run_us(h, uart, 10000);
+  CHECK(h.poller_.stats().bad_crc == bad0, "no junk SYNC from before the frame reached the parser (%u)",
+        h.poller_.stats().bad_crc - bad0);
+
+  // the RMT's interrupt held up: the release counted late
+  rmt.isr = false;
+  while (!h.rw_open_)
+    run_us(h, uart, 50);
+  run_us(h, uart, 10000);
+  rmt.isr = true;
+  CHECK(h.rw_late_ == 1, "a release that didn't come in time is counted (%u)", h.rw_late_);
+
+  // an update session starting: finish_window_(true) waits for the window and reads it
+  while (!h.rw_open_)
+    run_us(h, uart, 50);
+  const int64_t read_at = h.rw_read_us_;
+  run_us(h, uart, 1500);   // (the answers arrive)
+  h.finish_window_(true);
+  CHECK(!h.rw_open_ && clock_us >= read_at && h.enc_.symbols.reset.duration0 == 12000,
+        "finish_window_(true) waits for the window, reads it, the full reset back");
+
+  // the supply off: unavailable, no RW frames
+  calls.clear();
+  h.powered = false;
+  const size_t rw0 = static_cast<size_t>(std::count_if(rmt.sent.begin(), rmt.sent.end(), is_rw));
+  run_us(h, uart, 5000000);
+  bool gone = false;
+  for (auto &c : calls)
+    gone |= c.first == 0 && (c.second & TU_AVAILABILITY);
+  CHECK(gone && !h.poller_.answering(0) &&
+            static_cast<size_t>(std::count_if(rmt.sent.begin(), rmt.sent.end(), is_rw)) == rw0,
+        "the supply off: the receivers unavailable, no polls");
+  UltraHub::hubs_.clear();
+  now_ms = 0;
+  std::printf("  telemetry: %d RW frames on a 4-board line, 2 receivers, every window held and read\n", rw_frames);
+}
+
+/// Several lines with telemetry at once (a larger sender: one hub per line, each with its own RMT channel, UART,
+/// direction pin and receivers): they poll at the same time, their windows overlap (nothing is shared or taken in
+/// turns), each reads only its own receivers (their own voltages and chip ids) into its own poller, port and callbacks;
+/// one line's receivers going silent leaves the others answering.
+static void test_several_lines() {
+  constexpr int N = 4;
+  clock_us = 0;
+  now_ms = 0;
+  for (auto &r : rmts)
+    r = Rmt();
+  for (auto &a : answers_of)
+    a = Answers();
+  UltraHub::hubs_.clear();
+  Uart uarts[N];
+  Pin pins[N];
+  UltraHub hubs[N];
+  int calls[N]{};
+  for (int k = 0; k < N; k++) {
+    hubs[k].channel_ = k;
+    hubs[k].pin_ = static_cast<uint8_t>(16 + k);
+    rmts[k].hub = &hubs[k];
+    hubs[k].start(&uarts[k], &pins[k]);
+    hubs[k].rw_callback_.f.push_back([&calls, k](uint16_t, uint32_t) { calls[k]++; });
+  }
+  int overlap = 0, rw_frames[N]{};
+  auto run = [&](int64_t us) {
+    const int64_t end = clock_us + us;
+    while (clock_us < end) {
+      advance(50);
+      for (int k = 0; k < N; k++) {
+        Rmt &r = rmts[k];
+        if (r.busy && clock_us >= r.done_us) {
+          r.busy = false;
+          UltraHub::rw_done_isr_(k, nullptr, &hubs[k]);
+        }
+        Answers &a = answers_of[k];
+        if (a.pending && clock_us >= a.at_us) {
+          uarts[k].rx.insert(uarts[k].rx.end(), a.bytes.begin(), a.bytes.end());
+          a.pending = false;
+        }
+        hubs[k].loop();
+      }
+      int open = 0;
+      for (auto &h : hubs)
+        open += h.rw_open_;
+      overlap += open >= 2;
+    }
+  };
+  run(4000000);
+  bool own = true, all = true;
+  for (int k = 0; k < N; k++) {
+    for (const Sent &s : rmts[k].sent)
+      rw_frames[k] += is_rw(s);
+    const TelemetryPoller &p = hubs[k].poller_;
+    all &= p.answering(0) && p.answering(1) && rw_frames[k] >= 2 && calls[k] > 0 && pins[k].level;
+    own &= std::fabs(telemetry_value(p.data(0), TV_SUPPLY_VOLTAGE) - (24.0f + 12.0f * k)) < 1e-3f &&
+           p.uid16(0) == 0x1000 + 0x100 * k && p.uid16(1) == 0x1001 + 0x100 * k && p.stats().stale == 0 &&
+           p.stats().missing == 0;
+  }
+  CHECK(all, "%d lines: each polls its own 2 receivers (%d / %d / %d / %d RW frames), its callbacks", N, rw_frames[0],
+        rw_frames[1], rw_frames[2], rw_frames[3]);
+  CHECK(own, "each line's poller holds only its own receivers (their voltages, chip ids), nothing stale or missing");
+  CHECK(overlap > 0, "the lines' windows overlap: each line's on its own (%d samples with 2 or more open)", overlap);
+  // line 1's receivers go silent: only its receivers unavailable, the others keep answering
+  receivers_on_of[1] = false;
+  run(6000000);
+  CHECK(!hubs[1].poller_.answering(0) && !hubs[1].poller_.answering(1) && hubs[0].poller_.answering(0) &&
+            hubs[2].poller_.answering(1) && hubs[3].poller_.answering(0),
+        "line 1's receivers silent: only they are unavailable");
+  receivers_on_of[1] = true;
+  run(6000000);
+  CHECK(hubs[1].poller_.answering(0) && hubs[1].poller_.answering(1), "and back");
+  UltraHub::hubs_.clear();
+  now_ms = 0;
+  std::printf("  telemetry: %d lines polling at once, %d samples with overlapping windows\n", N, overlap);
+}
+
+#undef USE_DIG2ANALOG_ULTRA_TELEMETRY
+#undef IRAM_ATTR
+
+}  // namespace hub_rw
+
+// ================================================================================================ receiver entities
+// The receivers' Home Assistant entities (ultra_receiver.cpp: UltraReceiver, UltraTelemetryPort, UltraLightTelemetry,
+// cut into build/lifecycle/receiver_*.inc) on stand-in sensors, fed by a real TelemetryPoller.
+namespace receiver_entities {
+
+namespace sensor {
+struct Sensor {
+  bool has{false};
+  float state{NAN};
+  int publishes{0};
+  bool has_state() const { return this->has; }
+  void publish_state(float v) {
+    this->state = v;
+    this->has = true;
+    this->publishes++;
+  }
+};
+}  // namespace sensor
+namespace text_sensor {
+struct TextSensor {
+  bool has{false};
+  std::string state;
+  int publishes{0};
+  bool has_state() const { return this->has; }
+  void publish_state(const std::string &v) {
+    this->state = v;
+    this->has = true;
+    this->publishes++;
+  }
+};
+}  // namespace text_sensor
+namespace binary_sensor {
+struct BinarySensor {
+  bool state{false};
+  void publish_state(bool v) { this->state = v; }
+};
+}  // namespace binary_sensor
+
+struct UltraHub {
+  TelemetryPoller p;
+  PortMonitor m;
+  const TelemetryPoller &telemetry() const { return this->p; }
+  const PortMonitor &port_monitor() const { return this->m; }
+};
+
+#include "receiver_consts.inc"
+
+struct UltraReceiver {   // as ultra_receiver.h
+  enum Value : uint8_t {
+    POWER = 0, ENERGY, BUS_VOLTAGE, MCU_TEMPERATURE, INPUT_CURRENT, UPTIME, TRIPS, SUPPLY_DIPS, LIMIT_EVENTS,
+    MISSED_POLLS, VOLTAGE_DROP, CABLE_RESISTANCE, LED_SUPPLY, CURRENT_PEAK, SUPPLY_IMPEDANCE, LIT_HOURS, POWER_UPS,
+    VALUE_COUNT,
+  };
+  enum Text : uint8_t {
+    STATUS = 0, STATUS_DETAIL, FIRMWARE, LAST_RESET, LAST_TRIP, LAST_DIP, LINK, CHANNEL_HEALTH, TEXT_COUNT,
+  };
+  void update_(uint32_t updates);
+  void value_(uint8_t which, float v);
+  void text_(uint8_t which, const std::string &s);
+  UltraHub *hub_{nullptr};
+  uint16_t board_{0};
+  sensor::Sensor *values_[VALUE_COUNT]{};
+  text_sensor::TextSensor *texts_[TEXT_COUNT]{};
+  binary_sensor::BinarySensor *problem_{nullptr};
+  uint32_t slow_ms_{0};
+  bool slow_sent_{false};
+};
+struct UltraTelemetryPort {   // as ultra_receiver.h
+  enum Value : uint8_t { POWER = 0, CURRENT, LOAD, CABLE_LOSS, CABLE_LOSS_PCT, PEAK_LOAD, VALUE_COUNT };
+  enum Text : uint8_t { RECEIVERS = 0, STATUS, STATUS_DETAIL, TEXT_COUNT };
+  void update_();
+  UltraHub *hub_{nullptr};
+  sensor::Sensor *values_[VALUE_COUNT]{};
+  text_sensor::TextSensor *texts_[TEXT_COUNT]{};
+  binary_sensor::BinarySensor *problem_{nullptr};
+};
+struct UltraLightTelemetry {
+  void update_(uint32_t updates);
+  UltraHub *hub_{nullptr};
+  uint16_t board_{0};
+  uint8_t mask_{0};
+  sensor::Sensor *power_{nullptr};
+  sensor::Sensor *energy_{nullptr};
+  text_sensor::TextSensor *status_{nullptr};
+  EnergyCounter energy_count_;
+};
+
+#include "receiver_methods.inc"
+
+/// a receiver's answer to a POLL slot (index from the slot), for the stand-in line below
+static void answer(const uint8_t *s, uint16_t uid, const ReceiverData &model, uint8_t why, std::vector<uint8_t> &out) {
+  uint8_t a[32]{}, d[24]{};
+  const uint8_t page = s[ULTRA_POLL_PAGE];
+  if (page == ULTRA_PAGE_STATUS) {
+    ultra_put24(d + ULTRA_ST_FW_VERSION, 0x000608);
+    ultra_put24(d + ULTRA_ST_UPTIME, model.uptime_s);
+    d[ULTRA_ST_STATE] = model.power_state;
+    ultra_put16(d + ULTRA_ST_VBUS, model.vbus_10mv);
+    ultra_put16(d + ULTRA_ST_MCU_TEMP, model.mcu_temp);
+    ultra_put16(d + ULTRA_ST_CURRENT, model.current_ma);
+    d[ULTRA_ST_MEASURED] = ULTRA_ST_M_VBUS | ULTRA_ST_M_CURRENT;
+    d[ULTRA_ST_RESET] = ULTRA_ST_RST_POWER;
+  } else if (page == ULTRA_PAGE_IDENTITY) {
+    ultra_put32(d + ULTRA_ID_FW_VERSION, 0x000608FF);
+    ultra_put32(d + ULTRA_ID_FEATURES, model.features);
+  } else if (page == ULTRA_PAGE_ENERGY) {
+    ultra_put32(d + ULTRA_EN_TOTAL_WH, 1234);
+    ultra_put32(d + ULTRA_EN_POWER_MW, 34000);
+    if (model.features & ULTRA_FEAT_LIFETIME) {   // (0.2.5)
+      ultra_put16(d + ULTRA_EN_VB, model.vb_10mv);
+      ultra_put16(d + ULTRA_EN_PEAK_MA, model.peak_ma);
+    }
+  } else if (page == ULTRA_PAGE_LIFETIME) {
+    ultra_put24(d + ULTRA_LT_LIT, model.lt_lit);
+    ultra_put24(d + ULTRA_LT_POWER_UPS, model.lt_power_ups);
+    ultra_put16(d + ULTRA_LT_SHORT_TRIPS, model.lt_short_trips);
+    ultra_put24(d + ULTRA_LT_DIPS, model.lt_dips);
+  } else if (page == ULTRA_PAGE_DIAG && s[ULTRA_POLL_ARG] == 0) {
+    d[ULTRA_DG_BC_CAUSE] = 0xFF;
+    ultra_put16(d + ULTRA_DG_SUPPLY_Z, model.supply_z_mohm);
+  } else if (page == ULTRA_PAGE_DIAG && s[ULTRA_POLL_ARG] == 1) {
+    d[ULTRA_DG_TRIP] = model.fm_trip;
+    ultra_put16(d + ULTRA_DG_TRIP_LIT_H, model.fm_trip_lit_h);
+  } else if (page == ULTRA_PAGE_OUTPUTS) {
+    const uint16_t ma[5] = {250, 250, 240, 255, 410};
+    for (int i = 0; i < 5; i++)
+      ultra_put16(d + ULTRA_OU_CURRENT + 2 * i, ma[i]);
+    d[ULTRA_OU_WHY] = why;
+  }
+  a[0] = ULTRA_RSP_SYNC;
+  a[1] = page;
+  a[2] = static_cast<uint8_t>(s[ULTRA_POLL_INDEX] << 4);
+  a[3] = s[2];
+  ultra_put16(a + 4, uid);
+  std::memcpy(a + ULTRA_RSP_DATA, d, 24);
+  ultra_put16(a + 30, ultra_crc16(a, 30));
+  out.push_back(ULTRA_RSP_LEAD);
+  out.insert(out.end(), a, a + 32);
+}
+
+/// Two receivers, the second with several lights: its Status, Status detail and Problem, its values (unavailable when
+/// it stops answering, the texts kept), the uptime / missed polls at most once a minute, the port's summary, a light's
+/// estimate and status.
+static void test_receiver_entities() {
+  now_ms = 0;
+  UltraHub hub;
+  hub.p.init(2, ULTRA_RW_RATE_1M, TelemetryIntervals{});
+  hub.p.set_outputs(1, true);
+  hub.p.locked(0);
+  sensor::Sensor vals[2][UltraReceiver::VALUE_COUNT];
+  text_sensor::TextSensor texts[2][UltraReceiver::TEXT_COUNT];
+  binary_sensor::BinarySensor problems[2];
+  UltraReceiver rx[2];
+  for (uint16_t k = 0; k < 2; k++) {
+    rx[k].hub_ = &hub;
+    rx[k].board_ = k;
+    rx[k].problem_ = &problems[k];
+    for (int i = 0; i < UltraReceiver::VALUE_COUNT; i++)
+      rx[k].values_[i] = &vals[k][i];
+    for (int i = 0; i < UltraReceiver::TEXT_COUNT; i++)
+      rx[k].texts_[i] = &texts[k][i];
+  }
+  sensor::Sensor port_values[UltraTelemetryPort::VALUE_COUNT], light_power, light_energy;
+  sensor::Sensor &port_power = port_values[UltraTelemetryPort::POWER];
+  binary_sensor::BinarySensor port_problem;
+  text_sensor::TextSensor port_texts[UltraTelemetryPort::TEXT_COUNT], light_status;
+  text_sensor::TextSensor &port_receivers = port_texts[UltraTelemetryPort::RECEIVERS];
+  UltraTelemetryPort port;
+  port.hub_ = &hub;
+  port.problem_ = &port_problem;
+  for (int i = 0; i < UltraTelemetryPort::VALUE_COUNT; i++)
+    port.values_[i] = &port_values[i];
+  for (int i = 0; i < UltraTelemetryPort::TEXT_COUNT; i++)
+    port.texts_[i] = &port_texts[i];
+  PortMonitor::Config pcfg;
+  pcfg.supply_v = 51.0f;
+  hub.m.configure(pcfg);
+  UltraLightTelemetry light;
+  light.hub_ = &hub;
+  light.board_ = 1;
+  light.mask_ = 0x10;   // CH5
+  light.power_ = &light_power;
+  light.energy_ = &light_energy;
+  light.status_ = &light_status;
+
+  ReceiverData model[2];
+  for (auto &m : model) {
+    m.vbus_10mv = 5000;   // 50.00 V x 0.680 A = 34.0 W (Power: STATUS's voltage x current)
+    m.mcu_temp = 380;
+    m.current_ma = 680;
+    m.uptime_s = 100;
+    m.features = ULTRA_FEAT_ENERGY;
+  }
+  // receiver 2 is a 0.2.5 one: LED supply and peak (ENERGY), LIFETIME, DIAG's two parts
+  model[1].features |= ULTRA_FEAT_LIFETIME | ULTRA_FEAT_DIAG;
+  model[1].vb_10mv = 2400;
+  model[1].peak_ma = 900;
+  model[1].lt_lit = 12345;
+  model[1].lt_power_ups = 41;
+  model[1].lt_short_trips = 3;
+  model[1].lt_dips = 2;
+  model[1].supply_z_mohm = 95;
+  model[1].fm_trip = 1 | 25 << 2;   // a short at 12.5 A, at 1100 lit hours
+  model[1].fm_trip_lit_h = 1100;
+  uint8_t why = 0;
+  bool silent0 = false;
+  auto window = [&]() {
+    std::vector<uint8_t> slots(64), uart;
+    uint32_t w;
+    const uint16_t n = hub.p.build(now_ms, slots.data(), &w);
+    for (uint16_t b = 0; b < n; b++) {
+      if (b == 0 && silent0)
+        break;   // (it silences the one behind it too)
+      if (slots[32 * b + ULTRA_POLL_INDEX] != ULTRA_POLL_RELAY_ONLY)
+        answer(slots.data() + 32 * b, static_cast<uint16_t>(0x9C00 + b), model[b], why, uart);
+    }
+    now_ms += 10;
+    hub.p.finish(now_ms, uart.data(), uart.size());
+    hub.m.update(now_ms, hub.p);
+    for (uint16_t k = 0; k < 2; k++) {   // as UltraHub::rw_publish_: the port's load, the callbacks, the window's
+      const uint32_t u = hub.p.take_updates(k);
+      if (u == 0)
+        continue;
+      rx[k].update_(u);
+      if (k == 1)
+        light.update_(u);
+    }
+    port.update_();
+  };
+  auto run = [&](uint32_t ms) {
+    const uint32_t end = now_ms + ms;
+    while (now_ms < end) {
+      if (hub.p.due(now_ms))
+        window();
+      else
+        now_ms += 50;
+    }
+  };
+  run(20000);
+  CHECK(texts[0][UltraReceiver::STATUS].state == "OK" && !problems[0].state &&
+            texts[0][UltraReceiver::STATUS_DETAIL].state == "OK." &&
+            std::fabs(vals[0][UltraReceiver::POWER].state - 34.0f) < 1e-3f &&
+            vals[0][UltraReceiver::ENERGY].state == 1234.0f &&
+            std::fabs(vals[0][UltraReceiver::BUS_VOLTAGE].state - 50.0f) < 1e-3f &&
+            texts[0][UltraReceiver::FIRMWARE].state == "0.6.8" &&
+            texts[1][UltraReceiver::LINK].state == "2 \xC2\xB7 UID 9C01",
+        "receiver entities: Status '%s', Power %.1f W, Energy %.0f Wh, bus %.2f V, firmware '%s', link '%s'",
+        texts[0][UltraReceiver::STATUS].state.c_str(), vals[0][UltraReceiver::POWER].state,
+        vals[0][UltraReceiver::ENERGY].state, vals[0][UltraReceiver::BUS_VOLTAGE].state,
+        texts[0][UltraReceiver::FIRMWARE].state.c_str(), texts[1][UltraReceiver::LINK].state.c_str());
+  // the port: 1.36 A (60 %) at a 51 V sender: 69.4 W; the cable: (51 - 50) V x 1.36 A + (50 - 50) V x 0.68 A
+  CHECK(port_receivers.state == "2 of 2 answering" && std::fabs(port_power.state - 51.0f * 1.36f) < 1e-3f &&
+            std::fabs(port_values[UltraTelemetryPort::CURRENT].state - 1.36f) < 1e-4f &&
+            std::fabs(port_values[UltraTelemetryPort::LOAD].state - 1.36f / 2.25f * 100.0f) < 1e-3f &&
+            std::fabs(port_values[UltraTelemetryPort::CABLE_LOSS].state - 1.36f) < 1e-3f &&
+            port_texts[UltraTelemetryPort::STATUS].state == "OK" && !port_problem.state &&
+            std::fabs(vals[1][UltraReceiver::VOLTAGE_DROP].state - 1.0f) < 1e-3f,
+        "port: '%s', %.2f A, %.1f W, cable loss %.2f W, status '%s'; receiver 2's drop %.2f V",
+        port_receivers.state.c_str(), port_values[UltraTelemetryPort::CURRENT].state, port_power.state,
+        port_values[UltraTelemetryPort::CABLE_LOSS].state, port_texts[UltraTelemetryPort::STATUS].state.c_str(),
+        vals[1][UltraReceiver::VOLTAGE_DROP].state);
+  CHECK(std::fabs(light_power.state - 34.0f * 410 / 1405) < 1e-3f && light_status.state == "OK" &&
+            light_energy.has_state(),
+        "a light's estimate: %.2f W, status '%s'", light_power.state, light_status.state.c_str());
+  // (Power: unavailable, then V x I from STATUS, then ENERGY's own; STATUS came ~6 times)
+  CHECK(vals[0][UltraReceiver::UPTIME].publishes == 1 && vals[0][UltraReceiver::POWER].publishes <= 3,
+        "the uptime at most once a minute, unchanged values not again (%d, %d)",
+        vals[0][UltraReceiver::UPTIME].publishes, vals[0][UltraReceiver::POWER].publishes);
+  // (0.2.5) receiver 2's new entities; receiver 1 (0.2.4): unknown; the port's peak load: 0.68 + 0.90 A
+  CHECK(std::fabs(vals[1][UltraReceiver::LED_SUPPLY].state - 24.0f) < 1e-3f &&
+            std::fabs(vals[1][UltraReceiver::CURRENT_PEAK].state - 0.9f) < 1e-4f &&
+            vals[1][UltraReceiver::SUPPLY_IMPEDANCE].state == 95.0f &&
+            std::fabs(vals[1][UltraReceiver::LIT_HOURS].state - 1234.5f) < 1e-2f &&
+            vals[1][UltraReceiver::POWER_UPS].state == 41.0f && vals[1][UltraReceiver::TRIPS].state == 3.0f &&
+            vals[1][UltraReceiver::SUPPLY_DIPS].state == 2.0f &&
+            texts[1][UltraReceiver::LAST_TRIP].state == "short circuit at 12.5 A (at 1100 lit hours, before its last "
+                                                        "power-up)" &&
+            std::isnan(vals[0][UltraReceiver::LED_SUPPLY].state) && std::isnan(vals[0][UltraReceiver::LIT_HOURS].state) &&
+            std::fabs(port_values[UltraTelemetryPort::PEAK_LOAD].state - 1.58f / 2.25f * 100.0f) < 1e-3f,
+        "0.2.5 entities: LED %.2f V, peak %.3f A, Z %.0f, lit %.1f h, %.0f ups, %.0f trips, last trip '%s'; port peak "
+        "%.1f %%",
+        vals[1][UltraReceiver::LED_SUPPLY].state, vals[1][UltraReceiver::CURRENT_PEAK].state,
+        vals[1][UltraReceiver::SUPPLY_IMPEDANCE].state, vals[1][UltraReceiver::LIT_HOURS].state,
+        vals[1][UltraReceiver::POWER_UPS].state, vals[1][UltraReceiver::TRIPS].state,
+        texts[1][UltraReceiver::LAST_TRIP].state.c_str(), port_values[UltraTelemetryPort::PEAK_LOAD].state);
+
+  // limiting on receiver 2: its status, its light's; the port without a problem
+  model[1].power_state = ULTRA_ST_LIMITING;
+  why = ULTRA_OU_W_LIMIT;
+  run(8000);
+  CHECK(texts[1][UltraReceiver::STATUS].state == "Limiting" && !problems[1].state && light_status.state == "Limiting" &&
+            !port_problem.state && port_texts[UltraTelemetryPort::STATUS].state == "1 limiting",
+        "limiting: '%s', the light '%s'", texts[1][UltraReceiver::STATUS].state.c_str(), light_status.state.c_str());
+
+  // (0.2.5) STATUS's reason "too hot" on receiver 2: its Status and Problem; its light isn't dimmed by it (Limiting)
+  model[1].power_state = ULTRA_ST_LIMITING | ULTRA_ST_WHY_HOT << ULTRA_ST_WHY_SHIFT;
+  run(8000);
+  CHECK(texts[1][UltraReceiver::STATUS].state == "Too hot" && problems[1].state && light_status.state == "Limiting" &&
+            port_problem.state && port_texts[UltraTelemetryPort::STATUS].state == "Too hot",
+        "too hot: '%s' / '%s', the light '%s', port '%s'", texts[1][UltraReceiver::STATUS].state.c_str(),
+        texts[1][UltraReceiver::STATUS_DETAIL].state.c_str(), light_status.state.c_str(),
+        port_texts[UltraTelemetryPort::STATUS].state.c_str());
+  model[1].power_state = ULTRA_ST_LIMITING;
+  run(4000);
+
+  // receiver 1 stops answering: No answer, a problem, values unavailable, texts kept; receiver 2 behind it too
+  silent0 = true;
+  run(30000);
+  CHECK(texts[0][UltraReceiver::STATUS].state == "No answer" && problems[0].state &&
+            std::isnan(vals[0][UltraReceiver::POWER].state) && texts[0][UltraReceiver::FIRMWARE].state == "0.6.8" &&
+            texts[1][UltraReceiver::STATUS_DETAIL].state.find("receiver 1 before it doesn't answer") != std::string::npos &&
+            port_problem.state && port_receivers.state == "0 of 2 answering" && std::isnan(port_power.state) &&
+            port_texts[UltraTelemetryPort::STATUS].state == "No answer" &&
+            light_status.state == "No answer" && std::isnan(light_power.state),
+        "no answer: '%s' / '%s', port '%s'", texts[0][UltraReceiver::STATUS_DETAIL].state.c_str(),
+        texts[1][UltraReceiver::STATUS_DETAIL].state.c_str(), port_receivers.state.c_str());
+  CHECK(vals[0][UltraReceiver::MISSED_POLLS].has_state() && vals[0][UltraReceiver::MISSED_POLLS].state > 0.0f,
+        "missed polls: %.1f %%", vals[0][UltraReceiver::MISSED_POLLS].state);
+  silent0 = false;
+  run(20000);
+  CHECK(texts[0][UltraReceiver::STATUS].state == "OK" && port_receivers.state == "2 of 2 answering",
+        "back: '%s', '%s'", texts[0][UltraReceiver::STATUS].state.c_str(), port_receivers.state.c_str());
+  now_ms = 0;
+  std::printf("  receiver entities: Status / Problem / detail, values, the port's summary, a light's estimate\n");
+}
+
+}  // namespace receiver_entities
+
 }  // namespace esphome::dig2analog_ultra
 
 using namespace esphome::dig2analog_ultra;
+
+// ================================================================================================ auto_retry
+// The update entity after a session's result (fw_update.cpp perform, start_session_, session_done_, abort and loop()'s
+// SENDING / CHECKING): the session again for boards that missed it, blind on a one-way line, from the receivers'
+// versions on a line of Diff-Power receivers (telemetry).
+namespace update_retry {
+#define USE_DIG2ANALOG_ULTRA_TELEMETRY
+static const char *const BLINK_LEGEND = "Red blinks: ...";
+static constexpr float DOWNLOAD_SHARE = 15.0f;
+static constexpr uint32_t PUBLISH_MS = 1000;
+
+/// The hub as the entity sees it: the result of each session (after its PING burst), the receivers' telemetry.
+struct UltraHub {
+  enum UpdateResult : uint8_t { UPD_NONE = 0, UPD_DONE, UPD_ABORTED, UPD_FAILED };
+  enum PowerCycle : uint8_t { CYCLE_NONE = 0, CYCLE_WAIT_OFF, CYCLE_OFF, CYCLE_DONE, CYCLE_FAILED };
+  uint16_t boards{3};
+  bool with_telemetry{false};
+  TelemetryPoller p;
+  int sessions{0};
+  bool forced{false}, aborted{false};
+  UpdateResult result{UPD_NONE};
+  bool start_update(const uint8_t *, size_t, const UpdateSession::Options &o) {
+    this->sessions++;
+    this->forced = o.force;
+    return true;
+  }
+  UpdateResult take_update_result() {
+    const UpdateResult r = this->result;
+    this->result = UPD_NONE;
+    return r;
+  }
+  bool update_running() const { return true; }
+  float update_progress() const { return 0.5f; }
+  uint8_t update_pass() const { return 0; }
+  uint16_t get_num_boards() const { return this->boards; }
+  bool has_telemetry() const { return this->with_telemetry; }
+  const TelemetryPoller &telemetry() const { return this->p; }
+  bool has_power_supply() const { return false; }
+  void power_cycle() {}
+  uint32_t power_cycle_ms() const { return 0; }
+  PowerCycle power_cycle_state() const { return CYCLE_NONE; }
+  void abort_update() { this->aborted = true; }
+  void hold_power(bool) {}
+};
+
+struct UltraFirmwareUpdate {
+  enum Phase : uint8_t { IDLE, QUEUED, DOWNLOADING, WAIT_POWER, SENDING, CHECKING };
+  // the component's (build/lifecycle/update_retry_methods.inc)
+  void perform(bool force);
+  bool line_answers_() const;
+  void start_install_();
+  void start_session_();
+  void session_done_();
+  void abort();
+  /// loop()'s SENDING and CHECKING steps (build/lifecycle/update_sending.inc)
+  void step() {
+    const uint32_t now = millis();
+    switch (this->phase_) {
+#include "update_sending.inc"
+      default:
+        break;
+    }
+  }
+  // stand-ins
+  std::string get_name() const { return "test"; }
+  void set_status_(const std::string &s) {
+    if (this->texts.empty() || this->texts.back() != s)
+      this->texts.push_back(s);
+  }
+  void publish_progress_(float, bool) {}
+  void finish_(const std::string &s, bool installed) {
+    this->phase_ = IDLE;
+    this->texts.push_back(s);
+    this->installed = installed;
+  }
+  struct Info {
+    std::string latest_version{"0.6.9"};
+  } update_info_;
+  std::vector<std::string> texts;
+  bool installed{false};
+
+  static UltraFirmwareUpdate *active_;
+  UltraHub *hub_{nullptr};
+  Phase phase_{IDLE};
+  uint8_t state_{0};
+  bool have_release_{true}, force_{false}, recover_{false}, power_cycle_{false};
+  uint8_t passes_{3}, auto_retry_{2};
+  AutoRetry retry_;
+  uint32_t installed_{0x000608FF}, latest_{0x000609FF}, job_version_{0}, lead_in_ms_{500}, phase_ms_{0};
+  uint32_t last_publish_ms_{0};
+  std::atomic<bool> dl_abort_{false};
+  std::atomic<uint32_t> dl_bytes_{0};
+  FwImageInfo image_, job_image_;
+  std::string image_url_, job_url_;
+  uint8_t *img_{nullptr};
+  size_t img_size_{0};
+};
+UltraFirmwareUpdate *UltraFirmwareUpdate::active_ = nullptr;
+
+#include "update_retry_methods.inc"
+
+/// A receiver's answer to its POLL (the pages the check reads: IDENTITY, STATUS), as a receiver on `version` would.
+static void answer(const uint8_t *s, uint16_t k, uint32_t version, std::vector<uint8_t> &out) {
+  uint8_t a[32]{}, d[24]{};
+  const uint8_t page = s[ULTRA_POLL_PAGE];
+  if (page == ULTRA_PAGE_IDENTITY) {
+    ultra_put32(d + ULTRA_ID_FW_VERSION, version);
+    d[ULTRA_ID_BL_VERSION] = 2;
+    d[ULTRA_ID_HW_ID] = UPD_HW_ID_D2A_ULTRA_5CH;
+  } else if (page == ULTRA_PAGE_STATUS) {
+    d[ULTRA_ST_HW] = (UPD_HW_ID_D2A_ULTRA_5CH << 4) | UPD_REV_D2A_R04;
+    ultra_put24(d + ULTRA_ST_UPTIME, 100 + now_ms / 1000);
+    d[ULTRA_ST_RESET] = ULTRA_ST_RST_POWER;
+  }
+  a[0] = ULTRA_RSP_SYNC;
+  a[1] = page;
+  a[2] = static_cast<uint8_t>(s[ULTRA_POLL_INDEX] << 4);
+  a[3] = s[2];
+  ultra_put16(a + 4, static_cast<uint16_t>(0x7700 + k));
+  std::memcpy(a + ULTRA_RSP_DATA, d, 24);
+  ultra_put16(a + 30, ultra_crc16(a, 30));
+  out.push_back(ULTRA_RSP_LEAD);
+  out.insert(out.end(), a, a + 32);
+}
+
+/// The receivers answer for ms (versions[k]; 0: it doesn't answer, nor the ones behind it), the entity steps.
+static void run(UltraFirmwareUpdate &u, UltraHub &h, const uint32_t *versions, uint32_t ms) {
+  const uint32_t end = now_ms + ms;
+  while (now_ms < end) {
+    if (h.with_telemetry && h.p.due(now_ms)) {
+      std::vector<uint8_t> slots(32 * h.boards), uart;
+      uint32_t w;
+      const uint16_t n = h.p.build(now_ms, slots.data(), &w);
+      for (uint16_t b = 0; b < n && versions[b] != 0; b++) {
+        if (slots[32 * b + ULTRA_POLL_INDEX] != ULTRA_POLL_RELAY_ONLY)
+          answer(slots.data() + 32 * b, b, versions[b], uart);
+      }
+      now_ms += 10;
+      h.p.finish(now_ms, uart.data(), uart.size());
+    } else {
+      now_ms += 50;
+    }
+    u.step();
+  }
+}
+
+/// A session's result comes in; the entity steps once.
+static void result(UltraFirmwareUpdate &u, UltraHub &h, UltraHub::UpdateResult r) {
+  h.result = r;
+  now_ms += 3000;
+  u.step();
+}
+
+static void test_auto_retry() {
+  const uint32_t V = 0x000609FF, OLD = 0x000608FF;
+  // a one-way line: every retry sent (the hub can't see), texts, then done
+  {
+    now_ms = 1000;
+    UltraHub h;
+    UltraFirmwareUpdate u;
+    u.hub_ = &h;
+    u.perform(false);
+    CHECK(u.phase_ == UltraFirmwareUpdate::QUEUED && u.retry_.retries() == 2 && !u.retry_.verify(),
+          "a one-way line: 2 retries, blind");
+    u.start_session_();
+    result(u, h, UltraHub::UPD_DONE);
+    CHECK(h.sessions == 2 && u.phase_ == UltraFirmwareUpdate::SENDING &&
+              u.texts.back() == "retry 1 of 2 for boards that may have missed the update",
+          "blind: the session again (%d), '%s'", h.sessions, u.texts.back().c_str());
+    now_ms += 2000;
+    u.step();
+    CHECK(u.texts.back() == "retry 1 of 2: sending: pass 1 of 3, 50 %", "its progress: '%s'", u.texts.back().c_str());
+    result(u, h, UltraHub::UPD_DONE);
+    result(u, h, UltraHub::UPD_DONE);
+    CHECK(h.sessions == 3 && u.phase_ == UltraFirmwareUpdate::IDLE && u.installed && !h.forced &&
+              u.texts.back() == std::string("done: 0.6.9 sent to the 3 boards of this line in 3 sessions. ") +
+                                    BLINK_LEGEND,
+          "blind: 3 sessions, never forced, then done: '%s'", u.texts.back().c_str());
+  }
+  // force_update / recover: no retry
+  {
+    UltraHub h;
+    UltraFirmwareUpdate u;
+    u.hub_ = &h;
+    u.perform(true);
+    u.start_session_();
+    result(u, h, UltraHub::UPD_DONE);
+    CHECK(h.sessions == 1 && h.forced && u.phase_ == UltraFirmwareUpdate::IDLE &&
+              u.texts.back().rfind("done: 0.6.9 sent to the 3 boards of this line. ", 0) == 0,
+          "force: one session, no retry ('%s')", u.texts.back().c_str());
+  }
+  // an abort the user asked for: no retry, also not while the receivers are checked
+  {
+    UltraHub h;
+    UltraFirmwareUpdate u;
+    u.hub_ = &h;
+    u.perform(false);
+    u.start_session_();
+    u.abort();
+    result(u, h, UltraHub::UPD_ABORTED);
+    CHECK(h.aborted && h.sessions == 1 && u.phase_ == UltraFirmwareUpdate::IDLE && !u.installed &&
+              u.texts.back().rfind("aborted", 0) == 0,
+          "abort while sending: no retry ('%s')", u.texts.back().c_str());
+    UltraHub t;
+    t.with_telemetry = true;
+    t.p.init(3, ULTRA_RW_RATE_1M, TelemetryIntervals{});
+    UltraFirmwareUpdate v;
+    v.hub_ = &t;
+    v.perform(false);
+    v.start_session_();
+    result(v, t, UltraHub::UPD_DONE);
+    CHECK(v.phase_ == UltraFirmwareUpdate::CHECKING, "telemetry: the receivers are checked");
+    v.abort();
+    CHECK(t.sessions == 1 && v.phase_ == UltraFirmwareUpdate::IDLE && v.texts.back().rfind("aborted", 0) == 0,
+          "abort while checking: no retry ('%s')", v.texts.back().c_str());
+  }
+  // a line of 3 receivers: all on the release -> done at once; one in its bootloader -> retries while it doesn't answer
+  {
+    now_ms = 100000;
+    UltraHub h;
+    h.with_telemetry = true;
+    h.p.init(3, ULTRA_RW_RATE_1M, TelemetryIntervals{});
+    h.p.locked(now_ms);
+    const uint32_t before[3] = {OLD, OLD, OLD}, after[3] = {V, V, V};
+    UltraFirmwareUpdate u;
+    u.hub_ = &h;
+    u.job_image_.hw_id = UPD_HW_ID_D2A_ULTRA_5CH;
+    u.image_ = u.job_image_;
+    u.image_.hw_rev_mask = 1u << UPD_REV_D2A_R04;
+    u.image_.min_bootloader = 2;
+    run(u, h, before, 3000);
+    u.perform(false);
+    CHECK(u.retry_.verify(), "every board answers: the retries check their versions");
+    u.start_session_();
+    result(u, h, UltraHub::UPD_DONE);
+    CHECK(u.phase_ == UltraFirmwareUpdate::CHECKING && u.texts.back() == "installed; checking the 3 receivers",
+          "'%s'", u.texts.back().c_str());
+    // (each restarted with the release: uptime from 0, IDENTITY again)
+    h.p = TelemetryPoller{};
+    h.p.init(3, ULTRA_RW_RATE_1M, TelemetryIntervals{});
+    h.p.locked(now_ms);
+    run(u, h, after, 5000);
+    CHECK(h.sessions == 1 && u.phase_ == UltraFirmwareUpdate::IDLE && u.installed &&
+              u.texts.back() == "done: all 3 receivers on 0.6.9",
+          "all on the release: no retry, '%s'", u.texts.back().c_str());
+
+    UltraFirmwareUpdate w;
+    w.hub_ = &h;
+    w.image_ = u.image_;
+    h.p = TelemetryPoller{};   // (a line on the old version again)
+    h.p.init(3, ULTRA_RW_RATE_1M, TelemetryIntervals{});
+    h.p.locked(now_ms);
+    run(w, h, before, 3000);
+    w.perform(false);
+    w.start_session_();
+    result(w, h, UltraHub::UPD_DONE);
+    // receiver 1 restarted with the release; receiver 2 waits in its bootloader (and silences receiver 3)
+    const uint32_t stuck[3] = {V, 0, 0};
+    h.p = TelemetryPoller{};
+    h.p.init(3, ULTRA_RW_RATE_1M, TelemetryIntervals{});
+    h.p.locked(now_ms);
+    run(w, h, stuck, AutoRetry::CHECK_MS + 2000);
+    const bool said = std::find(w.texts.begin(), w.texts.end(), "retry 1 of 2: 2 receivers don't answer") !=
+                      w.texts.end();
+    CHECK(h.sessions == 3 && w.phase_ == UltraFirmwareUpdate::SENDING && said &&
+              w.texts.back() == "retry 1 of 2: sending: pass 1 of 3, 50 %",
+          "receiver 2 in its bootloader: retry 1 (%d), why said %d, then '%s'", h.sessions, said,
+          w.texts.back().c_str());
+    result(w, h, UltraHub::UPD_DONE);
+    run(w, h, after, 5000);
+    CHECK(h.sessions == 3 && w.phase_ == UltraFirmwareUpdate::IDLE && w.installed && w.retry_.used() == 1 &&
+              w.texts.back() == "done: all 3 receivers on 0.6.9",
+          "the retry installed it: no second retry, '%s'", w.texts.back().c_str());
+  }
+  now_ms = 0;
+}
+
+#undef USE_DIG2ANALOG_ULTRA_TELEMETRY
+}  // namespace update_retry
 
 int main() {
   lights::test_light();
@@ -1039,6 +2122,10 @@ int main() {
   hub_start::test_group_budget();
   hub_update::test_update_task();
   hub_update::test_update_lead_in();
+  hub_rw::test_telemetry_window();
+  hub_rw::test_several_lines();
+  receiver_entities::test_receiver_entities();
+  update_retry::test_auto_retry();
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "ALL ULTRA LIFECYCLE TESTS PASSED", failures);
   return failures ? 1 : 0;
 }

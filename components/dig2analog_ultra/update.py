@@ -2,7 +2,8 @@
 
 The entity reads the firmware repo's signed channel manifest from GitHub; Install downloads the image and sends it
 to every board of the line in one session. The boards decide themselves (newer: install, same: skip, older: reject
-unless forced) and blink the result. Design: the firmware wiki's Updating Over The Data Line page.
+unless forced) and blink the result. auto_retry sends the session again for boards that missed it (update_retry.h).
+Design: the firmware wiki's Updating Over The Data Line page.
 """
 
 import re
@@ -25,6 +26,7 @@ CONF_PUBLIC_KEYS = "public_keys"
 CONF_VERIFY_SIGNATURE = "verify_signature"
 CONF_BOARD_REVISION = "board_revision"
 CONF_PASSES = "passes"
+CONF_AUTO_RETRY = "auto_retry"
 CONF_LEAD_IN = "lead_in"
 CONF_POWER_CYCLE = "power_cycle"
 
@@ -91,6 +93,10 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_BOARD_REVISION, default=3): cv.int_range(min=0, max=15),
             # every page this often per session (a board that missed one gets it in the next pass)
             cv.Optional(CONF_PASSES, default=3): cv.int_range(min=1, max=8),
+            # sessions again after an install for boards that missed it (0: off): on a line of Diff-Power receivers
+            # (telemetry) only while one isn't on the release, on a one-way line always (blind). Boards that have it
+            # ignore a repeat. Never after force_update, recover or an abort.
+            cv.Optional(CONF_AUTO_RETRY, default=2): cv.int_range(min=0, max=5),
             # optional: switch the channel from Home Assistant (stored on the ESP32)
             cv.Optional(CONF_CHANNEL_SELECT): select.select_schema(
                 FwChannelSelect, entity_category=ENTITY_CATEGORY_CONFIG, icon="mdi:source-branch"
@@ -150,6 +156,7 @@ async def to_code(config):
     cg.add(var.set_verify_signature(config[CONF_VERIFY_SIGNATURE]))
     cg.add(var.set_hardware(HW_ID_D2A_ULTRA_5CH, config[CONF_BOARD_REVISION]))
     cg.add(var.set_passes(config[CONF_PASSES]))
+    cg.add(var.set_auto_retry(config[CONF_AUTO_RETRY]))
     cg.add(hub.set_ping_burst(True))  # freshly installed boards confirm themselves at a PING
     if sel_conf := config.get(CONF_CHANNEL_SELECT):
         sel = await select.new_select(sel_conf, options=list(CHANNELS))

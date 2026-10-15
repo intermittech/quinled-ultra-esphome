@@ -2,6 +2,9 @@
 
 #ifdef USE_ESP32
 
+// (light_state.h first: base_light_effects.h uses LightState but doesn't include it; without api: nothing before it
+// in esphome.h does)
+#include "esphome/components/light/light_state.h"
 #include "esphome/components/light/base_light_effects.h"
 #include "esphome/components/light/light_effect.h"
 #include "esphome/core/hal.h"

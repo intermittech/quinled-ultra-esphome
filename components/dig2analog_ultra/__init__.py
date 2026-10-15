@@ -30,10 +30,28 @@ from esphome.const import (
 from esphome.core import CORE
 from esphome.types import ConfigType
 
+from .receiver_schema import (
+    CONF_TELEMETRY,
+    TELEMETRY_SCHEMA,
+    telemetry_defaults,
+    telemetry_to_code,
+    validate_telemetry,
+    validate_telemetry_lines,
+)
+
 _LOGGER = logging.getLogger(__name__)
 
 DEPENDENCIES = ["esp32"]
 MULTI_CONF = True
+
+
+def AUTO_LOAD(config=None):
+    """The entity types of the Diff-Power receivers' telemetry, only for a line with telemetry: (no config: all)."""
+    confs = config if isinstance(config, list) else [config]
+    if config is None or any(isinstance(c, dict) and c.get(CONF_TELEMETRY) for c in confs):
+        return ["sensor", "binary_sensor", "text_sensor"]
+    return []
+
 
 dig2analog_ultra_ns = cg.esphome_ns.namespace("dig2analog_ultra")
 UltraHub = dig2analog_ultra_ns.class_("UltraHub", cg.Component)
@@ -61,6 +79,8 @@ CONF_MIN_PULSE = "min_pulse"
 CONF_STAGGER = "stagger"
 CONF_SIGNAL_LOSS = "signal_loss"
 CONF_SIGNAL_LOSS_TIMEOUT = "signal_loss_timeout"
+CONF_TRIP_RETRIES = "trip_retries"
+CONF_TRIP_RETRY_INTERVAL = "trip_retry_interval"
 CONF_FEEDBACK_CHANNEL = "feedback_channel"
 CONF_POWER_LIMIT = "power_limit"
 CONF_CHANNEL_CURRENT = "channel_current"
@@ -102,10 +122,14 @@ CFG_CH_CURRENT = 11
 CFG_CH_MAX = 16
 CFG_BOARD_MAX = 21
 CFG_BOOT_PROTOCOL = 22  # persisted on the board
+CFG_RETRY = 24  # persisted on the board (protocol 0.2.5): count | interval << 8
 
 DITHERING = {"on": 0, "off_at_low_levels": 1, "off": 2}
 DIM_FLOOR = {"skip": 0, "clamp": 1, "off": 2}
-SIGNAL_LOSS = {"hold": 0, "off": 1, "fade_off": 2}
+# scene (protocol 0.2.5, firmware 0.6.9): fade to the light's power-on scene / effect (a light without one holds)
+SIGNAL_LOSS = {"hold": 0, "off": 1, "fade_off": 2, "scene": 3}
+TRIP_RETRIES_DEFAULT = 10  # the boards' own default: 10 retries 1 s apart
+TRIP_RETRIES_FOREVER = 255
 FEEDBACK = {"red": 0, "all": 1, "off": 2}
 # each mode followed by its spread-spectrum variant; "spread" = adaptive_spread
 STAGGER = {"off": 0, "fixed": 1, "fixed_spread": 2, "adaptive": 3, "adaptive_spread": 4, "spread": 4}
@@ -117,6 +141,13 @@ def _validate_stagger(value):
     if isinstance(value, bool):
         return "fixed" if value else "off"
     return cv.one_of(*STAGGER, lower=True)(value)
+
+
+def _validate_trip_retries(value):
+    """0 (never retry) to 254, or forever."""
+    if isinstance(value, str) and value.strip().lower() in ("forever", "always"):
+        return TRIP_RETRIES_FOREVER
+    return cv.int_range(min=0, max=254)(value)
 
 
 def _enum_or_bool(mapping, bools):
@@ -305,6 +336,7 @@ CURRENT_CALIBRATION_SCHEMA = cv.Schema(
 )
 
 CONFIG_SCHEMA = cv.All(
+    telemetry_defaults,   # the receivers' entities, named for their devices (before they are validated)
     esp32.only_on_variant(
         unsupported=list(esp32_rmt.VARIANTS_NO_RMT),
         msg_prefix="dig2analog_ultra (RMT)",
@@ -347,9 +379,21 @@ CONFIG_SCHEMA = cv.All(
                 cv.positive_time_period_milliseconds,
                 cv.Range(min=cv.TimePeriod(milliseconds=500), max=cv.TimePeriod(seconds=60)),
             ),
+            # After an overcurrent trip a board switches its outputs on again trip_retry_interval later, at most
+            # trip_retries times (0: never; forever); after the last one they stay off until a new command or a power
+            # cycle, and 60 s without a trip starts the count again. Stored on the boards (protocol 0.2.5, firmware
+            # 0.6.9; older boards skip it). Not given: the boards keep theirs (default 10 retries, 1 s apart).
+            cv.Optional(CONF_TRIP_RETRIES): _validate_trip_retries,
+            cv.Optional(CONF_TRIP_RETRY_INTERVAL): cv.All(
+                cv.positive_time_period_seconds,
+                cv.Range(min=cv.TimePeriod(seconds=1), max=cv.TimePeriod(seconds=255)),
+            ),
             cv.Optional(CONF_FEEDBACK_CHANNEL, default="red"): cv.enum(FEEDBACK, lower=True),
             cv.Optional(CONF_POWER_LIMIT): _validate_power_limit,
             cv.Optional(CONF_CURRENT_CALIBRATION): CURRENT_CALIBRATION_SCHEMA,
+            # QuinLED Diff-Power ultra receivers report back (receiver_schema.py): their power, energy, status,
+            # problems and diagnostics, each receiver a Home Assistant device of its own. Off unless configured.
+            cv.Optional(CONF_TELEMETRY): TELEMETRY_SCHEMA,
             # Protocol mode the boards start in after power-up; stored on the boards (the only setting that is),
             # written only when it differs. Not given: the boards keep what they have (default auto).
             cv.Optional(CONF_BOOT_PROTOCOL): cv.enum(BOOT_PROTOCOL, lower=True),
@@ -434,6 +478,13 @@ def _validate_rmt_memory(full):
         if c.get("platform") == "esp32_rmt_led_strip"
     ]
     users += [(f"remote_transmitter '{c[CONF_ID]}'", c) for c in full.get("remote_transmitter", []) or []]
+    dma = [name for name, c in users if c.get(CONF_USE_DMA)]
+    if len(dma) > 1:
+        # (ESP-IDF rmt_tx.c: only the group's last transmit channel can use DMA)
+        raise cv.Invalid(
+            f"only one RMT transmitter of the {variant} can use DMA (its last channel); {', '.join(dma)} have "
+            "use_dma: true. Give the others rmt_symbols instead"
+        )
     need = 0
     for _, c in users:
         symbols = c.get(CONF_RMT_SYMBOLS, block)
@@ -451,7 +502,9 @@ def _validate_rmt_memory(full):
 def _final_validate(configs):
     full = fv.full_config.get()
     _validate_rmt_memory(full)
+    validate_telemetry_lines(full)
     for conf in configs if isinstance(configs, list) else [configs]:
+        validate_telemetry(full, conf, conf[CONF_NUM_BOARDS])
         # signal_loss off / fade_off: a board switches off after signal_loss_timeout (sent in 100 ms) without a good
         # frame; at rest a frame comes every refresh_interval, so one lost frame must not reach the timeout
         refresh = int(conf[CONF_REFRESH_INTERVAL].total_milliseconds)
@@ -459,7 +512,8 @@ def _final_validate(configs):
         if conf[CONF_SIGNAL_LOSS] != "hold" and 2 * refresh > timeout:
             raise cv.Invalid(
                 f"refresh_interval ({refresh} ms) must be at most half of signal_loss_timeout ({timeout} ms) with "
-                f"signal_loss: {conf[CONF_SIGNAL_LOSS]}, or a single lost frame switches the lights off"
+                f"signal_loss: {conf[CONF_SIGNAL_LOSS]}, or a single lost frame takes the lights to their signal loss "
+                "state"
             )
         used = {}
         count = {}
@@ -569,11 +623,17 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_board_config(-1, CFG_BOARD_MAX, round(plim.get(CONF_MAX_BOARD_CURRENT, 0.0) * 1000)))
     if CONF_BOOT_PROTOCOL in config:
         cg.add(var.set_board_config(-1, CFG_BOOT_PROTOCOL, BOOT_PROTOCOL[config[CONF_BOOT_PROTOCOL]]))
+    if CONF_TRIP_RETRIES in config or CONF_TRIP_RETRY_INTERVAL in config:
+        count = config.get(CONF_TRIP_RETRIES, TRIP_RETRIES_DEFAULT)
+        interval = int(config[CONF_TRIP_RETRY_INTERVAL].total_seconds) if CONF_TRIP_RETRY_INTERVAL in config else 1
+        cg.add(var.set_board_config(-1, CFG_RETRY, count | interval << 8))
 
     if CONF_POWER_SUPPLY in config:
         psu = await cg.get_variable(config[CONF_POWER_SUPPLY])
         cg.add(var.set_power_supply(psu, _keep_on_time_ms(CORE.config, config[CONF_POWER_SUPPLY])))
         cg.add(var.set_power_on_delay(config[CONF_POWER_ON_DELAY].total_milliseconds))
+    if CONF_TELEMETRY in config:
+        await telemetry_to_code(var, config)
     if CONF_CURRENT_CALIBRATION in config:
         cal = config[CONF_CURRENT_CALIBRATION]
         cg.add(

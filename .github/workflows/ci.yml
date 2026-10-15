@@ -14,7 +14,8 @@ env:
   ESPHOME_VERSION: "2026.9.1"   # brings ESP-IDF 5.5.5 for the esp-idf framework
   ZIGLANG_VERSION: "0.16.0"     # the host tests' C / C++ compiler
   FIRMWARE_REF: main            # intermittech/quinled-ultra-firmware
-  PROTOCOL_REF: v0.2.3          # intermittech/quinled-ultra-protocol (ultra_protocol.h must match this tag)
+  PROTOCOL_REF: v0.2.5          # intermittech/quinled-ultra-protocol (ultra_protocol.h must match this tag)
+  ULTRA_REQUIRE_DEPS: "1"       # the tests fail (not skip) when the firmware or the protocol checkout is missing
 
 jobs:
   host:
@@ -51,6 +52,15 @@ jobs:
       - name: Contract test (the scheduler through the board's receive path and engine, 50 boards, two pins)
         working-directory: quinled-ultra-esphome
         run: python tests/run_ultra_contract_test.py
+      - name: Telemetry test (the return channel's hub side against a modelled receiver chain)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_telemetry_test.py
+      - name: Telemetry contract test (the hub's polls through the receiver firmware's own answer path)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_telemetry_contract_test.py
+      - name: Update retry test (auto_retry with the sender through the board firmware's bootloader)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_update_retry_test.py
       - name: Schema tests
         working-directory: quinled-ultra-esphome
         run: python tests/validate_configs.py
@@ -64,6 +74,8 @@ jobs:
         config:
           - ultra/ultra-example.yaml
           - ultra/ultra-strip.yaml
+          - ultra/ultra-telemetry.yaml
+          - ultra/ultra-p4-telemetry.yaml
           - examples-local/quinled-dig2analog-ultra-rgbcct.yaml
           - examples-local/quinled-dig2analog-ultra-downlights.yaml
           - examples-local/quinled-dig2analog-ultra-candle-niche.yaml

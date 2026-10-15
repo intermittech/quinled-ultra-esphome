@@ -639,23 +639,28 @@ class Scheduler {
   /// the host clock at the last bit (the header carries the low 32 bits).
   int64_t build_frame(int64_t start_us, uint8_t *out) {
     uint8_t *s = out;
+    for (size_t i = 0; i < this->boards_.size(); i++, s += ULTRA_SLOT_BYTES)
+      this->fill_slot_(i, s, start_us);
+    this->hdr_flags_ = 0;
+    return this->finish_(start_us, out);
+  }
+
+  /// An RW frame (the return channel, ultra_telemetry.h): its first `polls` slots are the POLLs from poll_slots, the
+  /// others as build_frame() fills them; the header has ULTRA_HDR_RW. (The hub sends one only while nothing is queued:
+  /// commands go first.)
+  int64_t build_rw_frame(int64_t start_us, uint8_t *out, const uint8_t *poll_slots, size_t polls) {
+    uint8_t *s = out;
     for (size_t i = 0; i < this->boards_.size(); i++, s += ULTRA_SLOT_BYTES) {
-      this->starts_[i] = NO_START;
-      this->floors_[i] = 0;
-      Board &b = this->boards_[i];
-      // every 16th slot of a board with a continuous stream is a refresh: a board that rebooted meanwhile still gets
-      // its CONFIG and light definitions
-      if (b.urgent_run >= 15 && this->take_refresh_(b, s, i, start_us)) {
-        b.urgent_run = 0;
-      } else if (this->take_urgent_(b, s, i, start_us)) {
-        b.urgent_run++;
+      if (i < polls) {
+        std::memcpy(s, poll_slots + ULTRA_SLOT_BYTES * i, ULTRA_SLOT_BYTES);
+        this->starts_[i] = NO_START;
+        this->floors_[i] = 0;
+        this->durations_[i] = 0;
       } else {
-        b.urgent_run = 0;
-        if (!this->take_refresh_(b, s, i, start_us))
-          ultra_slot_nop(s);
+        this->fill_slot_(i, s, start_us);
       }
-      this->durations_[i] = s[0] == ULTRA_SET ? ultra_get24(s + ULTRA_PAYLOAD + 22) : 0;
     }
+    this->hdr_flags_ = ULTRA_HDR_RW;
     return this->finish_(start_us, out);
   }
 
@@ -670,6 +675,7 @@ class Scheduler {
       this->starts_[i] = NO_START;
       this->floors_[i] = 0;
     }
+    this->hdr_flags_ = 0;
     return this->finish_(start_us, out);
   }
   /// A preamble frame: DARK slots (all zero) + header, see preamble_frames().
@@ -679,11 +685,13 @@ class Scheduler {
       this->starts_[i] = NO_START;
       this->floors_[i] = 0;
     }
+    this->hdr_flags_ = 0;
     return this->finish_(start_us, out);
   }
 
  protected:
   static constexpr uint8_t CONFIG_PAGES = 3;
+  static_assert(1 + CONFIG_PAGES * 9 >= ULTRA_CFG_COUNT, "every official CONFIG id in a CONFIG slot");
 
   struct Item {
     uint8_t slot[ULTRA_SLOT_BYTES]{};
@@ -871,6 +879,25 @@ class Scheduler {
     ultra_slot_seal(s);
   }
 
+  /// Slot i of a frame: a queued command, else the board's next refresh item, else NOP.
+  void fill_slot_(size_t i, uint8_t *s, int64_t start_us) {
+    this->starts_[i] = NO_START;
+    this->floors_[i] = 0;
+    Board &b = this->boards_[i];
+    // every 16th slot of a board with a continuous stream is a refresh: a board that rebooted meanwhile still gets
+    // its CONFIG and light definitions
+    if (b.urgent_run >= 15 && this->take_refresh_(b, s, i, start_us)) {
+      b.urgent_run = 0;
+    } else if (this->take_urgent_(b, s, i, start_us)) {
+      b.urgent_run++;
+    } else {
+      b.urgent_run = 0;
+      if (!this->take_refresh_(b, s, i, start_us))
+        ultra_slot_nop(s);
+    }
+    this->durations_[i] = s[0] == ULTRA_SET ? ultra_get24(s + ULTRA_PAYLOAD + 22) : 0;
+  }
+
   /// The command with the fewest copies sent (oldest first): first copies of everything go out first. A streamed
   /// SET that waited behind others glides at least as long as it has been since the light's last one went out.
   bool take_urgent_(Board &b, uint8_t *s, size_t slot, int64_t now_us) {
@@ -959,10 +986,10 @@ class Scheduler {
     for (int pass = 0; pass < 2; pass++) {
       for (size_t i = 0; i < n; i++)
         stamp_(out + ULTRA_SLOT_BYTES * i, this->starts_[i], t, this->floors_[i] != 0, this->durations_[i]);
-      ultra_build_header(h, static_cast<uint32_t>(t));
+      ultra_build_header_flags(h, static_cast<uint32_t>(t), this->hdr_flags_);
       t = start_us + static_cast<int64_t>((this->wire_ns(out, slots + ULTRA_HDR_BYTES) + 500) / 1000);
     }
-    ultra_build_header(h, static_cast<uint32_t>(t));
+    ultra_build_header_flags(h, static_cast<uint32_t>(t), this->hdr_flags_);
     return t;
   }
 
@@ -970,6 +997,7 @@ class Scheduler {
   std::vector<int64_t> starts_;      // per slot of the frame being built: its absolute start (SET / EFFECT)
   std::vector<uint32_t> durations_;  // per slot: a SET's own duration (stamp_ may shorten it in the frame)
   std::vector<uint8_t> floors_;      // per slot: a streamed SET (start not before the frame's TIME)
+  uint8_t hdr_flags_{0};             // the frame being built: ULTRA_HDR_RW for an RW frame (retime_frame keeps it)
   uint32_t t0h_{250}, t0l_{1050}, t1h_{700}, t1l_{650};
   uint8_t repeats_{3};
   uint32_t order_{0};

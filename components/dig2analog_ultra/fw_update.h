@@ -4,7 +4,9 @@
 // It reads the channel's signed manifest from GitHub (fw_manifest.h, fw_signature.h), and on Install downloads the
 // image, checks it, and sends it to every board of the line in one session (the hub's update task,
 // update_session.h). The boards decide themselves: newer -> install, same -> skip, older -> reject (unless forced),
-// and blink the result; the ESP32 can't read their versions, so "installed" is what this line was last updated to.
+// and blink the result. auto_retry (update_retry.h) sends the session again for boards that missed it: on a line of
+// Diff-Power receivers only while one isn't on the release (telemetry), on a one-way line blind. On a one-way line the
+// ESP32 can't read the boards' versions, so "installed" is what this line was last updated to.
 // Design: the firmware wiki's Updating Over The Data Line page.
 
 #include "esphome/core/defines.h"
@@ -26,6 +28,7 @@
 #include "dig2analog_ultra.h"
 #include "fw_image_cache.h"
 #include "fw_manifest.h"
+#include "update_retry.h"
 
 #include <atomic>
 #include <freertos/FreeRTOS.h>
@@ -61,6 +64,8 @@ class UltraFirmwareUpdate final : public update::UpdateEntity, public PollingCom
     this->hw_rev_ = hw_rev;
   }
   void set_passes(uint8_t passes) { this->passes_ = passes; }
+  /// sessions again after an install for boards that missed it (0: off; never with force / recover, never after abort)
+  void set_auto_retry(uint8_t retries) { this->auto_retry_ = retries; }
 #ifdef USE_TEXT_SENSOR
   void set_status_sensor(text_sensor::TextSensor *s) { this->status_sensor_ = s; }
 #endif
@@ -76,7 +81,7 @@ class UltraFirmwareUpdate final : public update::UpdateEntity, public PollingCom
   void recover(uint32_t lead_in_ms, bool power_cycle);
 
  protected:
-  enum Phase : uint8_t { IDLE, QUEUED, DOWNLOADING, WAIT_POWER, SENDING };
+  enum Phase : uint8_t { IDLE, QUEUED, DOWNLOADING, WAIT_POWER, SENDING, CHECKING };
   struct CheckResult;
   struct DownloadResult;
   static void check_task_(void *arg);
@@ -88,6 +93,8 @@ class UltraFirmwareUpdate final : public update::UpdateEntity, public PollingCom
   void image_ready_();
   void start_install_();
   void start_session_();
+  void session_done_();
+  bool line_answers_() const;
   void finish_(const std::string &status, bool installed);
   void free_image_();
   void set_status_(const std::string &text);
@@ -104,6 +111,8 @@ class UltraFirmwareUpdate final : public update::UpdateEntity, public PollingCom
   uint8_t hw_id_{UPD_HW_ID_D2A_ULTRA_5CH};
   uint8_t hw_rev_{UPD_REV_D2A_R04};
   uint8_t passes_{3};
+  uint8_t auto_retry_{2};
+  AutoRetry retry_;        // this install's retries (update_retry.h)
 #ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *status_sensor_{nullptr};
 #endif

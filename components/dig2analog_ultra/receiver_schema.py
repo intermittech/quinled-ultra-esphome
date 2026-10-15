@@ -273,10 +273,10 @@ TELEMETRY_SCHEMA = cv.Schema(
         # dig2analog board doesn't pass answers on, so receivers behind one can't be heard.
         cv.Required(CONF_RECEIVERS): cv.All(cv.ensure_list(RECEIVER_SCHEMA), cv.Length(min=1, max=64)),
         cv.Optional(CONF_DIAGNOSTICS, default="full"): cv.one_of(*DIAG_LEVELS, lower=True),
-        # the sender port's current limit (3 x 750 mA PTCs), the load's warning and problem
+        # the sender port's current limit (3 x 750 mA PTCs), the load's warning and problem (early: PTCs trip easily)
         cv.Optional(CONF_PORT_LIMIT, default="2.25A"): cv.All(cv.current, cv.Range(min=0.1, max=20.0)),
-        cv.Optional(CONF_LOAD_WARNING, default="90%"): cv.percentage,
-        cv.Optional(CONF_LOAD_PROBLEM, default="95%"): cv.percentage,
+        cv.Optional(CONF_LOAD_WARNING, default="80%"): cv.percentage,
+        cv.Optional(CONF_LOAD_PROBLEM, default="90%"): cv.percentage,
         cv.Optional(CONF_LOAD_PROBLEM_TIME, default="30s"): cv.positive_time_period_milliseconds,
         # the sender's voltage (power at the sender, the first cable's loss); without it: receiver 1's highest
         cv.Optional(CONF_SUPPLY_VOLTAGE): cv.All(cv.voltage, cv.Range(min=5.0, max=60.0)),

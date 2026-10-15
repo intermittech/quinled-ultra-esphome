@@ -1493,8 +1493,8 @@ class PortMonitor {
   struct Config {
     float limit_a{2.25f};        // the port's current limit
     float supply_v{NAN};         // the sender's voltage; NAN: learned (receiver 1's highest bus voltage)
-    float warning_pct{90.0f};    // a warning (the Status) from this load on
-    float problem_pct{95.0f};    // a problem after this load lasted problem_ms (100 %: at once)
+    float warning_pct{80.0f};    // a warning (the Status) from this load on
+    float problem_pct{90.0f};    // a problem after this load lasted problem_ms (100 %: at once)
     uint32_t problem_ms{30000};
   };
   static constexpr float RESISTANCE_MIN_A = 0.3f;   // a segment's resistance only from this current on (10 mV steps)

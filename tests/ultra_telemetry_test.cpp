@@ -856,7 +856,8 @@ static void test_status() {
 
 /// The port's load (PortMonitor): the receivers' input currents against the limit, the power at the sender, the
 /// cable loss along the chain (and per receiver its voltage drop, the segment before it); a learned sender voltage;
-/// the warning, the problem at 100 % or held at 95 %; a receiver that doesn't answer: incomplete, no cable loss.
+/// the warning from 80 %, the problem at 100 % or held at 90 % (the defaults; and a port's own 90 / 95 %); a receiver
+/// that doesn't answer: incomplete, no cable loss.
 static void test_port() {
   Chain c(3);
   const uint16_t volts[3] = {5400, 5260, 5130};   // 54.0 / 52.6 / 51.3 V
@@ -899,24 +900,57 @@ static void test_port() {
   CHECK(std::fabs(l.supply_v() - 54.8f) < 1e-3f && std::fabs(l.power_w() - 54.8f * 1.62f) < 1e-3f,
         "learned sender voltage %.2f V", l.supply_v());
 
-  // near the limit: a warning at 91 %; 96 % held for 30 s: a problem; 101 %: at once
-  for (auto &r : c.rx)
-    r.current = 683;   // 2.05 A: 91 %
+  // near the limit, the defaults: a warning at 81 %; 88 % for 40 s: no problem; 91 % held for 30 s: a problem;
+  // 101 %: at once. A port with its own (load_warning 90 %, load_problem 95 %): no warning at 81 / 88 %, at 91 % a
+  // warning only; 96 % held for 30 s: a problem
+  PortMonitor u;
+  PortMonitor::Config own = cfg;
+  own.warning_pct = 90.0f;
+  own.problem_pct = 95.0f;
+  u.configure(own);
+  const auto load = [&](uint16_t ma) {
+    for (auto &r : c.rx)
+      r.current = ma;
+  };
+  load(608);   // 1.82 A: 81 %
   c.run(p, 4000);
   m.update(c.now_ms, p);
-  CHECK(m.warning() && !m.problem() && port_status(m, p) == "90 % load" &&
-            port_status_detail(m) == "2.0 A of 2.25 A (90 %): near the port's limit.",
-        "91 %%: '%s' / '%s'", port_status(m, p).c_str(), port_status_detail(m).c_str());
-  for (auto &r : c.rx)
-    r.current = 720;   // 2.16 A: 96 %
+  u.update(c.now_ms, p);
+  CHECK(m.warning() && !m.problem() && port_status(m, p) == "80 % load" &&
+            port_status_detail(m) == "1.8 A of 2.25 A (80 %): near the port's limit." && !u.warning(),
+        "81 %%: '%s' / '%s' (own 90 %%: %s)", port_status(m, p).c_str(), port_status_detail(m).c_str(),
+        u.warning() ? "a warning" : "none");
+  load(660);   // 1.98 A: 88 %
+  bool any = false, own_any = false;
+  for (int s = 0; s < 40; s++) {
+    c.run(p, 1000);
+    m.update(c.now_ms, p);
+    u.update(c.now_ms, p);
+    any |= m.problem();
+    own_any |= u.warning() || u.problem();
+  }
+  CHECK(m.warning() && !any && !own_any, "88 %% for 40 s: a warning, no problem (own: %s)",
+        own_any ? "a warning or problem" : "none");
+  load(683);   // 2.05 A: 91 %
   bool early = false;
   for (int s = 0; s < 40; s++) {
     c.run(p, 1000);
     m.update(c.now_ms, p);
+    u.update(c.now_ms, p);
     early |= s < 25 && m.problem();
+    own_any |= u.problem();
   }
-  CHECK(!early && m.problem() && port_status_detail(m).find("may trip") != std::string::npos,
-        "96 %%: a problem only after 30 s ('%s')", port_status_detail(m).c_str());
+  CHECK(!early && m.problem() && port_status_detail(m).find("may trip") != std::string::npos && u.warning() &&
+            !own_any,
+        "91 %%: a problem only after 30 s ('%s'); own 95 %%: a warning only", port_status_detail(m).c_str());
+  load(720);   // 2.16 A: 96 %
+  early = false;
+  for (int s = 0; s < 40; s++) {
+    c.run(p, 1000);
+    u.update(c.now_ms, p);
+    early |= s < 25 && u.problem();
+  }
+  CHECK(!early && u.problem(), "96 %%, own 95 %%: a problem only after 30 s");
   for (auto &r : c.rx)
     r.current = 760;   // 2.28 A: 101 %
   PortMonitor o;

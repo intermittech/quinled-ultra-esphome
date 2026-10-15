@@ -1697,6 +1697,63 @@ static void test_ledger_counters() {
         static_cast<unsigned>(ledger_key("port4")));
 }
 
+/// Review r9 F7 (pre-existing): the lock interval after a preamble is waited out once (the first frame after it
+/// forgets it); a lock 24.8 days old (past the signed half of millis()) must not stop the polls. GPT's
+/// POLL_LOCK_LONG_RUN probe, with the first frame the hub sends.
+static void test_r9_lock_long_run() {
+  TelemetryPoller p;
+  p.init(1, ULTRA_RW_RATE_1M, TelemetryIntervals{});
+  p.locked(0);
+  const bool early = p.due(1000), after = p.due(1001);
+  std::vector<uint8_t> slots(ULTRA_SLOT_BYTES * 2);
+  uint32_t w = 0;
+  p.build(1001, slots.data(), &w);   // (the first frame after the lock)
+  p.finish(1010, nullptr, 0);
+  p.read_now(0, TP_STATUS, 0x80000000u);
+  const bool aged = p.due(0x80000000u), later = p.due(0xFFFFF000u);
+  p.locked(0xFFFFFF00u);   // a new preamble: its own lock interval again (across millis()'s wrap)
+  const bool relock = p.due(0xFFFFFF00u + 500), relock_after = p.due(0xFFFFFF00u + 1001);
+  CHECK(!early && after && aged && later && !relock && relock_after,
+        "F7: polls after the lock interval (%d / %d), still at 24.9 and 49 days (%d / %d); a new lock waits again (%d / %d)",
+        early, after, aged, later, relock, relock_after);
+}
+
+/// Review r9 F7, its kin: a receiver's restart hold (1 s) must not cut the chain behind it 24.8 days later, and a
+/// line back from a month in standby must poll at once (its pages' last times are older than half of millis()).
+static void test_r9_long_runs() {
+  auto age = [](Chain &c, uint32_t ms) {   // the line on, nothing polled meanwhile (the receivers count on)
+    c.now_ms += ms;
+    for (auto &m : c.rx)
+      m.uptime = (m.uptime + ms / 1000) & 0xFFFFFF;
+  };
+  {
+    Chain c(2);
+    TelemetryPoller p = started(c, 2);
+    c.run(p, 8000);
+    c.rx[0].restart();   // (a hold of 1 s: the receiver behind it waits)
+    c.run(p, 20000);
+    age(c, 0x80000000u);
+    const uint32_t s1 = c.rx[1].asked[ULTRA_PAGE_STATUS];
+    c.run(p, 10000);
+    CHECK(c.rx[1].asked[ULTRA_PAGE_STATUS] > s1 && p.answering(1),
+          "F7: 24.9 days after receiver 1 restarted, receiver 2 behind it still polled (%u STATUS)",
+          c.rx[1].asked[ULTRA_PAGE_STATUS] - s1);
+  }
+  {
+    Chain c(1);
+    TelemetryPoller p = started(c, 1);
+    c.run(p, 8000);
+    p.unpowered();   // a month in standby
+    age(c, 0x90000000u);
+    c.rx[0].restart();
+    p.locked(c.now_ms);
+    const uint32_t s = c.rx[0].asked[ULTRA_PAGE_STATUS];
+    c.run(p, 5000);
+    CHECK(c.rx[0].asked[ULTRA_PAGE_STATUS] > s && p.answering(0),
+          "F7: back after 28 days in standby: polled at once (%u STATUS)", c.rx[0].asked[ULTRA_PAGE_STATUS] - s);
+  }
+}
+
 /// (0.2.6) DIAG 20 bit 7: the receiver's lifetime record held: a note after the Status detail, no problem
 static void test_record_held() {
   Chain c(1);
@@ -1747,6 +1804,8 @@ int main() {
   test_ledger_misc();
   test_ledger_counters();
   test_pacing();
+  test_r9_lock_long_run();
+  test_r9_long_runs();
   test_record_held();
   test_status();
   test_port();

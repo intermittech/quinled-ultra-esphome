@@ -681,6 +681,9 @@ class TelemetryPoller {
   // (its clock rated), so an acknowledge never reaches a new boot whose counts happen to match
   static constexpr uint32_t ACK_FRESH_MS = 100;
   static constexpr uint32_t RESTART_HOLD_MS = ULTRA_RW_LOCK_MS;
+  // a page's time further ahead than any interval (24 h at most, and its backoff): from over half a millis() wrap
+  // ago (a receiver not heard for that long, a line in standby for weeks): overdue
+  static constexpr int32_t STALE_MS = 25 * 3600000;
 
   /// receivers: the first boards of the line (1..64); rate ULTRA_RW_RATE_*
   void init(uint16_t receivers, uint8_t rate, const TelemetryIntervals &iv, uint8_t seed = 0x5A) {
@@ -702,6 +705,7 @@ class TelemetryPoller {
   void locked(uint32_t now_ms) {
     this->locked_ = true;
     this->lock_ms_ = now_ms;
+    this->lock_wait_ = true;
   }
   /// The boards lost their supply (or the line stopped): every receiver unavailable; they restart.
   /// Every receiver's sensors again (take_updates: TU_AVAILABILITY): their status changed with the line's power
@@ -736,8 +740,12 @@ class TelemetryPoller {
   /// An RW frame should go out now: the chain is locked, the spacing allows one, and a receiver it can hear has a
   /// page due.
   bool due(uint32_t now_ms) const {
-    // (> in whole ms: at least ULTRA_RW_LOCK_MS whatever the phase of millis())
-    if (!this->locked_ || this->rx_.empty() || static_cast<int32_t>(now_ms - this->lock_ms_) <= (int32_t) ULTRA_RW_LOCK_MS)
+    if (!this->locked_ || this->rx_.empty())
+      return false;
+    // the lock interval after a preamble (> in whole ms: at least ULTRA_RW_LOCK_MS whatever the phase of millis());
+    // the first frame after it forgets it (build()), so a lock half a millis() wrap old (24.8 days) can't stop the
+    // polls
+    if (this->lock_wait_ && static_cast<int32_t>(now_ms - this->lock_ms_) <= (int32_t) ULTRA_RW_LOCK_MS)
       return false;
     if (this->sent_any_ && now_ms - this->last_ms_ < MIN_SPACING_MS)
       return false;
@@ -753,6 +761,13 @@ class TelemetryPoller {
   /// The RW frame's POLL slots for boards 0..n-1 into slots (n x ULTRA_SLOT_BYTES; boards behind them take normal
   /// slots); returns n (0: nothing to poll). window_us: W, the window after the frame's last bit.
   uint16_t build(uint32_t now_ms, uint8_t *slots, uint32_t *window_us) {
+    // what is over is forgotten (compared to an old time half a millis() wrap later, it would look new again)
+    if (this->lock_wait_ && static_cast<int32_t>(now_ms - this->lock_ms_) > (int32_t) ULTRA_RW_LOCK_MS)
+      this->lock_wait_ = false;
+    for (auto &r : this->rx_) {
+      if (r.hold && static_cast<int32_t>(now_ms - r.hold_until) >= 0)
+        r.hold = false;
+    }
     const size_t reach = this->reach_(now_ms);
     this->win_.clear();
     if (reach == 0)
@@ -922,7 +937,7 @@ class TelemetryPoller {
     uint16_t unsupported{0};   // bit 1 << TP_*: answered UNSUPPORTED (until the board restarts or changes)
     uint32_t next[TP_COUNT]{};
     uint32_t hold_until{0};    // restarted: not polled past before this
-    bool hold{false};
+    bool hold{false};          // (build() forgets it once over: it can't come back half a millis() wrap later)
     uint32_t status_ms{0};     // when its last STATUS was read (restart detection)
     bool ack_due{false};       // POWER showed a latch: acknowledge with the next POWER poll
     bool ack_sent{false};      // ... it went out with the last one
@@ -983,7 +998,9 @@ class TelemetryPoller {
     for (uint8_t tp = 0; tp < TP_COUNT; tp++) {
       if (!this->enabled_(r, tp))
         continue;
-      const int32_t o = static_cast<int32_t>(now_ms - r.next[tp]);
+      int32_t o = static_cast<int32_t>(now_ms - r.next[tp]);
+      if (o < -STALE_MS)
+        o = INT32_MAX / 2;   // (more than any interval ahead: its time from over half a millis() wrap ago: overdue)
       if (o > most) {
         most = o;
         best = tp;
@@ -1135,6 +1152,7 @@ class TelemetryPoller {
   TelemetryIntervals iv_{};
   uint8_t rate_{ULTRA_RW_RATE_1M};
   bool locked_{false};
+  bool lock_wait_{false};   // the lock interval not waited out yet (build() forgets it after)
   uint32_t lock_ms_{0};
   bool sent_any_{false};
   uint32_t last_ms_{0};

@@ -1086,7 +1086,7 @@ void UltraHub::ledger_service_() {
         any = true;
       }
     }
-    // (blocks of 32: a receiver more or less keeps the size; never fewer than the stored copy uses)
+    // (runtime room in blocks of 32, independent of the compact blob; never fewer than the stored copy uses)
     const size_t n = ledger_receivers();
     const size_t pos = std::max((n + 31) / 32 * 32, (used_p + 31) / 32 * 32);
     const size_t room = std::max((n + std::max<size_t>(4, n / 2) + 31) / 32 * 32, (used_e + 31) / 32 * 32);
@@ -1105,7 +1105,7 @@ void UltraHub::ledger_service_() {
     g_ledger_day_ms += LEDGER_DAY_MS;
     l.set_day(l.day() + 1);
   }
-  if (l.dirty() && now - g_ledger_saved_ms >= LEDGER_SAVE_MS)
+  if (now - g_ledger_saved_ms >= LEDGER_SAVE_MS && l.dirty())
     ledger_save_(false);
 }
 
@@ -1128,7 +1128,11 @@ void UltraHub::ledger_save_(bool now) {
     const uint32_t gen = g_ledger_generation + 1;
     l.save(blob.get(), gen);
     const uint32_t size = static_cast<uint32_t>(n);
-    bool ok = g_ledger_pref[gen & 1].save(blob.get(), n) && global_preferences->sync();
+    // The ESP32 flash preference copies the supplied length on save (its key is independent of length), so the
+    // same preference accepts a compact blob growing/shrinking between saves. Release ours before sync's read-back.
+    bool ok = g_ledger_pref[gen & 1].save(blob.get(), n);
+    blob.reset();
+    ok = ok && global_preferences->sync();
     ok = ok && g_ledger_size[gen & 1].save(reinterpret_cast<const uint8_t *>(&size), sizeof(size)) &&
          global_preferences->sync();
     if (ok) {
@@ -1159,15 +1163,23 @@ void UltraHub::ledger_line_() {
       this->keeper_.cut(this->port_->core().line_ms());
   }
 #endif
-  this->lit_rx_.assign(this->poller_.receivers(), 0);
+  const bool tick = this->keeper_.lit_due(now);
+  this->lit_rx_.resize(this->poller_.receivers(), 0);
+  // Keep last loop's state in bit 1 while reducing this loop's lights into bit 0. Transition detection stays at
+  // loop cadence (including short pulses and fade deadlines); unchanged clock accounting runs every 50 ms.
+  for (auto &lit : this->lit_rx_)
+    lit = (lit & 1u) << 1;
   if (this->boards_powered_()) {
     for (auto *l : this->lights_) {
       if (l->get_board() < this->lit_rx_.size() && l->is_lit(now))
-        this->lit_rx_[l->get_board()] = 1;
+        this->lit_rx_[l->get_board()] |= 1;
     }
   }
-  for (uint16_t i = 0; i < this->lit_rx_.size(); i++)
-    this->keeper_.lit_tick(i, this->lit_rx_[i] != 0, now);
+  for (uint16_t i = 0; i < this->lit_rx_.size(); i++) {
+    const uint8_t lit = this->lit_rx_[i];
+    if (tick || (lit & 1u) != (lit >> 1))
+      this->keeper_.lit_tick(i, (lit & 1u) != 0, now);
+  }
 }
 #endif
 

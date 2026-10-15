@@ -1497,6 +1497,7 @@ static void test_ledger_restart() {
   drive(c, h, ha, 5000);
   CHECK(near(h.k.energy_wh(0), shown + 0.7), "then on (%.3f)", h.k.energy_wh(0));
   // N2: used while the ESP32 was off (a clean shutdown stored the ledger)
+  blob.resize(led2.blob_size());
   led2.save(blob.data(), 2);
   m.use(20000);
   m.uptime += 3600;
@@ -1527,6 +1528,7 @@ static void test_ledger_restart() {
   CHECK(near(h.k.energy_wh(0), e0 + 0.6), "a power-off without a cut: +0.1 Wh, not its power-up's count again (%.3f)",
         h.k.energy_wh(0) - e0);
   // N3: a used board fitted while the ESP32 was off (shut down cleanly): the position goes on, not +50 kWh
+  blob.resize(led3.blob_size());
   led3.save(blob.data(), 3);
   const double last = ha.last[0];
   Model b;
@@ -1546,6 +1548,7 @@ static void test_ledger_restart() {
   CHECK(h.new_boards == 1 && near(h.k.energy_wh(0), last) && ha.worst_back == 0,
         "N3: a used board fitted while the ESP32 was off: the position goes on (%.3f, was %.3f)", h.k.energy_wh(0), last);
   // ... after a crash instead (the last save older): back by what was shown since that save at most
+  blob.resize(led4.blob_size());
   led4.save(blob.data(), 4);
   const double at_save = h.k.energy_wh(0);
   c.rx[0].use(5000);
@@ -1855,6 +1858,7 @@ static void test_r9_load_replaces() {
   std::vector<uint8_t> old(l.blob_size()), newer(l.blob_size());
   l.save(old.data(), 2);
   l.set_day(LEDGER_AGE_DAYS);   // (aged out)
+  newer.resize(l.blob_size());
   l.save(newer.data(), 3);
   LifetimeLedger out;
   out.init(4, 2);
@@ -1932,6 +1936,7 @@ static void test_r9_restart_with_lead() {
         "the ESP32 restarted under a board 50 Wh behind its ledger: %.3f Wh (shown before %.3f, back %.3f)",
         h.k.energy_wh(0), shown, ha.worst_back);
   // ... and the board power-cycled while the ESP32 was off (a new session: its whole count new)
+  blob.resize(restored.blob_size());
   restored.save(blob.data(), 2);
   c.rx[0].power_up();
   c.rx[0].use(2000);

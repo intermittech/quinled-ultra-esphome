@@ -58,6 +58,9 @@ jobs:
       - name: Telemetry contract test (the hub's polls through the receiver firmware's own answer path)
         working-directory: quinled-ultra-esphome
         run: python tests/run_ultra_telemetry_contract_test.py
+      - name: Ledger test (the lifetime ledger against its frozen reference, stored-copy faults, long runs)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_ledger_test.py
       - name: Diff-Power test (the port power manager's core)
         working-directory: quinled-ultra-esphome
         run: python tests/run_diffpower_test.py

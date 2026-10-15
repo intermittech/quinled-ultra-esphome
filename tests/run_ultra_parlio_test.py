@@ -27,21 +27,29 @@ ROOT = HERE.parent
 COMP = ROOT / "components" / "dig2analog_ultra"
 BUILD = HERE / "build" / "parlio"
 ZIG = [sys.executable, "-m", "ziglang"]
-SOURCES = ("dig2analog_ultra.cpp", "dig2analog_ultra.h", "ultra_parlio.h")
+SOURCES = ("dig2analog_ultra.cpp", "dig2analog_ultra.h", "ultra_parlio.h", "../diffpower/diffpower.cpp")
 
 # <name>.inc: the definitions in dig2analog_ultra.cpp that start with these signatures
 PIECES = {
     "hub_loop.inc": ["void UltraHub::loop("],
     "hub_transmit.inc": ["void UltraHub::transmit_(", "esp_err_t UltraHub::lane_post_("],
     "hub_rw.inc": [
-        "bool UltraHub::rw_due_(", "bool UltraHub::rw_uart_turn_(", "void UltraHub::rw_drop_turn_(",
+        "bool UltraHub::rw_due_(", "bool UltraHub::rx_settling(", "bool UltraHub::rw_uart_turn_(",
+        "void UltraHub::rw_drop_turn_(",
         "bool IRAM_ATTR UltraHub::rw_done_isr_(", "void IRAM_ATTR UltraHub::rw_lane_release_(",
         "void UltraHub::finish_window_(", "void UltraHub::rw_publish_(",
     ],
     "hub_start.inc": ["int64_t UltraHub::lead_us(", "int64_t UltraHub::command_lead_us_(", "int64_t UltraHub::start_time_us("],
     "hub_update_start.inc": ["bool UltraHub::start_update("],
     "hub_update_lane.inc": ["static void upd_stamp(", "uint8_t UltraHub::update_lane_("],
+    "hub_port.inc": [
+        "void UltraHub::resync(", "bool UltraHub::boards_powered_(", "bool UltraHub::line_free_(",
+        "bool UltraHub::line_out_(", "void UltraHub::attach_port_(", "void UltraHub::send_power_off_notice(",
+        "void UltraHub::pump_notice_(", "void UltraHub::service_notice_(",
+    ],
 }
+# port.inc: the Diff-Power port's own (components/diffpower/diffpower.cpp)
+PORT_PIECES = ["void DiffPowerPort::loop(", "void DiffPowerPort::apply_(", "void DiffPowerPort::shutdown_all("]
 
 # (what breaks, file, the text, its broken version): the checks must fail with each
 NEGATIVE = [
@@ -73,6 +81,15 @@ NEGATIVE = [
     ("an update keeps the turn of a poll frame that never went out", "dig2analog_ultra.cpp",
      "  this->tx_rw_ = false;        // a poll frame that never went out: its UART's turn goes to the next line\n"
      "  this->rw_drop_turn_();\n", ""),
+    ("a lane's notice copy reported to its port as it is posted (not as it starts on the wire)", "dig2analog_ultra.cpp",
+     "      this->notice_at_us_ = start;   // (on the wire from its start: then the port is told, service_notice_())\n",
+     "      this->port_->notice_sent();\n"),
+    ("the lock interval after a preamble on a lane waits for the RMT", "dig2analog_ultra.cpp",
+     "    return now_us_() >= this->lane_->end_us();   // (its frame and its reset: the lane's quiet after it)\n",
+     "    return rmt_tx_wait_all_done(this->channel_, 0) == ESP_OK;\n"),
+    ("the shutdown's notice on a lane waits for the RMT", "dig2analog_ultra.cpp",
+     "  if (this->line_free_())\n    this->transmit_();\n}\n",
+     "  if (rmt_tx_wait_all_done(this->channel_, 0) == ESP_OK)\n    this->transmit_();\n}\n"),
     ("no turn-taking on a shared UART", "dig2analog_ultra.cpp",
      "    if (hub->rw_turn_)\n      return false;   // its window is open\n", ""),
     ("the direction pin let go of a byte before the RW frame's end", "ultra_parlio.h",
@@ -82,7 +99,8 @@ NEGATIVE = [
      "static constexpr uint32_t PARLIO_RELEASE_NS = 2000;", "static constexpr uint32_t PARLIO_RELEASE_NS = 200000;"),
 ]
 
-FEATURES = ("USE_DIG2ANALOG_ULTRA_TELEMETRY", "USE_DIG2ANALOG_ULTRA_PARLIO", "USE_DIG2ANALOG_ULTRA_UPDATE")
+FEATURES = ("USE_DIG2ANALOG_ULTRA_TELEMETRY", "USE_DIG2ANALOG_ULTRA_PARLIO", "USE_DIG2ANALOG_ULTRA_UPDATE",
+            "USE_DIFFPOWER")
 
 
 def read_sources(mutation=None) -> dict:
@@ -114,7 +132,7 @@ def feature_check(sources: dict, out: Path) -> list:
         used = set(re.findall(r"\bUltraHub::(\w+)", body)) | set(re.findall(r"\bthis->(\w+_)\b", body))
         missing = sorted(n for n in used if n not in declared)
         if missing:
-            fails.append(f"FAIL feature check: with {' + '.join(d[20:].lower() for d in defines) or 'no options'}, "
+            fails.append(f"FAIL feature check: with {' + '.join(d.split('_')[-1].lower() for d in defines) or 'no options'}, "
                          f"dig2analog_ultra.cpp names {', '.join(missing)}, not declared in dig2analog_ultra.h")
     return fails
 
@@ -125,6 +143,8 @@ def prepare(out: Path, sources: dict) -> None:
     for inc, signatures in PIECES.items():
         text = sources["dig2analog_ultra.cpp"]
         (out / inc).write_text("\n\n".join(definition(text, s) for s in signatures) + "\n", encoding="utf-8")
+    (out / "port.inc").write_text("\n\n".join(definition(sources["../diffpower/diffpower.cpp"], s) for s in PORT_PIECES)
+                                  + "\n", encoding="utf-8")
     (out / "ultra_parlio.h").write_text(sources["ultra_parlio.h"], encoding="utf-8")
 
 
@@ -151,7 +171,7 @@ def main() -> int:
     for line in fails:
         print(line, flush=True)
     print(f"feature check: the members dig2analog_ultra.cpp names are declared, with each of the "
-          f"{2 ** len(FEATURES)} combinations of telemetry / PARLIO / updates: {'FAILED' if fails else 'ok'}", flush=True)
+          f"{2 ** len(FEATURES)} combinations of telemetry / PARLIO / updates / Diff-Power ports: {'FAILED' if fails else 'ok'}", flush=True)
     prepare(base, sources)
     rc = subprocess.run([str(build(base, checked))]).returncode
     if fails:

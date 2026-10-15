@@ -18,6 +18,8 @@
 //     overlap, windows of different UARTs do, every receiver answers with its own data, a silent lane leaves the
 //     others answering; RMT lines sharing a UART; a busy line can't starve the others; a poll that failed to go out
 //     doesn't keep the UART through an update; a group start on a lane with long buffers covers its command cadence;
+//     a line on a Diff-Power port, on a lane: the preamble and the lock interval after each wake, the power-off
+//     notice's copies timed on the wire, no polls while the port isn't powered, the shutdown hook through the stream;
 //  7. a firmware update session on a lane: every page pause on the wire, expired reservations, refused frames, a
 //     stalled stream with and without an abort, the last frame out before it returns.
 // Build: python tests/run_ultra_parlio_test.py (also its negative controls and the render benchmark)
@@ -26,6 +28,7 @@
 #include "../components/dig2analog_ultra/ultra_parlio.h"
 #include "../components/dig2analog_ultra/ultra_telemetry.h"
 #include "../components/dig2analog_ultra/update_session.h"
+#include "../components/diffpower/diffpower_core.h"
 
 #include <algorithm>
 #include <array>
@@ -114,7 +117,7 @@ static uint32_t margin_ns(uint32_t sample_ns, uint8_t width) {
 ///    it over task_ns later; late(k) delays it further at the switch to chunk k;
 ///  - the timer: at the stream's next alarm (+ timer_ns): the releases, the deadline; after a kill the task restarts
 ///    the stream restart_ns later.
-/// wire: the pins, sample by sample (sample s at wire_t0 + s x sample).
+/// wire: the pins, sample by sample (sample s at wire_t0 + s x sample), as far as they have played.
 struct Stream {
   ParlioStream s;
   uint8_t width{16};
@@ -138,6 +141,7 @@ struct Stream {
   int64_t handed{0}, handed_at{0};
   bool need_render{false}, need_hand{false}, dead{false};
   int64_t render_at{0}, hand_at{0}, rendered{0}, cut{0}, last_event{0};
+  size_t played{0};        // the samples of the chunk on the wire on `wire` so far
 
   bool init(const Grid &g, uint8_t w, uint32_t chunk_groups, uint8_t lanes_used, uint16_t inv, int64_t start_ns) {
     this->sample_ns = g.sample_ns;
@@ -168,11 +172,17 @@ struct Stream {
     this->handed = first + 1;
     this->handed_at = t;
     this->need_render = this->need_hand = this->dead = false;
+    this->played = 0;
   }
-  void append(int64_t c, size_t n) {
-    const uint8_t *b = this->buf[c & 1].data();
-    for (size_t i = 0; i < n; i++)
+  /// the chunk on the wire up to host time t (its buffer doesn't change while it plays)
+  void play_to(int64_t t) {
+    if (this->dead || t <= this->T)
+      return;
+    const size_t n = std::min<size_t>(this->chunk_samples(), static_cast<size_t>((t - this->T) / this->sample_ns));
+    const uint8_t *b = this->buf[this->on_wire & 1].data();
+    for (size_t i = this->played; i < n; i++)
       this->wire.push_back(this->width == 8 ? b[i] : static_cast<uint16_t>(b[2 * i] | b[2 * i + 1] << 8));
+    this->played = std::max(this->played, n);
   }
   void idle_until(int64_t t) {
     while (this->wire_end() < t)
@@ -216,12 +226,13 @@ struct Stream {
           }
         }
         if (kill && !this->dead) {   // the pins to their idle level now: the chunk on the wire is cut here
+          this->play_to(e);
           this->dead = true;
           this->cut = e;
-          this->append(this->on_wire, static_cast<size_t>((e - this->T) / this->sample_ns));
         }
       } else if (e == e_end) {
-        this->append(this->on_wire, this->chunk_samples());
+        this->play_to(e);
+        this->played = 0;
         // the DMA moves on to the newest buffer, if it came in time; else it plays the same one again
         if (this->handed > this->on_wire && this->handed_at <= this->T + this->C() - this->margin) {
           this->on_wire = this->handed;
@@ -239,6 +250,7 @@ struct Stream {
         this->start_at(this->wire_end());
       }
     }
+    this->play_to(t_ns);
   }
   /// up to the end of the chunk on the wire (or the restart after a kill)
   void step() { this->run_until(this->dead ? this->cut + this->restart_ns : this->T + this->C()); }
@@ -905,6 +917,8 @@ int main(int argc, char **argv) {
   hub_lanes::test_fair_uart();
   hub_lanes::test_failed_poll_then_update();
   hub_lanes::test_group_cadence();
+  hub_lanes::test_port_on_lane(96, "1 ms buffers");
+  hub_lanes::test_port_on_lane(928, "10 ms buffers");
   hub_update::test_update_on_lane();
   hub_update::test_update_failures();
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "ALL ULTRA PARLIO TESTS PASSED", failures);

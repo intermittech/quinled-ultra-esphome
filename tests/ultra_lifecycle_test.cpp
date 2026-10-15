@@ -490,6 +490,8 @@ struct UltraHub {
   enum UpdateResult : uint8_t { UPD_NONE = 0, UPD_DONE, UPD_ABORTED, UPD_FAILED };
   enum UpdateState : uint8_t { UPD_IDLE = 0, UPD_RUNNING, UPD_FINISHED };
   void loop();   // the component's (build/lifecycle/hub_loop.inc)
+  bool line_free_();   // (hub_line.inc)
+  bool line_out_();
   // stand-ins
   struct {
     void stop() {}
@@ -528,6 +530,7 @@ struct UltraHub {
 };
 
 #include "hub_loop.inc"
+#include "hub_line.inc"
 
 /// After a session and its quiet second, the result waits until the resync's PING burst and dark tail are out on the
 /// wire: the boards confirm their new firmware with it, and the update holds the power supply until its result. A
@@ -1183,6 +1186,9 @@ struct UltraHub {
   } *port_{nullptr};
   bool port_attached_{true};
   void attach_port_() {}
+  void service_notice_() {}   // (a lane's notice copy: tests/ultra_parlio_test.cpp)
+  bool line_free_();          // (hub_line.inc)
+  bool line_out_();
   uint32_t rw_late_{0}, rw_extra_us_{0};
   rmt_symbol_word_t reset_symbol_{}, rw_reset_symbol_{};
   struct {
@@ -1227,6 +1233,7 @@ uint32_t UltraHub::rw_wait_seq_ = 0;
 static constexpr uint32_t RW_WAIT_STALE_MS = 100;
 
 #include "hub_loop.inc"
+#include "hub_line.inc"
 #include "hub_transmit.inc"
 #include "hub_rw.inc"
 
@@ -2661,10 +2668,13 @@ struct UltraHub {
   void attach_port_();
   void send_power_off_notice(uint8_t copy);
   void pump_notice_();
+  void service_notice_();
   bool boards_powered_() const;
   bool has_power_supply() const;
   void power_cycle();
   void transmit_();   // (hub_transmit.inc)
+  bool line_free_();  // (hub_line.inc)
+  bool line_out_();
   // stand-ins
   void resync(bool) { this->resyncs++; }
   void wake_() { this->wakes++; }
@@ -2677,6 +2687,7 @@ struct UltraHub {
   diffpower::DiffPowerPort *port_{nullptr};
   bool port_attached_{false}, cal_power_hold_{false}, upd_power_hold_{false};
   uint32_t notices_{0};
+  int64_t notice_at_us_{0};
   uint8_t pin_{16};
   int resyncs{0}, wakes{0};
   std::atomic<uint8_t> upd_state_{UPD_IDLE};
@@ -2697,6 +2708,7 @@ struct UltraHub {
   int channel_{0}, encoder_{0};
 };
 #include "hub_port.inc"
+#include "hub_line.inc"
 #include "hub_transmit.inc"
 
 /// The boards whose slot in frame f has IDENTIFY 7 (argument 0, CRC ok); seq: their SEQs

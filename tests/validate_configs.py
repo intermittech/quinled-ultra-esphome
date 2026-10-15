@@ -159,6 +159,18 @@ diffpower:
     enable_pin: GPIO26
     detect_pin: GPIO27
 """
+# two ports on an ESP32-P4 (the PARLIO cases' lanes on them)
+P4_PORTS = """\
+diffpower:
+  - id: dp1
+    name: Port 1 power
+    enable_pin: GPIO45
+    detect_pin: GPIO46
+  - id: dp2
+    name: Port 2 power
+    enable_pin: GPIO47
+    detect_pin: GPIO48
+"""
 DP_MONO = """\
 output:
   - platform: ledc
@@ -1182,6 +1194,11 @@ CASES = [
     ),
     # PARLIO: up to 16 lanes on an ESP32-P4, telemetry on 4 UARTs shared by 4 lanes each
     ("parlio 16 lanes, 4 UARTs x 4 lanes with receiver enable pins", parlio(), True, None, P4),
+    ("parlio lanes on Diff-Power ports",
+     parlio(lanes=2, telemetry=False, hub_extra={0: "    port: dp1\n", 1: "    port: dp2\n"}) + P4_PORTS, True, None, P4),
+    ("parlio two lanes on one Diff-Power port",
+     parlio(lanes=2, telemetry=False, hub_extra={0: "    port: dp1\n", 1: "    port: dp1\n"}) + P4_PORTS, False,
+     "are both on port 'dp1'", P4),
     ("parlio 16 lanes without telemetry", parlio(telemetry=False), True, None, P4),
     ("parlio 3 lanes (8-bit samples)", parlio(lanes=3, telemetry=False), True, None, P4),
     ("parlio 2 lanes of a 4-pin bus (2 idle)", parlio(lanes=2, pins=4, telemetry=False), True, None, P4),

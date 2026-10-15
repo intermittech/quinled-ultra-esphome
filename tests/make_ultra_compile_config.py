@@ -4,8 +4,9 @@ calibration, the version display, the board firmware update with a power supply 
 the hub's code. Also tests/build/ultra/ultra-strip.yaml: the dig2analog_ultra_strip example with a partition, effect_glide modes
 and the downlight notification pattern; tests/build/ultra/ultra-telemetry.yaml: ultra-example with Diff-Power receiver
 telemetry (the UART, the direction pin, every receiver sensor and text); tests/build/ultra/ultra-p4-telemetry.yaml (4
-RMT lines with telemetry on a P4), ultra-p4-parlio.yaml (16 PARLIO lanes, 4 shared UARTs) and
-ultra-p4-parlio-lights.yaml (8 lanes at 10 MHz, no telemetry). The examples themselves:
+RMT lines with telemetry on a P4), ultra-p4-parlio.yaml (16 PARLIO lanes, 4 shared UARTs),
+ultra-p4-parlio-ports.yaml (the same, each lane on a Diff-Power port) and ultra-p4-parlio-lights.yaml (8 lanes at 10
+MHz, no telemetry). The examples themselves:
 tests/local_examples.py.
 
 Usage: .venv/Scripts/python tests/make_ultra_compile_config.py
@@ -482,10 +483,11 @@ def p4_telemetry_config() -> str:
             "\ndig2analog_ultra:\n" + hubs + "\nlight:\n" + lights)
 
 
-def p4_parlio_config() -> str:
+def p4_parlio_config(ports: bool = False) -> str:
     """tests/build/ultra/ultra-p4-parlio.yaml: a 16-port sender on an ESP32-P4: 16 lanes of one PARLIO bus, telemetry
     on 4 UARTs shared by 4 lanes each (a direction pin per lane on the P4, its receiver enable on an MCP23017: any
-    output pin will do), a light per lane, and an RMT line next to them."""
+    output pin will do), a light per lane, and an RMT line next to them. ports (ultra-p4-parlio-ports.yaml): each lane
+    on its Diff-Power port (diffpower), the enables on a second MCP23017, the detects on a third."""
     de = [20, 21, 22, 23, 26, 27, 28, 29, 30, 31, 32, 33, 39, 40, 41, 42]
     uarts, hubs, lights = "", "", ""
     for g in range(4):
@@ -496,16 +498,27 @@ def p4_parlio_config() -> str:
                  f"      uart_id: rs485_g{k // 4 + 1}\n      name: Port {k + 1}\n      receivers: 2\n"
                  f"      diagnostics: basic\n      direction_pin: GPIO{de[k]}\n      receiver_enable_pin:\n"
                  f"        mcp23xxx: rx_enable\n        number: {k}\n")
+        if ports:
+            hubs += f"    port: dp{k + 1}\n"
         lights += (f"  - platform: dig2analog_ultra\n    dig2analog_ultra_id: port{k + 1}\n    name: Port {k + 1} RGBCCT\n"
                    f"    board: 0\n    red: 1\n    green: 2\n    blue: 3\n    cold_white: 4\n    warm_white: 5\n")
     hubs += "  - id: rmt_line\n    pin: GPIO45\n    num_boards: 1\n    rmt_symbols: 48\n"
     lights += ("  - platform: dig2analog_ultra\n    dig2analog_ultra_id: rmt_line\n    name: RMT line\n    board: 0\n"
                "    channel: 1\n")
-    return ("esphome:\n  name: d2a-ultra-p4-parlio\n\nesp32:\n  board: esp32-p4_r3\n  framework:\n    type: esp-idf\n\n"
+    expanders, diffpower = "", ""
+    if ports:
+        expanders = "  - id: port_enable\n    address: 0x21\n  - id: port_detect\n    address: 0x22\n"
+        diffpower = "\ndiffpower:\n" + "".join(
+            f"  - id: dp{k + 1}\n    name: Port {k + 1} power\n    enable_pin:\n      mcp23xxx: port_enable\n"
+            f"      number: {k}\n    detect_pin:\n      mcp23xxx: port_detect\n      number: {k}\n      mode: INPUT\n"
+            for k in range(16))
+    return ("esphome:\n  name: d2a-ultra-p4-parlio" + ("-ports" if ports else "") + "\n\nesp32:\n  board: esp32-p4_r3\n"
+            "  framework:\n    type: esp-idf\n\n"
             "external_components:\n  - source:\n      type: local\n      path: ../../../components\n"
-            "    components: [dig2analog_ultra, dig2analog_ultra_parlio]\n\nlogger:\n\n"
-            "i2c:\n  sda: GPIO43\n  scl: GPIO44\n\nmcp23017:\n  - id: rx_enable\n    address: 0x20\n\n"
-            "uart:\n" + uarts +
+            "    components: [dig2analog_ultra, dig2analog_ultra_parlio" + (", diffpower" if ports else "") + "]\n\n"
+            "logger:\n\n"
+            "i2c:\n  sda: GPIO43\n  scl: GPIO44\n\nmcp23017:\n  - id: rx_enable\n    address: 0x20\n" + expanders +
+            "\nuart:\n" + uarts + diffpower +
             "\ndig2analog_ultra_parlio:\n  - id: ports\n    pins: [" + ", ".join(f"GPIO{i}" for i in range(16)) + "]\n"
             "\ndig2analog_ultra:\n" + hubs + "\nlight:\n" + lights)
 
@@ -595,12 +608,13 @@ def main() -> None:
     (OUT / "ultra-diffpower.yaml").write_text(DIFFPOWER_CONFIG, encoding="utf-8")
     (OUT / "ultra-p4-parlio.yaml").write_text(p4_parlio_config(), encoding="utf-8")
     (OUT / "ultra-p4-parlio-lights.yaml").write_text(p4_parlio_lights_config(), encoding="utf-8")
+    (OUT / "ultra-p4-parlio-ports.yaml").write_text(p4_parlio_config(ports=True), encoding="utf-8")
     secrets = OUT / "secrets.yaml"
     if not secrets.exists():
         secrets.write_text('wifi_ssid: "test"\nwifi_password: "testtest"\n', encoding="utf-8")
     print(f"written {OUT / 'ultra-example.yaml'}, {OUT / 'ultra-strip.yaml'}, {OUT / 'ultra-telemetry.yaml'}, "
           f"{OUT / 'ultra-p4-telemetry.yaml'}, {OUT / 'ultra-diffpower.yaml'}, {OUT / 'ultra-p4-parlio.yaml'}, "
-          f"{OUT / 'ultra-p4-parlio-lights.yaml'}")
+          f"{OUT / 'ultra-p4-parlio-lights.yaml'}, {OUT / 'ultra-p4-parlio-ports.yaml'}")
 
 
 if __name__ == "__main__":

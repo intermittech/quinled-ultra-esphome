@@ -36,6 +36,7 @@ PIECES = {
          "void UltraFirmwareUpdate::session_done_(", "void UltraFirmwareUpdate::abort("],
     ),
     "hub_loop.inc": ("dig2analog_ultra.cpp", ["void UltraHub::loop("]),
+    "hub_line.inc": ("dig2analog_ultra.cpp", ["bool UltraHub::line_free_(", "bool UltraHub::line_out_("]),
     "hub_transmit.inc": ("dig2analog_ultra.cpp", ["void UltraHub::transmit_("]),
     "hub_power.inc": ("dig2analog_ultra.cpp", ["void UltraHub::power_cycle(", "void UltraHub::service_power_("]),
     "hub_start.inc": (
@@ -65,7 +66,8 @@ PIECES = {
     "hub_port.inc": (
         "dig2analog_ultra.cpp",
         ["void UltraHub::attach_port_(", "void UltraHub::send_power_off_notice(", "void UltraHub::pump_notice_(",
-         "bool UltraHub::boards_powered_(", "bool UltraHub::has_power_supply(", "void UltraHub::power_cycle("],
+         "void UltraHub::service_notice_(", "bool UltraHub::boards_powered_(", "bool UltraHub::has_power_supply(",
+         "void UltraHub::power_cycle("],
     ),
     "receiver_methods.inc": (
         "ultra_receiver.cpp",

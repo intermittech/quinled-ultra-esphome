@@ -8,6 +8,8 @@ namespace hub_lanes {
 #define USE_DIG2ANALOG_ULTRA_TELEMETRY
 #define USE_DIG2ANALOG_ULTRA_PARLIO
 #define USE_DIG2ANALOG_ULTRA_UPDATE
+#define USE_DIFFPOWER
+using namespace ::esphome::diffpower;
 static constexpr int ESP_OK = 0;
 using esp_err_t = int;
 static constexpr esp_err_t ESP_ERR_TIMEOUT = 0x107;
@@ -40,6 +42,7 @@ struct Pin {
     this->level = v;
     this->log.emplace_back(clock_us, v);
   }
+  bool digital_read() const { return this->level; }
   void reset(bool v) {
     this->level = v;
     this->log.assign(1, {INT64_MIN, v});
@@ -88,6 +91,83 @@ static Rmt rmts[8];
 static esp_err_t rmt_tx_wait_all_done(int ch, int) { return rmts[ch].busy ? -1 : ESP_OK; }
 static esp_err_t rmt_transmit(int ch, int, const uint8_t *data, size_t n, const rmt_transmit_config_t *);
 
+// ---- a Diff-Power port (components/diffpower): its loop(), apply_() and shutdown_all() (build/parlio/<variant>/port.inc,
+// cut unchanged) on the real PortCore; its enable and detect pins, the hub's callbacks; no entities, no storage.
+/// the test's time inside the port's shutdown (its delay()): the stream plays on, the wire is decoded
+static std::function<void(int64_t)> advance_us;
+static void delay(uint32_t ms) { advance_us(static_cast<int64_t>(ms) * 1000); }
+struct AppStub {
+  void feed_wdt() {}
+};
+static AppStub App;
+struct PrefsStub {
+  bool sync() { return true; }
+};
+static PrefsStub prefs_stub;
+static PrefsStub *const global_preferences = &prefs_stub;
+static constexpr uint32_t MINUTE_MS = 60000;
+static constexpr uint32_t SAVE_STANDBY_S = 600;
+static constexpr uint32_t SHUTDOWN_MAX_MS = 1100;
+static const uint32_t RESEND_MS[] = {300, 1000};
+
+/// a light of the line, as its port sees it (UltraLight: its turn-off period, lit)
+struct TestLight {
+  bool lit{false};
+  uint32_t get_standby_after() const { return 1000; }
+  bool is_lit(uint32_t) const { return this->lit; }
+  void *get_state() const { return nullptr; }
+};
+
+struct DiffPowerPort {
+  struct LoadRef {
+    std::function<bool(uint32_t)> lit;
+    void *light;
+    bool resend;
+  };
+  template<typename... A> struct Callbacks {
+    std::vector<std::function<void(A...)>> f;
+    void call(A... a) {
+      for (auto &x : this->f)
+        x(a...);
+    }
+    size_t size() const { return this->f.size(); }
+  };
+  // the component's (port.inc)
+  void loop();
+  void apply_(uint8_t ev, uint32_t now);
+  static void shutdown_all();
+  // as diffpower.h
+  void add_load(uint32_t hold_ms, std::function<bool(uint32_t)> &&lit, void *light = nullptr, bool resend = false) {
+    this->core_.add_load(hold_ms);
+    this->loads_.push_back(LoadRef{std::move(lit), light, resend});
+  }
+  bool is_ready() const { return this->core_.ready(); }
+  void add_on_ready_callback(std::function<void()> &&cb) { this->ready_cb_.f.push_back(std::move(cb)); }
+  void add_on_notice_callback(std::function<void(uint8_t)> &&cb) { this->notice_cb_.f.push_back(std::move(cb)); }
+  void add_on_pump_callback(std::function<void()> &&cb) { this->pump_cb_.f.push_back(std::move(cb)); }
+  void notice_sent() { this->core_.notice_sent(millis()); }
+  void power_cycle() { this->apply_(this->core_.power_cycle(millis()), millis()); }
+  uint32_t power_cycle_ms() const { return this->core_.power_cycle_ms(); }
+  // stand-ins
+  void update_dark_(uint32_t) {}
+  void save_stats_() {}
+  void publish_() {}
+  void resend_() {}
+  void set_timeout(uint32_t, std::function<void()> &&) {}
+  PortCore core_;
+  Pin *enable_pin_{nullptr}, *detect_pin_{nullptr};
+  const char *name_{"Port 1"};
+  std::vector<LoadRef> loads_;
+  Callbacks<> ready_cb_, pump_cb_;
+  Callbacks<uint8_t> notice_cb_;
+  uint32_t minute_ms_{0}, saved_standby_s_{0}, saved_cycles_{0}, saved_drops_{0};
+  static std::vector<DiffPowerPort *> ports_;
+  static bool shut_down_;
+};
+std::vector<DiffPowerPort *> DiffPowerPort::ports_;
+bool DiffPowerPort::shut_down_{false};
+#include "port.inc"
+
 struct UltraHub {
   enum UpdateResult : uint8_t { UPD_NONE = 0, UPD_DONE, UPD_ABORTED, UPD_FAILED };
   enum UpdateState : uint8_t { UPD_IDLE = 0, UPD_RUNNING, UPD_FINISHED };
@@ -105,6 +185,16 @@ struct UltraHub {
   int64_t command_lead_us_() const;
   int64_t start_time_us(uint16_t board);
   bool start_update(const uint8_t *image, size_t size, const UpdateSession::Options &opt);   // (hub_update_start.inc)
+  void resync(bool power_on = false);   // (hub_port.inc)
+  bool boards_powered_() const;
+  bool line_free_();
+  bool line_out_();
+  bool rx_settling(uint16_t receiver) const;
+  void attach_port_();
+  void send_power_off_notice(uint8_t copy);
+  void pump_notice_();
+  void service_notice_();
+  bool port_standby() const { return this->port_ != nullptr && !this->port_->is_ready(); }
   static int64_t now_us_() { return clock_us; }
   // stand-ins
   struct {
@@ -112,8 +202,9 @@ struct UltraHub {
   } high_freq_;
   void service_calibration_() {}
   void wake_() {}
-  void resync() { this->preamble_ = 3; }
-  bool boards_powered_() const { return true; }
+  void arm_ping_burst_() {}
+  uint32_t update_frame_us() const { return 500; }
+  int64_t stream_lead_us_() const { return this->start_delay_us_ >= 0 ? this->start_delay_us_ : this->lead_us(1); }
   bool status_has_warning() const { return this->warning_; }
   void status_set_warning() { this->warning_ = true; }
   void status_clear_warning() { this->warning_ = false; }
@@ -126,6 +217,7 @@ struct UltraHub {
   uint16_t preamble_{0};
   bool preamble_full_{true}, tx_preamble_end_{false}, synced_once_{false};
   uint8_t switch_frame_{ULTRA_SWITCH_WS_FRAMES};
+  uint32_t switch_frame_us_{0};
   Scheduler sched_;
   uint16_t num_boards_{2};
   std::vector<uint8_t> buf_;
@@ -179,7 +271,20 @@ struct UltraHub {
   bool rw_open_{false};
   int64_t rw_t0_us_{0}, rw_end_us_{0}, rw_read_us_{0};
   bool rw_powered_{true};
+  bool rw_lock_end_{false};
+  static constexpr uint8_t RX_WOKE = 1, RX_WARNED = 2, RX_SETTLING = 4;
+  std::vector<uint8_t> rx_note_;
+  uint32_t woke_ms_{0};
   uint32_t rw_late_{0}, rw_extra_us_{0};
+  // the Diff-Power port
+  DiffPowerPort *port_{nullptr};
+  bool port_attached_{false};
+  uint32_t notices_{0};
+  int64_t notice_at_us_{0};
+  std::vector<TestLight *> lights_;
+  bool cal_power_hold_{false}, upd_power_hold_{false};
+  enum PowerCycle : uint8_t { CYCLE_NONE = 0, CYCLE_WAIT_OFF, CYCLE_OFF, CYCLE_DONE, CYCLE_FAILED };
+  PowerCycle cycle_{CYCLE_NONE};
   rmt_symbol_word_t reset_symbol_{}, rw_reset_symbol_{};
   struct {
     std::vector<std::function<void(uint16_t, uint32_t)>> f;
@@ -248,6 +353,7 @@ static constexpr uint32_t RW_WAIT_STALE_MS = 100;
 #include "hub_rw.inc"
 #include "hub_start.inc"
 #include "hub_update_start.inc"
+#include "hub_port.inc"
 
 /// The receivers of a line answer an RW frame's POLLs (a STATUS whose voltage and chip ids are the line's own,
 /// IDENTITY without optional pages, the rest unsupported; power: with power events, POWER and OUTPUTS answered): the
@@ -829,9 +935,200 @@ static void test_group_cadence() {
   UltraHub::hubs_.clear();
 }
 
+
+/// A line on a Diff-Power port, on a lane: the port's logic (components/diffpower) and the hub's side of it, unchanged,
+/// on the modelled stream; the receivers answer only while the port is powered. A lane has no RMT channel: asking it
+/// never says done. Through a wake, a planned power-off, a wake again and the controller's shutdown:
+///  - after each wake the preamble comes first (the first frame posted after it is DARK), and the first poll frame
+///    starts on the wire no sooner than ULTRA_RW_LOCK_MS after the preamble's last frame ended; the receivers answer;
+///  - no poll frame from the notice's first copy until the port is powered again;
+///  - each power-off: 3 notice copies (IDENTIFY POWER_OFF to every board), at least 50 ms apart from their starts on
+///    the wire, every copy out before the enable drops, the enable at least 100 ms after the third copy's start (as
+///    on an RMT line, where a copy starts as it is handed over);
+///  - the shutdown hook: the same 3 copies through the stream while the loop no longer runs, the enable low after.
+static void test_port_on_lane(uint32_t chunk_groups, const char *what) {
+  set_clock(400000000);
+  UltraHub::hubs_.clear();
+  DiffPowerPort::ports_.clear();
+  DiffPowerPort::shut_down_ = false;
+  tel = Telemetry();
+  static Stream bus;
+  renew(bus);
+  const Grid g = default_grid(16);
+  bus.init(g, 16, chunk_groups, 16, 0, clock_us * 1000 + 777);
+  const uint32_t sample_ns = g.sample_ns, P = g.period, group_ns = 8 * P * sample_ns;
+  const uint32_t reset_ns = (300000 + group_ns - 1) / group_ns * group_ns;
+  static UltraHub hub;
+  static Uart uart;
+  static Pin dir, enable, detect;
+  static TestLight light;
+  static DiffPowerPort port;
+  renew(hub);
+  renew(port);
+  uart = Uart();
+  light = TestLight();
+  enable.reset(false);
+  detect.reset(true);
+  PortConfig pc = port.core_.config();
+  pc.min_on_ms = 2000;
+  port.core_.configure(pc);
+  port.enable_pin_ = &enable;
+  port.detect_pin_ = &detect;
+  DiffPowerPort::ports_.push_back(&port);
+  TelemetryIntervals iv;
+  iv.status_ms = 1000;
+  hub.start(bus.s.lane(0), g.lane[0].h0 * sample_ns, (P - g.lane[0].h0) * sample_ns, g.lane[0].h1 * sample_ns,
+            (P - g.lane[0].h1) * sample_ns, reset_ns, &uart, &dir, nullptr, 600, 2, ULTRA_RW_RATE_1M, iv);
+  hub.port_ = &port;
+  hub.lights_.push_back(&light);
+  hub.channel_ = 7;          // (a lane has no RMT channel: it never says done)
+  rmts[7] = Rmt();
+  rmts[7].busy = true;
+  tel.uarts[0] = &uart;
+  tel.uart_of[0] = 0;
+  tel.dir[0] = &dir;
+
+  struct Seen {
+    int64_t start_us, end_us;
+    bool rw, dark, notice;
+  };
+  std::vector<Seen> seen;
+  Decoder dec;
+  size_t decoded = 0;
+  std::vector<std::pair<int64_t, uint8_t>> states{{clock_us, port.core_.state()}};
+  auto step = [&](int64_t until_us, bool loops) {
+    while (clock_us < until_us) {
+      const int64_t next = std::min(until_us, clock_us + 50);
+      bus.run_until(next * 1000);
+      set_clock(next);
+      for (size_t s = std::max<size_t>(decoded, 1); s < bus.wire.size(); s++) {
+        if ((bus.wire[s] ^ bus.wire[s - 1]) & 1u)
+          dec.edge(bus.level(0, s), static_cast<int64_t>(s), sample_ns);
+      }
+      decoded = bus.wire.size();
+      while (dec.end(static_cast<int64_t>(decoded), sample_ns)) {
+        const Decoder::Frame &f = dec.frames.back();
+        if (!valid_ultra(f.bytes) || f.bytes.size() != hub.sched_.frame_bytes())
+          continue;
+        Seen x{bus.time_of(f.start) / 1000, bus.time_of(f.t0) / 1000, false, true, false};
+        x.rw = (ultra_header_flags(f.bytes.data() + hub.sched_.header_offset()) & ULTRA_HDR_RW) != 0;
+        for (uint16_t b = 0; b < 2; b++) {
+          const uint8_t *sl = f.bytes.data() + ULTRA_SLOT_BYTES * b;
+          bool zero = true;
+          for (uint32_t i = 0; i < ULTRA_SLOT_BYTES; i++)
+            zero &= sl[i] == 0;
+          x.dark &= zero;
+          x.notice |= sl[0] == ULTRA_IDENTIFY && sl[ULTRA_PAYLOAD] == ULTRA_IDENT_POWER_OFF;
+        }
+        seen.push_back(x);
+        if (x.rw)
+          tel.rw_frame(0, x.end_us, f.bytes);
+      }
+      tel.on[0] = port.core_.state() == PS_ON || port.core_.state() == PS_NOTICE;
+      tel.tick();
+      if (loops) {
+        hub.loop();
+        if (clock_us % 1000 < 50)
+          port.loop();   // (ESPHome's loop, once a ms here)
+      }
+      if (port.core_.state() != states.back().second)
+        states.emplace_back(clock_us, port.core_.state());
+    }
+  };
+  advance_us = [&](int64_t us) { step(clock_us + us, false); };
+
+  std::vector<int64_t> on_at, notice_at, drop_at;   // the port powered; the episodes' first copy; the enable low
+  light.lit = true;
+  step(clock_us + 6000000, true);
+  const bool on1 = port.is_ready() && hub.poller_.answering(0) && hub.poller_.answering(1);
+  light.lit = false;
+  step(clock_us + 4000000, true);
+  const bool standby = port.core_.state() == PS_STANDBY && !enable.level;
+  light.lit = true;
+  step(clock_us + 6000000, true);
+  const bool on2 = port.is_ready() && hub.poller_.answering(0) && hub.poller_.answering(1);
+  const int64_t t_sd = clock_us;
+  DiffPowerPort::shutdown_all();
+  const int64_t sd_ms = (clock_us - t_sd) / 1000;
+  step(clock_us + 200000, false);   // (what was posted: out on the wire)
+  CHECK(on1 && standby && on2 && !enable.level && sd_ms < 1100, "%s: a line on a port, on a lane: powered, answering "
+        "(%d), standby (%d), powered again, answering (%d), the shutdown's enable low (%d) after %lld ms (%u windows, "
+        "%u answers, %u stale, %d let go late)", what, on1, standby, on2, !enable.level, static_cast<long long>(sd_ms),
+        hub.poller_.stats().windows, hub.poller_.stats().answers, hub.poller_.stats().stale, tel.late);
+
+  for (const auto &e : states) {
+    if (e.second == PS_ON)
+      on_at.push_back(e.first);
+  }
+  for (const auto &e : enable.log) {
+    if (e.first != INT64_MIN && !e.second)
+      drop_at.push_back(e.first);
+  }
+  // the wakes: preamble first, then the lock interval from its last frame's end before a poll frame
+  bool preamble_first = on_at.size() == 2, lock_ok = true, rw_after = true;
+  for (int64_t on : on_at) {
+    const Seen *first = nullptr;
+    int64_t last_dark_end = 0;
+    for (const Seen &x : seen) {
+      if (x.start_us < on + hub.lane_lead_us_)
+        continue;
+      if (first == nullptr)
+        first = &x;
+      if (!x.dark)
+        break;
+      last_dark_end = x.end_us;
+    }
+    preamble_first &= first != nullptr && first->dark;
+    const Seen *rw = nullptr;
+    for (const Seen &x : seen) {
+      if (x.rw && x.start_us >= on) {
+        rw = &x;
+        break;
+      }
+    }
+    rw_after &= rw != nullptr;
+    lock_ok &= rw != nullptr && rw->start_us >= last_dark_end + static_cast<int64_t>(ULTRA_RW_LOCK_MS) * 1000;
+  }
+  CHECK(preamble_first && rw_after && lock_ok, "%s: after each wake the preamble first, poll frames again, the first "
+        "no sooner than the lock interval after the preamble's end", what);
+  // the power-offs: the planned one and the shutdown's
+  bool copies_ok = drop_at.size() == 2, quiet = true;
+  int64_t least_gap = INT64_MAX, least_tail = INT64_MAX;
+  for (size_t k = 0; k < drop_at.size(); k++) {
+    const int64_t from = k == 0 ? on_at[0] : on_at.size() > 1 ? on_at[1] : 0;
+    std::vector<const Seen *> c;
+    for (const Seen &x : seen) {
+      if (x.notice && x.start_us >= from)
+        c.push_back(&x);
+      if (c.size() == 3)
+        break;
+    }
+    if (c.size() != 3) {
+      copies_ok = false;
+      continue;
+    }
+    least_gap = std::min({least_gap, c[1]->start_us - c[0]->start_us, c[2]->start_us - c[1]->start_us});
+    least_tail = std::min(least_tail, drop_at[k] - c[2]->start_us);
+    copies_ok &= c[2]->end_us < drop_at[k];
+    const int64_t until = k == 0 && on_at.size() > 1 ? on_at[1] + static_cast<int64_t>(ULTRA_RW_LOCK_MS) * 1000 : INT64_MAX;
+    for (const Seen &x : seen)
+      quiet &= !(x.rw && x.start_us >= c[0]->start_us && x.start_us < until);
+  }
+  CHECK(copies_ok && least_gap >= 50000 && least_tail >= 99000 && quiet, "%s: each power-off (planned, shutdown): 3 "
+        "notice copies at least %.1f ms apart on the wire, all out before the enable drops, it %.1f ms after the third "
+        "one's start at least; no poll frame from the first copy until powered again", what, least_gap / 1000.0,
+        least_tail / 1000.0);
+  std::printf("  a line on a Diff-Power port, on a lane (%s): preamble after each wake, polls after the lock interval, "
+              "notice copies >= %.1f ms apart, the enable %.1f ms after the third, the shutdown in %lld ms\n", what,
+              least_gap / 1000.0, least_tail / 1000.0, static_cast<long long>(sd_ms));
+  UltraHub::hubs_.clear();
+  DiffPowerPort::ports_.clear();
+}
+
 #undef USE_DIG2ANALOG_ULTRA_TELEMETRY
 #undef USE_DIG2ANALOG_ULTRA_PARLIO
 #undef USE_DIG2ANALOG_ULTRA_UPDATE
+#undef USE_DIFFPOWER
 
 }  // namespace hub_lanes
 

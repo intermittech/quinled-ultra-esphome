@@ -447,8 +447,10 @@ class UltraHub final : public Component {
   diffpower::DiffPowerPort *port_{nullptr};
   bool port_attached_{false};           // its loads registered (the first loop: the lights have their states)
   uint32_t notices_{0};
+  int64_t notice_at_us_{0};             // a lane's notice copy starts on the wire then: the port is told (0: none)
   void attach_port_();
   void pump_notice_();
+  void service_notice_();
 #endif
   bool cal_on_boot_{false};
   bool cal_boot_done_{false};
@@ -480,6 +482,10 @@ class UltraHub final : public Component {
   uint32_t build_peak_us_{0};   // the longest frame build since take_diagnostics()
   rmt_channel_handle_t channel_{nullptr};
   rmt_encoder_handle_t encoder_{nullptr};
+  /// The line takes the next frame now (the RMT is done, or the lane's mailbox is empty and its stream runs).
+  bool line_free_();
+  /// The line's last frame and its reset are out on the wire.
+  bool line_out_();
 #ifdef USE_DIG2ANALOG_ULTRA_PARLIO
   // a PARLIO lane instead of the RMT: frames are posted to the bus' stream a few ms ahead (ultra_parlio.h)
   ParlioLane *lane_{nullptr};

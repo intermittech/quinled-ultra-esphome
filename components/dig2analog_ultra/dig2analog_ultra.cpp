@@ -422,6 +422,7 @@ bool UltraHub::rw_due_(bool urgent) {
   // the receivers have no supply: unavailable until they answer again; on a Diff-Power port in standby they show
   // Standby, and once it is powered their status follows their answers again: every receiver's sensors both times
   if (!this->boards_powered_()) {
+    this->rw_waiting_ = false;   // (not waiting for the UART)
     if (this->rw_powered_) {
       this->rw_powered_ = false;
       this->poller_.unpowered();
@@ -444,7 +445,7 @@ bool UltraHub::rw_due_(bool urgent) {
   }
   // the lock interval from the last lock frame's end (it was set when the frame was built)
   if (this->rw_lock_end_) {
-    if (rmt_tx_wait_all_done(this->channel_, 0) != ESP_OK)
+    if (!this->line_out_())
       return false;
     this->poller_.locked(millis());
     this->rw_lock_end_ = false;
@@ -964,6 +965,7 @@ void UltraHub::attach_port_() {
   this->port_->add_on_ready_callback([this]() {
     ESP_LOGD(TAG, "GPIO%u: the port is powered, replaying the boards' state", this->pin_);
     this->sched_.cancel_power_off();   // (a notice copy not sent before the power-off: stale now)
+    this->notice_at_us_ = 0;
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
     if (this->cycle_ == CYCLE_OFF)
       this->cycle_ = CYCLE_DONE;   // (a recovery's power cycle: powered again)
@@ -994,6 +996,7 @@ void UltraHub::send_power_off_notice(uint8_t copy) {
 // at the next call (no waiting here: the port serves every line in turn). A response window ends first; an update
 // session owns the line: nothing.
 void UltraHub::pump_notice_() {
+  this->service_notice_();
   if (this->is_failed() || this->sched_.power_off_left() == 0)
     return;
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
@@ -1008,8 +1011,17 @@ void UltraHub::pump_notice_() {
   }
   this->rw_next_ = false;
 #endif
-  if (rmt_tx_wait_all_done(this->channel_, 0) == ESP_OK)
+  if (this->line_free_())
     this->transmit_();
+}
+
+// A lane's frame goes out a few ms after it was posted: its notice copy counts as sent (the port times the next copy
+// and the power-off from it) once it starts on the wire, as on the RMT, where it starts at once.
+void UltraHub::service_notice_() {
+  if (this->notice_at_us_ != 0 && now_us_() >= this->notice_at_us_) {
+    this->notice_at_us_ = 0;
+    this->port_->notice_sent();
+  }
 }
 #endif
 
@@ -1017,6 +1029,7 @@ void UltraHub::loop() {
 #ifdef USE_DIFFPOWER
   if (this->port_ != nullptr && !this->port_attached_)
     this->attach_port_();
+  this->service_notice_();
 #endif
   this->service_calibration_();
 #ifdef USE_POWER_SUPPLY
@@ -1087,14 +1100,8 @@ void UltraHub::loop() {
     return;
   // Non-blocking: if the previous frame (incl. its reset) is still on the wire, retry next loop. A lane: the renderer
   // hasn't taken the posted frame yet (it is a few ms ahead of the wire).
-#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
-  if (this->lane_ != nullptr ? !this->lane_->ready() || this->lane_->busy()
-                             : rmt_tx_wait_all_done(this->channel_, 0) != ESP_OK)
+  if (!this->line_free_())
     return;
-#else
-  if (rmt_tx_wait_all_done(this->channel_, 0) != ESP_OK)
-    return;
-#endif
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
   if (this->upd_resync_pending_ && !this->tx_prepared_ && this->preamble_ == 0 && !ping_pending) {
     this->upd_resync_pending_ = false;   // the PING burst and its dark tail are on the wire
@@ -1223,8 +1230,14 @@ void UltraHub::transmit_() {
 #endif
   this->tx_prepared_ = false;
 #ifdef USE_DIFFPOWER
-  if (this->sched_.take_power_off_sent() && this->port_ != nullptr)
-    this->port_->notice_sent();   // (its next copy 50 ms from now)
+  if (this->sched_.take_power_off_sent() && this->port_ != nullptr) {
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+    if (this->lane_ != nullptr)
+      this->notice_at_us_ = start;   // (on the wire from its start: then the port is told, service_notice_())
+    else
+#endif
+      this->port_->notice_sent();   // (its next copy 50 ms from now)
+  }
 #endif
   if (this->tx_preamble_end_ && this->boards_powered_())
     this->synced_once_ = true;
@@ -1232,6 +1245,22 @@ void UltraHub::transmit_() {
   this->last_frame_ms_ = millis();
   this->has_sent_ = true;
   this->frames_++;
+}
+
+bool UltraHub::line_free_() {
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+  if (this->lane_ != nullptr)
+    return this->lane_->ready() && !this->lane_->busy();
+#endif
+  return rmt_tx_wait_all_done(this->channel_, 0) == ESP_OK;
+}
+
+bool UltraHub::line_out_() {
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+  if (this->lane_ != nullptr)
+    return now_us_() >= this->lane_->end_us();   // (its frame and its reset: the lane's quiet after it)
+#endif
+  return rmt_tx_wait_all_done(this->channel_, 0) == ESP_OK;
 }
 
 #ifdef USE_DIG2ANALOG_ULTRA_PARLIO

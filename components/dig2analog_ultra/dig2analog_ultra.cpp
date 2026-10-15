@@ -1082,9 +1082,10 @@ void UltraHub::ledger_save_(bool now) {
   if (!g_ledger_loaded || (!l.dirty() && !now))
     return;
   if (l.dirty()) {
-    // the next generation into the other copy, its size after it, on the flash now; clean only once it is there (a
-    // failed write stays dirty: the next save, periodic or forced, writes it again; so does one without the memory
-    // for its stored form)
+    // the next generation into the copy not in use: its blob on the flash first, its size only then (a size never
+    // names a blob that isn't there), the copy in use whole throughout. Clean, and that generation the one in use,
+    // once both are there; a failure stays dirty and the next save, periodic or forced, writes the same copy again
+    // (so does one without the memory for its stored form)
     const size_t n = l.blob_size();
     std::unique_ptr<uint8_t[]> blob(new (std::nothrow) uint8_t[n]);
     if (!blob) {
@@ -1092,13 +1093,14 @@ void UltraHub::ledger_save_(bool now) {
       g_ledger_saved_ms = millis();
       return;
     }
-    g_ledger_generation++;
-    l.save(blob.get(), g_ledger_generation);
+    const uint32_t gen = g_ledger_generation + 1;
+    l.save(blob.get(), gen);
     const uint32_t size = static_cast<uint32_t>(n);
-    bool ok = g_ledger_pref[g_ledger_generation & 1].save(blob.get(), n);
-    ok = g_ledger_size[g_ledger_generation & 1].save(reinterpret_cast<const uint8_t *>(&size), sizeof(size)) && ok;
-    ok = global_preferences->sync() && ok;
+    bool ok = g_ledger_pref[gen & 1].save(blob.get(), n) && global_preferences->sync();
+    ok = ok && g_ledger_size[gen & 1].save(reinterpret_cast<const uint8_t *>(&size), sizeof(size)) &&
+         global_preferences->sync();
     if (ok) {
+      g_ledger_generation = gen;
       l.clear_dirty();
     } else {
       ESP_LOGW(TAG, "Lifetime ledger: storing it failed; again at the next save");

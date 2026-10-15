@@ -3114,7 +3114,8 @@ static std::map<uint32_t, std::vector<uint8_t>> stored, pending;
 static std::vector<uint32_t> order;
 static int saves = 0;
 static bool fail_sync = false;
-static int cut_after = -1;   // sync() writes this many queued saves, then the power goes
+static int cut_after = -1;   // this many more writes (across syncs), then the power goes
+static bool fail_blobs = false;   // a blob's write fails (no room); the 4-byte size records still go
 struct ESPPreferenceObject {
   uint32_t key{0};
   bool load(uint8_t *out, size_t size) {
@@ -3135,17 +3136,21 @@ struct ESPPreferenceObject {
 };
 struct Preferences {
   ESPPreferenceObject make_preference(size_t, uint32_t key, bool) { return ESPPreferenceObject{key}; }
-  bool sync() {
-    int n = 0;
+  bool sync() {   // (ESPHome's: every queued key in turn, on past a failed one; false if any failed)
+    bool ok = !fail_sync;
     for (uint32_t k : order) {
-      if (cut_after >= 0 && n++ >= cut_after)
+      if (cut_after == 0)
         break;
-      if (!fail_sync)
+      if (cut_after > 0)
+        cut_after--;
+      if (fail_blobs && pending[k].size() > 4)
+        ok = false;
+      else if (!fail_sync)
         stored[k] = pending[k];
     }
     pending.clear();
     order.clear();
-    return !fail_sync;
+    return ok;
   }
 };
 static Preferences prefs;
@@ -3294,6 +3299,53 @@ static void test_ledger_flush_failure() {
         "no memory for the stored form: nothing written, still dirty (%d); the next save writes it (%d)", waited,
         ultra_ledger().find(uid3) != nullptr);
   std::printf("  ledger store: a failed flush written again (forced and periodic), a save without memory too\n");
+}
+
+/// Design review, round 9: a resize whose blob writes fail (no room) while the size records would go: two valid
+/// copies, then 21 -> 22 receivers (3,506 -> 5,938 B) and two failed saves. The copy in use stays whole and readable
+/// (its generation and its board), the failed one never gets the new size; the next save that works writes it.
+static void test_ledger_resize_failures() {
+  UltraHub h;
+  uint8_t uid[12] = {0x46};
+  bool made = false;
+  stored.clear();
+  reboot(21);
+  h.ledger_service_();
+  LedgerEntry *e = ultra_ledger().touch(uid, &made);
+  ultra_ledger().add_energy(*e, 150000);
+  h.ledger_save_(true);
+  ultra_ledger().add_power_up(*e);
+  h.ledger_save_(true);   // (two valid copies: generation 2 in use)
+  reboot(22);
+  h.ledger_service_();
+  e = ultra_ledger().find(uid);
+  if (e == nullptr) {
+    CHECK(false, "resize failures: the stored ledger before them loads");
+    return;
+  }
+  ultra_ledger().add_power_up(*e);
+  fail_blobs = true;
+  h.ledger_save_(true);
+  h.ledger_save_(true);   // (both fail: the same copy tried again)
+  fail_blobs = false;
+  const bool dirty = ultra_ledger().dirty();
+  reboot(22);
+  h.ledger_service_();
+  e = ultra_ledger().find(uid);
+  const uint32_t gen = g_ledger_generation;
+  CHECK(dirty && e != nullptr && gen == 2,
+        "two failed blob writes of a resize: still dirty (%d), the copy in use loads (board %d, generation %u)", dirty,
+        e != nullptr, gen);
+  if (e == nullptr)
+    return;
+  ultra_ledger().add_power_up(*e);
+  h.ledger_save_(true);
+  reboot(22);
+  h.ledger_service_();
+  e = ultra_ledger().find(uid);
+  CHECK(e != nullptr && g_ledger_generation == 3 && e->c.ups == 2,
+        "then a save that works: the new size, generation %u (power-ups %u)", g_ledger_generation, e ? e->c.ups : 0);
+  std::printf("  ledger store: a resize whose blob writes fail keeps the copy in use whole\n");
 }
 }  // namespace ledger_store
 
@@ -3716,6 +3768,7 @@ int main() {
   update_retry::test_auto_retry();
   ledger_store::test_ledger_resize();
   ledger_store::test_ledger_flush_failure();
+  ledger_store::test_ledger_resize_failures();
   ledger_line::test_ledger_line();
   port_power::test_port();
   port_power::test_port_prepare();

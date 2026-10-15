@@ -440,10 +440,12 @@ inline LifetimeLedger &ultra_ledger() {
 /// Energy: each ENERGY reading adds the board's use since the one before (its count since power-up, which a sync
 /// never moves), never below its own lifetime. The readings wait for the next STATUS: its uptime dates a power-up, so
 /// a reading of the new one starts its count and one of the old one goes on (whatever order the pages came in); the
-/// 32-bit count may wrap within a power-up. A power-up's first reading: all its count is new when the board came on
-/// after the hub did (a restart, a cut of both, a board moved here); when the board was on before the hub (the ESP32
-/// restarted under it) or its entry was just made from its lifetime (first contact), only what comes after it. A
-/// power-off alone never counts as a restart (a supply that stayed on: its use isn't counted twice).
+/// 32-bit count may wrap within a power-up. A session's first reading at a position (after a power-up, the ESP32's
+/// restart, another board here): the board's session checkpoint in the ledger decides, by its UID wherever it was
+/// read last (its power-ups count, else its uptime): the same session goes on from the count it was last counted at
+/// (the ESP32 restarted under it, a powered board moved or back), a new one counts all of it, a board whose entry was
+/// just made from its lifetime (first contact) only what comes after. A power-off alone never counts as a restart (a
+/// supply that stayed on: its use isn't counted twice).
 class LedgerKeeper {
  public:
   /// what on_updates() saw (the hub logs it)

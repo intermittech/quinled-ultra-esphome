@@ -1855,6 +1855,69 @@ static void test_r9_restart_with_lead() {
         h.k.energy_wh(0));
 }
 
+/// Review r9 F4: a powered, known board moved to another slot (or back after another board was there) counts only
+/// what it used since it was last read: its count since power-up follows its UID in the ledger, not the slot. GPT's
+/// RETURN_KNOWN_BOARD and MOVED_LIVE_SLOTS probes.
+static void test_r9_moved_live_board() {
+  {
+    Chain c(1);
+    ledger_board(c.rx[0]);
+    c.rx[0].uptime = 0;
+    c.rx[0].boot_mwh = 0;
+    c.rx[0].total_wh = 100;
+    LifetimeLedger l;
+    l.init(8, 4);
+    LedgerHub h;
+    HaView ha;
+    start_hub(h, c, l);
+    drive(c, h, ha, 20000);
+    c.rx[0].use(10000);
+    drive(c, h, ha, 5000);
+    const Model a = c.rx[0];
+    const uint64_t before = l.find(a.uid)->c.mwh;
+    Model b = a;
+    b.uid[0] ^= 0x80;
+    b.total_wh = 200;
+    b.boot_mwh = 0;
+    b.uptime = 0;
+    c.rx[0] = b;
+    drive(c, h, ha, 10000);
+    c.rx[0] = a;
+    c.rx[0].uptime += 10;   // (still powered; no more use)
+    drive(c, h, ha, 15000);
+    CHECK(l.find(a.uid)->c.mwh == before && ha.worst_back == 0,
+          "F4: a powered board back at its slot: %llu mWh (was %llu), not its session again",
+          ull(l.find(a.uid)->c.mwh), ull(before));
+  }
+  {
+    Chain c(2);
+    for (auto &m : c.rx) {
+      ledger_board(m);
+      m.uptime = 0;
+      m.boot_mwh = 0;
+      m.total_wh = 100;
+    }
+    LifetimeLedger l;
+    l.init(8, 4);
+    LedgerHub h;
+    HaView ha;
+    start_hub(h, c, l);
+    drive(c, h, ha, 20000);
+    c.rx[0].use(10000);
+    c.rx[1].use(20000);
+    drive(c, h, ha, 5000);
+    std::vector<uint8_t> u0(c.rx[0].uid, c.rx[0].uid + 12), u1(c.rx[1].uid, c.rx[1].uid + 12);
+    const uint64_t a = l.find(u0.data())->c.mwh, b = l.find(u1.data())->c.mwh;
+    std::swap(c.rx[0], c.rx[1]);
+    drive(c, h, ha, 15000);
+    c.rx[0].use(1000);   // (then the moved boards' own use counts)
+    drive(c, h, ha, 10000);
+    CHECK(l.find(u0.data())->c.mwh == a && l.find(u1.data())->c.mwh == b + 1000,
+          "F4: two powered boards swapped: %llu / %llu mWh (were %llu / %llu, +1000 after)",
+          ull(l.find(u0.data())->c.mwh), ull(l.find(u1.data())->c.mwh), ull(a), ull(b));
+  }
+}
+
 /// (0.2.6) DIAG 20 bit 7: the receiver's lifetime record held: a note after the Status detail, no problem
 static void test_record_held() {
   Chain c(1);
@@ -1910,6 +1973,7 @@ int main() {
   test_r9_load_replaces();
   test_r9_uid16_collision();
   test_r9_restart_with_lead();
+  test_r9_moved_live_board();
   test_record_held();
   test_status();
   test_port();

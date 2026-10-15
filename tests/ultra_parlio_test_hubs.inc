@@ -321,13 +321,7 @@ struct UltraHub {
   enum PowerCycle : uint8_t { CYCLE_NONE = 0, CYCLE_WAIT_OFF, CYCLE_OFF, CYCLE_DONE, CYCLE_FAILED };
   PowerCycle cycle_{CYCLE_NONE};
   rmt_symbol_word_t reset_symbol_{}, rw_reset_symbol_{};
-  struct {
-    std::vector<std::function<void(uint16_t, uint32_t)>> f;
-    void call(uint16_t a, uint32_t b) {
-      for (auto &x : this->f)
-        x(a, b);
-    }
-  } rw_callback_;
+  ReceiverListeners rx_listeners_;   // (ultra_telemetry.h's: per receiver)
   struct {
     int calls{0};
     void call() { this->calls++; }
@@ -380,7 +374,8 @@ struct UltraHub {
       this->rw_extra_us_ = this->poller_.max_window_us() + ULTRA_RW_HOLDOFF_US;
     }
     this->preamble_ = 3;   // the start-up preamble
-    this->rw_callback_.f.push_back([](uint16_t, uint32_t) {});
+    for (uint16_t r = 0; r < this->poller_.receivers(); r++)
+      this->rx_listeners_.add(r, [](uint32_t) {});
     hubs_.push_back(this);
   }
 };

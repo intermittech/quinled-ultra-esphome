@@ -20,6 +20,8 @@
 #include "../components/diffpower/diffpower_core.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -28,6 +30,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <random>
 #include <new>
 #include <set>
 #include <string>
@@ -1211,13 +1214,7 @@ struct UltraHub {
   bool line_out_();
   uint32_t rw_late_{0}, rw_extra_us_{0};
   rmt_symbol_word_t reset_symbol_{}, rw_reset_symbol_{};
-  struct {
-    std::vector<std::function<void(uint16_t, uint32_t)>> f;
-    void call(uint16_t a, uint32_t b) {
-      for (auto &x : this->f)
-        x(a, b);
-    }
-  } rw_callback_;
+  ReceiverListeners rx_listeners_;   // (ultra_telemetry.h's: per receiver)
   struct {
     int calls{0};
     void call() { this->calls++; }
@@ -1360,7 +1357,8 @@ static void test_telemetry_window() {
   rmt.hub = &h;
   h.start(&uart, &pin);
   std::vector<std::pair<uint16_t, uint32_t>> calls;
-  h.rw_callback_.f.push_back([&](uint16_t r, uint32_t u) { calls.push_back({r, u}); });
+  for (uint16_t r = 0; r < h.poller_.receivers(); r++)
+    h.rx_listeners_.add(r, [&calls, r](uint32_t u) { calls.push_back({r, u}); });
   run_us(h, uart, 3000000);
   // the preamble went out first, the first RW frame at least 1 s after its last frame's end (its header and reset)
   const int64_t last_dark =
@@ -1503,7 +1501,8 @@ static void test_several_lines() {
     hubs[k].pin_ = static_cast<uint8_t>(16 + k);
     rmts[k].hub = &hubs[k];
     hubs[k].start(&uarts[k], &pins[k]);
-    hubs[k].rw_callback_.f.push_back([&calls, k](uint16_t, uint32_t) { calls[k]++; });
+    for (uint16_t r = 0; r < hubs[k].poller_.receivers(); r++)
+      hubs[k].rx_listeners_.add(r, [&calls, k](uint32_t) { calls[k]++; });
   }
   int overlap = 0, rw_frames[N]{};
   auto run = [&](int64_t us) {
@@ -1676,10 +1675,12 @@ static void test_wake_settling() {
     run_us(h, uart, 1000000);
     receivers_on = answer;
     std::vector<uint32_t> after;
-    h.rw_callback_.f.push_back([&](uint16_t i, uint32_t u) {
-      if (h.powered && (u & TU_AVAILABILITY))
-        after.push_back(i);
-    });
+    for (uint16_t r = 0; r < h.poller_.receivers(); r++) {
+      h.rx_listeners_.add(r, [&h, &after, r](uint32_t u) {
+        if (h.powered && (u & TU_AVAILABILITY))
+          after.push_back(r);
+      });
+    }
     h.powered = true;   // its wake: the preamble again
     h.resync();
     run_us(h, uart, 50000);
@@ -1745,11 +1746,18 @@ static void test_lock_from_end() {
 // cut into build/lifecycle/receiver_*.inc) on stand-in sensors, fed by a real TelemetryPoller.
 namespace receiver_entities {
 
+static std::vector<std::string> *pub_log = nullptr;   // (the dispatch test: every publish, in order, by entity id)
+static void log_publish(int id, const std::string &v) {
+  if (pub_log != nullptr)
+    pub_log->push_back(std::to_string(id) + "=" + v + "@" + std::to_string(now_ms));
+}
+
 namespace sensor {
 struct Sensor {
   bool has{false};
   float state{NAN};
   int publishes{0};
+  int id{-1};
   std::vector<std::pair<uint32_t, float>> history;   // (when, what)
   bool has_state() const { return this->has; }
   float get_raw_state() const { return this->state; }
@@ -1758,6 +1766,9 @@ struct Sensor {
     this->has = true;
     this->publishes++;
     this->history.push_back({now_ms, v});
+    char b[24];
+    std::snprintf(b, sizeof(b), "%.9g", v);
+    log_publish(this->id, b);
   }
 };
 }  // namespace sensor
@@ -1766,18 +1777,24 @@ struct TextSensor {
   bool has{false};
   std::string state;
   int publishes{0};
+  int id{-1};
   bool has_state() const { return this->has; }
   void publish_state(const std::string &v) {
     this->state = v;
     this->has = true;
     this->publishes++;
+    log_publish(this->id, v);
   }
 };
 }  // namespace text_sensor
 namespace binary_sensor {
 struct BinarySensor {
   bool state{false};
-  void publish_state(bool v) { this->state = v; }
+  int id{-1};
+  void publish_state(bool v) {
+    this->state = v;
+    log_publish(this->id, v ? "on" : "off");
+  }
 };
 }  // namespace binary_sensor
 
@@ -1921,6 +1938,200 @@ static void answer(const uint8_t *s, uint16_t uid, const ReceiverData &model, ui
   ultra_put16(a + 30, ultra_crc16(a, 30));
   out.push_back(ULTRA_RSP_LEAD);
   out.insert(out.end(), a, a + 32);
+}
+
+// ------------------------------------------------------------------------------------------- the dispatch (round 9)
+/// The poller's per-receiver state from a test (its data, its answering), without the wire
+struct PokePoller : TelemetryPoller {
+  static ReceiverData &data(TelemetryPoller &p, uint16_t i) { return (p.*(&PokePoller::rx_))[i].d; }
+  static void answering(TelemetryPoller &p, uint16_t i, bool on) { (p.*(&PokePoller::rx_))[i].answering = on; }
+};
+
+/// Two copies of a line's entities (every receiver value and text, its Problem, a light's estimate) on one hub's data
+struct DispatchWorld {
+  explicit DispatchWorld(uint16_t n) : vals(n), texts(n), problems(n), rx(n), lpow(n), lenergy(n), lstatus(n), lport(n),
+                                       light(n) {}
+  std::vector<std::array<sensor::Sensor, UltraReceiver::VALUE_COUNT>> vals;
+  std::vector<std::array<text_sensor::TextSensor, UltraReceiver::TEXT_COUNT>> texts;
+  std::vector<binary_sensor::BinarySensor> problems;
+  std::vector<UltraReceiver> rx;
+  std::vector<sensor::Sensor> lpow, lenergy;
+  std::vector<text_sensor::TextSensor> lstatus, lport;
+  std::vector<UltraLightTelemetry> light;
+  std::vector<std::string> log;
+  uint64_t calls{0};
+  void attach(UltraHub &hub, uint32_t key_base) {
+    for (uint16_t k = 0; k < this->rx.size(); k++) {
+      UltraReceiver &r = this->rx[k];
+      r.hub_ = &hub;
+      r.board_ = k;
+      r.problem_ = &this->problems[k];
+      this->problems[k].id = 20000 + k;
+      for (int i = 0; i < UltraReceiver::VALUE_COUNT; i++) {
+        r.values_[i] = &this->vals[k][i];
+        this->vals[k][i].id = k * 100 + i;
+      }
+      for (int i = 0; i < UltraReceiver::TEXT_COUNT; i++) {
+        r.texts_[i] = &this->texts[k][i];
+        this->texts[k][i].id = 10000 + k * 100 + i;
+      }
+      UltraLightTelemetry &l = this->light[k];
+      l.hub_ = &hub;
+      l.board_ = k;
+      l.mask_ = 0x1F;
+      l.key_ = key_base + k;   // (each copy its own ledger counters: both start from 0)
+      l.power_ = &this->lpow[k];
+      l.energy_ = &this->lenergy[k];
+      l.status_ = &this->lstatus[k];
+      l.port_ = &this->lport[k];
+      this->lpow[k].id = 30000 + k;
+      this->lenergy[k].id = 40000 + k;
+      this->lstatus[k].id = 50000 + k;
+      this->lport[k].id = 60000 + k;
+    }
+  }
+};
+
+/// Design review, round 9: a receiver's news goes to its own listeners only (ReceiverListeners) instead of to every
+/// listener of the line, each filtering by its receiver (as before). Differential: n receivers with every entity and a
+/// light each, windows of up to 16 receivers' news (values, availability, restarts, random): both ways give the same
+/// publishes, in the same order, at the same moments. Also the listener calls a window and the host time a window,
+/// with the entities' work and with the dispatch alone.
+static void test_receiver_dispatch(uint16_t n, int windows) {
+  now_ms = 0;
+  UltraHub::ledger().init(256, 256);
+  UltraHub hub;
+  hub.p.init(n, ULTRA_RW_RATE_1M, TelemetryIntervals{});
+  PortMonitor::Config pcfg;
+  pcfg.supply_v = 51.0f;
+  hub.m.configure(pcfg);
+  auto old_w = std::make_unique<DispatchWorld>(n), new_w = std::make_unique<DispatchWorld>(n);
+  old_w->attach(hub, 0x01000000);
+  new_w->attach(hub, 0x02000000);
+  // before: every entity of the line for every receiver's news, filtering; now: ReceiverListeners. Added as ESPHome
+  // sets them up: the receivers, then the lights
+  std::vector<std::function<void(uint16_t, uint32_t)>> before;
+  ReceiverListeners now;
+  DispatchWorld &o = *old_w, &w = *new_w;
+  for (uint16_t k = 0; k < n; k++) {
+    before.push_back([&o, k](uint16_t receiver, uint32_t updates) {
+      o.calls++;
+      if (receiver == o.rx[k].board_)
+        o.rx[k].update_(updates);
+    });
+    now.add(k, [&w, k](uint32_t updates) {
+      w.calls++;
+      w.rx[k].update_(updates);
+    });
+  }
+  for (uint16_t k = 0; k < n; k++) {
+    before.push_back([&o, k](uint16_t receiver, uint32_t updates) {
+      o.calls++;
+      if (receiver == o.light[k].board_)
+        o.light[k].update_(updates);
+    });
+    now.add(k, [&w, k](uint32_t updates) {
+      w.calls++;
+      w.light[k].update_(updates);
+    });
+  }
+  std::mt19937 rng(77);
+  double t_before = 0, t_now = 0;
+  std::vector<std::pair<uint16_t, uint32_t>> news;
+  for (int win = 0; win < windows; win++) {
+    now_ms += 250;
+    news.clear();
+    const int count = 1 + static_cast<int>(rng() % std::min<uint32_t>(16, n));
+    std::vector<uint16_t> order(n);
+    for (uint16_t k = 0; k < n; k++)
+      order[k] = k;
+    std::shuffle(order.begin(), order.end(), rng);
+    order.resize(count);
+    std::sort(order.begin(), order.end());   // (rw_publish_: the receivers in turn)
+    for (uint16_t i : order) {
+      ReceiverData &d = PokePoller::data(hub.p, i);
+      d.have_identity = d.have_status = d.have_energy = true;
+      d.features = ULTRA_FEAT_ENERGY | ULTRA_FEAT_LIFETIME;
+      d.uptime_s += 1;
+      d.vbus_10mv = static_cast<uint16_t>(4800 + rng() % 400);
+      d.current_ma = static_cast<uint16_t>(rng() % 3000);
+      d.measured = ULTRA_ST_M_VBUS | ULTRA_ST_M_CURRENT;
+      d.mcu_temp = static_cast<uint16_t>(300 + rng() % 200);
+      d.power_state = static_cast<uint8_t>(rng() % 8 == 0 ? rng() % 4 : 0);
+      d.total_wh += rng() % 3;
+      d.boot_mwh += rng() % 500;
+      d.power_mw = rng() % 80000;
+      d.have_lifetime = true;
+      d.lt_power_ups += rng() % 64 == 0;
+      uint32_t u = (1u << TP_STATUS) | (rng() % 4 == 0 ? 1u << TP_ENERGY : 0u) |
+                   (rng() % 16 == 0 ? 1u << TP_LIFETIME : 0u);
+      if (rng() % 40 == 0) {
+        PokePoller::answering(hub.p, i, !hub.p.answering(i));
+        u |= TU_AVAILABILITY;
+      } else if (!hub.p.answering(i)) {
+        PokePoller::answering(hub.p, i, true);
+        u |= TU_AVAILABILITY;
+      }
+      if (rng() % 200 == 0) {
+        d.uptime_s = 0;
+        u |= TU_RESTART;
+      }
+      news.push_back({i, u});
+    }
+    pub_log = &o.log;
+    auto t0 = std::chrono::steady_clock::now();
+    for (const auto &nw : news)
+      for (auto &f : before)
+        f(nw.first, nw.second);
+    auto t1 = std::chrono::steady_clock::now();
+    pub_log = &w.log;
+    for (const auto &nw : news)
+      now.call(nw.first, nw.second);
+    auto t2 = std::chrono::steady_clock::now();
+    pub_log = nullptr;
+    t_before += std::chrono::duration<double, std::micro>(t1 - t0).count();
+    t_now += std::chrono::duration<double, std::micro>(t2 - t1).count();
+  }
+  size_t first_diff = o.log.size() == w.log.size() ? o.log.size() : std::min(o.log.size(), w.log.size());
+  for (size_t i = 0; i < std::min(o.log.size(), w.log.size()); i++) {
+    if (o.log[i] != w.log[i]) {
+      first_diff = i;
+      break;
+    }
+  }
+  CHECK(o.log == w.log && !o.log.empty(),
+        "dispatch, %u receivers: the same %zu publishes in the same order either way (first difference at %zu)",
+        static_cast<unsigned>(n), o.log.size(), first_diff);
+  // the dispatch alone (the entities' work left out): a call that only counts
+  uint64_t c_before = 0, c_now = 0;
+  std::vector<std::function<void(uint16_t, uint32_t)>> before2;
+  ReceiverListeners now2;
+  for (uint16_t rep = 0; rep < 2; rep++)
+    for (uint16_t k = 0; k < n; k++) {
+      before2.push_back([&c_before, k](uint16_t r, uint32_t) { c_before += r == k; });
+      now2.add(k, [&c_now](uint32_t) { c_now++; });
+    }
+  const int reps = 20000;
+  auto t0 = std::chrono::steady_clock::now();
+  for (int r = 0; r < reps; r++)
+    for (uint16_t i = 0; i < std::min<uint16_t>(16, n); i++)
+      for (auto &f : before2)
+        f(i, 1);
+  auto t1 = std::chrono::steady_clock::now();
+  for (int r = 0; r < reps; r++)
+    for (uint16_t i = 0; i < std::min<uint16_t>(16, n); i++)
+      now2.call(i, 1);
+  auto t2 = std::chrono::steady_clock::now();
+  CHECK(c_before == c_now, "dispatch alone: the same receivers reached (%llu / %llu)",
+        static_cast<unsigned long long>(c_before), static_cast<unsigned long long>(c_now));
+  std::printf("  dispatch, %u receivers + %u lights, %d windows: %.1f / %.1f listener calls a window (before / now), "
+              "host %.1f / %.1f us a window with the entities' work; the dispatch alone, 16 receivers' news: %.2f / "
+              "%.2f us\n",
+              static_cast<unsigned>(n), static_cast<unsigned>(n), windows, double(o.calls) / windows,
+              double(w.calls) / windows, t_before / windows, t_now / windows,
+              std::chrono::duration<double, std::micro>(t1 - t0).count() / reps,
+              std::chrono::duration<double, std::micro>(t2 - t1).count() / reps);
+  now_ms = 0;
 }
 
 /// Two receivers, the second with several lights: its Status, Status detail and Problem, its values (unavailable when
@@ -3765,6 +3976,8 @@ int main() {
   hub_rw::test_wake_settling();
   hub_rw::test_lock_from_end();
   receiver_entities::test_receiver_entities();
+  receiver_entities::test_receiver_dispatch(50, 2000);
+  receiver_entities::test_receiver_dispatch(2, 2000);   // (a P4 port: 2 receivers a line)
   update_retry::test_auto_retry();
   ledger_store::test_ledger_resize();
   ledger_store::test_ledger_flush_failure();

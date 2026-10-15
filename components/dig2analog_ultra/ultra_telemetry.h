@@ -19,11 +19,13 @@
 //  - a restart (its uptime fell): nothing is polled past it for 1 s, IDENTITY again, no acknowledge across it;
 //  - POWER: read the counts (and SUPPLY's dip count), show them, acknowledge exactly those in the next POWER poll.
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -667,6 +669,33 @@ struct TelemetryIntervals {
   uint32_t health_ms{60000};
   uint32_t lifetime_ms{300000};   // LIFETIME
   uint32_t diag_ms{300000};       // DIAG's two parts (and after every restart: IDENTITY makes every page due)
+};
+
+/// A line's listeners per receiver (its entities): after a response window, the news of a receiver goes to its own
+/// listeners only, in the order they were added (not to every listener of the line to filter: 16 receivers' news a
+/// window on a line of 50 would be 1,600 calls).
+class ReceiverListeners {
+ public:
+  void add(uint16_t receiver, std::function<void(uint32_t)> &&listener) {
+    this->list_.push_back(std::move(listener));
+    this->owner_.push_back(receiver);
+    // into its place: after its receiver's own and the ones before it (each receiver's in the order added)
+    for (size_t i = this->list_.size() - 1; i > 0 && this->owner_[i - 1] > receiver; i--) {
+      this->list_[i].swap(this->list_[i - 1]);
+      std::swap(this->owner_[i], this->owner_[i - 1]);
+    }
+  }
+  /// receiver's news (TelemetryPoller::take_updates bits) to its listeners
+  void call(uint16_t receiver, uint32_t updates) const {
+    for (size_t i = std::lower_bound(this->owner_.begin(), this->owner_.end(), receiver) - this->owner_.begin();
+         i < this->owner_.size() && this->owner_[i] == receiver; i++)
+      this->list_[i](updates);
+  }
+  size_t size() const { return this->list_.size(); }
+
+ protected:
+  std::vector<std::function<void(uint32_t)>> list_;   // by receiver; in each, the order added
+  std::vector<uint16_t> owner_;                        // ... each one's receiver
 };
 
 class TelemetryPoller {

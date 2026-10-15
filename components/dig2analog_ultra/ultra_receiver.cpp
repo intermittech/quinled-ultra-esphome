@@ -68,10 +68,7 @@ static Pace receiver_pace(uint8_t which, uint32_t rate_ms) {
 }
 
 void UltraReceiver::setup() {
-  this->hub_->add_on_telemetry_callback([this](uint16_t receiver, uint32_t updates) {
-    if (receiver == this->board_)
-      this->update_(updates);
-  });
+  this->hub_->add_on_receiver_callback(this->board_, [this](uint32_t updates) { this->update_(updates); });
   // its port and position: "Port 4 · receiver 2" (the system health groups receivers by it)
   this->text_(PORT, std::string(this->hub_->telemetry_name()) + " \xC2\xB7 receiver " + std::to_string(this->board_ + 1));
 }
@@ -309,10 +306,7 @@ void UltraTelemetryPort::dump_config() {
 // ---------------------------------------------------------------------------------------------------------- light
 void UltraLightTelemetry::attach() {
   ledger_receivers() += 1;   // (its estimated energy's counter)
-  this->hub_->add_on_telemetry_callback([this](uint16_t receiver, uint32_t updates) {
-    if (receiver == this->board_)
-      this->update_(updates);
-  });
+  this->hub_->add_on_receiver_callback(this->board_, [this](uint32_t updates) { this->update_(updates); });
   this->hub_->add_on_shutdown_callback([this]() { this->store_energy_(true); });
 }
 

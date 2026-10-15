@@ -657,7 +657,7 @@ void UltraHub::rw_publish_() {
     if (lev & LedgerKeeper::EV_SYNCED) {
       ESP_LOGV(TAG, "%s \xC2\xB7 Receiver %u: its lifetime counters synced from the hub", this->tel_name_, i + 1);
     }
-    this->rw_callback_.call(i, u);
+    this->rx_listeners_.call(i, u);
   }
   this->rw_window_callback_.call();
 }

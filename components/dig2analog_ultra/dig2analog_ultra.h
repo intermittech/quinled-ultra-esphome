@@ -347,10 +347,10 @@ class UltraHub final : public Component {
   /// Its line's power just came back (a port's wake): not heard yet, not missed enough to count as gone (its status:
   /// Waking, no problem)
   bool rx_settling(uint16_t receiver) const;
-  /// After each response window: (receiver, what changed: ultra_telemetry.h take_updates() bits), for the receivers
-  /// whose data changed.
-  void add_on_telemetry_callback(std::function<void(uint16_t, uint32_t)> &&callback) {
-    this->rw_callback_.add(std::move(callback));
+  /// After each response window in which receiver's data changed: what changed (ultra_telemetry.h take_updates() bits);
+  /// only that receiver's callbacks are called.
+  void add_on_receiver_callback(uint16_t receiver, std::function<void(uint32_t)> &&callback) {
+    this->rx_listeners_.add(receiver, std::move(callback));
   }
   /// once after each response window (and when the receivers lose their supply): the port's summary
   void add_on_window_callback(std::function<void()> &&callback) { this->rw_window_callback_.add(std::move(callback)); }
@@ -432,7 +432,7 @@ class UltraHub final : public Component {
   uint32_t rw_late_{0};                   // windows where the line was let go of later than ULTRA_RW_RELEASE_US
   uint32_t rw_extra_us_{0};               // a command queued at a window's start waits this much longer (lead_us)
   rmt_symbol_word_t reset_symbol_{}, rw_reset_symbol_{};
-  CallbackManager<void(uint16_t, uint32_t)> rw_callback_;
+  ReceiverListeners rx_listeners_;        // per receiver: its entities (add_on_receiver_callback)
   CallbackManager<void()> rw_window_callback_;
 #endif
 

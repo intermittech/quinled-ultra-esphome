@@ -314,7 +314,7 @@ void UltraParlioBus::loop() {
 void UltraParlioBus::dump_config() {
   const uint32_t ns = this->stream_.clock().sample_ns();
   ESP_LOGCONFIG(TAG,
-                "QuinLED dig2analog Ultra PARLIO bus:\n"
+                "QuinLED Ultra protocol PARLIO bus:\n"
                 "  Lanes: %u, %u-bit samples at %" PRIu32 " Hz (%" PRIu32 " ns)\n"
                 "  Bit: %u samples (%" PRIu32 " ns), a group of 8 bits %" PRIu32 " ns\n"
                 "  Buffers: 2 x %u B in %s, a chunk of %" PRIu32 " groups (%" PRIu32 " us), handed over %" PRIu32

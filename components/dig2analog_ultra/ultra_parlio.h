@@ -1,7 +1,7 @@
 #pragma once
 
-// PARLIO lanes (ESP32-P4: one parallel-output DMA unit drives up to 16 data lines; dig2analog_ultra_parlio): each data
-// line is a lane, its waveform one bit of every sample. Without ESP-IDF / ESPHome dependencies
+// PARLIO lanes (ESP32-P4: one parallel-output DMA unit drives up to 16 data lines of the QuinLED Ultra protocol;
+// dig2analog_ultra_parlio): each data line is a lane, its waveform one bit of every sample. Without ESP-IDF / ESPHome dependencies
 // (tests/ultra_parlio_test.cpp runs it on a PC):
 //  - the bit grid: every bit of every lane takes one period (the bus' longest bit: a shorter bit's low time is
 //    stretched to it), a lane's '0' / '1' high time is its own. 8 bits are a group; a frame starts on a group, so a

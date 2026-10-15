@@ -107,7 +107,7 @@ static Rmt rmts[8];
 static esp_err_t rmt_tx_wait_all_done(int ch, int) { return rmts[ch].busy ? -1 : ESP_OK; }
 static esp_err_t rmt_transmit(int ch, int, const uint8_t *data, size_t n, const rmt_transmit_config_t *);
 
-// ---- a Diff-Power port (components/diffpower): its loop(), apply_() and shutdown_all() (build/parlio/<variant>/port.inc,
+// ---- a QuinLED Diff-Power port (components/diffpower): its loop(), apply_() and shutdown_all() (build/parlio/<variant>/port.inc,
 // cut unchanged) on the real PortCore; its enable and detect pins, the hub's callbacks; no entities, no storage.
 /// the test's time inside the port's shutdown (its delay()): the stream plays on, the wire is decoded
 static std::function<void(int64_t)> advance_us;

@@ -19,7 +19,7 @@
 //     overlap, windows of different UARTs do, every receiver answers with its own data, a silent lane leaves the
 //     others answering; RMT lines sharing a UART; a busy line can't starve the others; a poll that failed to go out
 //     doesn't keep the UART through an update; a group start on a lane with long buffers covers its command cadence;
-//     a line on a Diff-Power port, on a lane: the preamble and the lock interval after each wake, the power-off
+//     a line on a QuinLED Diff-Power port, on a lane: the preamble and the lock interval after each wake, the power-off
 //     notice's copies timed on the wire, no polls while the port isn't powered, the shutdown hook through the stream;
 //  7. a firmware update session on a lane: every page pause on the wire, expired reservations, refused frames, a
 //     stalled stream with and without an abort, the last frame out before it returns.

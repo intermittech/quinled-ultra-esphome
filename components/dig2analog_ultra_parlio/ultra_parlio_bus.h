@@ -13,7 +13,8 @@
 
 namespace esphome::dig2analog_ultra {
 
-/// The ESP32-P4's PARLIO TX unit driving up to 16 dig2analog_ultra lines (lanes; ultra_parlio.h ParlioStream). Two
+/// The ESP32-P4's PARLIO TX unit driving up to 16 lines of the QuinLED Ultra protocol (dig2analog_ultra hubs on its
+/// lanes; ultra_parlio.h ParlioStream). Two
 /// DMA buffers of one chunk each take turns (the driver's loop transmission switches to the newer one when the older
 /// ends); a task renders the next chunk into the buffer just freed. One GPTimer, whose interrupt also runs with the
 /// cache off, does two things from the stream's timing: it drops each lane's telemetry direction pin at its RW frame's

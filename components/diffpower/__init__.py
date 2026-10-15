@@ -7,7 +7,7 @@ blocks the loop.)"""
 
 from esphome import automation, pins
 import esphome.codegen as cg
-from esphome.components import binary_sensor, light, select, sensor, sun, text_sensor
+from esphome.components import binary_sensor, button, light, select, sensor, sun, text_sensor
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_DEVICE_ID,
@@ -30,13 +30,14 @@ CODEOWNERS = ["@intermittech"]
 MULTI_CONF = True
 
 
-AUTO_LOAD = ["binary_sensor", "light", "select", "sensor", "text_sensor"]
+AUTO_LOAD = ["binary_sensor", "button", "light", "select", "sensor", "text_sensor"]
 
 
 diffpower_ns = cg.esphome_ns.namespace("diffpower")
 DiffPowerPort = diffpower_ns.class_("DiffPowerPort", cg.Component)
 PowerModeSelect = diffpower_ns.class_("PowerModeSelect", select.Select, cg.Component)
 WakeAction = diffpower_ns.class_("WakeAction", automation.Action)
+WakeButton = diffpower_ns.class_("WakeButton", button.Button)
 
 CONF_ENABLE_PIN = "enable_pin"
 CONF_DETECT_PIN = "detect_pin"
@@ -59,6 +60,8 @@ CONF_STANDBY_CYCLES = "standby_cycles"
 CONF_STANDBY_HOURS = "standby_hours"
 CONF_DETECT_DROPS = "detect_drops"
 CONF_POWER_MODE_SELECT = "power_mode_select"
+CONF_WAKE = "wake"
+CONF_WAKE_TIMEOUT = "wake_timeout"
 
 # PowerMode (diffpower_core.h), and the select's options in that order
 POWER_MODES = {"standby": 0, "during_dark": 1, "always_on": 2}
@@ -137,12 +140,14 @@ PORT_ENTITIES = {
             cv.COMPONENT_SCHEMA
         ),
     ),
+    # a press wakes the port for wake_timeout (each press again from then on): motion automations press it
+    CONF_WAKE: ("button", "wake", button.button_schema(WakeButton, icon="mdi:power-plug")),
 }
 
 
 def _defaults(config):
-    """Every entity of the port, named after it ("Port 1 power state", ...) on its device_id if given; an entity set to
-    false is left out."""
+    """Every entity of the port: named after it ("Port 1 power state", ...), or on its own device_id without the
+    prefix ("Power state", "Wake", ...: the device's name is in front); an entity set to false is left out."""
     if not isinstance(config, dict):
         return config
     config = dict(config)
@@ -153,9 +158,11 @@ def _defaults(config):
             config.pop(key, None)
             continue
         ent = dict(value or {})
-        ent.setdefault(CONF_NAME, f"{port} {name}")
         if CONF_DEVICE_ID in config:
+            ent.setdefault(CONF_NAME, f"{name[0].upper()}{name[1:]}")
             ent.setdefault(CONF_DEVICE_ID, config[CONF_DEVICE_ID])
+        else:
+            ent.setdefault(CONF_NAME, f"{port} {name}")
         config[key] = ent
     return config
 
@@ -214,6 +221,10 @@ PORT_SCHEMA = cv.All(
             # powered at least this long once on: the floor of turn-off periods and pre-wakes (no wake storms)
             cv.Optional(CONF_MIN_ON_TIME, default="2min"): cv.All(
                 cv.positive_time_period_milliseconds, cv.Range(max=cv.TimePeriod(hours=1))
+            ),
+            # the Wake button's: powered this long after a press if no light turns on (at least min_on_time)
+            cv.Optional(CONF_WAKE_TIMEOUT, default="2min"): cv.All(
+                cv.positive_time_period_milliseconds, cv.Range(max=cv.TimePeriod(hours=24))
             ),
             cv.Optional(CONF_SUN_ID): cv.use_id(sun.Sun),
             cv.Optional(CONF_DARK_BEFORE, default="60min"): cv.All(
@@ -364,6 +375,10 @@ async def to_code(config):
         cg.add(var.set_hours_sensor(await sensor.new_sensor(conf)))
     if conf := config.get(CONF_DETECT_DROPS):
         cg.add(var.set_drops_sensor(await sensor.new_sensor(conf)))
+    if conf := config.get(CONF_WAKE):
+        btn = await button.new_button(conf)
+        cg.add(btn.set_port(var))
+        cg.add(btn.set_timeout(int(config[CONF_WAKE_TIMEOUT].total_milliseconds)))
     if conf := config.get(CONF_POWER_MODE_SELECT):
         options = MODE_OPTIONS if CONF_SUN_ID in config else [MODE_OPTIONS[0], MODE_OPTIONS[2]]
         sel = await select.new_select(conf, options=options)

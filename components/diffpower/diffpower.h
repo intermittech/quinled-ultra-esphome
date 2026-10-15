@@ -14,6 +14,9 @@
 #ifdef USE_BINARY_SENSOR
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #endif
+#ifdef USE_BUTTON
+#include "esphome/components/button/button.h"
+#endif
 #ifdef USE_SELECT
 #include "esphome/components/select/select.h"
 #endif
@@ -205,6 +208,20 @@ class PowerModeSelect final : public select::Select, public Component {
   size_t index_of_(uint8_t mode) const;
   DiffPowerPort *port_{nullptr};
   ESPPreferenceObject pref_;
+};
+#endif
+
+#ifdef USE_BUTTON
+/// The port's Wake button: a pre-wake for its wake_timeout (at least min_on_time); each press from then on
+class WakeButton final : public button::Button {
+ public:
+  void set_port(DiffPowerPort *port) { this->port_ = port; }
+  void set_timeout(uint32_t ms) { this->timeout_ms_ = ms; }
+
+ protected:
+  void press_action() override { this->port_->wake(this->timeout_ms_); }
+  DiffPowerPort *port_{nullptr};
+  uint32_t timeout_ms_{120000};
 };
 #endif
 

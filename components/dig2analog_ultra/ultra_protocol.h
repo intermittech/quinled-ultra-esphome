@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
  * Copyright (C) 2026 QuinLED
  *
- * QuinLED dig2analog Ultra protocol 0.2 (wire VERSION 2), this file: release 0.2.6 (CHANGELOG.md). Shared by the
+ * QuinLED Ultra protocol 0.2 (wire VERSION 2), this file: release 0.2.6 (CHANGELOG.md). Shared by the
  * board firmware (C) and the controllers (C / C++).
  * Master: include/ultra_protocol.h in https://github.com/intermittech/quinled-ultra-protocol (spec in its wiki).
  * Every copy (board firmware, ESPHome component, other controllers) must be byte-identical to one tagged release
@@ -26,8 +26,9 @@
  *         after the other, also a board still locked to WS2805 / WS2915 (it shows its WS window of those zeros:
  *         dark, never a colour). Idle frames afterwards use NOP slots.
  *
- * Compatibility rules (ULTRA_PROTOCOL.md): a board ignores what it doesn't know, so new features never disturb
- * boards with older firmware; the host sends only values defined here (the builders below never set anything else).
+ * Compatibility rules (the wiki: Compatibility and versioning): a board ignores what it doesn't know, so new features
+ * never disturb boards with older firmware; the host sends only values defined here (the builders below never set
+ * anything else).
  *  - Unknown slot TYPE (0x0B-0xFF; 0x0A before 0.2.3), LIGHT 5-14, IDENTIFY value or argument, SCENE mode: the slot
  *    is ignored.
  *  - Unknown CONFIG id: that pair is skipped, the others apply. Unknown effect id: ULTRA_FX_NONE (the light's plain
@@ -67,10 +68,10 @@ extern "C" {
 #define ULTRA_MAX_STEPS    8u          /* strobe / sequence steps per light */
 
 /* header FLAGS (low nibble of byte 2). On an RW or EXT frame a board keeps its lock and clock sync; a board without a
- * return channel (every dig2analog-ultra) ignores every slot of it, and a Diff-Power ultra receiver answers its POLL of
- * an RW frame without EXT (the return channel, 0.2.4, below). An UPD frame a board leaves to the update side (no clock
- * sync, no slot), HINT it ignores. RW and UPD are never set together; a board ignores such a frame. The hub sets none
- * of them in normal frames (0x00). */
+ * return channel (every QuinLED Dig2Analog-Ultra-5ch) ignores every slot of it, and a QuinLED Diff-Power Ultra-Analog
+ * receiver answers its POLL of an RW frame without EXT (the return channel, 0.2.4, below). An UPD frame a board leaves
+ * to the update side (no clock sync, no slot), HINT it ignores. RW and UPD are never set together; a board ignores
+ * such a frame. The hub sets none of them in normal frames (0x00). */
 #define ULTRA_HDR_RW       0x01u       /* a response window follows this frame (wiki: Return channel) */
 #define ULTRA_HDR_HINT     0x02u       /* optional: a frame-level hint (none defined yet); a board that doesn't know it
                                           processes the frame as usual */
@@ -97,31 +98,29 @@ enum {
                                   namespace: ultra_update.h) */
 };
 
-/* Return channel (0.2.4: QuinLED Diff-Power ultra receivers only, firmware 0.6.6 and later with BOARD=2; wiki: Return
- * channel). All times in us after t0 = the last falling edge of the RW frame as each board measures it locally (the
- * last edge the tail copy finds in the DIN ring, not the shared clock's phase), in host us (a board scales them with
- * the shared clock's measured rate). During the window the forwarding gate is held CLOSED (DOUT LOW, not high-Z): DIN
- * sees the relayed answers, and a re-armed plan would forward them downstream.
- * Host: no RW frame before the chain is locked (after the DARK preamble) and has sent headers for ULTRA_RW_LOCK_MS,
- * none during an update session, never with UPD, and never with EXT (until an extension defines it). In one RW frame
- * every POLL carries the same R and rate; the answer indices are unique, < R and rise along the chain, and the boards
- * between the hub and an answering board get ULTRA_POLL_RELAY_ONLY. Behind the last board that answers or relays, the
- * slots may be of any type (those boards don't take part and don't turn around). The next frame >= W +
- * ULTRA_RW_HOLDOFF_US after t0, answers or not; a missing answer (a lost POLL, a flash write just before the frame,
- * a late main loop, a board's clock not rated yet) is retried in a later window with a new SEQ. UID16 in the answers
- * shows index shifts.
- * Board: takes part when its own slot is a valid POLL (ultra_poll_valid) and the header has RW and not EXT. It turns
- * around in DIR_MIN..DIR_MAX, does the turnaround check at CHECK_US (the line HIGH for <= CHECK_HIGH_US, read back:
- * LOW = the segment above is still driven, a board there doesn't take part), sends its burst in its slot with the same
- * read-back after the line goes HIGH, and is in forward mode again W .. W + ULTRA_RW_END_US. A failed read-back (at
- * the check or at the burst): no answer and no relay for the rest of this window, CONTENTION in its next answer. A
- * valid POLL is always answered, a repeated SEQ too.
- * Burst (board i, s_i = FIRST + i x pitch): the line HIGH at s_i - EARLY .. s_i + LATE (slot 0: from s_0 - EARLY0),
- * the first start bit START_MIN .. START_MAX after it, then ULTRA_RW_LEAD_BYTES x ULTRA_RSP_LEAD and the 32-byte answer,
- * UART 8N1, LSB first, at the POLL's rate; the line LOW again (idle, a break at the hub's UART) by s_i + pitch - GUARD.
- * Hub: the turnaround checks' pulses reach it as junk UART bytes (CHECK_US .. ~1000 us); it discards every byte before
- * a SYNC without a framing error (any number of lead bytes), takes 32 bytes, and drops the answer on a framing error
- * or a CRC failure (ultra_answer_check). */
+/* Return channel (0.2.4: QuinLED Diff-Power Ultra-Analog receivers only, firmware 0.6.6 and later with BOARD=2; wiki:
+ * Return channel). All times in us after t0 = the last falling edge of the RW frame as each board measures it locally
+ * (the last edge the tail copy finds in the DIN ring, not the shared clock's phase), in host us (a board scales them
+ * with the shared clock's measured rate). During the window the forwarding gate is held CLOSED (DOUT LOW, not high-Z):
+ * DIN sees the relayed answers, and a re-armed plan would forward them downstream. Host: no RW frame before the chain
+ * is locked (after the DARK preamble) and has sent headers for ULTRA_RW_LOCK_MS, none during an update session, never
+ * with UPD, and never with EXT (until an extension defines it). In one RW frame every POLL carries the same R and rate;
+ * the answer indices are unique, < R and rise along the chain, and the boards between the hub and an answering board
+ * get ULTRA_POLL_RELAY_ONLY. Behind the last board that answers or relays, the slots may be of any type (those boards
+ * don't take part and don't turn around). The next frame >= W + ULTRA_RW_HOLDOFF_US after t0, answers or not; a missing
+ * answer (a lost POLL, a flash write just before the frame, a late main loop, a board's clock not rated yet) is retried
+ * in a later window with a new SEQ. UID16 in the answers shows index shifts. Board: takes part when its own slot is a
+ * valid POLL (ultra_poll_valid) and the header has RW and not EXT. It turns around in DIR_MIN..DIR_MAX, does the
+ * turnaround check at CHECK_US (the line HIGH for <= CHECK_HIGH_US, read back: LOW = the segment above is still driven,
+ * a board there doesn't take part), sends its burst in its slot with the same read-back after the line goes HIGH, and
+ * is in forward mode again W .. W + ULTRA_RW_END_US. A failed read-back (at the check or at the burst): no answer and
+ * no relay for the rest of this window, CONTENTION in its next answer. A valid POLL is always answered, a repeated SEQ
+ * too. Burst (board i, s_i = FIRST + i x pitch): the line HIGH at s_i - EARLY .. s_i + LATE (slot 0: from s_0 -
+ * EARLY0), the first start bit START_MIN .. START_MAX after it, then ULTRA_RW_LEAD_BYTES x ULTRA_RSP_LEAD and the
+ * 32-byte answer, UART 8N1, LSB first, at the POLL's rate; the line LOW again (idle, a break at the hub's UART) by s_i
+ * + pitch - GUARD. Hub: the turnaround checks' pulses reach it as junk UART bytes (CHECK_US .. ~1000 us); it discards
+ * every byte before a SYNC without a framing error (any number of lead bytes), takes 32 bytes, and drops the answer on
+ * a framing error or a CRC failure (ultra_answer_check). */
 #define ULTRA_POLL_RELAY_ONLY 0xFFu    /* POLL index: relay, don't answer (the page and its arguments are ignored) */
 #define ULTRA_RW_MAX_SLOTS    16u      /* INDEX is a nibble in the answer */
 #define ULTRA_RW_RELEASE_US   150u     /* host / sender has stopped driving */
@@ -191,12 +190,13 @@ enum {
 };
 /* IDENTITY page DATA: MCU UID (12) | firmware version word (4, ultra_update.h; 0 = unknown) | bootloader version (1,
  * 0 = none) | hardware id (1) | hardware capabilities (2, ULTRA_HWCAP_*: 0.2.4) | firmware features (4,
- * ULTRA_FEAT_*). Only over the return channel: for a board without one (every dig2analog-ultra) the host can't know its
- * features and relies on the compatibility rules above (an unknown command does nothing, an unknown effect shows the
- * plain state). */
+ * ULTRA_FEAT_*). Only over the return channel: for a board without one (every Dig2Analog-Ultra-5ch) the host can't
+ * know its features and relies on the compatibility rules above (an unknown command does nothing, an unknown effect
+ * shows the plain state). */
 #define ULTRA_ID_FW_VERSION       12u
 #define ULTRA_ID_BL_VERSION       16u    /* 0.2.4: (the offsets of the layout above) */
-#define ULTRA_ID_HW_ID            17u    /* 1 dig2analog-ultra-5ch (never answers), 2 Diff-Power ultra receiver */
+#define ULTRA_ID_HW_ID            17u    /* 1 Dig2Analog-Ultra-5ch (never answers), 2 Diff-Power Ultra-Analog
+                                            receiver */
 #define ULTRA_ID_HW_CAPS          18u
 #define ULTRA_ID_FEATURES         20u
 #define ULTRA_HWCAP_RETURN        0x0001u  /* 0.2.4: answers POLLs */
@@ -416,9 +416,14 @@ enum {
  * low 8 bits are its own (the record the hub reconciled against: a board that wrote since, or another board, merges
  * nothing). Each counter is raised by the hub's step d ahead (in the wire's units) when 0 < d <= its step, else kept:
  * nothing is ever lowered; a counter ahead by more than its step is ignored (result CAPPED), the others still merge.
- * The steps (the QuinLED Diff-Power ultra receiver): powered time 30 days; lit time the powered step + 0.1 h;
- * power-ups, trips and dips one per 10 s of the powered step + 64; the energy 1 kW over the powered step + 1 h. They
- * limit what a wrong ledger can do; the ledger's correctness is the hub's. A merged counter counts as stored: it
+ * Ahead: the 24-bit fields (powered, lit, power-ups, dips) modulo 2^24 (by less than 2^23), the 16- and 32-bit ones
+ * (the trips, the energy) plainly (a lower value never). The steps (the QuinLED Diff-Power Ultra-Analog receiver):
+ * powered time 30 days; lit time the powered time this merge raised + 0.1 h; power-ups, trips and dips one per 10 s
+ * of the powered time this merge raised + 64; the energy 1 kW over the powered time this merge raised + 1 h; none
+ * past the counter's room (the receiver's seconds and Wh are 32-bit: powered / lit time stop at 11,930,464 x 0.1 h,
+ * the energy at 4,294,967,295 Wh, for good: a CAPPED there is no backlog). They limit what a wrong ledger can do; the
+ * ledger's correctness is the hub's: its own accounting, not an echo of these reads (the wiki: Return channel, "The
+ * hub's ledger"). A merged counter counts as stored: it
  * never makes the board write; it is stored with the board's own next lifetime write, and the board's write allowance
  * counts only its own powered time. Hub: once per board power-up, when the ledger is ahead; then the notice (IDENTIFY
  * 7) if the line is to be switched off, and no POLL until the cut. A board without the feature answers
@@ -439,7 +444,8 @@ enum {
 #define ULTRA_LS_R_UID            2u     /* UID16 not the board's: nothing merged */
 #define ULTRA_LS_R_RECORDS        3u     /* RECORDS low 8 bits not the board's: nothing merged */
 #define ULTRA_LS_R_ONCE           4u     /* already merged this power-up: nothing merged */
-#define ULTRA_LS_R_CAPPED         5u     /* a counter ahead by more than its step: ignored (the others: APPLIED's) */
+#define ULTRA_LS_R_CAPPED         5u     /* a counter ahead by more than its step or its room: ignored (the others:
+                                            APPLIED's; with none applied it doesn't use up the power-up's merge) */
 #define ULTRA_LS_F_POWERED        0x01u
 #define ULTRA_LS_F_LIT            0x02u
 #define ULTRA_LS_F_UPS            0x04u
@@ -851,7 +857,7 @@ static inline void ultra_slot_config(uint8_t *s, uint8_t seq, const uint8_t *ids
  * ULTRA_IDENT_POWER_OFF (0.2.6, ultra_slot_power_off): a planned power-off notice. The hub sends it in the slot of every
  * board of a line, 3 copies with the same SEQ (applied once) at 0, 50 and 100 ms, and cuts the line's power at 200 ms;
  * once sent it always cuts (no take-back: a command after it waits for the power to be off, then wakes the line). A
- * board that knows it (the QuinLED Diff-Power ultra receiver, ULTRA_FEAT_STANDBY) fades to dark (0.3 s) and takes the
+ * board that knows it (the QuinLED Diff-Power Ultra-Analog receiver, ULTRA_FEAT_STANDBY) fades to dark (0.3 s) and takes the
  * coming cut as planned: no supply dip, and the lifetime record written only if there is something worth storing (a
  * board doesn't write its record for every standby cycle). After 2 s without the cut it forgets the notice. Its next
  * start is a power-up as any: such a receiver stays dark after every power-up until the first valid frame or 1.5 s,

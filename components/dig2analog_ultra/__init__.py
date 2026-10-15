@@ -370,7 +370,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_LANE): cv.int_range(min=0, max=15),
             cv.Required(CONF_NUM_BOARDS): cv.int_range(min=1, max=64),
             # '0' 250 ns, '1' 700 ns: centred on the boards' 472 ns decision, so the pulse-width change of every
-            # board's forwarding may add up in either direction over 50 boards (wiki: Ultra Mode)
+            # board's forwarding may add up in either direction over 50 boards (wiki: Ultra line options, Long chains)
             cv.Optional(CONF_BIT0_HIGH, default="250ns"): cv.positive_time_period_nanoseconds,
             cv.Optional(CONF_BIT0_LOW, default="1050ns"): cv.positive_time_period_nanoseconds,
             cv.Optional(CONF_BIT1_HIGH, default="700ns"): cv.positive_time_period_nanoseconds,

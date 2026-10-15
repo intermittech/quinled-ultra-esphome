@@ -21,7 +21,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 OUT = HERE / "build" / "ultra"
 
-# the wiki's Home Assistant example (Ultra-Mode.md, "camera mode, PWM frequency and stagger")
+# the wiki's Home Assistant example (Ultra-Board-Settings.md, "camera mode, PWM frequency and stagger")
 HA_GLOBALS = """globals:
   - id: pwm_hz                              # the PWM frequency select's value (camera mode goes back to it)
     type: float
@@ -149,7 +149,7 @@ button:
           id: ultra
           board: 1
       - lambda: id(ultra).show_version(0);
-  # the wiki's example (Ultra-Mode.md, "Boards forced to WS2805 / WS2915")
+  # the wiki's example (Ultra-Board-Settings.md, "Boards forced to WS2805 / WS2915")
   - platform: template
     name: Switch boards to Ultra
     icon: mdi:swap-horizontal

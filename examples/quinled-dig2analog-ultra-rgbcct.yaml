@@ -45,7 +45,8 @@ dig2analog_ultra:
   num_boards: 2
   # Board settings, sent to every board (they are not stored on the boards; change them here or at
   # runtime with id(ultra).set_pwm_frequency(board, hz) etc.)
-  pwm_frequency: 25kHz          # 2.2 - 100 kHz; presets have the cleanest bit depth (see the wiki)
+  pwm_frequency: 25kHz          # 2.2 - 100 kHz; presets have the cleanest bit depth (wiki: Ultra board settings,
+                                # PWM presets)
   dithering: "on"               # on, off_at_low_levels, off
   dither_threshold: 1.0%        # for off_at_low_levels
   dim_floor: skip               # skip, clamp, off: what happens below the shortest clean pulse

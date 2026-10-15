@@ -66,8 +66,8 @@ light:
 | Also | | power-on scene and effect, dim to warm, board current sense and calibration (on the board: protection, limits, automatic dimming), firmware updates over the data line |
 
 **Reporting back** (voltage, current, power, energy, temperature, power events and why a light is dim or off, to
-ESPHome and Home Assistant) is for **QuinLED Diff-Power Ultra receivers only**: the line's `telemetry:` (wiki: Ultra
-Mode, Diff-Power telemetry). The QuinLED Dig2Analog-Ultra-5ch's data line is one-way: it measures for itself and never
+ESPHome and Home Assistant) is for **QuinLED Diff-Power Ultra receivers only**: the line's `telemetry:` ([Diff-Power
+telemetry](https://github.com/intermittech/quinled-ultra-esphome/wiki/Diff-Power-Telemetry)). The QuinLED Dig2Analog-Ultra-5ch's data line is one-way: it measures for itself and never
 reports back.
 
 The QuinLED Dig2Analog-Ultra-5ch can also run in WS2805 / WS2915 mode with the
@@ -79,9 +79,10 @@ See the **[wiki](https://github.com/intermittech/quinled-ultra-esphome/wiki)**:
 
 | | |
 |---|---|
-| [Ultra mode](https://github.com/intermittech/quinled-ultra-esphome/wiki/Ultra-Mode) | Lights, board effects, board settings, line options, firmware updates, how it works |
+| [Ultra mode](https://github.com/intermittech/quinled-ultra-esphome/wiki/Ultra-Mode) | What it is, a quick start and its pages: lights, effects, board settings, current, line options, firmware updates, how it works |
 | [Ultra strip effects](https://github.com/intermittech/quinled-ultra-esphome/wiki/Ultra-Strip) | `dig2analog_ultra_strip`: ESPHome's addressable effects across Ultra lights |
-| [Diff-Power ports](https://github.com/intermittech/quinled-ultra-esphome/wiki/Diff-Power-Ports) | `diffpower`: a Diff-Power sender's ports in standby, waking, the power modes, pre-wake |
+| [Diff-Power ports](https://github.com/intermittech/quinled-ultra-esphome/wiki/Diff-Power-Ports) | `diffpower`: a Diff-Power sender's ports in standby, waking; [power modes](https://github.com/intermittech/quinled-ultra-esphome/wiki/Power-Modes), pre-wake |
+| [Diff-Power telemetry](https://github.com/intermittech/quinled-ultra-esphome/wiki/Diff-Power-Telemetry) | QuinLED Diff-Power Ultra receivers reporting back: entities, dashboards, the lifetime ledger |
 | [Installation](https://github.com/intermittech/quinled-ultra-esphome/wiki/Installation) | Adding the components, pinning a version |
 | [Bench plan](https://github.com/intermittech/quinled-ultra-esphome/wiki/Bench-Plan) | What still needs checking on hardware |
 | [Development](https://github.com/intermittech/quinled-ultra-esphome/wiki/Development) | Tests and layout |

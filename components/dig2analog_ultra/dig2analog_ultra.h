@@ -286,7 +286,7 @@ class UltraHub final : public Component {
   void add_light(UltraLight *light) { this->lights_.push_back(light); }
 
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
-  // Diff-Power receiver telemetry (the return channel, ultra_telemetry.h; wiki: Ultra Mode, Diff-Power telemetry).
+  // Diff-Power receiver telemetry (the return channel, ultra_telemetry.h; wiki: Diff-Power telemetry).
   /// uart: the UART with the hub's RS-485 receiver output on its RX (8N1 at the rate: ULTRA_RW_RATE_*); the first
   /// `receivers` boards of the line are receivers; how often each page is read.
   void set_telemetry(uart::UARTComponent *uart, uint16_t receivers, uint8_t rate, uint32_t status_ms,

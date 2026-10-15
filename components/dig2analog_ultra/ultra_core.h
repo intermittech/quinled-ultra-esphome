@@ -155,7 +155,7 @@ inline void pwm_for_frequency(float hz, uint16_t &preset, uint16_t &period) {
 inline uint16_t preamble_frames(uint16_t boards) { return static_cast<uint16_t>(ultra_preamble_frames(boards)); }
 /// After the boards' supply switched on, once a full preamble has reached them with power: they all stored Ultra and
 /// confirm it with the first frame, so a short preamble does (a board new since then locks in ~4 frames; 10 cover 2
-/// of them, the refresh brings the rest; wiki: Ultra Mode). 50 boards: 10 frames (0.18 s) instead of 202
+/// of them, the refresh brings the rest; wiki: Ultra how it works). 50 boards: 10 frames (0.18 s) instead of 202
 /// (3.6 s).
 static constexpr uint16_t POWER_ON_PREAMBLE_FRAMES = 10;
 inline uint16_t power_on_preamble_frames(uint16_t boards) {
@@ -750,7 +750,7 @@ class Scheduler {
     int64_t last_stream_us{NO_START};  // when its last streamed SET went out
   };
   /// Per board ~410 B, + ~430 B per light in use (allocated with its first command): 50 boards with one light each
-  /// take ~42 KB of the ESP32's heap (wiki: Ultra Mode). The queue holds keys (12 B per command) and is freed whenever
+  /// take ~42 KB of the ESP32's heap (wiki: Ultra line options). The queue holds keys (12 B per command) and is freed whenever
   /// it empties.
   struct Board {   // (the slots first: no padding)
     Item config[CONFIG_PAGES];

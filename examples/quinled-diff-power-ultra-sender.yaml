@@ -1,6 +1,6 @@
 # QuinLED Diff-Power sender with QuinLED Diff-Power Ultra receivers: two ports, each with an Ultra line and its
 # telemetry, its power switched by the port (standby while nothing on it is lit). Named the way Home Assistant finds
-# things across several controllers (wiki: Ultra Mode, "Names in Home Assistant"):
+# things across several controllers (wiki: Telemetry dashboards, "Names in Home Assistant"):
 #   - the controller: a short name, unique in the house (friendly_name: Sender 1); its totals are on it
 #   - each port: a device "Sender 1 · Port 1" (its telemetry and its Diff-Power port, without a name prefix)
 #   - a receiver with one light: a device named after the light, in its room; the light takes the device's name
@@ -75,7 +75,7 @@ captive_portal:
 
 # The time now, for the ports' "During dark" power mode (its sunrise / sunset come from Home Assistant's sun.sun: no
 # coordinates needed; without Home Assistant, or as its backup, add ESPHome's sun and a sun_id per port: wiki,
-# Diff-Power ports)
+# Power modes)
 time:
   - platform: homeassistant
     id: ha_time

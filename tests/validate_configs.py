@@ -873,6 +873,14 @@ CASES = [
         "only with your own source",
     ),
     ("ultra update bad source", ULTRA + UPD_NET + UPD + "    source: not a repo\n", False, "OWNER/REPO on GitHub"),
+    # no production signing keys yet: said at validation (QuinLED provisions them); not with the test keys
+    ("ultra update without production keys: warned", ULTRA + UPD_NET + UPD, True, "no production signing keys yet"),
+    ("ultra update test keys: no key warning", ULTRA + UPD_NET + UPD + "    public_keys: test\n", True,
+     "!no production signing keys yet"),
+    # the boards a line updates: Diff-Power receivers (hw_id 2) or the dig2analog (1)
+    ("ultra update hardware diff_power_receiver", ULTRA + UPD_NET + UPD + "    hardware: diff_power_receiver\n", True,
+     "hardware: diff_power_receiver"),
+    ("ultra update hardware bogus", ULTRA + UPD_NET + UPD + "    hardware: toaster\n", False, "hardware"),
     # auto_retry: sessions again for boards that missed one (0: off)
     ("ultra update auto_retry off", ULTRA + UPD_NET + UPD + "    auto_retry: 0\n", True, None),
     ("ultra update auto_retry 6", ULTRA + UPD_NET + UPD + "    auto_retry: 6\n", False, "auto_retry"),
@@ -1362,6 +1370,32 @@ def run_case(idx, name, body, expect_ok, needle, board="esp32dev"):
     return not problems
 
 
+def check_update_hardware() -> bool:
+    """update.py's hardware per line: receivers (hw_id 2, revision 0) on a line with telemetry, the dig2analog (1,
+    revision 3) without; given explicitly or with board_revision, those win."""
+    sys.path.insert(0, str(ROOT / "components"))
+    from dig2analog_ultra import update as upd
+
+    full = {"dig2analog_ultra": [{"id": "a", "telemetry": {"uart_id": "x"}}, {"id": "b"}]}
+    cases = [
+        ("a telemetry line: receivers", {"dig2analog_ultra_id": "a"}, (2, 0)),
+        ("a one-way line: the dig2analog", {"dig2analog_ultra_id": "b"}, (1, 3)),
+        ("given", {"dig2analog_ultra_id": "a", "hardware": "dig2analog_ultra_5ch"}, (1, 3)),
+        ("a revision given", {"dig2analog_ultra_id": "b", "board_revision": 2}, (1, 2)),
+    ]
+    ok = True
+    for what, conf, want in cases:
+        got = upd._hardware(conf, full)
+        good = got == want
+        ok &= good
+        print(f"{'ok  ' if good else 'FAIL'} update hardware: {what}: {got}")
+    keys_h = (ROOT / "components" / "dig2analog_ultra" / "fw_keys.h").read_text(encoding="utf-8")
+    good = "FW_PRODUCTION_KEY_COUNT =" in keys_h   # (what production_keys_provisioned() reads)
+    print(f"{'ok  ' if good else 'FAIL'} update: fw_keys.h states its production key count (provisioned: "
+          f"{upd.production_keys_provisioned()})")
+    return ok and good
+
+
 def check_group_budget() -> bool:
     """The codegen's group budget (__init__.py _max_group_commands): the commands one Home Assistant change to every
     light can give the busiest board, which the hub's start lead covers."""
@@ -1392,7 +1426,7 @@ def main() -> int:
     cases = list(enumerate(CASES))
     if filters:
         cases = [(i, c) for i, c in cases if any(f in c[0].lower() for f in filters)]
-    budget_ok = filters != [] or check_group_budget()
+    budget_ok = filters != [] or (check_group_budget() & check_update_hardware())
     results = [run_case(i, *case) for i, case in cases]
     failed = results.count(False)
     print(f"\n{len(results) - failed}/{len(results)} schema cases passed")

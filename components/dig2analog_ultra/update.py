@@ -6,6 +6,8 @@ unless forced) and blink the result. auto_retry sends the session again for boar
 Design: the firmware wiki's Updating Over The Data Line page.
 """
 
+import logging
+from pathlib import Path
 import re
 
 from esphome import automation
@@ -14,8 +16,11 @@ from esphome.components import http_request, select, text_sensor, update
 import esphome.config_validation as cv
 import esphome.final_validate as fv
 from esphome.const import CONF_ID, CONF_SOURCE, DEVICE_CLASS_FIRMWARE, ENTITY_CATEGORY_CONFIG, ENTITY_CATEGORY_DIAGNOSTIC
+from esphome.core import CORE
 
 from . import CONF_DIG2ANALOG_ULTRA_ID, UltraHub, dig2analog_ultra_ns
+
+_LOGGER = logging.getLogger(__name__)
 
 DEPENDENCIES = ["dig2analog_ultra", "http_request"]
 
@@ -25,6 +30,7 @@ CONF_STATUS = "status"
 CONF_PUBLIC_KEYS = "public_keys"
 CONF_VERIFY_SIGNATURE = "verify_signature"
 CONF_BOARD_REVISION = "board_revision"
+CONF_HARDWARE = "hardware"
 CONF_PASSES = "passes"
 CONF_AUTO_RETRY = "auto_retry"
 CONF_LEAD_IN = "lead_in"
@@ -44,6 +50,19 @@ PUBLIC_KEYS = {
     ),
 }
 HW_ID_D2A_ULTRA_5CH = 1  # UPD_HW_ID_D2A_ULTRA_5CH (ultra_update.h)
+# the boards a line updates: UPD_HW_ID_* (ultra_update.h) and the board revision's default (the bit of an image's
+# hw_rev_mask). Diff-Power receivers: revision 0 until their bootloader defines one.
+HARDWARE = {
+    "dig2analog_ultra_5ch": (HW_ID_D2A_ULTRA_5CH, 3),   # rev 0.4 (UPD_REV_D2A_R04)
+    "diff_power_receiver": (2, 0),                     # UPD_HW_ID_DP_ULTRA_RX
+}
+
+
+def production_keys_provisioned():
+    """fw_keys.h holds production keys (FW_PRODUCTION_KEY_COUNT > 0): QuinLED provisions them with the first release."""
+    text = (Path(__file__).parent / "fw_keys.h").read_text(encoding="utf-8")
+    m = re.search(r"FW_PRODUCTION_KEY_COUNT\s*=\s*(\d+)", text)
+    return m is not None and int(m.group(1)) > 0
 
 UltraFirmwareUpdate = dig2analog_ultra_ns.class_("UltraFirmwareUpdate", update.UpdateEntity, cg.PollingComponent)
 FwChannelSelect = dig2analog_ultra_ns.class_("FwChannelSelect", select.Select, cg.Component)
@@ -89,8 +108,12 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_CHANNEL, default="stable"): cv.enum(CHANNELS, lower=True),
             cv.Optional(CONF_PUBLIC_KEYS, default="production"): cv.one_of(*PUBLIC_KEYS, lower=True),
             cv.Optional(CONF_VERIFY_SIGNATURE, default=True): cv.boolean,
-            # board revision of this line (bit of an image's hw_rev_mask): 3 = dig2analog-ultra-5ch rev 0.4
-            cv.Optional(CONF_BOARD_REVISION, default=3): cv.int_range(min=0, max=15),
+            # the boards this line updates: dig2analog_ultra_5ch, or diff_power_receiver (QuinLED Diff-Power Ultra
+            # receivers); default: diff_power_receiver on a line with telemetry, else dig2analog_ultra_5ch
+            cv.Optional(CONF_HARDWARE): cv.one_of(*HARDWARE, lower=True),
+            # their board revision (bit of an image's hw_rev_mask); default: 3 (dig2analog-ultra-5ch rev 0.4), 0 for
+            # receivers
+            cv.Optional(CONF_BOARD_REVISION): cv.int_range(min=0, max=15),
             # every page this often per session (a board that missed one gets it in the next pass)
             cv.Optional(CONF_PASSES, default=3): cv.int_range(min=1, max=8),
             # sessions again after an install for boards that missed it (0: off): on a line of Diff-Power receivers
@@ -112,10 +135,30 @@ CONFIG_SCHEMA = cv.All(
 )
 
 
+def _hardware(config, full):
+    """(hw_id, revision) of the boards the update entity's line updates."""
+    kind = config.get(CONF_HARDWARE)
+    if kind is None:
+        hub = next(
+            (h for h in full.get("dig2analog_ultra", []) or [] if h[CONF_ID] == config[CONF_DIG2ANALOG_ULTRA_ID]),
+            {},
+        )
+        kind = "diff_power_receiver" if hub.get("telemetry") else "dig2analog_ultra_5ch"
+    hw_id, rev = HARDWARE[kind]
+    return hw_id, config.get(CONF_BOARD_REVISION, rev)
+
+
 def _final_validate(config):
     """One update entity per line: a session owns the line."""
     full = fv.full_config.get()
     hub = config[CONF_DIG2ANALOG_ULTRA_ID]
+    if config[CONF_PUBLIC_KEYS] == "production" and config[CONF_VERIFY_SIGNATURE] and not production_keys_provisioned():
+        _LOGGER.warning(
+            "update '%s': this component has no production signing keys yet (QuinLED provisions them with the "
+            "firmware's first release): until then no release installs. For bench builds: public_keys: test with "
+            "your own source.",
+            config.get("name", hub),
+        )
     same = [
         u
         for u in full.get("update", []) or []
@@ -154,7 +197,8 @@ async def to_code(config):
     keys, count = PUBLIC_KEYS[config[CONF_PUBLIC_KEYS]]
     cg.add(var.set_keys(cg.RawExpression(keys), cg.RawExpression(count)))
     cg.add(var.set_verify_signature(config[CONF_VERIFY_SIGNATURE]))
-    cg.add(var.set_hardware(HW_ID_D2A_ULTRA_5CH, config[CONF_BOARD_REVISION]))
+    hw_id, rev = _hardware(config, CORE.config)
+    cg.add(var.set_hardware(hw_id, rev))
     cg.add(var.set_passes(config[CONF_PASSES]))
     cg.add(var.set_auto_retry(config[CONF_AUTO_RETRY]))
     cg.add(hub.set_ping_burst(True))  # freshly installed boards confirm themselves at a PING

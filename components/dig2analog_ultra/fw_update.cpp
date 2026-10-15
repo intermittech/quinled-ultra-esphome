@@ -69,10 +69,15 @@ void UltraFirmwareUpdate::setup() {
   this->pref_ = this->make_entity_preference<uint32_t>();
   if (!this->pref_.load(&this->installed_))
     this->installed_ = 0;
-  this->update_info_.title = "QuinLED Dig2Analog-Ultra-5ch";
+  this->update_info_.title = this->hw_id_ == UPD_HW_ID_DP_ULTRA_RX ? "QuinLED Diff-Power Ultra receivers"
+                                                                    : "QuinLED Dig2Analog-Ultra-5ch";
   this->update_info_.current_version = this->installed_text_();
   this->publish_state();
-  this->set_status_("idle");
+  // without signing keys (public_keys: production before QuinLED provisions them) nothing can install: say so
+  this->set_status_(this->verify_ && this->nkeys_ == 0
+                        ? "no signing keys in this build: no release installs yet (QuinLED provisions the production "
+                          "keys with the firmware's first release)"
+                        : "idle");
   // the first look once the network is up, then every update_interval
   if (this->get_update_interval() != SCHEDULER_DONT_RUN) {
     this->set_interval(INITIAL_CHECK_ID, INITIAL_CHECK_MS, [this]() {
@@ -98,7 +103,8 @@ void UltraFirmwareUpdate::dump_config() {
                 this->line_answers_() ? "while a receiver isn't on the release" : "blind: a one-way line",
                 this->installed_text_().c_str());
   if (this->verify_ && this->nkeys_ == 0)
-    ESP_LOGW(TAG, "  No public keys: no release can be installed (production keys come with the firmware repo)");
+    ESP_LOGW(TAG, "  No signing keys in this build: no release installs (QuinLED provisions the production keys with the "
+                  "firmware's first release; bench builds: public_keys: test with your own source)");
 }
 
 std::string UltraFirmwareUpdate::installed_text_() const {

@@ -41,7 +41,10 @@ static const FwPublicKey FW_TEST_KEYS[] = {
 // Production (placeholders until the repo setup; a list, so a new key can be added before an old one is retired):
 //   {"release key 1", FW_RELEASE_KEY_1, sizeof(FW_RELEASE_KEY_1), FW_CH_STABLE | FW_CH_BETA | FW_CH_ALPHA},
 //   {"CI key 1",      FW_CI_KEY_1,      sizeof(FW_CI_KEY_1),      FW_CH_BETA | FW_CH_ALPHA},
-// Until then the list is empty and `public_keys: production` (the default) accepts no manifest.
+// Until then the list is empty and `public_keys: production` (the default) accepts no manifest: the configuration
+// check warns, the update entity's status and log say so. QuinLED provisions them: Quindor generates the production
+// key pair and keeps the private key; its public keys go here and FW_PRODUCTION_KEY_COUNT becomes their number
+// (update.py reads it).
 static const FwPublicKey *const FW_PRODUCTION_KEYS = nullptr;
 static constexpr size_t FW_PRODUCTION_KEY_COUNT = 0;
 

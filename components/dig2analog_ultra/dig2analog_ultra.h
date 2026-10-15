@@ -458,7 +458,8 @@ class UltraHub final : public Component {
   diffpower::DiffPowerPort *port_{nullptr};
   bool port_attached_{false};           // its loads registered (the first loop: the lights have their states)
   uint32_t notices_{0};
-  int64_t notice_at_us_{0};             // a lane's notice copy starts on the wire then: the port is told (0: none)
+  uint32_t notice_id_{0};               // a lane's notice copy: its post (counted once out on the wire; 0: none)
+  int64_t notice_end_us_{0};            // ... its last bit
   void attach_port_();
   void pump_notice_();
   void service_notice_();
@@ -504,6 +505,7 @@ class UltraHub final : public Component {
   esp_err_t lane_post_();
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   static void rw_lane_release_(void *arg);
+  uint8_t rw_dir_gpio_{0}, rw_dir_idle_{0};   // the direction pin's GPIO and released level (the lane's release)
 #endif
 #endif
 

@@ -64,6 +64,8 @@ class UltraParlioBus final : public Component {
   bool start_stream_();
   void restart_();
   void arm_();             // (under lock_) the timer at the stream's next alarm
+  uint16_t stop_();        // (under lock_) the stream stops: the pins idle, the releases of the frames out by then
+  void release_(uint16_t mask);   // (under lock_) the lanes' direction pins
   void pins_to_idle_();    // (in the interrupt) the data pins off the PARLIO, at their idle level
   void pins_to_parlio_();  // and back
 
@@ -92,7 +94,7 @@ class UltraParlioBus final : public Component {
 
   // diagnostics
   uint32_t render_us_max_{0}, render_us_sum_{0}, renders_{0};
-  uint32_t restarts_{0}, restarts_logged_{0}, tx_errors_{0};
+  uint32_t restarts_{0}, restarts_logged_{0}, tx_errors_{0}, start_retries_{0};
   volatile uint32_t switches_{0};
   uint32_t switches_seen_{0};
   uint32_t log_ms_{0};

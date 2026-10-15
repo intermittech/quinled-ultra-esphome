@@ -58,10 +58,25 @@ struct Pin {
     return l;
   }
 };
+/// ESPHome's ISR pin: its argument is an allocation of its own (it may be in PSRAM: external)
 struct IsrPin {
   Pin *pin{nullptr};
-  void digital_write(bool v) { this->pin->digital_write(v); }
+  bool external{false};
+  void digital_write(bool v) {
+    if (cache_off && this->external)
+      psram_in_isr++;
+    this->pin->digital_write(v);
+  }
 };
+/// the GPIO matrix, for a raw write (gpio_ll_set_level): the pins by number
+struct GpioDev {};
+static GpioDev GPIO;
+static Pin *gpio_pin[64];
+static uint8_t gpio_next = 20;
+static void gpio_ll_set_level(GpioDev *, uint32_t num, uint32_t level) {
+  if (num < 64 && gpio_pin[num] != nullptr)
+    gpio_pin[num]->digital_write(level != 0);
+}
 struct Uart {
   std::vector<uint8_t> rx;
   size_t available() const { return this->rx.size(); }
@@ -84,6 +99,7 @@ struct Rmt {
   bool rw_pending{false};
   uint32_t bit_ns{1300};
   bool refuse_rw{false};        // the next poll frame is refused (once)
+  bool refuse_rw_all{false};    // ... every one
   std::vector<std::pair<int64_t, std::vector<uint8_t>>> sent;   // (last bit us, frame)
   UltraHub *hub{nullptr};
 };
@@ -293,7 +309,9 @@ struct UltraHub {
   DiffPowerPort *port_{nullptr};
   bool port_attached_{false};
   uint32_t notices_{0};
-  int64_t notice_at_us_{0};
+  uint32_t notice_id_{0};
+  int64_t notice_end_us_{0};
+  uint8_t rw_dir_gpio_{0}, rw_dir_idle_{0};
   std::vector<TestLight *> lights_;
   bool cal_power_hold_{false}, upd_power_hold_{false};
   enum PowerCycle : uint8_t { CYCLE_NONE = 0, CYCLE_WAIT_OFF, CYCLE_OFF, CYCLE_DONE, CYCLE_FAILED };
@@ -342,6 +360,12 @@ struct UltraHub {
     if (dir != nullptr) {
       dir->reset(true);
       this->rw_dir_isr_.pin = dir;
+      this->rw_dir_isr_.external = true;   // (as if in PSRAM: the cache-off interrupt must not touch it)
+      if (gpio_next >= 64)
+        gpio_next = 20;
+      this->rw_dir_gpio_ = gpio_next++;
+      gpio_pin[this->rw_dir_gpio_] = dir;
+      this->rw_dir_idle_ = 0;
     }
     this->rw_rx_enable_pin_ = re;
     if (re != nullptr)
@@ -514,6 +538,7 @@ static Telemetry tel;
 /// receivers go silent leaves the others answering. A late render now and then kills the stream: the lines go on.
 static void test_sixteen_lanes() {
   set_clock(1000000);
+  psram_in_isr = 0;
   UltraHub::hubs_.clear();
   tel = Telemetry();
   static Stream bus;
@@ -643,7 +668,7 @@ static void test_sixteen_lanes() {
   }
   CHECK(lane_quiet && others > 1000, "%u windows: their lane low throughout, the other lanes sending (%u edges)",
         static_cast<unsigned>(quiet.size()), static_cast<unsigned>(others));
-  CHECK(frame_ok && time_worst <= 1500 && ultra_frames > 500, "%u Ultra frames decoded from the stream: valid headers, "
+  CHECK(frame_ok && time_worst <= 1500 + bus.start_hi_ns && ultra_frames > 500, "%u Ultra frames decoded from the stream: valid headers, "
         "TIME their last edge within %lld ns", static_cast<unsigned>(ultra_frames), static_cast<long long>(time_worst));
   // lane 5's receivers go silent: only they are unavailable
   tel.on[5] = false;
@@ -660,6 +685,8 @@ static void test_sixteen_lanes() {
   CHECK(hubs[5].poller_.answering(0) && hubs[5].poller_.answering(1), "and back");
   tel.overlaps(&same, &across);
   CHECK(same == 0 && tel.max_enabled <= 1, "still no overlap on a UART after it (%d)", same);
+  CHECK(psram_in_isr == 0, "the timer's interrupt (cache off) let go of the direction pins without touching the "
+        "ISR pins' own allocations (%d times)", psram_in_isr);
   CHECK(bus.restarts >= 10 && bus.replays == 0, "through %lld kills of the stream, no buffer played twice",
         static_cast<long long>(bus.restarts));
   std::printf("  16 lanes, 4 UARTs x 4: %u RW windows (%d pairs overlapping across UARTs, none on one), %u Ultra frames, "
@@ -674,7 +701,7 @@ static esp_err_t rmt_transmit(int ch, int, const uint8_t *data, size_t n, const 
   UltraHub *h = rmt.hub;
   const uint8_t *hd = data + n - ULTRA_HDR_BYTES;
   const bool rw = n == h->sched_.frame_bytes() && (ultra_header_flags(hd) & ULTRA_HDR_RW);
-  if (rw && rmt.refuse_rw) {
+  if (rw && (rmt.refuse_rw || rmt.refuse_rw_all)) {
     rmt.refuse_rw = false;
     return -1;
   }
@@ -690,7 +717,7 @@ static esp_err_t rmt_transmit(int ch, int, const uint8_t *data, size_t n, const 
 }
 
 /// RMT lines, their frames and done interrupts, every 20 us
-static void run_rmt(UltraHub *hubs, int n, int64_t us) {
+static void run_rmt(UltraHub *hubs, int n, int64_t us, DiffPowerPort *port = nullptr) {
   const int64_t end = clock_us + us;
   while (clock_us < end) {
     set_clock(clock_us + 20);
@@ -709,6 +736,8 @@ static void run_rmt(UltraHub *hubs, int n, int64_t us) {
     for (int k = 0; k < n; k++) {
       const uint32_t built = hubs[k].poller_.stats().windows;
       hubs[k].loop();
+      if (k == 0 && port != nullptr)
+        port->loop();
       if (hubs[k].poller_.stats().windows != built) {   // an RW frame (its window) went out
         hubs[k].windows++;
         hubs[k].last_window_us = clock_us;
@@ -959,7 +988,7 @@ static void test_group_cadence() {
 ///    the wire, every copy out before the enable drops, the enable at least 100 ms after the third copy's start (as
 ///    on an RMT line, where a copy starts as it is handed over);
 ///  - the shutdown hook: the same 3 copies through the stream while the loop no longer runs, the enable low after.
-static void test_port_on_lane(uint32_t chunk_groups, const char *what) {
+static void test_port_on_lane(uint32_t chunk_groups, const char *what, bool inject = false) {
   set_clock(400000000);
   UltraHub::hubs_.clear();
   DiffPowerPort::ports_.clear();
@@ -1009,9 +1038,22 @@ static void test_port_on_lane(uint32_t chunk_groups, const char *what) {
   Decoder dec;
   size_t decoded = 0;
   std::vector<std::pair<int64_t, uint8_t>> states{{clock_us, port.core_.state()}};
+  // inject: the stream stops (a late render) at notice copies: right after the planned power-off's first post (the
+  // copy is refused: it never went out), within its third post's last bytes and the shutdown's first (cut)
+  int phase = 0, posts = 0, injected = 0;
+  uint32_t last_id = 0;
+  int64_t kill_at = 0;
   auto step = [&](int64_t until_us, bool loops) {
     while (clock_us < until_us) {
       const int64_t next = std::min(until_us, clock_us + 50);
+      if (kill_at != 0 && kill_at <= next) {
+        bus.run_until(kill_at * 1000);
+        if (!bus.dead) {
+          bus.stop_at(kill_at * 1000);
+          injected++;
+        }
+        kill_at = 0;
+      }
       bus.run_until(next * 1000);
       set_clock(next);
       for (size_t s = std::max<size_t>(decoded, 1); s < bus.wire.size(); s++) {
@@ -1046,6 +1088,14 @@ static void test_port_on_lane(uint32_t chunk_groups, const char *what) {
       }
       if (port.core_.state() != states.back().second)
         states.emplace_back(clock_us, port.core_.state());
+      if (hub.notice_id_ != 0 && hub.notice_id_ != last_id) {   // a notice copy posted
+        last_id = hub.notice_id_;
+        posts++;
+        if (inject && phase == 1 && posts == 1)
+          kill_at = clock_us + 1;
+        else if (inject && ((phase == 1 && posts == 3) || (phase == 2 && posts == 1)))
+          kill_at = hub.notice_end_us_ - 30;
+      }
     }
   };
   advance_us = [&](int64_t us) { step(clock_us + us, false); };
@@ -1055,12 +1105,17 @@ static void test_port_on_lane(uint32_t chunk_groups, const char *what) {
   step(clock_us + 6000000, true);
   const bool on1 = port.is_ready() && hub.poller_.answering(0) && hub.poller_.answering(1);
   light.lit = false;
+  phase = 1;
+  posts = 0;
   step(clock_us + 4000000, true);
   const bool standby = port.core_.state() == PS_STANDBY && !enable.level;
+  phase = 0;
   light.lit = true;
   step(clock_us + 6000000, true);
   const bool on2 = port.is_ready() && hub.poller_.answering(0) && hub.poller_.answering(1);
   const int64_t t_sd = clock_us;
+  phase = 2;
+  posts = 0;
   DiffPowerPort::shutdown_all();
   const int64_t sd_ms = (clock_us - t_sd) / 1000;
   step(clock_us + 200000, false);   // (what was posted: out on the wire)
@@ -1131,9 +1186,75 @@ static void test_port_on_lane(uint32_t chunk_groups, const char *what) {
         "notice copies at least %.1f ms apart on the wire, all out before the enable drops, it %.1f ms after the third "
         "one's start at least; no poll frame from the first copy until powered again", what, least_gap / 1000.0,
         least_tail / 1000.0);
+  CHECK(!inject || injected == 3, "%s: the stream stopped at 3 notice copies (%d)", what, injected);
+  CHECK(psram_in_isr == 0, "%s: the timer's interrupt touched no ISR pin's own allocation (%d)", what, psram_in_isr);
   std::printf("  a line on a Diff-Power port, on a lane (%s): preamble after each wake, polls after the lock interval, "
-              "notice copies >= %.1f ms apart, the enable %.1f ms after the third, the shutdown in %lld ms\n", what,
-              least_gap / 1000.0, least_tail / 1000.0, static_cast<long long>(sd_ms));
+              "notice copies >= %.1f ms apart, the enable %.1f ms after the third, the shutdown in %lld ms%s\n", what,
+              least_gap / 1000.0, least_tail / 1000.0, static_cast<long long>(sd_ms),
+              inject ? "; 3 copies refused or cut by stops of the stream, sent again" : "");
+  UltraHub::hubs_.clear();
+  DiffPowerPort::ports_.clear();
+}
+
+
+/// A poll frame the transmitter keeps refusing holds its line's UART turn while it is retried; when the line's
+/// Diff-Power port goes down, the frame is dropped and the turn with it (its receiver off): the other line on the UART
+/// polls on.
+static void test_port_down_unsent_poll() {
+  set_clock(600000000);
+  UltraHub::hubs_.clear();
+  DiffPowerPort::ports_.clear();
+  DiffPowerPort::shut_down_ = false;
+  tel = Telemetry();
+  static UltraHub hubs[2];
+  static Uart uart;
+  static Pin dir[2], re[2], enable, detect;
+  static TestLight light;
+  static DiffPowerPort port;
+  uart = Uart();
+  renew(port);
+  light = TestLight();
+  light.lit = true;
+  enable.reset(false);
+  detect.reset(true);
+  PortConfig pc = port.core_.config();
+  pc.min_on_ms = 2000;
+  port.core_.configure(pc);
+  port.enable_pin_ = &enable;
+  port.detect_pin_ = &detect;
+  DiffPowerPort::ports_.push_back(&port);
+  for (int k = 0; k < 2; k++) {
+    renew(hubs[k]);
+    hubs[k].channel_ = k;
+    rmts[k] = Rmt();
+    rmts[k].hub = &hubs[k];
+    TelemetryIntervals iv;
+    iv.status_ms = 1000;
+    hubs[k].start(nullptr, 250, 1050, 700, 650, 300000, &uart, &dir[k], &re[k], 700 + k, 2, ULTRA_RW_RATE_1M, iv);
+    tel.uart_of[k] = 0;
+    tel.re[k] = &re[k];
+    tel.dir[k] = &dir[k];
+  }
+  tel.uarts[0] = &uart;
+  hubs[0].port_ = &port;
+  hubs[0].lights_.push_back(&light);
+  run_rmt(hubs, 2, 6000000, &port);   // powered, both lines polling
+  const bool both = port.is_ready() && hubs[0].poller_.answering(0) && hubs[1].poller_.answering(0);
+  rmts[0].refuse_rw_all = true;       // line 0's poll frames refused from now on: it keeps its turn, retrying
+  for (int t = 0; t < 300000 && !(hubs[0].rw_turn_ && hubs[0].tx_prepared_ && !hubs[0].rw_open_); t++)
+    run_rmt(hubs, 2, 20, &port);
+  const bool held = hubs[0].rw_turn_ && hubs[0].tx_prepared_ && re[0].level;
+  light.lit = false;                  // its port goes down (the light's turn-off period, the notice)
+  run_rmt(hubs, 2, 3000000, &port);
+  const uint32_t before = hubs[1].windows;
+  run_rmt(hubs, 2, 5000000, &port);
+  CHECK(both && held && !port.is_ready() && !hubs[0].rw_turn_ && !re[0].level && hubs[1].windows >= before + 3 &&
+            hubs[1].poller_.answering(0),
+        "a refused poll frame holds its line's UART turn (%d); its port down, the frame and the turn are dropped (turn "
+        "%d, receiver %d): the other line polls on (%u windows in 5 s)", held, hubs[0].rw_turn_, re[0].level,
+        hubs[1].windows - before);
+  std::printf("  a refused poll frame, then its port down: the frame and its UART turn dropped, the other line polls "
+              "on\n");
   UltraHub::hubs_.clear();
   DiffPowerPort::ports_.clear();
 }

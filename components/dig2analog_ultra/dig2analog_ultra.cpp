@@ -19,6 +19,7 @@
 #include <esp_timer.h>
 #ifdef USE_DIG2ANALOG_ULTRA_PARLIO
 #include <esp_memory_utils.h>
+#include <hal/gpio_ll.h>
 #endif
 
 namespace esphome::dig2analog_ultra {
@@ -423,6 +424,14 @@ bool UltraHub::rw_due_(bool urgent) {
   // Standby, and once it is powered their status follows their answers again: every receiver's sensors both times
   if (!this->boards_powered_()) {
     this->rw_waiting_ = false;   // (not waiting for the UART)
+    // a poll frame prepared but not sent (its transmit refused): dropped, and its UART turn (the boards have no
+    // supply; once they have, the replay sends everything); a window already open keeps its turn until it is read
+    if (this->tx_prepared_ && this->tx_rw_ && !this->rw_open_) {
+      this->tx_prepared_ = false;
+      this->tx_rw_ = false;
+      this->rw_release_ = false;
+      this->rw_drop_turn_();
+    }
     if (this->rw_powered_) {
       this->rw_powered_ = false;
       this->poller_.unpowered();
@@ -512,8 +521,17 @@ bool IRAM_ATTR UltraHub::rw_done_isr_(rmt_channel_handle_t, const rmt_tx_done_ev
 }
 
 #ifdef USE_DIG2ANALOG_ULTRA_PARLIO
-// A lane: the bus' timer alarm at the RW frame's last bit (PARLIO_RELEASE_NS after it), from the stream's timing.
-void IRAM_ATTR UltraHub::rw_lane_release_(void *arg) { UltraHub::rw_done_isr_(nullptr, nullptr, arg); }
+// A lane: the bus' timer alarm at the RW frame's last bit (PARLIO_RELEASE_NS after it), from the stream's timing. It
+// runs with the cache off too: it writes the pin itself, from the hub (in internal RAM: setup() checks), not through
+// the ISR pin (its argument is an allocation of its own, which may be in PSRAM).
+void IRAM_ATTR UltraHub::rw_lane_release_(void *arg) {
+  auto *hub = static_cast<UltraHub *>(arg);
+  if (hub->rw_release_) {
+    gpio_ll_set_level(&GPIO, hub->rw_dir_gpio_, hub->rw_dir_idle_);
+    hub->rw_release_ = false;
+    hub->rw_released_us_ = esp_timer_get_time();
+  }
+}
 #endif
 
 // The window is over (wait: until its bytes can be read; <= 26 ms): the UART's bytes to the poller, the sensors.
@@ -878,6 +896,10 @@ void UltraHub::setup() {
       this->rw_dir_pin_->setup();         // the hub drives the line
       this->rw_dir_pin_->digital_write(true);
       this->rw_dir_isr_ = this->rw_dir_pin_->to_isr();
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+      this->rw_dir_gpio_ = this->rw_dir_pin_->get_pin();   // (a lane's release writes it itself)
+      this->rw_dir_idle_ = this->rw_dir_pin_->is_inverted() ? 1 : 0;
+#endif
     }
     if (this->rw_rx_enable_pin_ != nullptr) {
       this->rw_rx_enable_pin_->setup();   // off until this line's first window (its UART may be shared)
@@ -1061,7 +1083,7 @@ void UltraHub::attach_port_() {
   this->port_->add_on_ready_callback([this]() {
     ESP_LOGD(TAG, "GPIO%u: the port is powered, replaying the boards' state", this->pin_);
     this->sched_.cancel_power_off();   // (a notice copy not sent before the power-off: stale now)
-    this->notice_at_us_ = 0;
+    this->notice_id_ = 0;
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
     if (this->cycle_ == CYCLE_OFF)
       this->cycle_ = CYCLE_DONE;   // (a recovery's power cycle: powered again)
@@ -1120,12 +1142,24 @@ void UltraHub::pump_notice_() {
 }
 
 // A lane's frame goes out a few ms after it was posted: its notice copy counts as sent (the port times the next copy
-// and the power-off from it) once it starts on the wire, as on the RMT, where it starts at once.
+// and the power-off from it) once it is out on the wire, whole. A copy the stream refused or cut (it restarted) never
+// reached the boards: it goes again, the same SEQ, in the next frame.
 void UltraHub::service_notice_() {
-  if (this->notice_at_us_ != 0 && now_us_() >= this->notice_at_us_) {
-    this->notice_at_us_ = 0;
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+  if (this->notice_id_ == 0)
+    return;
+  const uint8_t outcome = this->lane_->outcome(this->notice_id_, this->notice_end_us_, now_us_());
+  if (outcome == ParlioLane::PENDING)
+    return;
+  this->notice_id_ = 0;
+  if (outcome == ParlioLane::ON_WIRE) {
     this->port_->notice_sent();
+  } else {
+    for (uint16_t i = 0; i < this->num_boards_; i++)
+      this->sched_.power_off(i, false);
+    this->wake_();
   }
+#endif
 }
 #endif
 
@@ -1339,9 +1373,10 @@ void UltraHub::transmit_() {
 #ifdef USE_DIFFPOWER
   if (this->sched_.take_power_off_sent() && this->port_ != nullptr) {
 #ifdef USE_DIG2ANALOG_ULTRA_PARLIO
-    if (this->lane_ != nullptr)
-      this->notice_at_us_ = start;   // (on the wire from its start: then the port is told, service_notice_())
-    else
+    if (this->lane_ != nullptr) {
+      this->notice_id_ = this->lane_->posted_id();   // (once out on the wire the port is told: service_notice_())
+      this->notice_end_us_ = this->lane_->frame_end_us();
+    } else
 #endif
       this->port_->notice_sent();   // (its next copy 50 ms from now)
   }

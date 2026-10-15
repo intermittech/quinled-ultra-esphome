@@ -14,6 +14,7 @@
 //     the wire is exactly a frame a hub posted, once, with its real TIME (a repeat would splice valid slots into the
 //     wrong boards' positions); the stream restarts and frames flow again;
 //  5. a late switch interrupt changes nothing; a kill cancels the releases of the frames it cuts, never moves one;
+//     the handover around its deadline, a start whose clock was read late, a poll frame that ends just before a stop;
 //  6. 16 lanes on the hub's own code, 4 UARTs shared by 4 lanes each (also through a kill): windows of one UART never
 //     overlap, windows of different UARTs do, every receiver answers with its own data, a silent lane leaves the
 //     others answering; RMT lines sharing a UART; a busy line can't starve the others; a poll that failed to go out
@@ -71,6 +72,9 @@ static uint32_t now_ms = 0;
 static int64_t clock_us = 0;   // the host clock (esp_timer)
 static uint32_t millis() { return now_ms; }
 static int64_t esp_timer_get_time() { return clock_us; }
+/// in the timer's interrupt, which may run with the cache off (flash writes): what it touches must be in internal RAM
+static bool cache_off = false;
+static int psram_in_isr = 0;   // accesses to memory that may be in PSRAM from there
 static void set_clock(int64_t us) {
   clock_us = us;
   now_ms = static_cast<uint32_t>(us / 1000);
@@ -111,13 +115,16 @@ static uint32_t margin_ns(uint32_t sample_ns, uint8_t width) {
 
 // ================================================================================================ the bus, modelled
 /// The bus as ultra_parlio_bus.cpp drives ParlioStream (times in host ns):
-///  - the DMA plays chunk after chunk; at each boundary it takes the newest buffer handed over by the stream's margin
-///    before it (its last descriptors), else it plays the same buffer again (loop transmission) - unless the timer
-///    killed the stream: then the pins are idle;
+///  - the DMA plays chunk after chunk; at each boundary it takes the newest buffer handed over by dma_margin before it
+///    (its last descriptors; the stream's margin unless a test says otherwise), else it plays the same buffer again
+///    (loop transmission) - unless the stream was stopped: then the pins are idle;
 ///  - at each buffer switch the switch interrupt (isr_ns late) wakes the task, which renders the next chunk and hands
-///    it over task_ns later; late(k) delays it further at the switch to chunk k;
-///  - the timer: at the stream's next alarm (+ timer_ns): the releases, the deadline; after a kill the task restarts
-///    the stream restart_ns later.
+///    it over task_ns later (the stream checks the time: too late, the task stops it); late(k) delays it further at
+///    the switch to chunk k;
+///  - the timer: at the stream's next alarm (+ timer_ns): the releases, the deadline (a stop); after a stop the task
+///    restarts the stream restart_ns later;
+///  - a (re)start: the first sample goes out at t, the host clock read start_lo_ns before it and start_hi(try) after
+///    it; a try the stream refuses (too uncertain) plays idle samples, the next one follows 100 us later.
 /// wire: the pins, sample by sample (sample s at wire_t0 + s x sample), as far as they have played.
 struct Stream {
   ParlioStream s;
@@ -129,13 +136,16 @@ struct Stream {
   std::vector<uint16_t> wire;
   int64_t wire_t0{0};
   int64_t isr_ns{2000}, task_ns{50000}, timer_ns{2000}, restart_ns{300000};
+  int64_t dma_margin{0};                 // the DMA's cutoff before a chunk's end (init: the stream's margin)
+  int64_t start_lo_ns{2000}, start_hi_ns{1000};
+  std::function<int64_t(int)> start_hi;  // the clock after the first transmit call, per try (default start_hi_ns)
   std::function<int64_t(int64_t)> late;
   struct Fired {
     uint8_t lane;
     int64_t at;
   };
   std::vector<Fired> fired;   // the releases, when the timer dropped a pin
-  int64_t replays{0}, restarts{0};
+  int64_t replays{0}, restarts{0}, start_retries{0};
   // state
   int64_t T{0};            // the chunk on the wire started
   int64_t on_wire{0};      // its index (its buffer: on_wire & 1)
@@ -149,6 +159,7 @@ struct Stream {
     this->width = w;
     this->invert = inv;
     this->margin = margin_ns(g.sample_ns, w);
+    this->dma_margin = this->margin;
     if (!this->s.init(g.lane, lanes_used, inv, g.sample_ns, w, g.period, chunk_groups, this->margin))
       return false;
     for (auto &b : this->buf)
@@ -165,9 +176,16 @@ struct Stream {
   int64_t wire_end() const { return this->wire_t0 + static_cast<int64_t>(this->wire.size()) * this->sample_ns; }
   void start_at(int64_t t) {
     const int64_t first = this->s.next_chunk();
-    for (int i = 0; i < 2; i++)
-      this->s.clear(this->buf[i].data(), static_cast<uint8_t>(i));
-    this->s.start(first, t);
+    for (int attempt = 1;; attempt++) {
+      for (int i = 0; i < 2; i++)
+        this->s.clear(this->buf[i].data(), static_cast<uint8_t>(i));
+      const int64_t hi = this->start_hi ? this->start_hi(attempt) : this->start_hi_ns;
+      if (this->s.start(first, t - this->start_lo_ns, t + hi, (t + hi) / 1000 + 20, attempt >= 4))
+        break;
+      this->start_retries++;   // (idle samples; the DMA stops, the next try a little later)
+      this->idle_until(t + hi + 100000);
+      t = this->wire_end();
+    }
     this->T = t;
     this->on_wire = first;
     this->handed = first + 1;
@@ -212,30 +230,24 @@ struct Stream {
         this->hand_at = e + this->task_ns;
       } else if (e == e_hand) {
         this->need_hand = false;
-        if (!this->s.killed()) {   // (the bus: under its lock, after the transmit)
-          this->s.handed_over(this->rendered);
-          this->handed = this->rendered;
-          this->handed_at = e;
-        }
-      } else if (e == e_alarm) {
-        bool kill = false;
-        const uint16_t mask = this->s.alarm(e / 1000, &kill);
-        for (uint8_t k = 0; k < PARLIO_MAX_LANES; k++) {
-          if (mask & (1u << k)) {
-            this->s.lane(k)->release_now();
-            this->fired.push_back(Fired{k, e});
+        if (!this->s.killed()) {   // (the bus: under its lock, the transmit call returned)
+          if (this->s.handed_over(this->rendered, e / 1000)) {
+            this->handed = this->rendered;
+            this->handed_at = e;
+          } else {
+            this->stop_at(e);   // too late for its deadline: the task stops the stream itself
           }
         }
-        if (kill && !this->dead) {   // the pins to their idle level now: the chunk on the wire is cut here
-          this->play_to(e);
-          this->dead = true;
-          this->cut = e;
-        }
+      } else if (e == e_alarm) {
+        if (this->s.late(e / 1000))
+          this->stop_at(e);
+        else
+          this->fire(this->s.releases_due(e / 1000), e);
       } else if (e == e_end) {
         this->play_to(e);
         this->played = 0;
         // the DMA moves on to the newest buffer, if it came in time; else it plays the same one again
-        if (this->handed > this->on_wire && this->handed_at <= this->T + this->C() - this->margin) {
+        if (this->handed > this->on_wire && this->handed_at <= this->T + this->C() - this->dma_margin) {
           this->on_wire = this->handed;
           this->need_render = true;
           const int64_t extra = this->late ? this->late(this->on_wire) : 0;
@@ -252,6 +264,25 @@ struct Stream {
       }
     }
     this->play_to(t_ns);
+  }
+  /// the bus' stop at e: the pins to their idle level (the chunk on the wire is cut here), then the releases of the
+  /// frames out by then
+  void stop_at(int64_t e) {
+    this->play_to(e);
+    this->dead = true;
+    this->cut = e;
+    this->fire(this->s.stop(e / 1000), e);
+  }
+  bool cache_off_isr{true};   // (the releases run in the timer's interrupt, which may run with the cache off)
+  void fire(uint16_t mask, int64_t e) {
+    for (uint8_t k = 0; k < PARLIO_MAX_LANES; k++) {
+      if (mask & (1u << k)) {
+        cache_off = this->cache_off_isr;
+        this->s.lane(k)->release_now();
+        cache_off = false;
+        this->fired.push_back(Fired{k, e});
+      }
+    }
   }
   /// up to the end of the chunk on the wire (or the restart after a kill)
   void step() { this->run_until(this->dead ? this->cut + this->restart_ns : this->T + this->C()); }
@@ -504,7 +535,8 @@ static void test_waveform() {
 /// Ultra frames of real schedulers (1 to 50 boards) on 16 lanes: each header's TIME (and what build_frame returned) is
 /// its last falling edge on the stream, within 1.5 us: the us rounding (0.5 us each for the start and the bits), and
 /// the frame's last bit, the header's CRC, which the scheduler counts before TIME is in it (a '0' or a '1' low: 450 ns
-/// apart at 20 MHz); RMT lines have the same.
+/// apart at 20 MHz); RMT lines have the same. Plus the start's uncertainty: the stream counts from the host clock after
+/// the first transmit call (start_hi_ns after the first sample here).
 static void test_time() {
   const Grid g = default_grid(16);
   Stream s;
@@ -561,8 +593,9 @@ static void test_time() {
       frames++;
     }
   }
-  CHECK(edges && header && worst <= 1500 && frames > 500, "TIME of %u frames on 16 lanes (1 to 50 boards): the last "
-        "falling edge on the stream within %lld ns (1.5 us), the header carries it", static_cast<unsigned>(frames),
+  CHECK(edges && header && worst <= 1500 + s.start_hi_ns && frames > 500, "TIME of %u frames on 16 lanes (1 to 50 "
+        "boards): the last falling edge on the stream within %lld ns (1.5 us + the start's), the header carries it",
+        static_cast<unsigned>(frames),
         static_cast<long long>(worst));
   std::printf("  TIME: %u frames on 16 lanes, the header's TIME within %lld ns of the frame's last edge\n",
               static_cast<unsigned>(frames), static_cast<long long>(worst));
@@ -704,7 +737,8 @@ static size_t run_lateness(Stream &s, LaneRun *lr, const Grid &g, int switches, 
       worst = std::max<int64_t>(worst, err < 0 ? -err : err);
     }
   }
-  CHECK(unmatched == 0 && matched_twice == 0 && worst <= 1500, "%s: %u valid frames on the wire, each exactly a posted "
+  CHECK(unmatched == 0 && matched_twice == 0 && worst <= 1500 + s.start_hi_ns, "%s: %u valid frames on the wire, each "
+        "exactly a posted "
         "frame, once (%u not, %u twice), TIME its last edge within %lld ns; %u cut frames (the boards drop them)", what,
         static_cast<unsigned>(valid), static_cast<unsigned>(unmatched), static_cast<unsigned>(matched_twice),
         static_cast<long long>(worst), static_cast<unsigned>(cut));
@@ -832,6 +866,199 @@ static void test_late_interrupts() {
   }
 }
 
+// ================================================================================================ 6. boundaries
+/// The handover around its deadline (a 40-byte frame in the chunk that would play twice; the switch's next chunk
+/// handed over from 3 us before the deadline to 20 us after it, with the timer's interrupt 0, 2, 20 or 200 us late):
+/// never a buffer played twice, the frame on the wire once at most, nothing else valid.
+static void test_deadline_boundary() {
+  int64_t worst_repeats = 0;
+  int cases = 0, bad = 0;
+  for (int64_t timer : {0, 2000, 20000, 200000}) {
+    for (int64_t delta : {-3000, -1000, -400, 0, 1, 300, 1000, 2000, 3000, 20000}) {
+      Stream s;
+      const Grid g = default_grid(16);
+      s.init(g, 16, 96, 16, 0, 4000000000 + 333);
+      s.timer_ns = timer;
+      ParlioLane *l = s.s.lane(0);
+      l->begin(40, nullptr, nullptr);
+      s.run_until(s.wire_t0 + s.C() + 100000);
+      std::vector<uint8_t> f(40);
+      ultra_slot_begin(f.data(), ULTRA_CONFIG, ULTRA_LIGHT_BOARD, 0, 1);
+      ultra_slot_seal(f.data());
+      const int64_t start = l->reserve_us();
+      ultra_build_header(f.data() + 32, static_cast<uint32_t>(start + 431));
+      l->post(f.data(), f.size(), 300, false);
+      const int64_t kf = l->reserved_group() / 96;   // the frame's chunk: the next one's handover is the late one
+      s.late = [&s, kf, delta](int64_t k) -> int64_t {
+        if (k != kf)
+          return 0;
+        return s.s.deadline_us() * 1000 + delta - (s.T + s.C() + s.isr_ns + s.task_ns);
+      };
+      s.run_until(s.wire_t0 + 9 * s.C());
+      const Decoder d = Decoder::of(s, 0);
+      int valid = 0, other = 0;
+      for (const Decoder::Frame &x : d.frames) {
+        if (valid_ultra(x.bytes)) {
+          valid++;
+          other += x.bytes != f;
+        }
+      }
+      worst_repeats = std::max(worst_repeats, s.replays);
+      bad += s.replays != 0 || valid > 1 || other != 0;
+      cases++;
+    }
+  }
+  CHECK(bad == 0 && worst_repeats == 0, "the handover around its deadline (%d cases: -3 to +20 us, the timer 0-200 us "
+        "late): never a buffer played twice (%lld), the frame once at most, nothing else valid (%d bad)", cases,
+        static_cast<long long>(worst_repeats), bad);
+  std::printf("  deadline boundary: %d handovers from 3 us before to 20 us after the deadline, the timer 0-200 us late: "
+              "no buffer played twice\n", cases);
+}
+
+/// A (re)start whose host clock was read 300 us after the first sample, every try (the last try takes it): the deadlines
+/// count from the clock before the transmit call, so a handover 100 us after the physical deadline is refused and the
+/// stream stops before the DMA (its two descriptors of look-ahead, without the slack) plays a buffer twice; an 8-board
+/// frame across the chunk boundary never reaches a board in another's slot; the direction pin's release (from the
+/// later clock) never comes before its frame's last bit. Also after a restart; and a slow first try is tried again.
+static void test_start_origin() {
+  for (int restart = 0; restart < 2; restart++) {
+    Stream s;
+    const Grid g = default_grid(16);
+    s.start_hi = [](int) -> int64_t { return 300000; };
+    s.init(g, 16, 96, 16, 0, 5000000000);
+    if (restart) {
+      s.run_until(s.wire_t0 + 2 * s.C());
+      s.stop_at(s.wire_end());
+      s.run_until(s.cut + s.restart_ns + 1000);
+    }
+    s.dma_margin = s.margin - 50000;
+    const int64_t first = s.on_wire;
+    s.task_ns = 30000;
+    s.late = [&s, first](int64_t k) -> int64_t {
+      if (k != first + 4)
+        return 0;
+      return (s.T + s.C() + s.C() - s.margin + 100000) - (s.T + s.C() + s.isr_ns + s.task_ns);
+    };
+    ParlioLane *l = s.s.lane(0);
+    int released = 0;
+    l->begin(264, [](void *a) { (*static_cast<int *>(a))++; }, &released);
+    std::vector<uint8_t> f(264);
+    for (uint8_t i = 0; i < 8; i++) {
+      uint8_t id = ULTRA_CFG_LOSS_TIMEOUT;
+      uint16_t value = static_cast<uint16_t>(i + 10);
+      ultra_slot_config(f.data() + 32 * i, static_cast<uint8_t>(i + 1), &id, &value, 1);
+    }
+    const int64_t start = l->reserve_us();
+    ultra_build_header(f.data() + 256, static_cast<uint32_t>(start + 2851));
+    l->post(f.data(), f.size(), 300, true);
+    s.run_until(s.wire_t0 + 12 * s.C());
+    const Decoder d = Decoder::of(s, 0);
+    int other = 0, copies = 0;
+    int64_t edge = -1;
+    for (const Decoder::Frame &x : d.frames) {
+      if (!valid_ultra(x.bytes))
+        continue;
+      other += x.bytes != f;
+      copies += x.bytes == f;
+      if (x.bytes == f)
+        edge = s.time_of(x.t0);
+    }
+    bool early = false;
+    for (const Stream::Fired &r : s.fired)
+      early |= edge >= 0 && r.at < edge;
+    CHECK(s.replays == 0 && other == 0 && copies <= 1 && !early && s.start_retries >= 3, "%s with its clock read 300 us "
+          "after the first sample: no buffer played twice (%lld), no frame but the posted one (%d), once at most (%d), "
+          "no release before its frame's last bit; %lld tries", restart ? "a restart" : "a start",
+          static_cast<long long>(s.replays), other, copies, static_cast<long long>(s.start_retries));
+  }
+  // a slow first try, the next one quick: tried again, the TIMEs right
+  Stream s;
+  const Grid g = default_grid(16);
+  s.start_hi = [](int attempt) -> int64_t { return attempt == 1 ? 300000 : 1000; };
+  s.init(g, 16, 96, 16, 0, 6000000000);
+  ParlioLane *l = s.s.lane(0);
+  l->begin(40, nullptr, nullptr);
+  s.run_until(s.wire_t0 + s.C() + 100000);
+  Scheduler sched;
+  sched.init(1, 9, 3);
+  sched.set_bit_timing(250, (g.period - 5) * 50, 700, (g.period - 14) * 50);
+  std::vector<uint8_t> f(sched.frame_bytes());
+  const int64_t t = sched.build_frame(l->reserve_us(), f.data());
+  l->post(f.data(), f.size(), 300, false);
+  s.run_until(s.wire_t0 + 6 * s.C());
+  const Decoder d = Decoder::of(s, 0);
+  const int64_t err = d.frames.empty() ? INT64_MAX : t * 1000 - s.time_of(d.frames.back().t0);
+  CHECK(s.start_retries == 1 && std::llabs(err) <= 1500 + s.start_hi_ns, "a slow start tried again (%lld): the TIME "
+        "of the next frame its last edge within %lld ns", static_cast<long long>(s.start_retries),
+        static_cast<long long>(err));
+  std::printf("  start origin: the clock read 300 us late (start, restart): the deadlines from before the call, no "
+              "repeat, no early release; a slow start tried again\n");
+}
+
+/// A poll frame that ends just before the stream stops (the release 2 us after its last bit falls after the deadline):
+/// the frame is out whole, so its direction pin is released (at the stop), never left driven. Swept over the deadline's place in a group (the clock before the start, 0-11 us), 10 and 20 MHz.
+static void test_release_at_stop() {
+  int runs = 0, complete = 0, missing = 0, early = 0;
+  for (uint32_t sample_ns : {100u, 50u}) {
+    for (int64_t lo = 0; lo < 11200; lo += 200) {
+      for (int shift = 0; shift < 2; shift++) {
+        Stream s;
+        const Grid g = default_grid(16, sample_ns);
+        s.start_lo_ns = lo;
+        s.init(g, 16, 96, 16, 0, 1000000000);
+        ParlioLane *l = s.s.lane(0);
+        int released = 0;
+        l->begin(400, [](void *a) { (*static_cast<int *>(a))++; }, &released);
+        s.run_until(s.wire_t0 + s.C() + 100000);
+        // the poll frame (1 board) ends in the group of the deadline of its chunk's successor: a filler first, taken a
+        // chunk before the poll frame is posted
+        std::vector<uint8_t> rw(ultra_frame_bytes(1)), filler(1, 0);
+        ultra_slot_poll(rw.data(), 2, 0, 1, ULTRA_PAGE_STATUS, ULTRA_RW_RATE_1M, nullptr, 0);
+        const ParlioClock &clk = s.s.clock();
+        l->reserve_us();
+        const int64_t h = l->reserved_group();
+        const int64_t kf = h / 96 + 2;   // the poll frame's chunk
+        const ParlioClock::State st = clk.read();
+        const int64_t t0_phys = st.t0_ns - s.start_hi_ns;
+        const int64_t dl_ns = ((t0_phys - lo + (kf + 1) * s.C() - s.margin) / 1000) * 1000;
+        const int64_t end_group = (dl_ns - t0_phys) / clk.group_ns() + shift;
+        const int64_t rw_start = end_group - static_cast<int64_t>(rw.size());
+        const uint32_t q = static_cast<uint32_t>(rw_start - h - 1);
+        if (rw_start < h + 2 || rw_start / 96 != kf)
+          continue;
+        l->post(filler.data(), 1, static_cast<uint32_t>(q * clk.group_ns() / 1000), false);
+        s.run_until(s.wire_t0 + (kf - 2) * s.C() - 200000);
+        if (l->busy())
+          continue;
+        const int64_t start = l->reserve_us();
+        ultra_build_header_flags(rw.data() + rw.size() - ULTRA_HDR_BYTES, static_cast<uint32_t>(start), ULTRA_HDR_RW);
+        if (!l->post(rw.data(), rw.size(), 6000, true) || l->reserved_group() != rw_start)
+          continue;
+        s.late = [kf](int64_t k) -> int64_t { return k == kf ? 2000000 : 0; };   // its successor late: a stop
+        s.run_until(s.wire_t0 + (kf + 4) * s.C());
+        runs++;
+        const Decoder d = Decoder::of(s, 0);
+        int64_t edge = -1;
+        for (const Decoder::Frame &x : d.frames) {
+          if (x.bytes == rw)
+            edge = s.time_of(x.t0);
+        }
+        complete += edge >= 0;
+        if (edge >= 0) {
+          missing += released != 1;
+          for (const Stream::Fired &r : s.fired)
+            early += r.at < edge || r.at > edge + 12000;
+        }   // (a release for a cut frame is harmless: its line idles anyway)
+      }
+    }
+  }
+  CHECK(runs > 100 && complete > 20 && missing == 0 && early == 0, "%d poll frames ending around a stop (10 / 20 "
+        "MHz): each of the %d out whole got its release, after its last bit (%d missing, %d early or late)", runs,
+        complete, missing, early);
+  std::printf("  release at a stop: %d poll frames ending around the deadline, the %d out whole released\n", runs,
+              complete);
+}
+
 //BUS_TESTS_END
 }  // namespace esphome::dig2analog_ultra
 
@@ -866,7 +1093,7 @@ static int bench() {
       buf[i].assign(st.chunk_bytes(), 0);
       st.clear(buf[i].data(), static_cast<uint8_t>(i));
     }
-    st.start(0, 0);
+    st.start(0, 0, 0, 0);
     void *bufs[2] = {buf[0].data(), buf[1].data()};
     std::vector<uint8_t> frame(ultra_frame_bytes(8));   // 8 boards
     std::mt19937 rng(1);
@@ -888,7 +1115,7 @@ static int bench() {
       }
       const auto a = std::chrono::steady_clock::now();
       const int64_t ch = st.render(bufs);
-      st.handed_over(ch);
+      st.handed_over(ch, st.deadline_us() - 1);
       ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - a).count();
       sink += buf[ch & 1][static_cast<size_t>(i) % buf[0].size()];
     }
@@ -913,6 +1140,9 @@ int main(int argc, char **argv) {
   test_windows();
   test_late_render();
   test_late_interrupts();
+  test_deadline_boundary();
+  test_start_origin();
+  test_release_at_stop();
   hub_lanes::test_sixteen_lanes();
   hub_lanes::test_rmt_shared_uart();
   hub_lanes::test_fair_uart();
@@ -920,6 +1150,9 @@ int main(int argc, char **argv) {
   hub_lanes::test_group_cadence();
   hub_lanes::test_port_on_lane(96, "1 ms buffers");
   hub_lanes::test_port_on_lane(928, "10 ms buffers");
+  hub_lanes::test_port_on_lane(96, "1 ms buffers, stops at notices", true);
+  hub_lanes::test_port_on_lane(928, "10 ms buffers, stops at notices", true);
+  hub_lanes::test_port_down_unsent_poll();
   hub_update::test_update_on_lane();
   hub_update::test_update_failures();
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "ALL ULTRA PARLIO TESTS PASSED", failures);

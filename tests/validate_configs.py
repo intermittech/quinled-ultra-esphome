@@ -244,6 +244,25 @@ def tel_lines(n, uarts=None, names=None, devices=None, extra=""):
     return out
 
 
+def ram_lines(n, receivers, diagnostics="full"):
+    """n lines of `receivers` receivers each (a light per receiver), each with telemetry on its own UART."""
+    hub_pins, rx_pins = [16, 18, 19, 21], [22, 23, 25, 26]
+    out = "uart:\n"
+    for i in range(n):
+        out += f"  - id: rx{i}\n    rx_pin: GPIO{rx_pins[i]}\n    baud_rate: 1000000\n    rx_buffer_size: 2048\n"
+    out += "dig2analog_ultra:\n"
+    for i in range(n):
+        out += (f"  - id: u{i}\n    pin: GPIO{hub_pins[i]}\n    num_boards: {receivers}\n    rmt_symbols: 64\n"
+                f"    telemetry:\n      uart_id: rx{i}\n      name: Port {i + 1}\n      receivers: {receivers}\n"
+                f"      diagnostics: {diagnostics}\n")
+    out += "light:\n"
+    for i in range(n):
+        for b in range(receivers):
+            out += (f"  - platform: dig2analog_ultra\n    dig2analog_ultra_id: u{i}\n    name: l{i}_{b}\n"
+                    f"    board: {b}\n    channel: 1\n")
+    return out
+
+
 def lines(n, symbols=None):
     out = "dig2analog_ultra:\n"
     for i in range(n):
@@ -1244,6 +1263,11 @@ CASES = [
     # Home Assistant (quinled-ultra-homeassistant esphome-requirements): the update rate, the live twins, the Port text,
     # the Identify button, the controller's totals, DE and /RE tied on a shared UART
     ("ultra telemetry update_rate normal", ULTRA + TELEMETRY + "    update_rate: normal\n" + RX_UART, True, None),
+    # the RAM estimate (a codegen warning above ~60 KB on a classic ESP32): 2 lines x 12 receivers (a light each) with
+    # full diagnostics warn; the same with basic diagnostics, or one small line, don't
+    ("ultra RAM warning: 24 receivers, full diagnostics (~71 KB)", ram_lines(2, 12), True, "of the ESP32's RAM"),
+    ("ultra RAM: 24 receivers, basic diagnostics (~54 KB)", ram_lines(2, 12, "basic"), True, "!of the ESP32's RAM"),
+    ("ultra RAM: one small line", ram_lines(1, 2), True, "!of the ESP32's RAM"),
     ("ultra telemetry update_rate bogus", ULTRA + TELEMETRY + "    update_rate: ludicrous\n" + RX_UART, False,
      "Unknown value"),
     ("ultra telemetry live twins on devices", ULTRA + TELEMETRY + RX_LIST + RX_UART, True, "name: Live power"),

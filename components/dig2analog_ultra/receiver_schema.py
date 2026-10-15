@@ -2,6 +2,8 @@
 (a Home Assistant device of its own, `device_id`), the port's summary, and the lights' estimates. Used by __init__.py
 and light.py; the logic is ultra_telemetry.h, the entities ultra_receiver.h."""
 
+import logging
+
 from esphome import pins
 import esphome.codegen as cg
 from esphome.components import binary_sensor, button, sensor, text_sensor, uart
@@ -379,6 +381,71 @@ def telemetry_defaults(config):
         tel[key] = _entity(tel.get(key), label, device, key in PORT_DISABLED)
     config[CONF_TELEMETRY] = tel
     return config
+
+
+# The ESP32 RAM a configuration's lines take, roughly (measured on a classic ESP32, rounds 9-10): per receiver with
+# its entities by diagnostics level, per light with its share of its line's state, per estimated light (a receiver
+# with several lights), a line's own, the UART buffers, the lifetime ledger's reserve (its own sizing rule).
+_LOGGER = logging.getLogger(__name__)
+RAM_PER_RECEIVER = {"full": 1600, "basic": 900, "none": 600}
+RAM_PER_LIGHT = 900
+RAM_PER_ESTIMATE = 200
+RAM_PER_LINE = 1000
+RAM_LEDGER_ENTRY, RAM_LEDGER_POSITION = 80, 40
+RAM_WARN_CLASSIC = 60 * 1024   # a classic ESP32: ~100-150 KB free with Wi-Fi and the API
+
+
+def ram_estimate(full):
+    """(bytes, parts) of every dig2analog_ultra line in the configuration."""
+    hubs = full.get("dig2analog_ultra", []) or []
+    parts = {"lines": RAM_PER_LINE * len(hubs), "receivers": 0, "lights": 0, "estimates": 0, "uarts": 0,
+             "ledger": 0}
+    counters = 0   # the ledger's positions: a receiver each, a port each, an estimated light each
+    uarts = set()
+    for conf in hubs:
+        counts = lights_per_board(full, conf[CONF_ID])
+        parts["lights"] += RAM_PER_LIGHT * sum(counts.values())
+        tel = conf.get(CONF_TELEMETRY)
+        if not tel:
+            continue
+        recs = tel.get(CONF_RECEIVERS) or []
+        level = str(tel.get(CONF_DIAGNOSTICS, "full")).lower()
+        parts["receivers"] += RAM_PER_RECEIVER.get(level, RAM_PER_RECEIVER["full"]) * len(recs)
+        counters += len(recs) + 1
+        if tel.get(CONF_LIGHT_ENTITIES, True):
+            est = sum(n for b, n in counts.items() if b < len(recs) and n > 1)
+            parts["estimates"] += RAM_PER_ESTIMATE * est
+            counters += est
+        uid = str(tel.get(CONF_UART_ID))
+        if uid not in uarts:
+            uarts.add(uid)
+            u = uart_of(full, tel.get(CONF_UART_ID))
+            parts["uarts"] += int(u.get(CONF_RX_BUFFER_SIZE, RW_RX_BUFFER_MIN)) if u else RW_RX_BUFFER_MIN
+    if counters:
+        pos = (counters + 31) // 32 * 32
+        room = (counters + max(4, counters // 2) + 31) // 32 * 32
+        parts["ledger"] = room * RAM_LEDGER_ENTRY + pos * RAM_LEDGER_POSITION
+    return sum(parts.values()), parts
+
+
+def warn_ram(full):
+    """A warning when the lines would leave a classic ESP32 short of heap."""
+    from esphome.components import esp32
+
+    total, parts = ram_estimate(full)
+    if esp32.get_esp32_variant() != esp32.VARIANT_ESP32 or total <= RAM_WARN_CLASSIC:
+        return total
+    detail = ", ".join(f"{k} {v / 1024:.1f}" for k, v in parts.items() if v)
+    _LOGGER.warning(
+        "dig2analog_ultra: these lines take about %.0f KB of the ESP32's RAM (KB: %s). A classic ESP32 has about "
+        "100-150 KB free with Wi-Fi and the API, so above ~%d KB it may run short (a crash under load, a failed OTA). "
+        "Use diagnostics: basic on the big lines (0.7 KB less per receiver), fewer lines per ESP32, or an ESP32-S3 / "
+        "P4.",
+        total / 1024,
+        detail,
+        RAM_WARN_CLASSIC // 1024,
+    )
+    return total
 
 
 def uart_of(full, uart_id):

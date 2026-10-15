@@ -39,6 +39,7 @@ from .receiver_schema import (
     telemetry_to_code,
     validate_telemetry,
     validate_telemetry_lines,
+    warn_ram,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -598,6 +599,10 @@ def _validate_lanes(full):
 
 def _final_validate(configs):
     full = fv.full_config.get()
+    hubs = full.get("dig2analog_ultra", []) or []
+    first = configs[0] if isinstance(configs, list) else configs
+    if hubs and first[CONF_ID] == hubs[0][CONF_ID]:
+        warn_ram(full)   # (once: every line counts)
     _validate_rmt_memory(full)
     _validate_lanes(full)
     validate_telemetry_lines(full)

@@ -218,15 +218,18 @@ class LifetimeLedger {
     LifeCounters t = rx;
     t.powered = up_to_(e.c.powered, rx.powered, LS_STEP_POWERED);
     const uint32_t dp = t.powered - rx.powered;
-    t.lit = up_to_(e.c.lit, rx.lit, dp + 1);
-    const uint32_t ev = dp * LS_STEP_EVENTS_PER_01H + LS_STEP_EVENTS;
+    // the other caps follow the powered step the board applies at the POLL: its own time may pass a 0.1 h between the
+    // read and the POLL (that step one less), so one unit of margin (none needed without a step: it can't go below 0)
+    const uint32_t dm = dp > 0 ? dp - 1 : 0;
+    t.lit = up_to_(e.c.lit, rx.lit, dm + 1);
+    const uint32_t ev = dm * LS_STEP_EVENTS_PER_01H + LS_STEP_EVENTS;
     t.ups = up_to_(e.c.ups, rx.ups, ev);
     t.dips = up_to_(e.c.dips, rx.dips, ev);
     t.ovl = static_cast<uint16_t>(up_to_(e.c.ovl, rx.ovl, ev));
     t.shorts = static_cast<uint16_t>(up_to_(e.c.shorts, rx.shorts, ev));
     const uint64_t frac = rx.mwh % 1000, rx_wh = rx.mwh / 1000;
     uint64_t wh = e.c.mwh > frac ? (e.c.mwh - frac) / 1000 : 0;
-    const uint64_t cap = rx_wh + static_cast<uint64_t>(dp) * LS_STEP_WH_PER_01H + LS_STEP_WH;
+    const uint64_t cap = rx_wh + static_cast<uint64_t>(dm) * LS_STEP_WH_PER_01H + LS_STEP_WH;
     wh = wh > cap ? cap : wh;
     t.mwh = (wh > rx_wh ? wh : rx_wh) * 1000 + frac;
     return t;

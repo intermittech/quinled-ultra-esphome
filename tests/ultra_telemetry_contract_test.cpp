@@ -1836,6 +1836,38 @@ static void sc_month() {
         "%lld, %lld, %lld, %lld; %u writes)",
         (long long) y.d_pow, (long long) y.d_lit, (long long) y.d_ups, (long long) y.d_wh, (long long) y.h_pow,
         (long long) y.h_lit, (long long) y.h_ups, (long long) y.h_wh, y.writes);
+  // the read-to-POLL race against the real merge (design review round 9, cross-check F6): the board's own time passes
+  // a 0.1 h between the hub's read and its LIFE_SYNC POLL (its powered step one less, its other caps with it); a ledger
+  // ahead in every field, sent at the caps that read allows, still comes back applied
+  {
+    MonthRx r;
+    life_rec_t rec = used;
+    rec.on_s = 360u * 5000u + 357u;   // (3 s below a 0.1 h)
+    r.init(rec);
+    r.power_up(0);
+    uint8_t d[24];
+    ReceiverData rd;
+    r.page(TP_LIFETIME, 500, d);
+    decode_receiver_page(rd, ULTRA_PAGE_LIFETIME, d);
+    r.page(TP_ENERGY, 500, d);
+    decode_receiver_page(rd, ULTRA_PAGE_ENERGY, d);
+    const LifeCounters rc = receiver_counters(rd);
+    LedgerEntry le;
+    le.c = rc;
+    le.c.powered += 10;
+    le.c.lit += 20;
+    le.c.ups += 1000;
+    le.c.mwh += 5000000;
+    le.records = rd.lt_records;
+    uint8_t args[LifetimeLedger::LS_ARGS];
+    LifetimeLedger::sync_args(le, rc, r.uid16, args);
+    const uint8_t res = r.sync(args, 4500, d);   // (4 s on: 5,001 x 0.1 h now)
+    const uint8_t all = ULTRA_LS_F_POWERED | ULTRA_LS_F_LIT | ULTRA_LS_F_UPS | ULTRA_LS_F_WH;
+    CHECK(rd.lt_powered == 5000 && r.e.lt.on_s / 360u == 5010 && res == ULTRA_LS_R_APPLIED &&
+              d[ULTRA_LS_A_APPLIED] == all,
+          "month: the read-to-POLL race: applied (result %u, fields %02X; read at %u, now %u x 0.1 h)", res,
+          d[ULTRA_LS_A_APPLIED], rd.lt_powered, r.e.lt.on_s / 360u);
+  }
   life_rec_t clean = used;   // (no remainders)
   clean.on_s = 360u * 5000u;
   clean.lit_s = 360u * 2000u;

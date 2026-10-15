@@ -131,10 +131,8 @@ struct Model {
       this->wh_bump_on_sync--;
       this->total_wh++;
     }
-    if (this->powered_bump_on_sync > 0) {
-      this->powered_bump_on_sync--;
-      this->powered_01h++;
-    }
+    this->powered_01h += this->powered_bump_on_sync;   // (its own time on since the read: 0.1 h units)
+    this->powered_bump_on_sync = 0;
     uint8_t result = ULTRA_LS_R_APPLIED, mask = 0;
     const uint8_t *l = arg + ULTRA_LS_LIFETIME;
     const uint32_t a_pow = ultra_get24(l + ULTRA_LT_POWERED), a_lit = ultra_get24(l + ULTRA_LT_LIT),
@@ -1234,18 +1232,34 @@ static void test_ledger_sync() {
   drive(c, h, ha, 15000);
   CHECK(m.syncs == 10 && m.sync_result == ULTRA_LS_R_APPLIED && !h.k.attention(0) && m.total_wh == 1238,
         "the next power-up: applied, attention cleared");
-  // capped: its powered grew 0.1 h between the read and the sync, so lit is over its cap: the rest next power-up
+  // the read-to-POLL race (design review round 9, cross-check F6): its powered time passed a 0.1 h between the read
+  // and the POLL, so its powered step and with it its lit cap are one less: the ledger's one unit of margin keeps the
+  // sync applied (lit +5 of the 6 it lost; the last one at its next power-up)
   m.power_up();
   m.powered_01h -= 5;
   m.lit_01h -= 6;
   m.powered_bump_on_sync = 1;
   drive(c, h, ha, 15000);
-  CHECK(m.syncs == 11 && m.sync_result == ULTRA_LS_R_CAPPED && (m.sync_mask & ULTRA_LS_F_POWERED) && !(m.sync_mask & ULTRA_LS_F_LIT) &&
-            m.powered_01h == 24690 && m.lit_01h == 12339 && !h.k.attention(0),
+  CHECK(m.syncs == 11 && m.sync_result == ULTRA_LS_R_APPLIED && (m.sync_mask & ULTRA_LS_F_LIT) &&
+            m.powered_01h == 24690 && m.lit_01h == 12344 && !h.k.attention(0),
+        "the read-to-POLL race: applied (result %u, mask %02X): powered %u, lit %u", m.sync_result, m.sync_mask,
+        m.powered_01h, m.lit_01h);
+  m.power_up();
+  drive(c, h, ha, 15000);
+  CHECK(m.syncs == 12 && m.sync_result == ULTRA_LS_R_APPLIED && m.lit_01h == 12345,
+        "its next power-up: the last lit unit (its cap without powered behind: %u)", m.lit_01h);
+  // capped (two units in between: past the margin): powered merged, lit not, done; the rest next power-up
+  m.power_up();
+  m.powered_01h -= 5;
+  m.lit_01h -= 6;
+  m.powered_bump_on_sync = 2;
+  drive(c, h, ha, 15000);
+  CHECK(m.syncs == 13 && m.sync_result == ULTRA_LS_R_CAPPED && (m.sync_mask & ULTRA_LS_F_POWERED) &&
+            !(m.sync_mask & ULTRA_LS_F_LIT) && m.powered_01h == 24690 && m.lit_01h == 12339 && !h.k.attention(0),
         "capped (lit over its cap): powered merged, lit not (%u), done (mask %02X)", m.lit_01h, m.sync_mask);
   m.power_up();
   drive(c, h, ha, 15000);
-  CHECK(m.syncs == 12 && m.sync_result == ULTRA_LS_R_APPLIED && m.lit_01h == 12340,
+  CHECK(m.syncs == 14 && m.sync_result == ULTRA_LS_R_APPLIED && m.lit_01h == 12340,
         "its next power-up: lit +1 (its cap without powered behind: %u)", m.lit_01h);
   CHECK(ha.worst_back == 0, "Energy never went back (%.3f Wh)", ha.worst_back);
   std::printf("  ledger: adopt, merge, one sync per power-up, the mWh carried, every answer path\n");
@@ -1392,10 +1406,11 @@ static void test_ledger_erased() {
   m.lt_dips = m.lt_overloads = m.lt_shorts = 0;
   m.total_wh = 3;
   drive(c, h, ha, 15000);
-  CHECK(h.restores == 1 && m.syncs == 1 && m.powered_01h == 7220 && m.lit_01h == 7211 && m.total_wh == 1234 &&
+  CHECK(h.restores == 1 && m.syncs == 1 && m.powered_01h == 7220 && m.lit_01h == 7210 && m.total_wh == 1234 &&
             m.lt_dips == 2 && m.lt_shorts == 3,
-        "erased: logged (%u), the first power-up back by the caps' steps (powered %u, lit %u, %u Wh)", h.restores,
-        m.powered_01h, m.lit_01h, m.total_wh);
+        "erased: logged (%u), the first power-up back by the caps' steps, lit one less (the race margin) (powered %u, "
+        "lit %u, %u Wh)",
+        h.restores, m.powered_01h, m.lit_01h, m.total_wh);
   for (int k = 0; k < 4; k++) {
     m.power_up();
     drive(c, h, ha, 15000);

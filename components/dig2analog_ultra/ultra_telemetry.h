@@ -1096,6 +1096,10 @@ class TelemetryPoller {
   }
 
   void decode_(Receiver &r, uint8_t tp, const uint8_t *data, uint32_t now_ms) {
+    // IDENTITY with another full UID than the one read before (the UID16 the same: a CRC collision): another board,
+    // what was read of the one before is void
+    if (tp == TP_IDENTITY && r.d.have_identity && std::memcmp(r.d.uid, data, 12) != 0)
+      this->restarted_(r, now_ms, true);
     ReceiverData &d = r.d;
     const uint32_t old_up = d.uptime_s, old_ms = r.status_ms;
     const bool had_status = d.have_status;

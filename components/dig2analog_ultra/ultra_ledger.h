@@ -456,16 +456,20 @@ class LedgerKeeper {
     uint8_t ev = EV_NONE;
     const uint64_t up = this->up_(now_ms);
     if (updates & TU_RESTART) {   // a power-up (or another board): what it says now, then maybe a sync
-      x.lt_read = x.en_read = false;
-      x.phase = WAIT;
-      x.tries = 0;
-      x.merged = false;
-      x.adopted = false;
-      x.entry = nullptr;        // (found again by its UID)
-      x.energy_seen = false;    // (its position follows it once its ENERGY was read)
-      x.restart_due = true;     // (dated by its STATUS)
+      session_reset_(x);
       if (!d.have_identity)
         x.pending = 0;          // another board: the one before's last readings dropped (a hot swap: rare)
+    }
+    // the board here by its full UID (whatever its UID16 says): another one starts afresh, nothing of the one before
+    // (its readings, its count since power-up) carried over
+    if (d.have_identity && (!x.have_uid || std::memcmp(x.uid, d.uid, 12) != 0)) {
+      if (x.have_uid) {
+        session_reset_(x);
+        x.pending = 0;
+        x.have_boot = false;
+      }
+      std::memcpy(x.uid, d.uid, 12);
+      x.have_uid = true;
     }
     if ((updates & (1u << TP_ENERGY)) && d.have_energy && x.pending < PENDING)
       x.reading[x.pending++] = Reading{d.boot_mwh, receiver_counters(d).mwh, now_ms};   // (dated by the next STATUS)
@@ -581,6 +585,8 @@ class LedgerKeeper {
     uint32_t boot_last{0};        // the count of the last reading counted (this power-up)
     bool have_boot{false};        // ... known (since the hub started, for this board)
     bool restart_due{false};      // a power-up seen: its first reading not counted yet
+    uint8_t uid[12]{};            // the board whose session this is (its full UID)
+    bool have_uid{false};
     LedgerEntry *entry{nullptr};
     uint64_t energy_mwh{0};
     bool have_energy{false};
@@ -595,6 +601,18 @@ class LedgerKeeper {
     uint8_t result{0xFF};
     uint32_t last_sync_ms{0};
   };
+
+  /// a power-up or another board: what it says now, then maybe a sync
+  static void session_reset_(Rx &x) {
+    x.lt_read = x.en_read = false;
+    x.phase = WAIT;
+    x.tries = 0;
+    x.merged = false;
+    x.adopted = false;
+    x.entry = nullptr;        // (found again by its UID)
+    x.energy_seen = false;    // (its position follows it once its ENERGY was read)
+    x.restart_due = true;     // (dated by its STATUS)
+  }
 
   /// the hub's time since it started (64-bit: millis() wraps)
   uint64_t up_(uint32_t now_ms) {

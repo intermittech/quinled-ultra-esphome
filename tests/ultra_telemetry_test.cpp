@@ -1775,6 +1775,42 @@ static void test_r9_load_replaces() {
         gen, out.find(uid) != nullptr);
 }
 
+/// Review r9 F3: a replaced board whose UID16 is the old one's (a CRC collision) is still another board: its full
+/// UID decides. The position goes on (no 50 kWh jump), the new entry adopts its own lifetime. GPT's UID16_COLLISION.
+static void test_r9_uid16_collision() {
+  Chain c(1);
+  ledger_board(c.rx[0]);
+  c.rx[0].total_wh = 100;
+  c.rx[0].boot_mwh = 0;
+  LifetimeLedger l;
+  l.init(8, 4);
+  LedgerHub h;
+  HaView ha;
+  start_hub(h, c, l);
+  drive(c, h, ha, 10000);
+  Model b = c.rx[0];
+  b.uid[0] ^= 0x80;
+  const uint16_t fingerprint = c.rx[0].uid16();
+  for (unsigned v = 0; v < 65536; v++) {
+    b.uid[10] = static_cast<uint8_t>(v >> 8);
+    b.uid[11] = static_cast<uint8_t>(v);
+    if (b.uid16() == fingerprint)
+      break;
+  }
+  CHECK(b.uid16() == fingerprint && std::memcmp(b.uid, c.rx[0].uid, 12) != 0, "F3: a distinct UID with the same UID16");
+  b.total_wh = 50000;
+  b.boot_mwh = 0;
+  b.uptime = 0;
+  b.merged = false;
+  const double before = h.k.energy_wh(0);
+  c.rx[0] = b;
+  drive(c, h, ha, 15000);
+  CHECK(near(h.k.energy_wh(0), before) && h.new_boards == 1 && l.find(b.uid) != nullptr &&
+            l.find(b.uid)->c.mwh == 50000000 && h.p.data(0).uid[0] == b.uid[0],
+        "F3: the same UID16, another board: the position goes on (%.3f, was %.3f), its own entry (%llu mWh)",
+        h.k.energy_wh(0), before, ull(l.find(b.uid) ? l.find(b.uid)->c.mwh : 0));
+}
+
 /// (0.2.6) DIAG 20 bit 7: the receiver's lifetime record held: a note after the Status detail, no problem
 static void test_record_held() {
   Chain c(1);
@@ -1828,6 +1864,7 @@ int main() {
   test_r9_lock_long_run();
   test_r9_long_runs();
   test_r9_load_replaces();
+  test_r9_uid16_collision();
   test_record_held();
   test_status();
   test_port();

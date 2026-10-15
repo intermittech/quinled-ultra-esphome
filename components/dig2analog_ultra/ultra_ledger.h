@@ -275,13 +275,18 @@ class LifetimeLedger {
     }
     ultra_put16(out + this->blob_size() - 2, ultra_crc16(out, static_cast<uint32_t>(this->blob_size() - 2)));
   }
-  /// A stored copy (any size: the entries and positions that fit); false: not a valid one.
+  /// A stored copy (any size: the entries and positions that fit), replacing everything (what isn't in it is gone);
+  /// false: not a valid one (nothing changed).
   bool load(const uint8_t *in, size_t n, uint32_t *generation) {
     if (n < HDR + 2 || ultra_get32(in) != LEDGER_MAGIC || ultra_get16(in + n - 2) != ultra_crc16(in, static_cast<uint32_t>(n - 2)))
       return false;
     const size_t ne = ultra_get16(in + 12), np = ultra_get16(in + 14);
     if (HDR + ENTRY * ne + POS * np + 2 != n)
       return false;
+    for (auto &e : this->entries_)
+      e = LedgerEntry{};
+    for (auto &p : this->positions_)
+      p = LedgerPosition{};
     *generation = ultra_get32(in + 4);
     this->day_ = ultra_get32(in + 8);
     const uint8_t *b = in + HDR;

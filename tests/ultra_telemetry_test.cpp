@@ -1754,6 +1754,27 @@ static void test_r9_long_runs() {
   }
 }
 
+/// Review r9 F8: a load replaces the ledger: an entry absent from the newer copy (aged out there) doesn't survive from
+/// a copy loaded before it. GPT's ALTERNATING_LOAD probe.
+static void test_r9_load_replaces() {
+  uint8_t uid[12] = {1};
+  bool created = false;
+  LifetimeLedger l;
+  l.init(4, 2);
+  l.touch(uid, &created)->c.mwh = 123000;
+  std::vector<uint8_t> old(l.blob_size()), newer(l.blob_size());
+  l.save(old.data(), 2);
+  l.set_day(LEDGER_AGE_DAYS);   // (aged out)
+  l.save(newer.data(), 3);
+  LifetimeLedger out;
+  out.init(4, 2);
+  uint32_t gen = 0;
+  out.load(old.data(), old.size(), &gen);
+  out.load(newer.data(), newer.size(), &gen);
+  CHECK(gen == 3 && out.find(uid) == nullptr, "F8: the newer copy (generation %u) without the aged entry: gone (%d)",
+        gen, out.find(uid) != nullptr);
+}
+
 /// (0.2.6) DIAG 20 bit 7: the receiver's lifetime record held: a note after the Status detail, no problem
 static void test_record_held() {
   Chain c(1);
@@ -1806,6 +1827,7 @@ int main() {
   test_pacing();
   test_r9_lock_long_run();
   test_r9_long_runs();
+  test_r9_load_replaces();
   test_record_held();
   test_status();
   test_port();

@@ -1029,8 +1029,10 @@ void UltraHub::ledger_service_() {
     const size_t n = ledger_receivers(), pos = (n + 31) / 32 * 32, room = (n + std::max<size_t>(4, n / 2) + 31) / 32 * 32;
     l.init(room, pos);
     g_ledger_blob.assign(l.blob_size(), 0);
+    // the newer valid copy, loaded alone (what the newer one dropped stays dropped)
     uint32_t newest = 0;
     bool any = false;
+    std::vector<uint8_t> best;
     for (int k = 0; k < 2; k++) {
       g_ledger_pref[k] = global_preferences->make_preference(g_ledger_blob.size(), fnv1_hash(k == 0 ? "ultra_ledger_a" : "ultra_ledger_b"),
                                                              true);
@@ -1040,11 +1042,13 @@ void UltraHub::ledger_service_() {
       uint32_t gen = 0;
       if (g_ledger_pref[k].load(b.data(), b.size()) && probe.load(b.data(), b.size(), &gen) &&
           (!any || static_cast<int32_t>(gen - newest) > 0)) {
-        l.load(b.data(), b.size(), &gen);
+        best.swap(b);
         newest = gen;
         any = true;
       }
     }
+    if (any)
+      l.load(best.data(), best.size(), &newest);
     g_ledger_generation = newest;
     g_ledger_saved_ms = g_ledger_day_ms = now;
     ESP_LOGD(TAG, "Lifetime ledger: %u board(s) room, %s", static_cast<unsigned>(l.capacity()),

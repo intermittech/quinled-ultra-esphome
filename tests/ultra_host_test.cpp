@@ -1112,8 +1112,8 @@ struct SchedPeek : Scheduler {
 /// The refresh rotation (the rule shared with the sender library): idle frames take each board's refresh list; the
 /// clearing slots of unused light indices are in rounds 0, 1, 2, 6, 10, ... after the init, and again after a change
 /// of the board's lights (from round 0); the used lights' items in every round. 3 boards with 1 / 3 / 5 lights, 20
-/// rounds; then board 0 to 2 lights and 10 more. The rounds go to the cross-check trace (the sender's in the same
-/// folder) when that folder exists. And a 1-light board's SET refresh period before / now.
+/// rounds; then board 0 to 2 lights and 10 more; a resync and 10 more. With ULTRA_ROTATION_TRACE set, the rounds go to
+/// that file (one line each, the sender library's trace format: a cross-check). And the SET refresh period before / now.
 struct RotPeek : Scheduler {
   /// board b's next refresh slot (as an idle frame takes it) and its position in the list
   bool next(uint16_t b, uint8_t *s, uint16_t *pos) {
@@ -1256,8 +1256,9 @@ static void test_refresh_rotation() {
       line("resync", b, m[b] + r, r);
   }
   CHECK(again, "resync: every board's clearing slots from round 0 again");
-  // the cross-check trace (review-r11/rotation-trace/esphome.txt; compare.py there), when that folder exists
-  if (FILE *f = std::fopen("D:/Claude-Folders/Claude-WS2915_dig2analog/review-r11/rotation-trace/esphome.txt", "w")) {
+  // the cross-check trace: ULTRA_ROTATION_TRACE names the file (compared with the sender library's)
+  const char *trace_file = std::getenv("ULTRA_ROTATION_TRACE");
+  if (FILE *f = trace_file != nullptr ? std::fopen(trace_file, "w") : nullptr) {
     for (const auto &l : trace)
       std::fprintf(f, "%s\n", l.c_str());
     std::fclose(f);

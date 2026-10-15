@@ -309,8 +309,11 @@ struct UltraHub {
   int64_t rw_t0_us_{0}, rw_end_us_{0}, rw_read_us_{0};
   bool rw_powered_{true};
   bool rw_lock_end_{false};
-  static constexpr uint8_t RX_WOKE = 1, RX_WARNED = 2, RX_SETTLING = 4;
+  static constexpr uint8_t RX_WOKE = 1, RX_WARNED = 2, RX_SETTLING = 4, RX_NO_STANDBY = 8;
   std::vector<uint8_t> rx_note_;
+  uint8_t no_standby_{0};   // (receivers without standby support: the port's planned power-offs capped)
+  PowerOffCap off_cap_;
+  bool standby_hold_(uint32_t now) { return this->no_standby_ != 0 && this->off_cap_.hold(now); }
   uint32_t woke_ms_{0};
   uint32_t rw_late_{0}, rw_extra_us_{0};
   // the Diff-Power port

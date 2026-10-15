@@ -1430,7 +1430,7 @@ static void sc_update_repeat() {
   }
 }
 
-// --------------------------------------------------------- a month of short wakes (review r9, Fable C items 1-2)
+// --------------------------------------------------------------- a month of short wakes (design review, round 9)
 /// The poller fed straight from a receiver model's pages (no wire: 3,000 power-ups in seconds): its own page choice
 /// (pick_, read_now, the sync's arguments), decoding and restart detection, as an answer on the wire takes them.
 struct FeedPoller : TelemetryPoller {
@@ -1610,7 +1610,7 @@ struct MonthEnd {
   bool hub_ok() const { return within(h_pow, h_lit, h_ups, h_wh); }
 };
 
-/// One port, one receiver: `wakes` power-ups (Fable's: a light 60 s at 30 W, its turn-off period of 170 s dark, the
+/// One port, one receiver: `wakes` power-ups (a light 60 s at 30 W, its turn-off period of 170 s dark, the
 /// hub's last reads, the notice, the cut, ~10 min off; every 10th wake lit 10 min when `long_tenth`: those store their
 /// record). The hub: the component's keeper (power_on / lit_tick / prepare / cut, the poller fed the board's pages,
 /// the ESP32 restarted twice in between), or (echo) a naive hub that keeps the highest of its LIFETIME / ENERGY reads
@@ -1797,7 +1797,7 @@ static void month_print(const char *what, const MonthEnd &r) {
               r.results[ULTRA_LS_R_NOOP], r.results[ULTRA_LS_R_CAPPED]);
 }
 
-/// review r9, Fable C 1-2: a receiver merges the hub's counters in whole wire units and loses its own time and energy
+/// Design review, round 9: a receiver merges the hub's counters in whole wire units and loses its own time and energy
 /// below a unit at every cut, so the ledger must be the hub's own accounting. 30 days x 100 short wakes of a standby
 /// port (nothing stored on the board): after its next power-up every counter within one unit of the truth, on the
 /// board (energy_sync's merge) and in the hub's ledger; the same with every tenth wake long enough to be stored (the
@@ -1826,7 +1826,7 @@ static void sc_month() {
         "%lld, %lld; %u writes)",
         (long long) s.d_pow, (long long) s.d_lit, (long long) s.d_ups, (long long) s.d_wh, (long long) s.h_pow,
         (long long) s.h_lit, (long long) s.h_ups, (long long) s.h_wh, s.writes);
-  // a year of it (review r9, GPT R9-R1: a hub that takes the board's rounded value back during sessions it saw adopts
+  // a year of it (design review, round 9: a hub that takes the board's rounded value back during sessions it saw adopts
   // the board's own remainder, ~6 h a year): the truth is summed apart from the ledger (the port's on-times, the lit
   // spans, the integrated power, the boots), so a slow drift shows
   const MonthEnd y = month_run(used, 36500, true, false, 13);
@@ -1836,7 +1836,7 @@ static void sc_month() {
         "%lld, %lld, %lld, %lld; %u writes)",
         (long long) y.d_pow, (long long) y.d_lit, (long long) y.d_ups, (long long) y.d_wh, (long long) y.h_pow,
         (long long) y.h_lit, (long long) y.h_ups, (long long) y.h_wh, y.writes);
-  // the read-to-POLL race against the real merge (design review round 9, cross-check F6): the board's own time passes
+  // the read-to-POLL race against the real merge (design review, round 9): the board's own time passes
   // a 0.1 h between the hub's read and its LIFE_SYNC POLL (its powered step one less, its other caps with it); a ledger
   // ahead in every field, sent at the caps that read allows, still comes back applied
   {

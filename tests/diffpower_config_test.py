@@ -1,6 +1,6 @@
 """The Diff-Power port's codegen helpers (components/diffpower/__init__.py) on hand-made configurations: the lights
 that share pixels with a port's lights (partitions at any depth, the strips under them, a cycle), their turn-off
-periods, and the lights diffpower.wake may name (review-r8/portmgr-recheck-gpt N5). Needs ESPHome (the venv).
+periods, and the lights diffpower.wake may name (design review, round 8). Needs ESPHome (the venv).
 
 Run: python tests/diffpower_config_test.py"""
 

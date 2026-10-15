@@ -1,7 +1,7 @@
 #pragma once
 
 // A QuinLED Diff-Power sender port's power manager, without ESPHome (tests/diffpower_test.cpp runs it with simulated
-// time). Wiki: Diff-Power ports. The design: review-r8/fable-standby §5, with review-r8/portmgr-gpt's fixes.
+// time). Wiki: Diff-Power ports. The design: design review, round 8 (with its fixes).
 //
 // The hardware: per port an enable output and a detect input. The port carries ~4.5 V / 100 mA (standby, the board
 // detection) all the time; its 55 V needs enable AND detect (the sender's AND gate) and arrives ~1.5 s after both

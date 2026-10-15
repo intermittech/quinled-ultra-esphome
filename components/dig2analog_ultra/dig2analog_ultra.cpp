@@ -1100,7 +1100,7 @@ void UltraHub::ledger_save_(bool now) {
   g_ledger_saved_ms = millis();
 }
 
-// The ledger counts this line's receivers itself (ultra_ledger.h; review r9, Fable C): a Diff-Power port's power-on
+// The ledger counts this line's receivers itself (ultra_ledger.h; design review, round 9): a Diff-Power port's power-on
 // and cut (its enable AND detect, as the port timed them: every board's session from there, its powered time to
 // there), and each receiver's lit time (any of its lights lit while the boards are ready).
 void UltraHub::ledger_line_() {

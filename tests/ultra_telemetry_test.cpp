@@ -3,7 +3,7 @@
 // missing and late answers, a receiver that never answers, restarts and swapped boards, the POWER acknowledge,
 // BUSY / UNSUPPORTED pages, more than 16 receivers, the sensor values / texts, and protocol 0.2.5 (LIFETIME, DIAG's
 // two parts, STATUS's reason, ENERGY's LED supply and peak, HEALTH's flags), and (0.2.6) the lifetime ledger and its
-// LIFE_SYNC (components/dig2analog_ultra/ultra_ledger.h; review-r8/fable-sync §5 13-17, a replaced / moved board, a
+// LIFE_SYNC (components/dig2analog_ultra/ultra_ledger.h; design review, round 8, a replaced / moved board, a
 // replaced controller). The receiver firmware's own answer path: tests/ultra_telemetry_contract_test.cpp.
 //
 // Build and run: python tests/run_ultra_telemetry_test.py
@@ -66,7 +66,7 @@ struct Model {
   uint32_t lit_01h{12345}, power_ups{41}, lt_dips{2};
   uint16_t lt_overloads{1}, lt_shorts{3};
   uint32_t powered_01h{24690}, records{77};   // LIFETIME 0 / 21
-  // LIFE_SYNC (0.2.6, feature bit 22): one applied merge per power-up; the caps (review-r8/fable-sync §3)
+  // LIFE_SYNC (0.2.6, feature bit 22): one applied merge per power-up; the caps (design review, round 8)
   bool merged{false};
   uint32_t syncs{0};
   uint8_t sync_result{0xFF}, sync_mask{0};
@@ -1147,7 +1147,7 @@ static uint64_t ledger_mwh(const LedgerHub &h, uint16_t i) {
 static unsigned long long ull(uint64_t v) { return static_cast<unsigned long long>(v); }
 static bool near(double a, double b) { return std::fabs(a - b) < 1e-6; }
 
-/// §5 13 / 16: first contact adopts; the ledger merges every reading, never down; after a power-up the ledger given
+/// First contact adopts; the ledger counts on from there, never down; after a power-up the ledger given
 /// back once (applied); mWh carried across Wh boundaries and across the cuts that drop a board's fraction (only whole
 /// missing Wh go back); the answer paths: a record written since (re-read, applied), no-op, once, refused twice
 /// (needs attention, the ledger shown), capped (the rest at the next power-up).
@@ -1232,7 +1232,7 @@ static void test_ledger_sync() {
   drive(c, h, ha, 15000);
   CHECK(m.syncs == 10 && m.sync_result == ULTRA_LS_R_APPLIED && !h.k.attention(0) && m.total_wh == 1238,
         "the next power-up: applied, attention cleared");
-  // the read-to-POLL race (design review round 9, cross-check F6): its powered time passed a 0.1 h between the read
+  // the read-to-POLL race (design review, round 9): its powered time passed a 0.1 h between the read
   // and the POLL, so its powered step and with it its lit cap are one less: the ledger's one unit of margin keeps the
   // sync applied (lit +5 of the 6 it lost; the last one at its next power-up)
   m.power_up();
@@ -1265,7 +1265,7 @@ static void test_ledger_sync() {
   std::printf("  ledger: adopt, merge, one sync per power-up, the mWh carried, every answer path\n");
 }
 
-/// §5 16: the Wh a sync gives back count the board's own fraction: 1.967 Wh lost at a cut, 0.9 Wh into its new
+/// The Wh a sync gives back count the board's own fraction: 1.967 Wh lost at a cut, 0.9 Wh into its new
 /// power-up when the hub reads it: 1 whole Wh back (the board never above the ledger; 0.967 stays with the hub).
 static void test_ledger_fraction() {
   Chain c(1);
@@ -1291,7 +1291,7 @@ static void test_ledger_fraction() {
         ull(board), ull(ledger_mwh(h, 0)));
 }
 
-/// §5 14 and the replacement cases: a receiver ahead (adopted per counter); a replaced board at a position (a new
+/// The replacement cases: a receiver ahead (adopted per counter); a replaced board at a position (a new
 /// entry, the position's Energy goes on, the old entry kept); a board moved to another line's position (its entry
 /// follows it, the counters go on); a new controller adopts the boards' lifetime.
 static void test_ledger_boards() {
@@ -1388,7 +1388,7 @@ static void test_ledger_boards() {
   std::printf("  ledger: a receiver ahead, a replaced board, a moved board, a new controller\n");
 }
 
-/// §5 14: a board whose record went back (erased): logged once, the ledger given back over a few power-ups (each
+/// A board whose record went back (erased): logged once, the ledger given back over a few power-ups (each
 /// counter at most the receiver's cap per merge); its position never back.
 static void test_ledger_erased() {
   Chain c(1);
@@ -1423,7 +1423,7 @@ static void test_ledger_erased() {
   std::printf("  ledger: an erased board restored over 4 power-ups\n");
 }
 
-/// §5 15 and GPT's N1-N3: the ESP32 restarts (a stored ledger older than what was shown): the board's lifetime, its
+/// The ESP32 restarts (a stored ledger older than what was shown): the board's lifetime, its
 /// power-up's count not again; used while the ESP32 was off: counted; a used board fitted while it was off: the
 /// position goes on; a reading of a new power-up before the STATUS that shows it; a power-off without a cut; the
 /// 32-bit count wrapping.
@@ -1540,10 +1540,10 @@ static void test_ledger_restart() {
   drive(w, hw, haw, 10000);
   CHECK(ledger_mwh(hw, 0) == w0 + 0x2000 && haw.worst_back == 0, "its count wrapped: +%llu mWh",
         ull(ledger_mwh(hw, 0) - w0));
-  std::printf("  ledger: the ESP32's restarts (N1-N3), a reading before its STATUS, no cut, the count's wrap\n");
+  std::printf("  ledger: the ESP32's restarts, a reading before its STATUS, no cut, the count's wrap\n");
 }
 
-/// §5 17: a board without LIFE_SYNC (0.2.5) never gets 0x0E (the ledger only, shown); without LIFETIME (0.2.4): its
+/// A board without LIFE_SYNC (0.2.5) never gets 0x0E (the ledger only, shown); without LIFETIME (0.2.4): its
 /// Energy through the ledger still. The stored form: two copies, a broken one refused; an old entry ages out.
 static void test_ledger_misc() {
   Chain c(2);
@@ -1718,9 +1718,9 @@ static void test_ledger_counters() {
         static_cast<unsigned>(ledger_key("port4")));
 }
 
-/// Review r9 F7 (pre-existing): the lock interval after a preamble is waited out once (the first frame after it
-/// forgets it); a lock 24.8 days old (past the signed half of millis()) must not stop the polls. GPT's
-/// POLL_LOCK_LONG_RUN probe, with the first frame the hub sends.
+/// The lock interval after a preamble is waited out once (the first frame after it
+/// forgets it); a lock 24.8 days old (past the signed half of millis()) must not stop the polls
+/// (with the first frame the hub sends).
 static void test_r9_lock_long_run() {
   TelemetryPoller p;
   p.init(1, ULTRA_RW_RATE_1M, TelemetryIntervals{});
@@ -1735,11 +1735,11 @@ static void test_r9_lock_long_run() {
   p.locked(0xFFFFFF00u);   // a new preamble: its own lock interval again (across millis()'s wrap)
   const bool relock = p.due(0xFFFFFF00u + 500), relock_after = p.due(0xFFFFFF00u + 1001);
   CHECK(!early && after && aged && later && !relock && relock_after,
-        "F7: polls after the lock interval (%d / %d), still at 24.9 and 49 days (%d / %d); a new lock waits again (%d / %d)",
+        "polls after the lock interval (%d / %d), still at 24.9 and 49 days (%d / %d); a new lock waits again (%d / %d)",
         early, after, aged, later, relock, relock_after);
 }
 
-/// Review r9 F7, its kin: a receiver's restart hold (1 s) must not cut the chain behind it 24.8 days later, and a
+/// The same kind: a receiver's restart hold (1 s) must not cut the chain behind it 24.8 days later, and a
 /// line back from a month in standby must poll at once (its pages' last times are older than half of millis()).
 static void test_r9_long_runs() {
   auto age = [](Chain &c, uint32_t ms) {   // the line on, nothing polled meanwhile (the receivers count on)
@@ -1757,7 +1757,7 @@ static void test_r9_long_runs() {
     const uint32_t s1 = c.rx[1].asked[ULTRA_PAGE_STATUS];
     c.run(p, 10000);
     CHECK(c.rx[1].asked[ULTRA_PAGE_STATUS] > s1 && p.answering(1),
-          "F7: 24.9 days after receiver 1 restarted, receiver 2 behind it still polled (%u STATUS)",
+          "24.9 days after receiver 1 restarted, receiver 2 behind it still polled (%u STATUS)",
           c.rx[1].asked[ULTRA_PAGE_STATUS] - s1);
   }
   {
@@ -1771,12 +1771,12 @@ static void test_r9_long_runs() {
     const uint32_t s = c.rx[0].asked[ULTRA_PAGE_STATUS];
     c.run(p, 5000);
     CHECK(c.rx[0].asked[ULTRA_PAGE_STATUS] > s && p.answering(0),
-          "F7: back after 28 days in standby: polled at once (%u STATUS)", c.rx[0].asked[ULTRA_PAGE_STATUS] - s);
+          "back after 28 days in standby: polled at once (%u STATUS)", c.rx[0].asked[ULTRA_PAGE_STATUS] - s);
   }
 }
 
-/// Review r9 F8: a load replaces the ledger: an entry absent from the newer copy (aged out there) doesn't survive from
-/// a copy loaded before it. GPT's ALTERNATING_LOAD probe.
+/// A load replaces the ledger: an entry absent from the newer copy (aged out there) doesn't survive from
+/// a copy loaded before it.
 static void test_r9_load_replaces() {
   uint8_t uid[12] = {1};
   bool created = false;
@@ -1792,12 +1792,12 @@ static void test_r9_load_replaces() {
   uint32_t gen = 0;
   out.load(old.data(), old.size(), &gen);
   out.load(newer.data(), newer.size(), &gen);
-  CHECK(gen == 3 && out.find(uid) == nullptr, "F8: the newer copy (generation %u) without the aged entry: gone (%d)",
+  CHECK(gen == 3 && out.find(uid) == nullptr, "the newer copy (generation %u) without the aged entry: gone (%d)",
         gen, out.find(uid) != nullptr);
 }
 
-/// Review r9 F3: a replaced board whose UID16 is the old one's (a CRC collision) is still another board: its full
-/// UID decides. The position goes on (no 50 kWh jump), the new entry adopts its own lifetime. GPT's UID16_COLLISION.
+/// A replaced board whose UID16 is the old one's (a CRC collision) is still another board: its full
+/// UID decides. The position goes on (no 50 kWh jump), the new entry adopts its own lifetime.
 static void test_r9_uid16_collision() {
   Chain c(1);
   ledger_board(c.rx[0]);
@@ -1818,7 +1818,7 @@ static void test_r9_uid16_collision() {
     if (b.uid16() == fingerprint)
       break;
   }
-  CHECK(b.uid16() == fingerprint && std::memcmp(b.uid, c.rx[0].uid, 12) != 0, "F3: a distinct UID with the same UID16");
+  CHECK(b.uid16() == fingerprint && std::memcmp(b.uid, c.rx[0].uid, 12) != 0, "a distinct UID with the same UID16");
   b.total_wh = 50000;
   b.boot_mwh = 0;
   b.uptime = 0;
@@ -1828,14 +1828,13 @@ static void test_r9_uid16_collision() {
   drive(c, h, ha, 15000);
   CHECK(near(h.k.energy_wh(0), before) && h.new_boards == 1 && l.find(b.uid) != nullptr &&
             l.find(b.uid)->c.mwh == 50000000 && h.p.data(0).uid[0] == b.uid[0],
-        "F3: the same UID16, another board: the position goes on (%.3f, was %.3f), its own entry (%llu mWh)",
+        "the same UID16, another board: the position goes on (%.3f, was %.3f), its own entry (%llu mWh)",
         h.k.energy_wh(0), before, ull(l.find(b.uid) ? l.find(b.uid)->c.mwh : 0));
 }
 
-/// Review r9 F1: the ESP32 restarts under a board whose ledger leads its own lifetime (50 Wh it lost earlier): the
+/// The ESP32 restarts under a board whose ledger leads its own lifetime (50 Wh it lost earlier): the
 /// stored checkpoint (the board's count since power-up when the ledger was stored) carries the use since then, so
-/// the position goes on from what it showed (160 Wh), not from the stored 150 or the board's 110. GPT's
-/// OFFSET_RESTART probe.
+/// the position goes on from what it showed (160 Wh), not from the stored 150 or the board's 110.
 static void test_r9_restart_with_lead() {
   Chain c(1);
   ledger_board(c.rx[0]);
@@ -1861,7 +1860,7 @@ static void test_r9_restart_with_lead() {
   start_hub(h, c, restored);
   drive(c, h, ha, 10000);
   CHECK(near(shown, 160.0) && near(h.k.energy_wh(0), shown) && ha.worst_back == 0,
-        "F1: the ESP32 restarted under a board 50 Wh behind its ledger: %.3f Wh (shown before %.3f, back %.3f)",
+        "the ESP32 restarted under a board 50 Wh behind its ledger: %.3f Wh (shown before %.3f, back %.3f)",
         h.k.energy_wh(0), shown, ha.worst_back);
   // ... and the board power-cycled while the ESP32 was off (a new session: its whole count new)
   restored.save(blob.data(), 2);
@@ -1872,13 +1871,12 @@ static void test_r9_restart_with_lead() {
   again.load(blob.data(), blob.size(), &gen);
   start_hub(h, c, again);
   drive(c, h, ha, 10000);
-  CHECK(near(h.k.energy_wh(0), shown + 2.0), "F1: a board power-cycled meanwhile: its new session counted (%.3f)",
+  CHECK(near(h.k.energy_wh(0), shown + 2.0), "a board power-cycled meanwhile: its new session counted (%.3f)",
         h.k.energy_wh(0));
 }
 
-/// Review r9 F4: a powered, known board moved to another slot (or back after another board was there) counts only
-/// what it used since it was last read: its count since power-up follows its UID in the ledger, not the slot. GPT's
-/// RETURN_KNOWN_BOARD and MOVED_LIVE_SLOTS probes.
+/// A powered, known board moved to another slot (or back after another board was there) counts only
+/// what it used since it was last read: its count since power-up follows its UID in the ledger, not the slot.
 static void test_r9_moved_live_board() {
   {
     Chain c(1);
@@ -1907,7 +1905,7 @@ static void test_r9_moved_live_board() {
     c.rx[0].uptime += 10;   // (still powered; no more use)
     drive(c, h, ha, 15000);
     CHECK(l.find(a.uid)->c.mwh == before && ha.worst_back == 0,
-          "F4: a powered board back at its slot: %llu mWh (was %llu), not its session again",
+          "a powered board back at its slot: %llu mWh (was %llu), not its session again",
           ull(l.find(a.uid)->c.mwh), ull(before));
   }
   {
@@ -1934,7 +1932,7 @@ static void test_r9_moved_live_board() {
     c.rx[0].use(1000);   // (then the moved boards' own use counts)
     drive(c, h, ha, 10000);
     CHECK(l.find(u0.data())->c.mwh == a && l.find(u1.data())->c.mwh == b + 1000,
-          "F4: two powered boards swapped: %llu / %llu mWh (were %llu / %llu, +1000 after)",
+          "two powered boards swapped: %llu / %llu mWh (were %llu / %llu, +1000 after)",
           ull(l.find(u0.data())->c.mwh), ull(l.find(u1.data())->c.mwh), ull(a), ull(b));
   }
 }

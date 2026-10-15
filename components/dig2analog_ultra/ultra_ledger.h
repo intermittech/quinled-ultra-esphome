@@ -1,6 +1,6 @@
 #pragma once
 
-// The receivers' lifetime ledger (protocol 0.2.6 LIFE_SYNC; review-r8/fable-sync §4): the hub keeps each board's
+// The receivers' lifetime ledger (protocol 0.2.6 LIFE_SYNC; design review, round 8): the hub keeps each board's
 // lifetime counters by its full 12-byte UID, counted by the hub itself (the board loses what it hadn't stored at a
 // power cut, and every cut its time and energy below a wire unit; the hub doesn't), and gives them back to the board
 // once per power-up when it is ahead. The Home Assistant
@@ -499,7 +499,7 @@ inline LifetimeLedger &ultra_ledger() {
 /// no-op / capped: done for this power-up; refused: read again, once more, then "needs attention"); before a planned
 /// power-off a final read and that sync (prepare()). The positions' Energy.
 ///
-/// The ledger is the hub's own fine accounting, never the board's reads echoed (review r9, Fable C 1-2: the receiver
+/// The ledger is the hub's own fine accounting, never the board's reads echoed (design review, round 9: the receiver
 /// merges whole units and loses its time and energy below a unit at every cut, so an echo gives back nothing of short
 /// runs): powered time on the hub's clock from the line's power-on (power_on(): a Diff-Power port's) or else from the
 /// board's uptime as first read, to the cut (cut()) or its last STATUS; lit time on the hub's clock from its own lights

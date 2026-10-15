@@ -1,10 +1,10 @@
 // Host test of the Diff-Power port power manager's core (components/diffpower/diffpower_core.h) with simulated time,
-// after review-r8/fable-standby §6 (ESPHome): the standby cycle (the notice's copies at 0 / 50 / 100 ms, the enable low
+// after design review, round 8 (ESPHome): the standby cycle (the notice's copies at 0 / 50 / 100 ms, the enable low
 // at 200, OFF_HOLD, STANDBY); a request during the notice (no take-back, the wake after min_off_time, the latency);
 // detect flapping and lost (FAULT, its return); the dark window (midnight, noon, 78 degrees north in June and December,
 // the offsets exact, no valid time); Always on at boot and a mode change (its turn-off period); pre-wakes and the
 // the min_on_time floor; the turn-off period per light; a port without a board; the counters; a controller shutdown; the
-// boot; millis() wrapping. Then review-r8/portmgr-gpt's failures as regressions: a plug across the millis() wrap, a
+// boot; millis() wrapping. Then the review's failures as regressions: a plug across the millis() wrap, a
 // detect dropout shorter than the debounce (waking and on), the notice's copies timed from their delivery (a slow
 // loop, a slow or dead transmitter), a pre-wake masked for 25 days, dark offsets up to 12 h (against a brute-force
 // search of the elevation), a shutdown during a notice, a deliberate power cycle. Negative controls alongside: what
@@ -466,7 +466,7 @@ static void test_wrap() {
   CHECK(s.p.state() == PS_STANDBY && s.copy_at.size() == 3, "the turn-off period and the notice across the wrap");
 }
 
-// ------------------------------------------------------------------------------- review-r8/portmgr-gpt regressions
+// ---------------------------------------------------------------------------------------- the review's regressions
 static void test_wrap_plug() {
   std::printf("a board plugged in across the millis() wrap: the hot-plug delay from its detect\n");
   Sim s(1);
@@ -588,7 +588,7 @@ static void test_masked_prewake() {
   s.run(11 * MIN);
   CHECK(!s.copy_at.empty() && s.p.state() != PS_ON, "Standby again: the notice after the mode's turn-off period (%u)",
         static_cast<unsigned>(s.p.state()));
-  // the same with updates 25 days apart (review-r8/portmgr-gpt's sequence): the timers compare elapsed time
+  // the same with updates 25 days apart (the review's sequence): the timers compare elapsed time
   PortCore q;
   q.set_detect(true, 0);
   q.prewake(0, 2 * MIN);
@@ -689,7 +689,7 @@ static void test_power_cycle() {
   CHECK(t.ready == 1, "from standby: a wake after the off time");
 }
 
-// ------------------------------------------------------------------- review-r8/portmgr-recheck-gpt regressions
+// ---------------------------------------------------------------------------- the review recheck's regressions
 static void test_prewake_at_expiry() {
   std::printf("a pre-wake right after the one before ran out (before the next update): kept\n");
   PortCore p;

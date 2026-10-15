@@ -1644,7 +1644,7 @@ static void test_standby_support() {
   std::printf("  telemetry: a receiver without standby support warned about once (on a Diff-Power port)\n");
 }
 
-/// After a wake (portmgr-gpt 3): every receiver settling (Waking: no problem) until it answers, or misses enough to be
+/// After a wake: every receiver settling (Waking: no problem) until it answers, or misses enough to be
 /// gone; then its status at once (a callback), and none of it logged as "doesn't answer".
 static void test_wake_settling() {
   for (bool answer : {true, false}) {
@@ -1687,7 +1687,7 @@ static void test_wake_settling() {
   std::printf("  telemetry: after a wake the receivers show Waking until they answer or miss 3 polls\n");
 }
 
-/// The lock interval runs from the last lock frame's end (portmgr-gpt 14): 64 boards; and with its frame refused once
+/// The lock interval runs from the last lock frame's end: 64 boards; and with its frame refused once
 static void test_lock_from_end() {
   for (bool refuse : {false, true}) {
     clock_us = 0;
@@ -2157,7 +2157,7 @@ static void test_receiver_entities() {
         "port in standby: Power / Current 0 (receiver %.1f W, port %.1f W, light %.1f W), the rest unknown, Energy "
         "kept (%.1f)",
         vals[1][UltraReceiver::POWER].state, port_power.state, light_power.state, vals[1][UltraReceiver::ENERGY].state);
-  // just woken, not heard yet: Waking and no problem (receivers, light, port), not No answer (portmgr-gpt 3)
+  // just woken, not heard yet: Waking and no problem (receivers, light, port), not No answer (design review, round 8)
   hub.standby = false;
   hub.settling = true;
   hub.p.touch_all();
@@ -2188,7 +2188,7 @@ static void test_receiver_entities() {
 // enable / detect pins, a plain light (any ESPHome light) and its state sent again once the port is powered, the
 // notice's copies asked one at a time and timed from their delivery (a modelled hub), the status texts, the counters
 // (saved, kept apart per port id), the select's restore, and the shutdown hook: 2 ports on and 1 in standby, a port
-// already in its notice, 4 slow transmitters, a quiet port's standby time (review-r8/portmgr-gpt 1, 4, 10, 11, 13).
+// already in its notice, 4 slow transmitters, a quiet port's standby time (design review, round 8).
 namespace port_power {
 #define USE_TEXT_SENSOR
 #define USE_BINARY_SENSOR
@@ -2585,7 +2585,7 @@ static void test_port() {
   DiffPowerPort::shutdown_all();
   CHECK(prefs.syncs == 1, "the hook runs once");
 
-  // portmgr-gpt 1: the shutdown 25 ms into a port's own notice: it goes on with its copies and its drop
+  // the shutdown 25 ms into a port's own notice: it goes on with its copies and its drop
   {
     now_ms = 100000;
     Pin en, det;
@@ -2607,7 +2607,7 @@ static void test_port() {
           "a shutdown during a notice: 3 copies, the enable low %u ms after it began",
           en.changed_at - hn.asked[0]);
   }
-  // portmgr-gpt 4: four slow transmitters (30 ms per pump): each port still 3 well spaced copies
+  // four slow transmitters (30 ms per pump): each port still 3 well spaced copies
   {
     now_ms = 200000;
     Pin en[4], det[4];
@@ -2637,7 +2637,7 @@ static void test_port() {
     CHECK(ok && now_ms - start < 1100, "4 slow transmitters: every port 3 well spaced copies (%u ms in all)",
           now_ms - start);
   }
-  // portmgr-recheck-gpt N6: a long notice (1.5 s, the core's cap raised with it) through the shutdown: not cut short
+  // a long notice (1.5 s, the core's cap raised with it) through the shutdown: not cut short
   {
     now_ms = 250000;
     Pin en, det;
@@ -2658,7 +2658,7 @@ static void test_port() {
     CHECK(hl.out.size() == 3 && !en.level && en.changed_at - hl.asked[0] >= 1500,
           "a 1.5 s notice at the shutdown: the enable low %u ms after it began", en.changed_at - hl.asked[0]);
   }
-  // portmgr-gpt 13: nine minutes in standby, then a reboot: that time saved
+  // nine minutes in standby, then a reboot: that time saved
   {
     now_ms = 300000;
     Pin en, det;
@@ -2674,7 +2674,7 @@ static void test_port() {
           "a reboot after 9 min of standby: %u s saved of %u", s.stats_pref_.v.standby_s, s.core_.standby_s());
   }
   DiffPowerPort::ports_.clear();
-  // portmgr-gpt 10: two ports with one name keep their counters apart (the key: their id)
+  // two ports with one name keep their counters apart (the key: their id)
   {
     stored.clear();
     Pin e1, d1, e2, d2;
@@ -2702,7 +2702,7 @@ static void test_port() {
           "same name, two ids: two records; a new name keeps its id's counters");
     DiffPowerPort::ports_.clear();
   }
-  // portmgr-gpt 11: During dark stored, the sun gone from the YAML: the YAML's mode, stored and shown
+  // During dark stored, the sun gone from the YAML: the YAML's mode, stored and shown
   {
     DiffPowerPort m;
     m.set_mode(MODE_STANDBY);
@@ -2755,8 +2755,8 @@ static void test_port() {
               "notice, slow transmitters, standby time), the counters per id, the select\n");
 }
 
-/// Before a planned power-off its hubs' last reads (an Ultra hub: the receivers' lifetime counters, a sync; review-r8
-/// fable-sync §4, §5 17): the port stays on (polls allowed) until every hub is ready, 3 s at most; then the notice, and
+/// Before a planned power-off its hubs' last reads (an Ultra hub: the receivers' lifetime counters, a sync):
+/// the port stays on (polls allowed) until every hub is ready, 3 s at most; then the notice, and
 /// from its first copy to the cut the port isn't ready (no POLL). Wanted again meanwhile: no power-off.
 static void test_port_prepare() {
   now_ms = 1000;
@@ -2864,7 +2864,7 @@ static void test_port_prepare() {
 // lights (with their own turn-off periods) and its calibration / update holds as the port's loads; powered:
 // everything again; each notice copy in the next frame for every board (IDENTIFY 7, one SEQ per notice, before what
 // is queued and before a preamble), reported once out; the shutdown's pump never waits; a stale copy dropped at the
-// next wake; a recovery's power cycle on the port (review-r8/portmgr-gpt 4, 12).
+// next wake; a recovery's power cycle on the port (design review, round 8).
 namespace hub_port {
 #define USE_DIFFPOWER   // (USE_DIG2ANALOG_ULTRA_UPDATE: defined at the top)
 struct rmt_transmit_config_t {
@@ -3077,7 +3077,7 @@ static void test_hub_port() {
   for (auto &f : port.ready)
     f();
   CHECK(h.sched_.power_off_left() == 0, "the wake: the stale copy dropped");
-  // a recovery's power cycle on the port (portmgr-gpt 12)
+  // a recovery's power cycle on the port (design review, round 8)
   CHECK(h.has_power_supply(), "a port counts as a supply the hub switches");
   h.power_cycle();
   CHECK(port.cycles == 1 && h.cycle_ == UltraHub::CYCLE_OFF, "power_cycle(): the port's cycle");
@@ -3166,7 +3166,7 @@ static void reboot(size_t receivers) {
   order.clear();
 }
 
-/// Review r9 F2: receivers added or removed across an allocation boundary (21 -> 22 receivers: 32 -> 64 entries; 32
+/// Receivers added or removed across an allocation boundary (21 -> 22 receivers: 32 -> 64 entries; 32
 /// -> 33: the positions too) keep the stored ledger; a cut between a copy and its size record keeps the other copy.
 static void test_ledger_resize() {
   UltraHub h;
@@ -3184,7 +3184,7 @@ static void test_ledger_resize() {
   h.ledger_service_();
   e = ultra_ledger().find(uid);
   const bool grown = e != nullptr && e->c.mwh == 150000 && ultra_ledger().blob_size() > small;
-  CHECK(grown, "F2: 21 -> 22 receivers (%u -> %u B): the stored ledger kept (%llu mWh)", static_cast<unsigned>(small),
+  CHECK(grown, "21 -> 22 receivers (%u -> %u B): the stored ledger kept (%llu mWh)", static_cast<unsigned>(small),
         static_cast<unsigned>(ultra_ledger().blob_size()), static_cast<unsigned long long>(e ? e->c.mwh : 0));
   if (e == nullptr)
     return;
@@ -3193,7 +3193,7 @@ static void test_ledger_resize() {
   reboot(21);   // (back: the newer copy is the bigger one)
   h.ledger_service_();
   e = ultra_ledger().find(uid);
-  CHECK(e != nullptr && e->c.mwh == 160000, "F2: back to 21: the newer, bigger copy loads (%llu mWh)",
+  CHECK(e != nullptr && e->c.mwh == 160000, "back to 21: the newer, bigger copy loads (%llu mWh)",
         static_cast<unsigned long long>(e ? e->c.mwh : 0));
   if (e == nullptr)
     return;
@@ -3202,7 +3202,7 @@ static void test_ledger_resize() {
   e = ultra_ledger().find(uid);
   bool sw = false;
   CHECK(e != nullptr && ultra_ledger().position_energy(5u << 16, *e, &sw) == 160000 && !sw,
-        "F2: 33 receivers: the position kept (no new board)");
+        "33 receivers: the position kept (no new board)");
   if (e == nullptr)
     return;
   // a cut between a copy (another size now) and its size record: that copy refused, the other one loads
@@ -3218,9 +3218,9 @@ static void test_ledger_resize() {
   reboot(70);
   h.ledger_service_();
   e = ultra_ledger().find(uid);
-  CHECK(e != nullptr && e->c.mwh == 170000, "F2: a cut between a copy and its size: the other copy (%llu mWh)",
+  CHECK(e != nullptr && e->c.mwh == 170000, "a cut between a copy and its size: the other copy (%llu mWh)",
         static_cast<unsigned long long>(e ? e->c.mwh : 0));
-  // (F8 on the boot loader: the newer copy, without an entry it aged out, wins whole; GPT's PRODUCTION_LOAD)
+  // (on the boot loader: the newer copy, without an entry it aged out, wins whole)
   stored.clear();
   reboot(1);
   h.ledger_service_();
@@ -3234,13 +3234,13 @@ static void test_ledger_resize() {
   reboot(1);
   h.ledger_service_();
   CHECK(g_ledger_generation == 3 && ultra_ledger().find(uid) == nullptr,
-        "F8: the newer copy (generation %u) without the aged entry: it stays gone", g_ledger_generation);
+        "the newer copy (generation %u) without the aged entry: it stays gone", g_ledger_generation);
   std::printf("  ledger store: receivers added and removed across the allocation boundaries, a cut mid-save, the newer "
               "copy whole\n");
 }
 
-/// Review r9 F6: a flush that fails (the NVS write) keeps the ledger dirty: a later forced save (a planned cut) with
-/// nothing new writes it again, and so does the periodic save. GPT's NVS_FAILURE probe.
+/// A flush that fails (the NVS write) keeps the ledger dirty: a later forced save (a planned cut) with
+/// nothing new writes it again, and so does the periodic save.
 static void test_ledger_flush_failure() {
   UltraHub h;
   uint8_t uid[12] = {0x43};
@@ -3256,7 +3256,7 @@ static void test_ledger_flush_failure() {
   h.ledger_save_(true);   // a planned cut, nothing new: written again
   reboot(1);
   h.ledger_service_();
-  CHECK(kept && ultra_ledger().find(uid) != nullptr, "F6: a failed flush stays dirty (%d) and the next forced save "
+  CHECK(kept && ultra_ledger().find(uid) != nullptr, "a failed flush stays dirty (%d) and the next forced save "
         "writes it (%d)", kept, ultra_ledger().find(uid) != nullptr);
   // the periodic save retries too
   uint8_t uid2[12] = {0x44};
@@ -3269,14 +3269,14 @@ static void test_ledger_flush_failure() {
   h.ledger_service_();
   reboot(1);
   h.ledger_service_();
-  CHECK(ultra_ledger().find(uid2) != nullptr, "F6: the periodic save after a failed one writes it again");
+  CHECK(ultra_ledger().find(uid2) != nullptr, "the periodic save after a failed one writes it again");
   std::printf("  ledger store: a failed flush written again (forced and periodic)\n");
 }
 }  // namespace ledger_store
 
 // ================================================================================================ ledger line
 // The hub's side of the ledger's own counts (dig2analog_ultra.cpp ledger_line_, cut into
-// build/lifecycle/hub_ledger_line.inc; review r9, Fable C 1-2): a Diff-Power port's power-on and cut as the port timed
+// build/lifecycle/hub_ledger_line.inc; design review, round 9): a Diff-Power port's power-on and cut as the port timed
 // them (PortCore::line_on / line_ms: the 55 V hotplug_ms after enable AND detect, until either drops), each receiver
 // lit while the boards are ready, by its own lights only.
 namespace ledger_line {

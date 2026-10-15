@@ -931,13 +931,13 @@ CASES = [
     ),
     ("diffpower time_unknown bogus", DP_PORT + "    time_unknown: maybe\n", False, "time_unknown"),
     ("diffpower notice_time too short", DP_PORT + "    notice_time: 100ms\n", False, "notice_time"),
-    # review-r8/portmgr-recheck-gpt N6: longer than the cap (and the receiver's 2 s) refused; 1 s the longest
+    # longer than the cap (and the receiver's 2 s) refused; 1 s the longest
     ("diffpower notice_time 2 s", DP_PORT + "    notice_time: 2s\n", False, "notice_time"),
     ("diffpower notice_time 1 s", DP_PORT + "    notice_time: 1s\n", True, None),
     ("diffpower power mode bogus", DP_PORT + "    power_mode: sometimes\n", False, "power_mode"),
     ("diffpower turn-off period too long", DP_PORT + "    standby_after: 2d\n", False, "standby_after"),
     ("diffpower unknown light", DP_PORT + "    lights: [nope]\n", False, "Couldn't find ID 'nope'"),
-    # review-r8/portmgr-gpt 8: the off time at least 1 s; a light's turn-off period at most 24 h; wake targets on a port
+    # the off time at least 1 s; a light's turn-off period at most 24 h; wake targets on a port
     ("diffpower min_off_time 0", DP_PORT + "    min_off_time: 0ms\n", False, "min_off_time"),
     ("diffpower min_off_time 500 ms", DP_PORT + "    min_off_time: 500ms\n", False, "min_off_time"),
     (
@@ -966,14 +966,14 @@ CASES = [
         False,
         "light 'l1' is on no Diff-Power port",
     ),
-    # portmgr-gpt 9: a partition of a strip on the port is the port's too (its pixels)
+    # a partition of a strip on the port is the port's too (its pixels)
     (
         "diffpower: a strip on a port, wake by its partition",
         DP_PORT + "    lights: [strip]\n" + DP_STRIP + DP_WAKE.format(light="part"),
         True,
         None,
     ),
-    # portmgr-recheck-gpt N5: a partition of a partition of the strip on the port is the port's too
+    # a partition of a partition of the strip on the port is the port's too
     (
         "diffpower: a strip on a port, wake by a nested partition",
         DP_PORT + "    lights: [strip]\n" + DP_STRIP
@@ -982,7 +982,7 @@ CASES = [
         True,
         None,
     ),
-    # portmgr-gpt 10: two ports with one name (their entities off): accepted, their counters kept apart by id
+    # two ports with one name (their entities off): accepted, their counters kept apart by id
     (
         "diffpower two ports with one name",
         DP_PORT + "    status: false\n    problem: false\n    standby_cycles: false\n    standby_hours: false\n"

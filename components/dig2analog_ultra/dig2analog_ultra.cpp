@@ -23,6 +23,10 @@
 #include <esp_memory_utils.h>
 #include <hal/gpio_ll.h>
 #endif
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+#include "esphome/components/uart/uart_component_esp_idf.h"
+#include <driver/uart.h>
+#endif
 
 namespace esphome::dig2analog_ultra {
 
@@ -589,8 +593,38 @@ void UltraHub::finish_window_(bool wait) {
     this->rw_driving_ = true;
   }
   this->rw_turn_ = false;
+  const TelemetryPoller::Stats &st = this->poller_.stats();
+  const uint32_t answers = st.answers, broken = st.bad_crc;
   this->poller_.finish(millis(), this->rw_rx_.data(), this->rw_rx_.size());
+  // the reply rate: a rate slower once broken answers keep coming, faster again after a quiet hour (ReplyRate)
+  const uint8_t was = this->reply_.rate();
+  if (this->reply_.window(millis(), st.answers - answers, st.bad_crc - broken)) {
+    static const char *const RATES[] = {"1 Mbaud", "500 kbaud", "250 kbaud"};
+    this->poller_.set_rate(this->reply_.rate());
+    this->rw_extra_us_ = this->poller_.max_window_us() + ULTRA_RW_HOLDOFF_US;   // (its windows' length)
+    if (this->reply_.rate() > was) {
+      ESP_LOGW(TAG, "Telemetry on GPIO%u: broken answers in %u of the last 32 windows: the receivers answer at %s now "
+               "(faster again after %" PRIu32 " min without)", this->pin_, static_cast<unsigned>(ReplyRate::BAD),
+               RATES[this->reply_.rate()], this->reply_.quiet_needed_ms() / 60000);
+    } else {
+      ESP_LOGI(TAG, "Telemetry on GPIO%u: no broken answers for %" PRIu32 " min: the receivers answer at %s again",
+               this->pin_, this->reply_.quiet_needed_ms() / 60000, RATES[this->reply_.rate()]);
+    }
+  }
   this->rw_publish_();
+}
+
+// ESPHome's UART keeps the rate it was given (its baud_rate member), the driver's is set directly: a register write
+// (load_settings() would reinstall the driver). Only between windows: the line is quiet then.
+void UltraHub::rw_uart_rate_() {
+  static const uint32_t BAUD[] = {1000000, 500000, 250000};
+  const uint32_t baud = BAUD[this->poller_.rate() % ULTRA_RW_RATES];
+  if (this->rw_uart_->get_baud_rate() == baud)
+    return;
+  this->rw_uart_->set_baud_rate(baud);
+  auto *idf = static_cast<uart::IDFUARTComponent *>(this->rw_uart_);
+  if (uart_set_baudrate(static_cast<uart_port_t>(idf->get_hw_serial_number()), baud) != ESP_OK)
+    ESP_LOGW(TAG, "Telemetry on GPIO%u: the UART's rate can't be set to %" PRIu32, this->pin_, baud);
 }
 
 // What changed per receiver: the port's load first (the receivers show their part), the log, then the sensors.
@@ -1497,6 +1531,7 @@ void UltraHub::transmit_() {
   // only an RW frame ends early (its window is the reset): every other frame has the full reset
   this->enc_.symbols.reset = this->tx_rw_ ? this->rw_reset_symbol_ : this->reset_symbol_;
   if (this->tx_rw_) {
+    this->rw_uart_rate_();   // (this line's reply rate)
     uint8_t junk[64];
     size_t n;
     while ((n = this->rw_uart_->available()) > 0 && this->rw_uart_->read_array(junk, std::min(n, sizeof(junk))))
@@ -1643,8 +1678,9 @@ void UltraHub::dump_config() {
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   if (this->rw_uart_ != nullptr) {
     static const char *const RATES[] = {"1 Mbaud", "500 kbaud", "250 kbaud"};
-    ESP_LOGCONFIG(TAG, "  Telemetry: %u receiver(s) (boards 0-%u), answers at %s, windows up to %" PRIu32 " us%s%s",
+    ESP_LOGCONFIG(TAG, "  Telemetry: %u receiver(s) (boards 0-%u), answers at %s%s, windows up to %" PRIu32 " us%s%s",
                   this->poller_.receivers(), this->poller_.receivers() - 1, RATES[this->poller_.rate() % 3],
+                  this->reply_.adaptive() ? " (slower on broken answers)" : " (pinned)",
                   this->poller_.max_window_us(), this->rw_dir_pin_ != nullptr ? ", direction pin" : "",
                   this->rw_rx_enable_pin_ != nullptr ? ", receiver enable pin (its UART may be shared)" : "");
   }

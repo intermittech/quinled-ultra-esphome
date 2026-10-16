@@ -290,6 +290,34 @@ void UltraTelemetryPort::update_() {
                       : standby ? std::string("The port is in standby (4.5 V).")
                       : waking  ? std::string("The port just woke: waiting for its receivers' first answers.")
                                 : port_status_detail(m));
+  this->publish_health_();
+}
+
+// The line's telemetry health, once a minute (after a window: none while the port is in standby, nothing changes then)
+void UltraTelemetryPort::publish_health_() {
+  const uint32_t now = millis();
+  if (!this->has_health_ || (this->health_seen_ && now - this->health_ms_ < HEALTH_MS))
+    return;
+  this->health_seen_ = true;
+  this->health_ms_ = now;
+  const TelemetryPoller::Stats &st = this->hub_->telemetry().stats();
+  auto put = [this](uint8_t which, float v) {
+    sensor::Sensor *s = this->health_[which];
+    if (s != nullptr && (!s->has_state() || s->state != v))
+      s->publish_state(v);
+  };
+  put(H_WINDOWS, static_cast<float>(st.windows));
+  const uint32_t missing = st.missing - this->missing_was_, asked = st.answers - this->answers_was_ + missing;
+  if (asked != 0)   // (none asked for in that minute: unchanged)
+    put(H_MISSING, 100.0f * static_cast<float>(missing) / static_cast<float>(asked));
+  this->answers_was_ = st.answers;
+  this->missing_was_ = st.missing;
+  put(H_BROKEN, static_cast<float>(st.bad_crc));
+  put(H_CONTENTION, static_cast<float>(st.contention));
+  put(H_RESTARTS, static_cast<float>(st.restarts));
+  put(H_LATE, static_cast<float>(this->hub_->late_releases()));
+  static const float KBIT[] = {1000.0f, 500.0f, 250.0f};
+  put(H_RATE, KBIT[this->hub_->reply_rate().rate() % ULTRA_RW_RATES]);
 }
 
 void UltraTelemetryPort::on_shutdown() {

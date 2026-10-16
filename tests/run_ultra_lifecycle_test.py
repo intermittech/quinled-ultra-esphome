@@ -53,7 +53,7 @@ PIECES = {
         "dig2analog_ultra.cpp",
         ["bool UltraHub::rw_due_(", "bool UltraHub::rx_settling(", "bool UltraHub::rw_uart_turn_(",
          "void UltraHub::rw_drop_turn_(", "bool IRAM_ATTR UltraHub::rw_done_isr_(", "void UltraHub::finish_window_(",
-         "void UltraHub::rw_publish_("],
+         "void UltraHub::rw_publish_(", "void UltraHub::rw_uart_rate_("],
     ),
     # the Diff-Power port (components/diffpower) and the hub's side of it
     "diffpower_methods.inc": (
@@ -83,7 +83,9 @@ PIECES = {
         "ultra_receiver.cpp",
         ["static Pace live_pace(", "static void publish_paced(", "static Pace receiver_pace(", "static Pace port_pace(",
          "void UltraReceiver::value_(", "void UltraReceiver::text_(", "void UltraReceiver::update_(",
-         "void UltraTelemetryPort::value_(", "void UltraTelemetryPort::update_(", "void UltraLightTelemetry::store_energy_(",
+         "void UltraTelemetryPort::value_(", "void UltraTelemetryPort::update_(",
+         "void UltraTelemetryPort::publish_health_(",
+         "void UltraLightTelemetry::store_energy_(",
          "void UltraLightTelemetry::update_("],
     ),
 }

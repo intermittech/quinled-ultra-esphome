@@ -2179,9 +2179,98 @@ static void test_power_off_cap() {
   CHECK(first_day && !back, "a burst, then 50 days checked every minute: held the first day, never after the wrap");
 }
 
+/// The reply rate (round 12): one rate slower at 4 broken of the last 32 counted windows (3: not; old ones slide out;
+/// windows without any answer don't count, missing answers alone neither), not below 250 k; one rate faster after an
+/// hour of windows without a broken one (a standby gap counts 60 s), never above the configured rate; a failed try
+/// doubles the quiet period up to a day, one that holds resets it; pinned: never.
+static void test_reply_rate() {
+  std::printf("the reply rate: slower on broken answers, faster after a quiet hour\n");
+  uint32_t now = 0xFFFFF000u;   // (across the millis() wrap)
+  ReplyRate r;
+  r.configure(ULTRA_RW_RATE_1M, true);
+  auto win = [&](uint32_t answers, uint32_t broken, uint32_t step = 1000) {
+    now += step;
+    return r.window(now, answers, broken);
+  };
+  // 3 broken of 32: no step; a 4th after the first slid out: none either
+  bool changed = false;
+  for (int k = 0; k < 32; k++)
+    changed |= win(2, k < 3 ? 1 : 0);
+  changed |= win(2, 1);   // (the window 32 back was broken: it slid out, 3 of 32 again)
+  CHECK(!changed && r.rate() == ULTRA_RW_RATE_1M, "3 of the last 32 broken: 1 M");
+  // windows without anything heard, or only missing answers: don't count (no step, and they don't push broken ones
+  // out): 3 broken and 28 good, 200 without an answer, then a broken one is the 4th of the last 32 counted
+  ReplyRate e;
+  e.configure(ULTRA_RW_RATE_1M, true);
+  uint32_t te = 0;
+  bool early = false;
+  for (int k = 0; k < 31; k++)
+    early |= e.window(te += 1000, 2, k < 3 ? 1 : 0);
+  for (int k = 0; k < 200; k++)
+    early |= e.window(te += 1000, 0, 0);
+  CHECK(!early && e.window(te += 1000, 1, 1) && e.rate() == ULTRA_RW_RATE_500K,
+        "200 windows without an answer between: they don't count (the 4th of 32 steps down)");
+  bool down = false;
+  for (int k = 0; k < 4 && !down; k++)   // (with the one before still among the last 32: at the 3rd)
+    down = win(2, 1);
+  CHECK(down && r.rate() == ULTRA_RW_RATE_500K && r.steps_down() == 1, "broken ones in a row: 500 k");
+  for (int k = 0; k < 3; k++)
+    win(2, 1);
+  CHECK(r.rate() == ULTRA_RW_RATE_500K, "after a step the count starts again: 3 more broken, still 500 k");
+  win(2, 1);
+  for (int k = 0; k < 40; k++)
+    win(2, 1);
+  CHECK(r.rate() == ULTRA_RW_RATE_250K && r.steps_down() == 2, "4 more: 250 k, the slowest (not below)");
+  // an hour of windows without a broken one: 500 k; a standby of 2 h between two windows counts 60 s
+  bool up = false;
+  for (int k = 0; k < 3599 && !up; k++)
+    up = win(2, 0);
+  CHECK(!up, "59:59 quiet: still 250 k");
+  win(2, 0, 2 * 3600000u);   // (a 2 h standby gap)
+  CHECK(r.rate() == ULTRA_RW_RATE_500K && r.steps_up() == 1, "an hour of windows (the gap counted 60 s): 500 k");
+  // the try fails (broken again): 250 k, and the next quiet period is 2 h
+  for (int k = 0; k < 4; k++)
+    win(2, 1);
+  CHECK(r.rate() == ULTRA_RW_RATE_250K && r.quiet_needed_ms() == 2 * ReplyRate::QUIET_MS,
+        "the try failed: 250 k, the next quiet period 2 h (%u min)", r.quiet_needed_ms() / 60000);
+  // failed tries double it up to a day
+  for (int t = 0; t < 8; t++) {
+    const uint32_t need = r.quiet_needed_ms();
+    for (uint32_t ms = 0; ms < need + 1000 && r.rate() != ULTRA_RW_RATE_500K; ms += 1000)
+      win(2, 0);
+    for (int k = 0; k < 4; k++)
+      win(2, 1);
+  }
+  CHECK(r.quiet_needed_ms() == ReplyRate::QUIET_MAX_MS, "8 failed tries: a day at most (%u h)",
+        r.quiet_needed_ms() / 3600000);
+  // a try that holds an hour resets it; at the configured rate (1 M) no more steps up
+  for (uint32_t ms = 0; ms <= ReplyRate::QUIET_MAX_MS && r.rate() != ULTRA_RW_RATE_500K; ms += 1000)
+    win(2, 0);
+  for (int k = 0; k < 3601; k++)
+    win(2, 0);
+  CHECK(r.quiet_needed_ms() == ReplyRate::QUIET_MS, "the try held an hour: the quiet period 1 h again");
+  for (int k = 0; k < 3601 * 3; k++)
+    win(2, 0);
+  CHECK(r.rate() == ULTRA_RW_RATE_1M && r.steps_up() >= 2, "then 1 M, the configured rate, and no higher");
+  // configured 500 k: never 1 M; pinned: never changes
+  ReplyRate t;
+  t.configure(ULTRA_RW_RATE_500K, true);
+  ReplyRate p;
+  p.configure(ULTRA_RW_RATE_1M, false);
+  bool moved = false;
+  for (int k = 0; k < 20000; k++) {
+    now += 1000;
+    t.window(now, 2, k % 2000 < 10 ? 1 : 0);
+    moved |= p.window(now, 2, 1);
+  }
+  CHECK(t.rate() >= ULTRA_RW_RATE_500K && !moved && p.rate() == ULTRA_RW_RATE_1M,
+        "configured 500 k: never faster (%u); pinned at 1 M: never moved", t.rate());
+}
+
 int main() {
   std::printf("ultra telemetry test (the return channel's hub side)\n");
   test_power_off_cap();
+  test_reply_rate();
   test_window_hash();
   test_due_memo();
   test_basic();

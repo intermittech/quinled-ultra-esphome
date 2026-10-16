@@ -37,7 +37,7 @@ PIECES = {
         "bool UltraHub::rw_due_(", "bool UltraHub::rx_settling(", "bool UltraHub::rw_uart_turn_(",
         "void UltraHub::rw_drop_turn_(",
         "bool IRAM_ATTR UltraHub::rw_done_isr_(", "void IRAM_ATTR UltraHub::rw_lane_release_(",
-        "void UltraHub::finish_window_(", "void UltraHub::rw_publish_(",
+        "void UltraHub::finish_window_(", "void UltraHub::rw_publish_(", "void UltraHub::rw_uart_rate_(",
     ],
     "hub_start.inc": ["int64_t UltraHub::lead_us(", "int64_t UltraHub::command_lead_us_(", "int64_t UltraHub::start_time_us("],
     "hub_update_start.inc": ["bool UltraHub::start_update("],

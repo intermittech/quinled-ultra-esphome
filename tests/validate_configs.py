@@ -1273,6 +1273,18 @@ CASES = [
     ("ultra RAM: one small line", ram_lines(1, 2), True, "!of the ESP32's RAM"),
     ("ultra telemetry update_rate bogus", ULTRA + TELEMETRY + "    update_rate: ludicrous\n" + RX_UART, False,
      "Unknown value"),
+    # the line's health (round 12): with diagnostics full (disabled until enabled), not with basic unless listed; the
+    # reply rate adaptive by default, adaptive_rate: false pins it
+    ("ultra telemetry health entities (full)", ULTRA + TELEMETRY + RX_UART, True, "name: Port reply rate"),
+    ("ultra telemetry health: missing answers", ULTRA + TELEMETRY + RX_UART, True, "name: Port missing answers"),
+    ("ultra telemetry no health entities with basic", ULTRA + TELEMETRY + "    diagnostics: basic\n" + RX_UART, True,
+     "!reply rate"),
+    ("ultra telemetry a health entity listed with basic",
+     ULTRA + TELEMETRY + "    diagnostics: basic\n    port_reply_rate:\n      name: Cable rate\n" + RX_UART, True,
+     "name: Cable rate"),
+    ("ultra telemetry adaptive_rate false", ULTRA + TELEMETRY + "    adaptive_rate: false\n" + RX_UART, True, None),
+    ("ultra telemetry adaptive_rate bogus", ULTRA + TELEMETRY + "    adaptive_rate: sometimes\n" + RX_UART, False,
+     "adaptive_rate"),
     ("ultra telemetry live twins on devices", ULTRA + TELEMETRY + RX_LIST + RX_UART, True, "name: Live power"),
     ("ultra telemetry Port text on a receiver's device", ULTRA + TELEMETRY + RX_LIST + RX_UART, True, "name: Port\n"),
     ("ultra telemetry Identify button", ULTRA + TELEMETRY + RX_LIST + RX_UART, True, "name: Identify"),

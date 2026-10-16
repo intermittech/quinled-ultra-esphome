@@ -725,6 +725,8 @@ class TelemetryPoller {
       this->rx_[i].seq = static_cast<uint8_t>(seed + 37 * i);
   }
   uint16_t receivers() const { return static_cast<uint16_t>(this->rx_.size()); }
+  /// the rate its POLLs ask the receivers to answer at (ReplyRate)
+  void set_rate(uint8_t rate) { this->rate_ = rate < ULTRA_RW_RATES ? rate : ULTRA_RW_RATE_1M; }
   uint8_t rate() const { return this->rate_; }
   /// The longest window one RW frame can open (us, W): up to 16 answer.
   uint32_t max_window_us() const {
@@ -1510,13 +1512,85 @@ inline float light_power_estimate(const ReceiverData &d, uint8_t mask) {
   return all == 0 ? 0.0f : total * static_cast<float>(mine) / static_cast<float>(all);
 }
 
-// ------------------------------------------------------------------------------------------------- the port's load
-/// A Diff-Power sender port: its receivers' bus-side input currents against the port's limit (3 x 750 mA PTCs = 2.25 A),
-/// the power at the sender, and the cable along the chain (from each receiver's bus voltage and the current through
-/// each segment: segment k carries the input currents of receivers k..N). Updated after every response window.
-/// A receiver that doesn't answer makes the port values incomplete (complete() false): the current and power without
-/// its share, no cable loss. The peak (0.2.5): each receiver's highest ~100 ms input current since its ENERGY read
-/// before (about a minute), added up: at most what the port carried (the peaks needn't coincide).
+// --------------------------------------------------------------------------------------- the receivers' reply rate
+/// The rate a line's receivers answer at (ULTRA_RW_RATE_*), stepped down on a cable that breaks their answers: one
+/// rate slower (1 M -> 500 k -> 250 k) once BAD of its last 32 counted windows had a broken answer (a SYNC byte whose
+/// answer fails its CRC). A window without any answer, whole or broken, doesn't count (a receiver gone, the port in
+/// standby: not the cable), and missing answers alone don't either. One rate faster again after QUIET_MS of windows
+/// without a broken answer (the time between windows counts up to GAP_MAX_MS: a port in standby meanwhile adds
+/// nothing), never above the configured rate (the UART's baud_rate). A step up that steps down again before it held
+/// QUIET_MS doubles the next quiet period (QUIET_MAX_MS at most); one that holds resets it. Pinned (adaptive_rate:
+/// false): always the configured rate.
+class ReplyRate {
+ public:
+  static constexpr uint8_t BAD = 4;                           // windows with a broken answer, of the last 32 counted
+  static constexpr uint32_t QUIET_MS = 3600000;               // an hour of telemetry without one: a rate faster
+  static constexpr uint32_t QUIET_MAX_MS = 24u * 3600000u;    // (doubled after failed tries, up to a day)
+  static constexpr uint32_t GAP_MAX_MS = 60000;               // the time between two windows counts this much at most
+
+  void configure(uint8_t top, bool adaptive) {
+    this->top_ = this->rate_ = top < ULTRA_RW_RATES ? top : ULTRA_RW_RATE_1M;
+    this->adaptive_ = adaptive;
+  }
+  uint8_t rate() const { return this->rate_; }
+  uint8_t top() const { return this->top_; }
+  bool adaptive() const { return this->adaptive_; }
+  /// the quiet time a step up needs now (QUIET_MS, doubled after each failed try)
+  uint32_t quiet_needed_ms() const { return this->need_ms_; }
+  uint32_t steps_down() const { return this->downs_; }
+  uint32_t steps_up() const { return this->ups_; }
+
+  /// A window's outcome: its answers matched and its broken answers. True: the rate changed (the next POLL asks for it)
+  bool window(uint32_t now_ms, uint32_t answers, uint32_t broken) {
+    const uint32_t gap = now_ms - this->last_ms_;
+    this->last_ms_ = now_ms;
+    if (!this->adaptive_ || (answers == 0 && broken == 0))
+      return false;
+    const uint32_t dt = this->started_ && gap < GAP_MAX_MS ? gap : (this->started_ ? GAP_MAX_MS : 0);
+    this->started_ = true;
+    this->hist_ = (this->hist_ << 1) | (broken != 0 ? 1u : 0u);
+    this->run_ms_ = sat_add_(this->run_ms_, dt);
+    if (broken != 0) {
+      this->quiet_ms_ = 0;
+      if (__builtin_popcount(this->hist_) < BAD || this->rate_ + 1u >= ULTRA_RW_RATES)
+        return false;
+      if (this->tried_)   // (the step up didn't hold)
+        this->need_ms_ = this->need_ms_ >= QUIET_MAX_MS / 2 ? QUIET_MAX_MS : this->need_ms_ * 2;
+      this->tried_ = false;
+      this->rate_++;
+      this->downs_++;
+      this->changed_();
+      return true;
+    }
+    this->quiet_ms_ = sat_add_(this->quiet_ms_, dt);
+    if (this->tried_ && this->run_ms_ >= QUIET_MS) {   // the step up held
+      this->tried_ = false;
+      this->need_ms_ = QUIET_MS;
+    }
+    if (this->rate_ <= this->top_ || this->quiet_ms_ < this->need_ms_)
+      return false;
+    this->rate_--;
+    this->ups_++;
+    this->tried_ = true;
+    this->changed_();
+    return true;
+  }
+
+ protected:
+  static uint32_t sat_add_(uint32_t a, uint32_t b) { return a > UINT32_MAX - b ? UINT32_MAX : a + b; }
+  void changed_() {
+    this->hist_ = 0;
+    this->run_ms_ = this->quiet_ms_ = 0;
+  }
+  uint32_t hist_{0};             // bit 0: the last counted window had a broken answer
+  uint32_t last_ms_{0}, run_ms_{0}, quiet_ms_{0};   // telemetry time at this rate, and since the last broken answer
+  uint32_t need_ms_{QUIET_MS};
+  uint32_t downs_{0}, ups_{0};
+  uint8_t top_{ULTRA_RW_RATE_1M}, rate_{ULTRA_RW_RATE_1M};
+  bool adaptive_{false}, tried_{false}, started_{false};
+};
+
+// --------------------------------------------------------------------------------- the standby cap (old receivers)
 /// The planned power-offs of a Diff-Power port with receivers that lack standby support (firmware before 0.6.10: each
 /// power-off and wake is a flash write and a power-on scene on them): at most CAP in 24 h. Once CAP are inside the
 /// last 24 h, hold() keeps the port powered until the oldest of them is 24 h old. Entries older than that are
@@ -1558,6 +1632,14 @@ class PowerOffCap {
   uint16_t used_{0};
 };
 
+
+// ------------------------------------------------------------------------------------------------- the port's load
+/// A Diff-Power sender port: its receivers' bus-side input currents against the port's limit (3 x 750 mA PTCs = 2.25 A),
+/// the power at the sender, and the cable along the chain (from each receiver's bus voltage and the current through
+/// each segment: segment k carries the input currents of receivers k..N). Updated after every response window.
+/// A receiver that doesn't answer makes the port values incomplete (complete() false): the current and power without
+/// its share, no cable loss. The peak (0.2.5): each receiver's highest ~100 ms input current since its ENERGY read
+/// before (about a minute), added up: at most what the port carried (the peaks needn't coincide).
 class PortMonitor {
  public:
   struct Config {

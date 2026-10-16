@@ -1160,7 +1160,21 @@ struct Uart {
     this->rx.erase(this->rx.begin(), this->rx.begin() + static_cast<std::ptrdiff_t>(n));
     return true;
   }
+  // the reply rate (round 12): ESPHome's member and the driver's (uart_set_baudrate)
+  uint32_t baud{1000000};
+  uint32_t get_baud_rate() const { return this->baud; }
+  void set_baud_rate(uint32_t b) { this->baud = b; }
+  uint8_t get_hw_serial_number() { return 0; }
 };
+namespace uart {
+using IDFUARTComponent = Uart;
+}
+using uart_port_t = int;
+static uint32_t uart_hw_baud = 1000000;
+static esp_err_t uart_set_baudrate(uart_port_t, uint32_t b) {
+  uart_hw_baud = b;
+  return ESP_OK;
+}
 
 struct UltraHub;
 /// The RMT: one frame at a time, done after its bits and its reset symbol (80 MHz ticks); then its interrupt.
@@ -1193,6 +1207,7 @@ struct UltraHub {
   void rw_drop_turn_();
   void finish_window_(bool wait);
   void rw_publish_();
+  void rw_uart_rate_();
   static bool rw_done_isr_(rmt_channel_handle_t, const rmt_tx_done_event_data_t *, void *arg);
   static int64_t now_us_() { return clock_us; }
   void wake_();                       // (hub_wake.inc)
@@ -1248,6 +1263,7 @@ struct UltraHub {
   volatile bool rw_release_{false};
   volatile int64_t rw_released_us_{0};
   TelemetryPoller poller_;
+  ReplyRate reply_;
   PortMonitor port_monitor_;
   EnergyCounter port_energy_;
   bool port_seeded_{false}, rw_rx_tied_{false};
@@ -1331,6 +1347,8 @@ static Answers answers_of[4];   // per line (its RMT channel): its receivers' an
 static Answers &answers = answers_of[0];
 static bool receivers_on_of[4] = {true, true, true, true};
 static bool &receivers_on = receivers_on_of[0];
+// the cable (round 12): answers at a rate faster than this (a lower ULTRA_RW_RATE_*) arrive broken (their CRC fails)
+static uint8_t cable_rate_of[4] = {0, 0, 0, 0};
 
 static esp_err_t rmt_transmit(int ch, int, const uint8_t *data, size_t n, const rmt_transmit_config_t *) {
   Rmt &rmt = rmts[ch];
@@ -1375,6 +1393,8 @@ static esp_err_t rmt_transmit(int ch, int, const uint8_t *data, size_t n, const 
       ultra_put16(a + 4, static_cast<uint16_t>(0x1000 + 0x100 * ch + b));
       std::memcpy(a + ULTRA_RSP_DATA, d, 24);
       ultra_put16(a + 30, ultra_crc16(a, 30));
+      if (s[ULTRA_POLL_RATE] < cable_rate_of[ch])
+        a[12] ^= 0x5A;   // (too fast for this cable: broken)
       answers.bytes.push_back(ULTRA_RSP_LEAD);
       answers.bytes.insert(answers.bytes.end(), a, a + 32);
     }
@@ -1464,6 +1484,63 @@ static void test_rw_no_standby() {
   CHECK(h.no_standby_ == 1 && (h.rx_note_[0] & UltraHub::RX_NO_STANDBY) && !(h.rx_note_[1] & UltraHub::RX_NO_STANDBY) &&
             (h.rx_note_[0] & UltraHub::RX_WARNED),
         "receivers without standby support: %u counted (receiver 0), warned once", h.no_standby_);
+}
+
+/// The reply rate on a line (round 12): what 20 s of telemetry ends with on a cable that breaks answers faster than
+/// `cable`, with adaptive_rate or pinned, the receivers answering or not.
+struct RateRun {
+  uint8_t rate, poll_rate;   // the poller's, and the last RW frame's POLL
+  uint32_t baud, hw_baud, extra_before, extra_after, broken, answers;
+};
+static RateRun reply_rate_run(uint8_t cable, bool adaptive, bool on) {
+  clock_us = 0;
+  now_ms = 0;
+  rmt = Rmt();
+  answers = Answers();
+  UltraHub::hubs_.clear();
+  cable_rate_of[0] = cable;
+  receivers_on = on;
+  uart_hw_baud = 1000000;
+  Uart uart;
+  Pin pin;
+  UltraHub h;
+  rmt.hub = &h;
+  h.start(&uart, &pin);
+  h.reply_.configure(ULTRA_RW_RATE_1M, adaptive);
+  const uint32_t before = h.rw_extra_us_;
+  run_us(h, uart, 20000000);
+  RateRun r{h.poller_.rate(), 0xFF, uart.baud, uart_hw_baud, before, h.rw_extra_us_, h.poller_.stats().bad_crc,
+            h.poller_.stats().answers};
+  for (auto it = rmt.sent.rbegin(); it != rmt.sent.rend(); ++it) {
+    if (is_rw(*it)) {
+      r.poll_rate = it->frame[ULTRA_POLL_RATE];
+      break;
+    }
+  }
+  cable_rate_of[0] = 0;
+  receivers_on = true;
+  return r;
+}
+
+/// A cable that breaks the answers at 1 Mbaud (fine at 500 k): the line steps down within a few windows, its POLLs ask
+/// for 500 k, the UART is set to 500 kbaud (ESPHome's and the driver's) at the next window, the commands' lead
+/// follows the longer windows; at 500 k nothing breaks: it stays there. Controls: a good cable stays at 1 M; pinned,
+/// the bad cable stays at 1 M (its answers keep breaking); receivers that don't answer (missing only): no step.
+static void test_rw_reply_rate() {
+  const RateRun bad = reply_rate_run(ULTRA_RW_RATE_500K, true, true);
+  CHECK(bad.rate == ULTRA_RW_RATE_500K && bad.poll_rate == ULTRA_RW_RATE_500K && bad.baud == 500000 &&
+            bad.hw_baud == 500000 && bad.extra_after > bad.extra_before && bad.broken >= ReplyRate::BAD &&
+            bad.broken <= 3 * ReplyRate::BAD && bad.answers >= 8,
+        "a cable broken at 1 M: 500 k (POLL %u, UART %u / %u), lead %u -> %u us, %u broken, %u answers",
+        bad.poll_rate, bad.baud, bad.hw_baud, bad.extra_before, bad.extra_after, bad.broken, bad.answers);
+  const RateRun good = reply_rate_run(0, true, true);
+  const RateRun pinned = reply_rate_run(ULTRA_RW_RATE_500K, false, true);
+  const RateRun silent = reply_rate_run(ULTRA_RW_RATE_500K, true, false);
+  CHECK(good.rate == ULTRA_RW_RATE_1M && good.baud == 1000000 && good.hw_baud == 1000000 && good.broken == 0 &&
+            pinned.rate == ULTRA_RW_RATE_1M && pinned.poll_rate == ULTRA_RW_RATE_1M &&
+            pinned.broken > 2 * ReplyRate::BAD &&
+            silent.rate == ULTRA_RW_RATE_1M && silent.answers == 0,
+        "controls: a good cable 1 M; pinned 1 M (%u broken); no answers at all 1 M", pinned.broken);
 }
 
 static void test_rw_fast_share() {
@@ -1958,6 +2035,10 @@ struct UltraHub {
   bool port_standby() const { return this->standby; }
   bool port_off() const { return this->off; }
   bool rx_settling(uint16_t) const { return this->settling; }
+  ReplyRate reply;
+  uint32_t late{0};
+  const ReplyRate &reply_rate() const { return this->reply; }
+  uint32_t late_releases() const { return this->late; }
 };
 
 #include "receiver_consts.inc"
@@ -1988,8 +2069,14 @@ struct UltraTelemetryPort {   // as ultra_receiver.h
     POWER = 0, CURRENT, LOAD, CABLE_LOSS, CABLE_LOSS_PCT, PEAK_LOAD, LIVE_POWER, ENERGY, VALUE_COUNT,
   };
   enum Text : uint8_t { RECEIVERS = 0, STATUS, STATUS_DETAIL, TEXT_COUNT };
+  enum Health : uint8_t { H_WINDOWS = 0, H_MISSING, H_BROKEN, H_CONTENTION, H_RESTARTS, H_LATE, H_RATE, HEALTH_COUNT };
+  static constexpr uint32_t HEALTH_MS = 60000;
   void update_();
   void value_(uint8_t which, float v, bool force);
+  void publish_health_();
+  sensor::Sensor *health_[HEALTH_COUNT]{};
+  bool has_health_{false}, health_seen_{false};
+  uint32_t health_ms_{0}, answers_was_{0}, missing_was_{0};
   UltraHub *hub_{nullptr};
   uint32_t unpaced_{0};
   sensor::Sensor *values_[VALUE_COUNT]{};
@@ -2303,6 +2390,10 @@ static void test_receiver_entities() {
     port.values_[i] = &port_values[i];
   for (int i = 0; i < UltraTelemetryPort::TEXT_COUNT; i++)
     port.texts_[i] = &port_texts[i];
+  sensor::Sensor port_health[UltraTelemetryPort::HEALTH_COUNT];
+  for (int i = 0; i < UltraTelemetryPort::HEALTH_COUNT; i++)
+    port.health_[i] = &port_health[i];
+  port.has_health_ = true;
   PortMonitor::Config pcfg;
   pcfg.supply_v = 51.0f;
   hub.m.configure(pcfg);
@@ -2545,8 +2636,27 @@ static void test_receiver_entities() {
         "powered and silent: No answer again");
   silent0 = false;
   run(20000);
+  // the line's health (round 12; diagnostic, disabled by default): once a minute, the missing answers of that minute
+  using H = UltraTelemetryPort;
+  run(125000);   // (all answer: a whole minute without missing ones)
+  const float clean = port_health[H::H_MISSING].state, w0 = port_health[H::H_WINDOWS].state;
+  const int pubs = port_health[H::H_WINDOWS].publishes;
+  hub.late = 7;
+  hub.reply.configure(ULTRA_RW_RATE_500K, false);
+  silent0 = true;
+  run(125000);   // (receiver 1 silent, receiver 2 behind it: every answer of a whole minute missing)
+  CHECK(clean == 0.0f && port_health[H::H_MISSING].state == 100.0f && port_health[H::H_WINDOWS].state > w0 &&
+            port_health[H::H_WINDOWS].publishes - pubs <= 3 && port_health[H::H_BROKEN].state == 0.0f &&
+            port_health[H::H_CONTENTION].state == 0.0f && port_health[H::H_LATE].state == 7.0f &&
+            port_health[H::H_RATE].state == 500.0f && port_health[H::H_RESTARTS].has_state(),
+        "health: missing %.0f %% then %.0f %%, windows %.0f -> %.0f (%d publishes in 2 min), late %.0f, rate %.0f kbit/s",
+        clean, port_health[H::H_MISSING].state, w0, port_health[H::H_WINDOWS].state,
+        port_health[H::H_WINDOWS].publishes - pubs, port_health[H::H_LATE].state, port_health[H::H_RATE].state);
+  silent0 = false;
+  run(20000);
   now_ms = 0;
-  std::printf("  receiver entities: Status / Problem / detail, values, the port's summary, a light's estimate\n");
+  std::printf("  receiver entities: Status / Problem / detail, values, the port's summary, a light's estimate, the "
+              "line's health\n");
 }
 
 }  // namespace receiver_entities
@@ -4245,6 +4355,7 @@ int main() {
   hub_rw::test_telemetry_window();
   hub_rw::test_rw_fast_share();
   hub_rw::test_rw_no_standby();
+  hub_rw::test_rw_reply_rate();
   hub_rw::test_several_lines();
   hub_rw::test_tied_shared_uart();
   hub_rw::test_standby_support();

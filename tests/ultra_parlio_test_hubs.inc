@@ -87,7 +87,24 @@ struct Uart {
     this->rx.erase(this->rx.begin(), this->rx.begin() + static_cast<std::ptrdiff_t>(n));
     return true;
   }
+  // the reply rate (round 12): ESPHome's member and the driver's (uart_set_baudrate), per UART number
+  uint32_t baud{1000000};
+  uint8_t num{0};
+  uint32_t get_baud_rate() const { return this->baud; }
+  void set_baud_rate(uint32_t b) { this->baud = b; }
+  uint8_t get_hw_serial_number() { return this->num; }
 };
+namespace uart {
+using IDFUARTComponent = Uart;
+}
+using uart_port_t = int;
+static uint32_t uart_hw_baud[4] = {1000000, 1000000, 1000000, 1000000};
+static int uart_hw_sets = 0;
+static esp_err_t uart_set_baudrate(uart_port_t n, uint32_t b) {
+  uart_hw_baud[n & 3] = b;
+  uart_hw_sets++;
+  return ESP_OK;
+}
 
 /// RMT lines: one frame at a time at bit_ns per bit, done after its reset symbol (80 MHz ticks), then its interrupt.
 struct UltraHub;
@@ -207,6 +224,7 @@ struct UltraHub {
   bool rw_uart_turn_();
   void rw_drop_turn_();
   void finish_window_(bool wait);
+  void rw_uart_rate_();
   void rw_publish_();
   static bool rw_done_isr_(rmt_channel_handle_t, const rmt_tx_done_event_data_t *, void *arg);
   static void rw_lane_release_(void *arg);
@@ -294,6 +312,7 @@ struct UltraHub {
   volatile bool rw_release_{false};
   volatile int64_t rw_released_us_{0};
   TelemetryPoller poller_;
+  ReplyRate reply_;
   PortMonitor port_monitor_;
   LedgerKeeper keeper_;   // (not attached: nothing to prepare; tests/ultra_telemetry_test.cpp runs it)
   EnergyCounter port_energy_;

@@ -106,10 +106,21 @@ class UltraTelemetryPort final : public Component {
     POWER = 0, CURRENT, LOAD, CABLE_LOSS, CABLE_LOSS_PCT, PEAK_LOAD, LIVE_POWER, ENERGY, VALUE_COUNT,
   };
   enum Text : uint8_t { RECEIVERS = 0, STATUS, STATUS_DETAIL, TEXT_COUNT };
+  /// the line's telemetry health (diagnostic, disabled by default; once a minute): poll windows, missing answers (%
+  /// of those asked for in that minute), broken answers (bad CRC), answers with contention, receiver restarts, late
+  /// releases of the line, the reply rate (kbit/s)
+  enum Health : uint8_t { H_WINDOWS = 0, H_MISSING, H_BROKEN, H_CONTENTION, H_RESTARTS, H_LATE, H_RATE, HEALTH_COUNT };
+  static constexpr uint32_t HEALTH_MS = 60000;
   void set_hub(UltraHub *hub) { this->hub_ = hub; }
   void set_value(uint8_t which, sensor::Sensor *s) {
     if (which < VALUE_COUNT)
       this->values_[which] = s;
+  }
+  void set_health(uint8_t which, sensor::Sensor *s) {
+    if (which < HEALTH_COUNT) {
+      this->health_[which] = s;
+      this->has_health_ = true;
+    }
   }
   void set_unpaced(uint8_t which) { this->unpaced_ |= 1u << which; }
   void set_text(uint8_t which, text_sensor::TextSensor *s) {
@@ -125,6 +136,7 @@ class UltraTelemetryPort final : public Component {
  protected:
   void update_();
   void value_(uint8_t which, float v, bool force);
+  void publish_health_();
   UltraHub *hub_{nullptr};
   uint32_t unpaced_{0};
   sensor::Sensor *values_[VALUE_COUNT]{};
@@ -133,6 +145,9 @@ class UltraTelemetryPort final : public Component {
   Paced paced_[VALUE_COUNT]{};
   MeanPaced power_mean_;
   bool standby_was_{false};
+  sensor::Sensor *health_[HEALTH_COUNT]{};
+  bool has_health_{false}, health_seen_{false};
+  uint32_t health_ms_{0}, answers_was_{0}, missing_was_{0};
 };
 
 /// A light on a receiver with several lights (on its own device): its estimated power (the receiver's measured power

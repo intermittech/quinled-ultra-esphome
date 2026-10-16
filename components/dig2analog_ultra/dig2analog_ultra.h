@@ -305,7 +305,14 @@ class UltraHub final : public Component {
     this->rate_ms_ = status_ms;
     this->poller_.init(receivers, rate,
                        TelemetryIntervals{status_ms, power_ms, energy_ms, supply_ms, health_ms, lifetime_ms, diag_ms});
+    this->reply_.configure(rate, true);
   }
+  /// adaptive_rate: false pins the receivers' reply rate at the UART's baud_rate (else slower on broken answers:
+  /// ReplyRate)
+  void set_telemetry_adaptive_rate(bool on) { this->reply_.configure(this->reply_.top(), on); }
+  const ReplyRate &reply_rate() const { return this->reply_; }
+  /// windows where the line was let go of late (the receivers found it still driven: no answers)
+  uint32_t late_releases() const { return this->rw_late_; }
   /// the update rate (STATUS, ms): the live values' pace (update_rate: fast 1 s, normal 2 s, slow 5 s)
   uint32_t update_rate_ms() const { return this->rate_ms_; }
   /// the line's key in the lifetime ledger (its id's hash): its receivers' positions and its port's energy stay with
@@ -399,6 +406,8 @@ class UltraHub final : public Component {
   bool rw_uart_turn_();
   /// The turn of a poll frame that won't go out (a resync, an update): let go of it (an open window keeps it).
   void rw_drop_turn_();
+  /// The UART at this line's reply rate, before its window (lines sharing a UART may answer at different rates)
+  void rw_uart_rate_();
   uart::UARTComponent *rw_uart_{nullptr};
   InternalGPIOPin *rw_dir_pin_{nullptr};
   ISRInternalGPIOPin rw_dir_isr_;
@@ -412,6 +421,7 @@ class UltraHub final : public Component {
   volatile bool rw_release_{false};       // the RMT's done interrupt lets go of the line (an RW frame is on the wire)
   volatile int64_t rw_released_us_{0};
   TelemetryPoller poller_;
+  ReplyRate reply_;                       // the receivers' reply rate: slower on a cable that breaks their answers
   PortMonitor port_monitor_;              // the port's load and cable, after each window
   LedgerKeeper keeper_;                   // this line's receivers in the lifetime ledger (ultra_ledger.h)
   const char *tel_name_{"Port"};

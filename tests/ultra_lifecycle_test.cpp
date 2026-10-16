@@ -1389,9 +1389,10 @@ static esp_err_t rmt_transmit(int ch, int, const uint8_t *data, size_t n, const 
         ultra_put16(d + ULTRA_ST_VBUS, static_cast<uint16_t>(2400 + 1200 * ch));   // line k: 24 V + 12 V x k
         ultra_put16(d + ULTRA_ST_MCU_TEMP, ULTRA_ST_NA);
         d[ULTRA_ST_MEASURED] = ULTRA_ST_M_VBUS;
-      } else if (page == ULTRA_PAGE_IDENTITY) {
-        d[0] = static_cast<uint8_t>(b + 1);
-        ultra_put32(d + ULTRA_ID_FEATURES, b == 1 ? ULTRA_FEAT_STANDBY : 0u);   // (receiver 1: 0.2.6 standby support)
+      } else if (page == ULTRA_PAGE_IDENTITY && s[ULTRA_POLL_ARG] == ULTRA_ID_PART_BOARD) {
+        d[ULTRA_ID_UID] = static_cast<uint8_t>(b + 1);
+      } else if (page == ULTRA_PAGE_IDENTITY && s[ULTRA_POLL_ARG] == ULTRA_ID_PART_FEATURES) {
+        ultra_put32(d + ULTRA_IDF_FEATURES, b == 1 ? ULTRA_FEAT_STANDBY : 0u);   // (receiver 1: 0.2.6 standby support)
       } else {
         page = ULTRA_PAGE_UNSUPPORTED;
       }
@@ -2128,11 +2129,12 @@ static void answer(const uint8_t *s, uint16_t uid, const ReceiverData &model, ui
     ultra_put16(d + ULTRA_ST_CURRENT, model.current_ma);
     d[ULTRA_ST_MEASURED] = ULTRA_ST_M_VBUS | ULTRA_ST_M_CURRENT;
     d[ULTRA_ST_RESET] = ULTRA_ST_RST_POWER;
-  } else if (page == ULTRA_PAGE_IDENTITY) {
+  } else if (page == ULTRA_PAGE_IDENTITY && s[ULTRA_POLL_ARG] == ULTRA_ID_PART_BOARD) {
     for (int k = 0; k < 12; k++)
-      d[k] = static_cast<uint8_t>(uid + 7 * k);
+      d[ULTRA_ID_UID + k] = static_cast<uint8_t>(uid + 7 * k);
     ultra_put32(d + ULTRA_ID_FW_VERSION, 0x000608FF);
-    ultra_put32(d + ULTRA_ID_FEATURES, model.features);
+  } else if (page == ULTRA_PAGE_IDENTITY && s[ULTRA_POLL_ARG] == ULTRA_ID_PART_FEATURES) {
+    ultra_put32(d + ULTRA_IDF_FEATURES, model.features);
   } else if (page == ULTRA_PAGE_ENERGY) {
     ultra_put32(d + ULTRA_EN_TOTAL_WH, 1234);
     ultra_put32(d + ULTRA_EN_POWER_MW, 34000);
@@ -4161,12 +4163,13 @@ UltraFirmwareUpdate *UltraFirmwareUpdate::active_ = nullptr;
 static void answer(const uint8_t *s, uint16_t k, uint32_t version, std::vector<uint8_t> &out) {
   uint8_t a[32]{}, d[24]{};
   const uint8_t page = s[ULTRA_POLL_PAGE];
-  if (page == ULTRA_PAGE_IDENTITY) {
+  if (page == ULTRA_PAGE_IDENTITY && s[ULTRA_POLL_ARG] == ULTRA_ID_PART_BOARD) {
     ultra_put32(d + ULTRA_ID_FW_VERSION, version);
     d[ULTRA_ID_BL_VERSION] = 2;
     d[ULTRA_ID_HW_ID] = UPD_HW_ID_D2A_ULTRA_5CH;
+    d[ULTRA_ID_HW_REV] = UPD_REV_D2A_R04;
   } else if (page == ULTRA_PAGE_STATUS) {
-    d[ULTRA_ST_HW] = (UPD_HW_ID_D2A_ULTRA_5CH << 4) | UPD_REV_D2A_R04;
+    d[ULTRA_ST_HW_ID] = UPD_HW_ID_D2A_ULTRA_5CH;
     ultra_put24(d + ULTRA_ST_UPTIME, 100 + now_ms / 1000);
     d[ULTRA_ST_RESET] = ULTRA_ST_RST_POWER;
   }

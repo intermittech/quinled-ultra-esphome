@@ -439,10 +439,11 @@ static std::vector<uint8_t> answers(const uint8_t *frame, uint16_t boards, int l
       ultra_put16(d + ULTRA_ST_VBUS, static_cast<uint16_t>(2400 + 50 * line));   // line k: 24 V + 0.5 V x k
       ultra_put16(d + ULTRA_ST_MCU_TEMP, ULTRA_ST_NA);
       d[ULTRA_ST_MEASURED] = ULTRA_ST_M_VBUS;
-    } else if (page == ULTRA_PAGE_IDENTITY) {
-      d[0] = static_cast<uint8_t>(b + 1);
+    } else if (page == ULTRA_PAGE_IDENTITY && s[ULTRA_POLL_ARG] == ULTRA_ID_PART_BOARD) {
+      d[ULTRA_ID_UID] = static_cast<uint8_t>(b + 1);
+    } else if (page == ULTRA_PAGE_IDENTITY && s[ULTRA_POLL_ARG] == ULTRA_ID_PART_FEATURES) {
       if (power)
-        ultra_put32(d + ULTRA_ID_FEATURES, ULTRA_FEAT_POWER_EVENTS);
+        ultra_put32(d + ULTRA_IDF_FEATURES, ULTRA_FEAT_POWER_EVENTS);
     } else if (power && (page == ULTRA_PAGE_POWER || page == ULTRA_PAGE_OUTPUTS)) {
       // (nothing to report)
     } else {

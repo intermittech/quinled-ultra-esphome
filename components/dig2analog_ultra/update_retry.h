@@ -36,14 +36,14 @@ enum RxUpdate : uint8_t {
   RXU_CANT,             // can't take it: other hardware or revision, an older bootloader, a newer version
 };
 
-/// A receiver against the release (IDENTITY: version, hardware, bootloader; STATUS: the board revision).
+/// A receiver against the release (IDENTITY: version, hardware and its revision, bootloader).
 inline RxUpdate receiver_update_state(const ReceiverData &d, bool answering, const UpdateTarget &t) {
   if (!answering)
     return RXU_NO_ANSWER;
   if (!d.have_identity)
     return RXU_OLD;
-  if (d.hw_id != t.hw_id || d.bl_version < t.min_bootloader ||
-      (d.have_status && ((t.hw_rev_mask >> (d.hw & 0x0F)) & 1u) == 0))
+  if (d.hw_id != t.hw_id || d.bl_version < t.min_bootloader || d.hw_rev > 15 ||
+      ((t.hw_rev_mask >> d.hw_rev) & 1u) == 0)
     return RXU_CANT;
   if (d.fw_word == t.version)
     return RXU_ON_VERSION;

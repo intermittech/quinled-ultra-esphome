@@ -65,7 +65,8 @@ static RxUpdate board_state(const image_t *target) {
   d.fw_word = upd_get32(&fl[UPD_APP_DESC - FL_BASE + UPD_D_FW_VERSION]);
   d.hw_id = BL_HW_ID;
   d.bl_version = BL_VERSION;
-  d.hw = static_cast<uint8_t>((BL_HW_ID << 4) | BL_HW_REV);
+  d.hw = BL_HW_ID;   // (0.2.7: STATUS 3 the hardware id; the revision is IDENTITY's)
+  d.hw_rev = BL_HW_REV;
   const UpdateTarget t{upd_get32(target->desc + UPD_D_FW_VERSION), target->desc[UPD_D_HW_ID],
                        static_cast<uint16_t>(upd_get16(target->desc + UPD_D_HW_REV_MASK)), target->desc[UPD_D_MIN_BL]};
   return receiver_update_state(d, true, t);
@@ -240,7 +241,7 @@ static void test_policy() {
         "no answer / not read yet");
   d.have_identity = d.have_status = true;
   d.hw_id = 1;
-  d.hw = 0x13;
+  d.hw_rev = 3;
   d.bl_version = 2;
   d.fw_word = 0x000608FF;
   CHECK(receiver_update_state(d, true, t) == RXU_OLD, "an older version: pending");
@@ -252,9 +253,9 @@ static void test_policy() {
   d.bl_version = 1;
   CHECK(receiver_update_state(d, true, t) == RXU_CANT, "an older bootloader: can't");
   d.bl_version = 2;
-  d.hw = 0x12;
+  d.hw_rev = 2;
   CHECK(receiver_update_state(d, true, t) == RXU_CANT, "another board revision: can't");
-  d.hw = 0x13;
+  d.hw_rev = 3;
   d.hw_id = 2;
   CHECK(receiver_update_state(d, true, t) == RXU_CANT, "other hardware: can't");
 }

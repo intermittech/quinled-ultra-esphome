@@ -662,7 +662,7 @@ class LedgerKeeper {
     const bool life = (updates & (1u << TP_LIFETIME)) && d.have_lifetime;
     const bool status = (updates & (1u << TP_STATUS)) && d.have_status;
     const bool sync = (updates & (1u << TP_SYNC)) && d.have_sync;
-    if (!(life || status || sync || (updates & (1u << (TP_IDENTITY))) || x.pending != 0))
+    if (!(life || status || sync || (updates & ((1u << TP_IDENTITY) | (1u << TP_FEATURES))) || x.pending != 0))
       return ev;
     bool created = false;
     LedgerEntry *e = this->ledger_->touch(d.uid, &created);

@@ -14,8 +14,8 @@ static const char *const TAG = "dig2analog_ultra.receiver";
 static constexpr uint32_t ALL_NEW = TU_AVAILABILITY | TU_RESTART;
 static constexpr uint32_t PG_STATUS = 1u << TP_STATUS, PG_POWER = 1u << TP_POWER, PG_ENERGY = 1u << TP_ENERGY,
                           PG_SUPPLY = 1u << TP_SUPPLY, PG_OUTPUTS = 1u << TP_OUTPUTS, PG_HEALTH = 1u << TP_HEALTH,
-                          PG_IDENTITY = 1u << TP_IDENTITY, PG_LIFETIME = 1u << TP_LIFETIME, PG_DIAG = 1u << TP_DIAG,
-                          PG_FAULTS = 1u << TP_FAULTS, PG_SYNC = 1u << TP_SYNC;
+                          PG_IDENTITY = 1u << TP_IDENTITY | 1u << TP_FEATURES, PG_LIFETIME = 1u << TP_LIFETIME,
+                          PG_DIAG = 1u << TP_DIAG, PG_FAULTS = 1u << TP_FAULTS, PG_SYNC = 1u << TP_SYNC;
 
 /// a live value's pace: its deadband at the update rate (a little less: the STATUS reads come with some jitter)
 static Pace live_pace(uint32_t rate_ms) { return Pace{PACE_LIVE_W.abs, PACE_LIVE_W.rel, rate_ms - rate_ms / 4}; }

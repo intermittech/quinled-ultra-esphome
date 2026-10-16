@@ -81,28 +81,33 @@ static int tp_of(uint8_t page, uint8_t part) {
 
 static bool contains(const std::string &s, const char *part) { return s.find(part) != std::string::npos; }
 
-static const char *const TP_NAME[TP_COUNT] = {"IDENTITY", "POWER",  "STATUS",   "OUTPUTS", "SUPPLY",
-                                              "ENERGY",   "HEALTH", "LIFETIME", "DIAG",    "DIAG 1"};
+static const char *const TP_NAME[TP_COUNT] = {"IDENTITY", "FEATURES", "POWER",    "STATUS", "OUTPUTS", "SUPPLY",
+                                              "ENERGY",   "HEALTH",   "LIFETIME", "DIAG",   "DIAG 1"};
 
 // ------------------------------------------------------------------------------- the firmware's state vs the poller
 /// The page just answered (as decoded into d) against the firmware's state when it built the answer.
 static void verify_page(int tp, const ReceiverData &d, const ucrx_truth_t &t, const char *w) {
   switch (tp) {
-    case TP_IDENTITY:
+    case TP_IDENTITY:   // (0.2.7: part 0, the board)
       CHECK(std::memcmp(d.uid, t.uid, 12) == 0 && d.fw_word == t.fw_version && d.bl_version == t.bl_version &&
-                d.hw_id == (t.hw_id != 0 ? t.hw_id : t.board) && d.hw_caps == t.hw_caps && d.features == t.features,
-            "%s: IDENTITY firmware %08X (%08X), bootloader %u (%u), hw %u, caps %04X (%04X), features %08X (%08X)", w,
-            (unsigned) d.fw_word, (unsigned) t.fw_version, d.bl_version, t.bl_version, d.hw_id, d.hw_caps, t.hw_caps,
-            (unsigned) d.features, (unsigned) t.features);
-      CHECK(telemetry_firmware_text(d) == t.fw_text, "%s: firmware text '%s', the firmware's '%s'", w,
-            telemetry_firmware_text(d).c_str(), t.fw_text);
+                d.hw_id == (t.hw_id != 0 ? t.hw_id : t.board) && d.hw_rev == t.hw_rev && d.hw_caps == t.hw_caps,
+            "%s: IDENTITY firmware %08X (%08X), bootloader %u (%u), hw %u rev %u (%u), caps %04X (%04X)", w,
+            (unsigned) d.fw_word, (unsigned) t.fw_version, d.bl_version, t.bl_version, d.hw_id, d.hw_rev, t.hw_rev,
+            (unsigned) d.hw_caps, t.hw_caps);
+      break;
+    case TP_FEATURES:   // (part 1: word 0)
+      CHECK(d.features == t.features, "%s: IDENTITY features %08X (%08X)", w, (unsigned) d.features,
+            (unsigned) t.features);
+      if (d.have_identity)
+        CHECK(telemetry_firmware_text(d) == t.fw_text, "%s: firmware text '%s', the firmware's '%s'", w,
+              telemetry_firmware_text(d).c_str(), t.fw_text);
       break;
     case TP_STATUS: {
       const uint16_t ma = static_cast<uint16_t>(t.i_avg_ma < 0 ? 0 : t.i_avg_ma > 65535 ? 65535 : t.i_avg_ma);
       const uint8_t measured = static_cast<uint8_t>((t.vbus_valid ? ULTRA_ST_M_VBUS : 0) |
                                                     (t.isense_enabled ? ULTRA_ST_M_CURRENT : 0) |
                                                     (t.isense_calibrated ? ULTRA_ST_M_CALIBRATED : 0));
-      const uint8_t hw = static_cast<uint8_t>(((t.hw_id != 0 ? t.hw_id : t.board) << 4) | (t.hw_rev & 15));
+      const uint8_t hw = t.hw_id != 0 ? t.hw_id : t.board;   // (0.2.7: the hardware id; its revision: IDENTITY)
       CHECK(d.fw_version == t.fw_version >> 8 && d.hw == hw && d.uptime_s + 1 >= t.up_s && d.uptime_s <= t.up_s &&
                 d.reset_cause == (t.reset_flags >> 26),
             "%s: STATUS version %06X (%06X), hw %02X, uptime %u (%u), reset %02X (%08X)", w, (unsigned) d.fw_version,
@@ -315,16 +320,19 @@ struct Fake {
     uint8_t page = s[ULTRA_POLL_PAGE], *d = a + ULTRA_RSP_DATA;
     std::memset(a, 0, ULTRA_SLOT_BYTES);
     switch (page) {
-      case ULTRA_PAGE_IDENTITY:
-        std::memcpy(d, this->uid, 12);
-        ultra_put32(d + ULTRA_ID_FW_VERSION, 0x000608FFu);
-        d[ULTRA_ID_HW_ID] = 2;
-        ultra_put16(d + ULTRA_ID_HW_CAPS, ULTRA_HWCAP_RETURN | ULTRA_HWCAP_RELAY);
-        ultra_put32(d + ULTRA_ID_FEATURES, this->features);
+      case ULTRA_PAGE_IDENTITY:   // (0.2.7: by part)
+        if (s[ULTRA_POLL_ARG] == ULTRA_ID_PART_FEATURES) {
+          ultra_put32(d + ULTRA_IDF_FEATURES, this->features);
+        } else {
+          std::memcpy(d + ULTRA_ID_UID, this->uid, 12);
+          ultra_put32(d + ULTRA_ID_FW_VERSION, 0x000608FFu);
+          d[ULTRA_ID_HW_ID] = 2;
+          ultra_put32(d + ULTRA_ID_CAPS, ULTRA_HWCAP_RETURN | ULTRA_HWCAP_RELAY);
+        }
         break;
       case ULTRA_PAGE_STATUS:
         ultra_put24(d + ULTRA_ST_FW_VERSION, 0x000608);
-        d[ULTRA_ST_HW] = 0x20;
+        d[ULTRA_ST_HW_ID] = 2;
         ultra_put24(d + ULTRA_ST_UPTIME, (now_ms - this->boot_ms) / 1000);
         d[ULTRA_ST_RESET] = ULTRA_ST_RST_POWER;
         ultra_put16(d + ULTRA_ST_MCU_TEMP, ULTRA_ST_NA);
@@ -493,8 +501,8 @@ struct Bench {
     this->polled = this->k < m;
     std::memcpy(this->poll, own, ULTRA_SLOT_BYTES);
     this->asked = this->polled && own[ULTRA_POLL_INDEX] != ULTRA_POLL_RELAY_ONLY;
-    this->tp = this->asked ? tp_of(own[ULTRA_POLL_PAGE], own[ULTRA_POLL_PAGE] == ULTRA_PAGE_DIAG ? own[ULTRA_POLL_ARG] : 0)
-                           : -1;
+    const uint8_t pg = own[ULTRA_POLL_PAGE];   // (DIAG and IDENTITY: their part in argument 0)
+    this->tp = this->asked ? tp_of(pg, pg == ULTRA_PAGE_DIAG || pg == ULTRA_PAGE_IDENTITY ? own[ULTRA_POLL_ARG] : 0) : -1;
     const bool ack =
         this->asked && own[ULTRA_POLL_PAGE] == ULTRA_PAGE_POWER && (own[ULTRA_POLL_ARG] & ULTRA_PW_ARG_ACK);
     if (this->asked) {
@@ -1563,8 +1571,10 @@ struct MonthRx {
     std::memset(d, 0, 24);
     switch (tp) {
       case TP_IDENTITY:
-        std::memcpy(d, this->uid, 12);
-        ultra_put32(d + ULTRA_ID_FEATURES,
+        std::memcpy(d + ULTRA_ID_UID, this->uid, 12);
+        break;
+      case TP_FEATURES:
+        ultra_put32(d + ULTRA_IDF_FEATURES,
                     ULTRA_FEAT_ENERGY | ULTRA_FEAT_LIFETIME | ULTRA_FEAT_LIFE_SYNC | ULTRA_FEAT_STANDBY);
         break;
       case TP_STATUS:
@@ -1950,8 +1960,10 @@ struct ProbeHub {
   }
   /// its reads (IDENTITY first after a power-up or a restart), and the sync the keeper asks for
   void sample(MonthRx &b, uint32_t now, bool identity = false, bool sync = true) {
-    if (identity)
+    if (identity) {
       this->page(b, TP_IDENTITY, now);
+      this->page(b, TP_FEATURES, now);
+    }
     this->page(b, TP_LIFETIME, now);
     this->page(b, TP_ENERGY, now);
     this->page(b, TP_STATUS, now);

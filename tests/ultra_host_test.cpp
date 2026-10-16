@@ -7,6 +7,7 @@
 // Build: python tests/run_ultra_host_test.py   (uses the ziglang pip package as C/C++ compiler)
 
 #include "../components/dig2analog_ultra/ultra_core.h"
+#include "../components/dig2analog_ultra/ultra_telemetry.h"
 
 #ifdef WITH_ENGINE
 extern "C" {
@@ -787,6 +788,38 @@ static std::vector<uint8_t> from_hex(const char *h) {
   for (; h[0] && h[1]; h += 2)
     out.push_back(static_cast<uint8_t>(std::strtoul(std::string(h, 2).c_str(), nullptr, 16)));
   return out;
+}
+
+// Protocol test vectors slot_poll_identity_features, answer_identity_board, answer_identity_features (0.2.7: IDENTITY
+// in two parts; checked against vectors.json as above): the poller's POLL of part 1, and both answers decoded.
+static const char *const VEC_SLOT_POLL_IDENTITY_FEATURES =
+    "07f06600010401010000000000000000000000000000000000000000000002a5";
+static const char *const VEC_ANSWER_IDENTITY_BOARD = "a5040067af3c00112233445566778899aabb00060bff020200000000000fee3d";
+static const char *const VEC_ANSWER_IDENTITY_FEATURES =
+    "a5040066af3c007fffff00000000000000000000000000000000000000006a87";
+
+static void test_identity_vectors() {
+  // the poller's own POLL of part 1 (index 0 of one, rate 1, SEQ 0x66)
+  uint8_t s[ULTRA_SLOT_BYTES]{};
+  const uint8_t arg[1] = {TP_PART[TP_FEATURES]};
+  ultra_slot_poll(s, 0x66, 0, 1, TP_PAGE_ID[TP_FEATURES], ULTRA_RW_RATE_500K, arg, 1);
+  const std::vector<uint8_t> poll = from_hex(VEC_SLOT_POLL_IDENTITY_FEATURES);
+  CHECK(std::equal(poll.begin(), poll.end(), s), "IDENTITY part 1's POLL as the vector slot_poll_identity_features");
+  // the answers: part 0 the board, part 1 its features
+  const std::vector<uint8_t> a0 = from_hex(VEC_ANSWER_IDENTITY_BOARD), a1 = from_hex(VEC_ANSWER_IDENTITY_FEATURES);
+  ReceiverData d;
+  decode_receiver_page(d, a0[1], a0.data() + ULTRA_RSP_DATA, TP_PART[TP_IDENTITY]);
+  const bool board_only = d.have_board && !d.have_identity;
+  decode_receiver_page(d, a1[1], a1.data() + ULTRA_RSP_DATA, TP_PART[TP_FEATURES]);
+  CHECK(ultra_answer_check(a0.data()) == 0 && ultra_answer_check(a1.data()) == 0 && board_only && d.have_identity &&
+            d.uid[0] == 0x00 && d.uid[11] == 0xBB && d.fw_word == 0x00060BFFu && d.bl_version == 2 && d.hw_id == 2 &&
+            d.hw_rev == 0 && d.hw_caps == 0x0000000Fu && d.features == 0x007FFFFFu &&
+            telemetry_firmware_text(d) == "0.6.11" && ultra_feat_has(a1.data() + ULTRA_RSP_DATA, 22) &&
+            !ultra_feat_has(a1.data() + ULTRA_RSP_DATA, 23),
+        "the IDENTITY vectors decoded: firmware %08X '%s', hardware %u rev %u, caps %08X, features %08X",
+        static_cast<unsigned>(d.fw_word), telemetry_firmware_text(d).c_str(), d.hw_id, d.hw_rev,
+        static_cast<unsigned>(d.hw_caps), static_cast<unsigned>(d.features));
+  std::printf("  the IDENTITY vectors (0.2.7): part 1's POLL, both answers decoded\n");
 }
 
 /// Power-on effect (SCENE_EFFECT, protocol 0.2.3; YAML power_on_effect): the scheduler's slot equals the protocol's test
@@ -1949,6 +1982,7 @@ static void test_wire_ns() {
 
 int main() {
   test_wire_ns();
+  test_identity_vectors();
   test_refresh_rotation();
   test_mapping();
   test_scheduler();

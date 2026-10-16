@@ -99,6 +99,9 @@ enum {
 #define UPD_HW_ID_D2A_ULTRA_5CH  1u       /* QuinLED dig2analog-ultra-5ch */
 #define UPD_HW_ID_DP_ULTRA_RX    2u       /* QuinLED Diff-Power Ultra-Analog receiver (no hardware yet) */
 #define UPD_HW_ID_DP_ULTRA_DIGITAL 3u     /* QuinLED Diff-Power Ultra-Digital receiver (protocol 0.2.7; no hardware yet) */
+/*      4-254                    later boards of the series, assigned here (one byte everywhere: the descriptor, the
+ *                               bootloader's info, IDENTITY 17, STATUS 3 since protocol 0.2.7); 0 / 255 never (0:
+ *                               no bootloader, 255: erased). 16 revisions a board (UPD_D_HW_REV_MASK). */
 /* board revisions (bit numbers of the revision mask; the bootloader carries its board's). An image installs only on
  * the hardware id and the revisions it lists. 0-2 were numbers of dig2analog-ultra drawings that were never built:
  * they stay unused, so no image can match them. */

@@ -42,7 +42,8 @@ static constexpr uint32_t LS_STEP_POWERED = 7200, LS_STEP_EVENTS = 64, LS_STEP_E
 
 /// The pages the hub reads; when several are equally overdue, the earlier one goes first.
 enum TelemetryPage : uint8_t {
-  TP_IDENTITY = 0,  // at the start, after a restart or a new board (UID16)
+  TP_IDENTITY = 0,  // IDENTITY part 0, the board: at the start, after a restart or a new board (UID16)
+  TP_FEATURES,      // IDENTITY part 1, the firmware's features (0.2.7): right after part 0
   TP_POWER,         // board limit, trips and latches (feature POWER_EVENTS)
   TP_STATUS,
   TP_OUTPUTS,       // optional: why the outputs differ from the lights (UNSUPPORTED: not asked again)
@@ -55,12 +56,13 @@ enum TelemetryPage : uint8_t {
   TP_SYNC,          // 0.2.6: LIFE_SYNC, only when the ledger asks (TelemetryPoller::request_sync)
   TP_COUNT,
 };
-static constexpr uint8_t TP_PAGE_ID[TP_COUNT] = {ULTRA_PAGE_IDENTITY, ULTRA_PAGE_POWER,    ULTRA_PAGE_STATUS,
-                                                 ULTRA_PAGE_OUTPUTS,  ULTRA_PAGE_SUPPLY,   ULTRA_PAGE_ENERGY,
-                                                 ULTRA_PAGE_HEALTH,   ULTRA_PAGE_LIFETIME, ULTRA_PAGE_DIAG,
-                                                 ULTRA_PAGE_DIAG,     ULTRA_PAGE_LIFE_SYNC};
+static constexpr uint8_t TP_PAGE_ID[TP_COUNT] = {ULTRA_PAGE_IDENTITY, ULTRA_PAGE_IDENTITY, ULTRA_PAGE_POWER,
+                                                 ULTRA_PAGE_STATUS,   ULTRA_PAGE_OUTPUTS,  ULTRA_PAGE_SUPPLY,
+                                                 ULTRA_PAGE_ENERGY,   ULTRA_PAGE_HEALTH,   ULTRA_PAGE_LIFETIME,
+                                                 ULTRA_PAGE_DIAG,     ULTRA_PAGE_DIAG,     ULTRA_PAGE_LIFE_SYNC};
 /// the IDENTITY feature a page needs (0: every receiver, or tried)
 static constexpr uint32_t TP_FEATURE[TP_COUNT] = {0,
+                                                  0,
                                                   ULTRA_FEAT_POWER_EVENTS,
                                                   0,
                                                   0,
@@ -71,8 +73,9 @@ static constexpr uint32_t TP_FEATURE[TP_COUNT] = {0,
                                                   ULTRA_FEAT_DIAG,
                                                   ULTRA_FEAT_DIAG,
                                                   ULTRA_FEAT_LIFE_SYNC};
-/// the POLL's argument byte 0 (DIAG: its part)
-static constexpr uint8_t TP_PART[TP_COUNT] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0};
+/// the POLL's argument byte 0 (IDENTITY, DIAG: its part)
+static constexpr uint8_t TP_PART[TP_COUNT] = {ULTRA_ID_PART_BOARD, ULTRA_ID_PART_FEATURES, 0, 0, 0, 0, 0, 0, 0, 0,
+                                              1, 0};
 /// the features of a 0.2.5 receiver (its ENERGY bytes 15-18 and HEALTH's hot flag are set; before: 0)
 static constexpr uint32_t FEATURES_025 = ULTRA_FEAT_LIFETIME | ULTRA_FEAT_DIAG | ULTRA_FEAT_RETRY | ULTRA_FEAT_LOSS_SCENE;
 
@@ -106,14 +109,15 @@ struct ReceiverData {
   uint32_t dip_age_s{0xFFFFFF};  // the newest logged dip
   // IDENTITY
   uint32_t fw_word{0};  // major << 24 | minor << 16 | patch << 8 | pre-release (0 = unknown)
-  uint32_t features{0};
-  uint16_t hw_caps{0};
-  bool have_identity{false};
+  uint32_t features{0};  // part 1's word 0: the ULTRA_FEAT_* bits (0.2.7: 192 bits; the later words: none used yet)
+  uint32_t hw_caps{0};   // ULTRA_HWCAP_*
+  bool have_board{false}, have_features{false};   // part 0, part 1 read
+  bool have_identity{false};                      // both: the board and its features known
   uint8_t uid[12]{};
-  uint8_t bl_version{0}, hw_id{0};
+  uint8_t bl_version{0}, hw_id{0}, hw_rev{0};
   // STATUS
   bool have_status{false};
-  uint8_t hw{0};
+  uint8_t hw{0};   // the hardware id (0.2.7: the whole byte; the revision is IDENTITY's)
   uint8_t reset_cause{0}, power_state{0};
   uint8_t measured{0}, pwm_preset{0};
   uint8_t modes{0};
@@ -180,18 +184,24 @@ inline uint8_t receiver_why(const ReceiverData &d) {
 /// One page's DATA (24 bytes) into d (pure; the page byte as answered; part: the POLL's argument, DIAG's part).
 inline void decode_receiver_page(ReceiverData &d, uint8_t page, const uint8_t *p, uint8_t part = 0) {
   switch (page) {
-    case ULTRA_PAGE_IDENTITY:
-      std::memcpy(d.uid, p, 12);
-      d.fw_word = ultra_get32(p + ULTRA_ID_FW_VERSION);
-      d.bl_version = p[ULTRA_ID_BL_VERSION];
-      d.hw_id = p[ULTRA_ID_HW_ID];
-      d.hw_caps = static_cast<uint16_t>(ultra_get16(p + ULTRA_ID_HW_CAPS));
-      d.features = ultra_get32(p + ULTRA_ID_FEATURES);
-      d.have_identity = true;
+    case ULTRA_PAGE_IDENTITY:   // (0.2.7: two parts, the POLL's argument)
+      if (part == ULTRA_ID_PART_FEATURES) {
+        d.features = ultra_get32(p + ULTRA_IDF_FEATURES);   // (word 0)
+        d.have_features = true;
+      } else {
+        std::memcpy(d.uid, p + ULTRA_ID_UID, 12);
+        d.fw_word = ultra_get32(p + ULTRA_ID_FW_VERSION);
+        d.bl_version = p[ULTRA_ID_BL_VERSION];
+        d.hw_id = p[ULTRA_ID_HW_ID];
+        d.hw_rev = p[ULTRA_ID_HW_REV];
+        d.hw_caps = ultra_get32(p + ULTRA_ID_CAPS);
+        d.have_board = true;
+      }
+      d.have_identity = d.have_board && d.have_features;
       break;
     case ULTRA_PAGE_STATUS:
       d.fw_version = ultra_get24(p + ULTRA_ST_FW_VERSION);
-      d.hw = p[ULTRA_ST_HW];
+      d.hw = p[ULTRA_ST_HW_ID];
       d.uptime_s = ultra_get24(p + ULTRA_ST_UPTIME);
       d.reset_cause = p[ULTRA_ST_RESET];
       d.power_state = p[ULTRA_ST_STATE];
@@ -1023,6 +1033,7 @@ class TelemetryPoller {
     uint8_t misses{0};
     uint8_t seq{0};
     bool need_identity{true};
+    bool need_features{false};   // IDENTITY part 1 due (after part 0)
     bool hold{false};          // (build() forgets it once over: it can't come back half a millis() wrap later)
     bool ack_due{false};       // POWER showed a latch: acknowledge with the next POWER poll
     bool ack_sent{false};      // ... it went out with the last one
@@ -1064,6 +1075,8 @@ class TelemetryPoller {
       return false;
     if (tp == TP_IDENTITY)
       return r.need_identity;
+    if (tp == TP_FEATURES)
+      return r.need_features;
     if (tp == TP_STATUS)
       return true;
     if (!r.d.have_identity)   // the optional pages once IDENTITY says which the board has
@@ -1082,8 +1095,9 @@ class TelemetryPoller {
       if (!this->enabled_(r, tp))
         continue;
       int32_t o = static_cast<int32_t>(now_ms - r.next[tp]);
-      if (o < -STALE_MS)
-        o = INT32_MAX / 2;   // (more than any interval ahead: its time from over half a millis() wrap ago: overdue)
+      if (o < -STALE_MS || (tp == TP_FEATURES && o >= 0))
+        o = INT32_MAX / 2;   // (more than any interval ahead: its time from over half a millis() wrap ago: overdue;
+                             // IDENTITY's part 1 right after part 0: the board's pages wait for its features)
       if (o > most) {
         most = o;
         best = tp;
@@ -1119,7 +1133,8 @@ class TelemetryPoller {
       r.updated |= (1u << TP_COUNT) - 1;   // every value unknown again
       r.sync_due = false;   // (the ledger asks again for the board that's there)
     }
-    r.need_identity = true;
+    r.need_identity = true;   // (then its features: part 1 after part 0)
+    r.need_features = false;
     r.next[TP_IDENTITY] = now_ms;
     r.ack_due = r.ack_sent = false;
     r.hold = true;
@@ -1171,6 +1186,8 @@ class TelemetryPoller {
       r.unsupported |= static_cast<uint16_t>(1u << tp);
       if (tp == TP_IDENTITY)
         r.need_identity = false;
+      if (tp == TP_FEATURES)
+        r.need_features = false;
       return true;
     }
     r.next[tp] = now_ms + this->interval_(tp);   // (decode_ may want it sooner)
@@ -1181,7 +1198,7 @@ class TelemetryPoller {
   void decode_(Receiver &r, uint8_t tp, const uint8_t *data, uint32_t now_ms) {
     // IDENTITY with another full UID than the one read before (the UID16 the same: a CRC collision): another board,
     // what was read of the one before is void
-    if (tp == TP_IDENTITY && r.d.have_identity && std::memcmp(r.d.uid, data, 12) != 0)
+    if (tp == TP_IDENTITY && r.d.have_board && std::memcmp(r.d.uid, data + ULTRA_ID_UID, 12) != 0)
       this->restarted_(r, now_ms, true);
     ReceiverData &d = r.d;
     const uint32_t old_up = d.uptime_s, old_ms = r.status_ms;
@@ -1191,8 +1208,13 @@ class TelemetryPoller {
     r.updated |= 1u << tp;
     r.fresh |= static_cast<uint16_t>(1u << tp);
     switch (tp) {
-      case TP_IDENTITY:
+      case TP_IDENTITY:   // part 0, the board: its features next (part 1)
         r.need_identity = false;
+        r.need_features = true;
+        r.next[TP_FEATURES] = now_ms;
+        break;
+      case TP_FEATURES:
+        r.need_features = false;
         for (uint8_t p = TP_POWER; p < TP_COUNT; p++) {   // the pages it has: due now
           if (p != TP_STATUS && this->enabled_(r, p))
             r.next[p] = now_ms;

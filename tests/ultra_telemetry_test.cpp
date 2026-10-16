@@ -57,7 +57,8 @@ struct Model {
   uint32_t total_wh{1234}, boot_mwh{567}, power_mw{36000};
   uint32_t features{ULTRA_FEAT_POWER_EVENTS | ULTRA_FEAT_SUPPLY_DIPS | ULTRA_FEAT_HEALTH | ULTRA_FEAT_ENERGY |
                     ULTRA_FEAT_MCU_TEMP | ULTRA_FEAT_CURRENT_SENSE};
-  uint32_t asked[16]{};      // POLLs per page id (< 16)
+  uint32_t asked[16]{};      // POLLs per page id (< 16; IDENTITY: part 0)
+  uint32_t features_asked{0};   // IDENTITY part 1 (0.2.7)
   uint32_t acks{0};          // acknowledges taken
   bool contention{false};
   // protocol 0.2.5 (set025(): its features too)
@@ -201,12 +202,14 @@ struct Model {
     const uint8_t *arg = poll + ULTRA_POLL_ARG;
     uint8_t d[24]{};
     uint8_t out_page = page;
-    if (page < 16)
+    if (page == ULTRA_PAGE_IDENTITY && arg[0] == ULTRA_ID_PART_FEATURES)
+      this->features_asked++;   // (asked[IDENTITY]: part 0, the board)
+    else if (page < 16)
       this->asked[page]++;
     switch (page) {
       case ULTRA_PAGE_STATUS:
         ultra_put24(d + ULTRA_ST_FW_VERSION, 0x000608);
-        d[ULTRA_ST_HW] = 0x21;
+        d[ULTRA_ST_HW_ID] = 2;
         ultra_put24(d + ULTRA_ST_UPTIME, this->uptime);
         d[ULTRA_ST_RESET] = this->reset;
         d[ULTRA_ST_STATE] = static_cast<uint8_t>(this->state | (this->latched ? ULTRA_ST_POWER_EVENT : 0) |
@@ -218,13 +221,19 @@ struct Model {
         ultra_put16(d + ULTRA_ST_CURRENT, this->current);
         d[ULTRA_ST_MEASURED] = ULTRA_ST_M_VBUS | ULTRA_ST_M_CURRENT;
         break;
-      case ULTRA_PAGE_IDENTITY:
-        std::memcpy(d, this->uid, 12);
-        ultra_put32(d + ULTRA_ID_FW_VERSION, 0x000608FF);
-        d[ULTRA_ID_BL_VERSION] = 2;
-        d[ULTRA_ID_HW_ID] = 2;
-        ultra_put16(d + ULTRA_ID_HW_CAPS, ULTRA_HWCAP_RETURN | ULTRA_HWCAP_RELAY | ULTRA_HWCAP_VBUS | ULTRA_HWCAP_CURRENT);
-        ultra_put32(d + ULTRA_ID_FEATURES, this->features);
+      case ULTRA_PAGE_IDENTITY:   // (0.2.7: part 0 the board, part 1 its features)
+        if (arg[0] == ULTRA_ID_PART_FEATURES) {
+          ultra_put32(d + ULTRA_IDF_FEATURES, this->features);
+        } else if (arg[0] == ULTRA_ID_PART_BOARD) {
+          std::memcpy(d + ULTRA_ID_UID, this->uid, 12);
+          ultra_put32(d + ULTRA_ID_FW_VERSION, 0x000608FF);
+          d[ULTRA_ID_BL_VERSION] = 2;
+          d[ULTRA_ID_HW_ID] = 2;
+          d[ULTRA_ID_HW_REV] = 1;
+          ultra_put32(d + ULTRA_ID_CAPS, ULTRA_HWCAP_RETURN | ULTRA_HWCAP_RELAY | ULTRA_HWCAP_VBUS | ULTRA_HWCAP_CURRENT);
+        } else {
+          out_page = ULTRA_PAGE_UNSUPPORTED;
+        }
         break;
       case ULTRA_PAGE_POWER:
         if (arg[0] & ULTRA_PW_ARG_ACK) {   // a latch clears when its count equals the acknowledged one
@@ -546,8 +555,13 @@ static void test_parser() {
   Chain c(2);
   TelemetryPoller p = started(c, 2);
   c.now_ms = 1000;
-  c.window(p);   // IDENTITY from both
-  CHECK(p.answering(0) && p.answering(1) && p.data(1).have_identity, "both identified");
+  c.window(p);   // IDENTITY part 0 from both, then (0.2.7) part 1, their features
+  const bool board = p.data(1).have_board && !p.data(1).have_identity;
+  c.now_ms += 100;
+  c.window(p);
+  CHECK(board && p.answering(0) && p.answering(1) && p.data(1).have_identity && c.rx[1].features_asked == 1,
+        "both identified: the board, then its features (board %d, answering %d %d, identity %d, features asked %u)",
+        board, p.answering(0), p.answering(1), p.data(1).have_identity, c.rx[1].features_asked);
   // a late copy of that window's bytes in the next one: wrong SEQ, not taken
   std::vector<uint8_t> slots(64);
   uint32_t w;

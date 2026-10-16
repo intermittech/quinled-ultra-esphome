@@ -84,6 +84,7 @@ PIECES = {
     "hub_rx.inc": (
         "dig2analog_ultra.cpp",
         ["void UltraHub::rx_settings_setup_(", "void UltraHub::rx_settings_lights_(", "void UltraHub::rx_settings_save_(",
+         "const char *UltraHub::line_name_(", "int UltraHub::rx_setting_key_(",
          "bool UltraHub::set_receiver_setting(", "std::string UltraHub::receiver_settings_text(",
          "bool UltraHub::is_line(", "void UltraHub::receiver_setting_action("],
     ),

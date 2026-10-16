@@ -481,6 +481,8 @@ class UltraHub final : public Component {
   void rx_settings_setup_();    // in setup(): loaded, the YAML's values kept, the CONFIG ones applied
   void rx_settings_lights_();   // at the first loop (the lights are there): dim to warm, the power-on effects
   void rx_settings_save_();
+  const char *line_name_() const;   // (the log: its telemetry name, else its id)
+  static int rx_setting_key_(const char *line, const std::string &key, const std::string &value);
   std::vector<RxOverride> rx_ovr_;
   ESPPreferenceObject rx_pref_;
   uint16_t rx_yaml_[8]{};

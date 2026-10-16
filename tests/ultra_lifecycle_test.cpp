@@ -27,6 +27,7 @@
 #include <thread>
 #include <atomic>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -4693,6 +4694,8 @@ struct UltraHub {
   bool set_receiver_setting(int board, const std::string &key, const std::string &value);
   std::string receiver_settings_text(uint16_t board) const;
   bool is_line(const std::string &name) const;
+  const char *line_name_() const;
+  static int rx_setting_key_(const char *line, const std::string &key, const std::string &value);
   static void receiver_setting_action(const std::string &port, const std::vector<int32_t> &receivers,
                                       const std::string &key, const std::string &value);
   // stand-ins
@@ -4734,7 +4737,20 @@ struct UltraHub {
   }
 };
 std::vector<UltraHub *> UltraHub::hubs_;
+static std::vector<std::string> warned;   // the log's warnings (what a dashboard's mistake shows)
+static void log_w(const char *fmt, ...) {
+  char b[320];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(b, sizeof(b), fmt, ap);
+  va_end(ap);
+  warned.push_back(b);
+}
+#undef ESP_LOGW
+#define ESP_LOGW(tag, ...) log_w(__VA_ARGS__)
 #include "hub_rx.inc"
+#undef ESP_LOGW
+#define ESP_LOGW(...) ((void) 0)
 
 static void test_receiver_settings() {
   stored.clear();
@@ -4778,6 +4794,32 @@ static void test_receiver_settings() {
             !h.set_receiver_setting(0, "retries", "300") && !h.set_receiver_setting(0, "dtw", "maybe") &&
             h.receiver_settings_text(0) == set0 && saves == saves0,
         "bad ones change nothing: '%s'", h.receiver_settings_text(0).c_str());
+  // ... and each one a warning in the log that says what's wrong (the action: one, not one per receiver)
+  warned.clear();
+  const std::string text1 = h.receiver_settings_text(1);
+  UltraHub::receiver_setting_action("Port 1", {1, 5}, "dither", "off_at_low_levels");   // (receiver 1: as it was)
+  UltraHub::receiver_setting_action("Port 1", {1, 2, 3}, "pwmm", "50k");
+  UltraHub::receiver_setting_action("Port 1", {1, 2}, "pwm", "1 kHz");
+  UltraHub::receiver_setting_action("Port 9", {1}, "pwm", "25k");
+  h.set_receiver_setting(1, "dtw", "on");
+  h.set_receiver_setting(0, "poe", "Fireworks");
+  h.set_receiver_setting(-1, "loss_timeout", "2min");
+  h.set_receiver_setting(3, "loss", "off");
+  const std::vector<std::string> want = {
+      "set_receiver_setting on Port 1: receiver 5 isn't on it (1-3)",
+      "set_receiver_setting on Port 1: no key 'pwmm' (pwm, dither, stagger, loss, loss_timeout, limit, retries, "
+      "retry_interval, dtw, poe or reset)",
+      "set_receiver_setting on Port 1: pwm '1 kHz' isn't valid: a preset 2.197k-100k (25k, 25 kHz) or 2197-100000 Hz",
+      "set_receiver_setting: no line 'Port 9' (a telemetry name, a line's id, or all)",
+      "set_receiver_setting on Port 1, receiver 2: dtw: no light there has dim_to_warm: in its YAML",
+      "set_receiver_setting on Port 1, receiver 1: poe 'Fireworks' isn't valid: one of the light's ultra_* effects "
+      "(not ultra_strobe) or none",
+      "set_receiver_setting on Port 1: loss_timeout '2min' isn't valid: 0.5s-60s",
+      "set_receiver_setting on Port 1: receiver 4 isn't on it (1-3)"};
+  CHECK(warned == want && h.receiver_settings_text(0) == set0 && h.receiver_settings_text(1) == text1 &&
+            saves == saves0 + 1,
+        "the warnings (%u): '%s' ... '%s'", static_cast<unsigned>(warned.size()),
+        warned.empty() ? "" : warned.front().c_str(), warned.empty() ? "" : warned.back().c_str());
   // the ESP32 restarts: the record on flash over the YAML's
   lights(l);
   UltraHub h2;

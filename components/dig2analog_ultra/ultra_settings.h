@@ -39,6 +39,19 @@ enum RxKey : uint8_t {
 static constexpr const char *RX_KEYS[RK_COUNT] = {"pwm",   "dither",         "stagger", "loss", "loss_timeout",
                                                   "limit", "retries",        "retry_interval", "dtw", "poe",
                                                   "reset"};
+/// what each key takes (the log's warning for a bad value)
+static constexpr const char *RX_VALUES[RK_COUNT] = {
+    "a preset 2.197k-100k (25k, 25 kHz) or 2197-100000 Hz",
+    "on, off_at_low_levels or off",
+    "off, fixed, fixed_spread, adaptive or adaptive_spread",
+    "hold, off, fade_off or scene",
+    "0.5s-60s",
+    "0-65 A (2.0A) or none",
+    "0-254 or forever",
+    "1s-255s, whole seconds",
+    "on or off",
+    "one of the light's ultra_* effects (not ultra_strobe) or none",
+    "(no value)"};
 static constexpr const char *DITHER_NAMES[3] = {"on", "off_at_low_levels", "off"};
 static constexpr const char *STAGGER_NAMES[5] = {"off", "fixed", "fixed_spread", "adaptive", "adaptive_spread"};
 static constexpr const char *LOSS_NAMES[4] = {"hold", "off", "fade_off", "scene"};

@@ -163,17 +163,42 @@ void UltraHub::rx_settings_save_() {
                         this->rx_ovr_.size() * sizeof(RxOverride));
 }
 
-bool UltraHub::set_receiver_setting(int board, const std::string &key, const std::string &value) {
+// (the line in the log: its telemetry name, else its id)
+const char *UltraHub::line_name_() const {
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  if (this->has_telemetry())
+    return this->tel_name_;
+#endif
+  return this->line_id_;
+}
+
+// a key and its value (poe: per board, below); a bad one: a warning that says what it takes, -1
+int UltraHub::rx_setting_key_(const char *line, const std::string &key, const std::string &value) {
   const int k = rx_key(key);
-  if (k < 0) {
-    ESP_LOGW(TAG, "Receiver setting on GPIO%u: no key '%s'", this->pin_, key.c_str());
+  RxOverride t;
+  bool on = false;
+  if (k < 0)
+    ESP_LOGW(TAG, "set_receiver_setting on %s: no key '%s' (pwm, dither, stagger, loss, loss_timeout, limit, "
+             "retries, retry_interval, dtw, poe or reset)", line, key.c_str());
+  else if ((k == RK_DTW && !parse_on_off(value, &on)) || (k < RK_DTW && !rx_override_cfg(t, k, value, 0)))
+    ESP_LOGW(TAG, "set_receiver_setting on %s: %s '%s' isn't valid: %s", line, RX_KEYS[k], value.c_str(),
+             RX_VALUES[k]);
+  else
+    return k;
+  return -1;
+}
+
+bool UltraHub::set_receiver_setting(int board, const std::string &key, const std::string &value) {
+  const int k = rx_setting_key_(this->line_name_(), key, value);
+  if (k < 0)
+    return false;
+  if (board >= this->num_boards_) {
+    ESP_LOGW(TAG, "set_receiver_setting on %s: receiver %d isn't on it (1-%u)", this->line_name_(), board + 1,
+             this->num_boards_);
     return false;
   }
   bool on = false;
-  if (k == RK_DTW && !parse_on_off(value, &on)) {
-    ESP_LOGW(TAG, "Receiver setting on GPIO%u: dtw '%s' isn't on / off", this->pin_, value.c_str());
-    return false;
-  }
+  parse_on_off(value, &on);
   bool ok = false;
   for (uint16_t b = 0; b < this->num_boards_ && b < this->rx_ovr_.size(); b++) {
     if (board >= 0 && board != b)
@@ -217,12 +242,8 @@ bool UltraHub::set_receiver_setting(int board, const std::string &key, const std
     } else {
       const uint16_t retry = this->sched_.has_config(b, ULTRA_CFG_RETRY) ? this->sched_.get_config(b, ULTRA_CFG_RETRY)
                                                                          : static_cast<uint16_t>(10 | 1 << 8);
-      RxOverride t = o;
-      if (!rx_override_cfg(t, k, value, retry)) {
-        ESP_LOGW(TAG, "Receiver setting on GPIO%u: %s '%s' isn't valid", this->pin_, key.c_str(), value.c_str());
+      if (!rx_override_cfg(o, k, value, retry))   // (checked above)
         return false;
-      }
-      o = t;
       for (uint8_t i = 0; i < 8; i++) {
         if (o.mask & (1u << i))
           this->sched_.set_config(b, RX_CFG[i], o.cfg[i]);
@@ -230,13 +251,17 @@ bool UltraHub::set_receiver_setting(int board, const std::string &key, const std
       ok = true;
     }
   }
-  if (!ok) {
-    ESP_LOGW(TAG, "Receiver setting on GPIO%u: %s '%s' taken by no board / light", this->pin_, key.c_str(),
-             value.c_str());
+  const std::string where = board < 0 ? std::string("every receiver") : "receiver " + std::to_string(board + 1);
+  if (!ok) {   // (only dtw / poe: no light of the board takes it)
+    if (k == RK_DTW)
+      ESP_LOGW(TAG, "set_receiver_setting on %s, %s: dtw: no light there has dim_to_warm: in its YAML",
+               this->line_name_(), where.c_str());
+    else
+      ESP_LOGW(TAG, "set_receiver_setting on %s, %s: poe '%s' isn't valid: %s", this->line_name_(), where.c_str(),
+               value.c_str(), RX_VALUES[k]);
     return false;
   }
-  ESP_LOGI(TAG, "Receiver setting on GPIO%u, board %d: %s %s", this->pin_, board < 0 ? -1 : board + 1, key.c_str(),
-           value.c_str());
+  ESP_LOGI(TAG, "set_receiver_setting on %s, %s: %s %s", this->line_name_(), where.c_str(), RX_KEYS[k], value.c_str());
   this->sched_.flush_config();
   this->wake_();
   this->rx_settings_save_();
@@ -281,10 +306,17 @@ void UltraHub::receiver_setting_action(const std::string &port, const std::vecto
                                        const std::string &key, const std::string &value) {
   const bool all = strcasecmp(port.c_str(), "all") == 0;
   bool any = false;
+  for (UltraHub *hub : hubs_)
+    any |= all || hub->is_line(port);
+  if (!any) {
+    ESP_LOGW(TAG, "set_receiver_setting: no line '%s' (a telemetry name, a line's id, or all)", port.c_str());
+    return;
+  }
+  if (rx_setting_key_(port.c_str(), key, value) < 0)   // (one warning, not one per receiver)
+    return;
   for (UltraHub *hub : hubs_) {
     if (!all && !hub->is_line(port))
       continue;
-    any = true;
     if (receivers.empty()) {
       hub->set_receiver_setting(-1, key, value);
       continue;
@@ -292,10 +324,11 @@ void UltraHub::receiver_setting_action(const std::string &port, const std::vecto
     for (int32_t r : receivers) {
       if (r >= 1 && r <= hub->num_boards_)
         hub->set_receiver_setting(r - 1, key, value);
+      else
+        ESP_LOGW(TAG, "set_receiver_setting on %s: receiver %d isn't on it (1-%u)", hub->line_name_(),
+                 static_cast<int>(r), hub->num_boards_);
     }
   }
-  if (!any)
-    ESP_LOGW(TAG, "set_receiver_setting: no line '%s' (a telemetry name, a line's id, or all)", port.c_str());
 }
 
 #ifdef USE_API_CUSTOM_SERVICES

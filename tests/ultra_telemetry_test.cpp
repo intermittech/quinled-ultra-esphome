@@ -642,6 +642,69 @@ static void test_missing() {
   CHECK(p.answering(2) && p.answering(3) && p.cut_at(c.now_ms) < 0, "receiver 2 answers again: 2 and 3 back");
 }
 
+/// Hot-plug (design review, round 14): a receiver unplugged for a minute and plugged in again (a power-up, its uptime
+/// from 0). Gone, it is asked once per back-off (2 s while it cuts receivers off behind it, 10 s as the last one; never
+/// a burst of its pages). Back, it is seen at its next poll and every page of it is due at once: its STATUS (the
+/// restart), both IDENTITY parts; the ones behind it after the restart's hold.
+struct ReplugTimes {
+  uint32_t gone_polls, seen, identified, behind;
+};
+static ReplugTimes replug(uint16_t n, uint16_t k) {
+  Chain c(n);
+  TelemetryPoller p = started(c, n);
+  c.run(p, 10000);
+  c.rx[k].has_channel = false;   // unplugged: it and the ones behind it silent
+  c.run(p, 40000);
+  const uint32_t polls0 = p.polls(k);
+  c.run(p, 20000);
+  ReplugTimes t{p.polls(k) - polls0, 0, 0, 0};
+  const uint32_t id0 = c.rx[k].asked[ULTRA_PAGE_IDENTITY], f0 = c.rx[k].features_asked, r0 = p.stats().restarts;
+  c.rx[k].restart();   // plugged in again: a power-up
+  c.rx[k].has_channel = true;
+  const uint32_t t0 = c.now_ms;
+  c.run_until(p, 15000, [&] {
+    if (!t.seen && p.answering(k))
+      t.seen = c.now_ms - t0;
+    if (!t.identified && c.rx[k].asked[ULTRA_PAGE_IDENTITY] > id0 && c.rx[k].features_asked > f0 &&
+        p.data(k).have_identity)
+      t.identified = c.now_ms - t0;
+    bool all = true;
+    for (uint16_t i = k; i < n; i++)
+      all &= p.answering(i);
+    if (!t.behind && all)
+      t.behind = c.now_ms - t0;
+    return t.seen && t.identified && t.behind;
+  });
+  CHECK(p.stats().restarts == r0 + 1 && c.rx[k].asked[ULTRA_PAGE_IDENTITY] == id0 + 1,
+        "re-plugged receiver %u of %u: one restart (+%u), IDENTITY once (+%u)", k + 1, n, p.stats().restarts - r0,
+        c.rx[k].asked[ULTRA_PAGE_IDENTITY] - id0);
+  return t;
+}
+static void test_replug() {
+  // the first receiver (nothing in front of it polls the line): asked every 2 s while gone
+  const ReplugTimes a = replug(4, 0);
+  CHECK(a.gone_polls >= 9 && a.gone_polls <= 11 && a.seen && a.seen <= 2100 && a.identified &&
+            a.identified <= a.seen + 300 && a.behind && a.behind <= a.seen + 1500,
+        "receiver 1 of 4 re-plugged: asked %u times in 20 s while gone; answering after %u ms, identified after %u "
+        "ms, all back after %u ms",
+        a.gone_polls, a.seen, a.identified, a.behind);
+  // the second (the first one polls the line): seen at the next window; its STATUS and IDENTITY at once, not after
+  // its pages' back-off
+  const ReplugTimes b = replug(4, 1);
+  CHECK(b.seen && b.seen <= 2100 && b.identified && b.identified <= b.seen + 300 && b.behind &&
+            b.behind <= b.seen + 1500,
+        "receiver 2 of 4 re-plugged: answering after %u ms, identified after %u ms, all back after %u ms", b.seen,
+        b.identified, b.behind);
+  // a lone receiver (no one behind it): every 10 s while gone, one poll each time (not its pages in a burst)
+  const ReplugTimes l = replug(1, 0);
+  CHECK(l.gone_polls >= 2 && l.gone_polls <= 3 && l.seen && l.seen <= 10100 && l.identified <= l.seen + 300,
+        "a lone receiver re-plugged: asked %u times in 20 s while gone; answering after %u ms", l.gone_polls, l.seen);
+  std::printf("  hot-plug: receiver 1 of 4 asked %u times in 20 s while gone, back after %u ms (identified %u, all "
+              "%u); receiver 2 of 4 back after %u ms (identified %u, all %u); a lone one asked %u times, back after "
+              "%u ms\n",
+              a.gone_polls, a.seen, a.identified, a.behind, b.seen, b.identified, b.behind, l.gone_polls, l.seen);
+}
+
 /// A restart (the uptime falls): IDENTITY again, nothing past it for 1 s, no acknowledge across it. A new board at a
 /// position (UID16): its data dropped and read again.
 static void test_restart_and_swap() {
@@ -2871,6 +2934,7 @@ int main() {
   test_basic();
   test_parser();
   test_missing();
+  test_replug();
   test_restart_and_swap();
   test_power_ack();
   test_busy_unsupported_why();

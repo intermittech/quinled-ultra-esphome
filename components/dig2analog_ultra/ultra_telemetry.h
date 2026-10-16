@@ -15,7 +15,8 @@
 //    UNSUPPORTED), UID16 against the board at that position (a new one: its data is dropped, IDENTITY read again);
 //  - a missing answer is normal: the page is asked again in a later window (new SEQ, bounded back-off). A receiver
 //    that doesn't take part silences every one behind it for that window: only the first missing answer counts. A
-//    receiver that keeps missing (CUT_MISSES windows) cuts off the ones behind it: they aren't polled until it answers;
+//    receiver that keeps missing (CUT_MISSES windows) cuts off the ones behind it: they aren't polled until it answers
+//    (it is asked at least every CUT_BACKOFF_MS meanwhile: a re-plugged receiver is seen within ~2 s);
 //  - a restart (its uptime fell): nothing is polled past it for 1 s, IDENTITY again, no acknowledge across it;
 //  - POWER: read the counts (and SUPPLY's dip count), show them, acknowledge exactly those in the next POWER poll.
 
@@ -746,6 +747,8 @@ class TelemetryPoller {
   static constexpr uint32_t MIN_SPACING_MS = 10;   // at most one RW frame per 10 ms (wiki: Return Channel)
   static constexpr uint32_t RETRY_MS = 250;        // a page asked again after a silenced or BUSY answer
   static constexpr uint32_t BACKOFF_MAX_MS = 10000;
+  static constexpr uint32_t CUT_BACKOFF_MS = 2000; // ... at most for one that cuts the chain (every one behind it
+                                                   // waits for it): a re-plugged receiver is seen within ~2 s
   static constexpr uint8_t UNAVAILABLE_MISSES = 3; // windows in a row: its sensors show "unavailable"
   static constexpr uint8_t CUT_MISSES = 3;         // ... and the receivers behind it aren't polled
   static constexpr uint32_t ACK_DELAY_MS = 1000;   // the acknowledge goes with the POWER poll this long after a read
@@ -999,10 +1002,19 @@ class TelemetryPoller {
       this->stats_.missing++;
       if (r.misses < 255)
         r.misses++;
-      const uint32_t back = r.misses >= 6 ? BACKOFF_MAX_MS : RETRY_MS << (r.misses - 1);
-      r.next[a.tp] = now_ms + (back > BACKOFF_MAX_MS ? BACKOFF_MAX_MS : back);
-      if (r.misses >= UNAVAILABLE_MISSES)
+      // 250 ms doubling up to 10 s; 2 s for one with receivers behind it once it cuts them off. Gone (unavailable),
+      // every page of it waits as long: one poll per back-off, not a burst of its pages
+      const uint32_t cap = r.misses >= CUT_MISSES && a.rx + 1u < this->rx_.size() ? CUT_BACKOFF_MS : BACKOFF_MAX_MS;
+      const uint32_t back = r.misses >= 6 ? cap : RETRY_MS << (r.misses - 1);
+      const uint32_t at = now_ms + (back > cap ? cap : back);
+      r.next[a.tp] = at;
+      if (r.misses >= UNAVAILABLE_MISSES) {
         this->unavailable_(r);
+        for (uint32_t &t : r.next) {
+          if (static_cast<int32_t>(t - at) < 0)
+            t = at;
+        }
+      }
     }
     // receivers behind a cut can't be heard: unavailable
     if (this->cut_(now_ms)) {
@@ -1203,6 +1215,11 @@ class TelemetryPoller {
       this->restarted_(r, now_ms, true);
     r.have_uid = true;
     r.uid16 = uid;
+    if (r.misses >= UNAVAILABLE_MISSES) {   // back after it was gone (re-plugged?): every page due now, STATUS first
+      for (uint32_t &t : r.next)            // (a restart shows in its uptime; its pages' back-off is over)
+        t = now_ms;
+      r.next[TP_STATUS] = now_ms - 1;
+    }
     r.misses = 0;
     if (!r.answering) {
       r.answering = true;

@@ -1,5 +1,6 @@
 #include "esphome/core/defines.h"
 #include "fw_update.h"
+#include "ultra_text.h"
 
 #if defined(USE_ESP32) && defined(USE_DIG2ANALOG_ULTRA_UPDATE)
 
@@ -69,8 +70,8 @@ void UltraFirmwareUpdate::setup() {
   this->pref_ = this->make_entity_preference<uint32_t>();
   if (!this->pref_.load(&this->installed_))
     this->installed_ = 0;
-  this->update_info_.title = this->hw_id_ == UPD_HW_ID_DP_ULTRA_RX ? "QuinLED Diff-Power Ultra receivers"
-                                                                    : "QuinLED Dig2Analog-Ultra-5ch";
+  this->update_info_.title = this->hw_id_ == UPD_HW_ID_DP_ULTRA_RX ? "QuinLED Diff-Power Ultra-Analog receivers"
+                                                                    : "QuinLED Dig2Analog-Ultra-5ch";   // (hardware 2 / 1)
   this->update_info_.current_version = this->installed_text_();
   this->publish_state();
   // without signing keys (public_keys: production before QuinLED provisions them) nothing can install: say so
@@ -112,8 +113,7 @@ std::string UltraFirmwareUpdate::installed_text_() const {
 }
 
 void UltraFirmwareUpdate::set_status_(const std::string &status) {
-  // (Home Assistant takes up to 255 characters)
-  const std::string text = status.size() > 255 ? status.substr(0, 252) + "..." : status;
+  const std::string text = text_state(status);   // (Home Assistant takes up to 255 characters)
   if (text == this->status_text_)
     return;
   this->status_text_ = text;

@@ -80,8 +80,9 @@ void UltraReceiver::value_(uint8_t which, float v, bool force) {
                 v, force);
 }
 
-void UltraReceiver::text_(uint8_t which, const std::string &s) {
+void UltraReceiver::text_(uint8_t which, const std::string &v) {
   text_sensor::TextSensor *t = this->texts_[which];
+  const std::string s = text_state(v);   // (Home Assistant's 255 characters)
   if (t != nullptr && !s.empty() && (!t->has_state() || t->state != s))
     t->publish_state(s);
 }
@@ -245,10 +246,11 @@ void UltraTelemetryPort::setup() {
 
 void UltraTelemetryPort::publish_commission_() {
   const Commissioning &c = this->hub_->commissioning();
-  if (this->comm_status_ != nullptr && (!this->comm_status_->has_state() || this->comm_status_->state != c.status()))
-    this->comm_status_->publish_state(c.status());
-  if (this->comm_report_ != nullptr && (!this->comm_report_->has_state() || this->comm_report_->state != c.report()))
-    this->comm_report_->publish_state(c.report());
+  const std::string status = text_state(c.status()), report = text_state(c.report());
+  if (this->comm_status_ != nullptr && (!this->comm_status_->has_state() || this->comm_status_->state != status))
+    this->comm_status_->publish_state(status);
+  if (this->comm_report_ != nullptr && (!this->comm_report_->has_state() || this->comm_report_->state != report))
+    this->comm_report_->publish_state(report);
   if (this->commissioned_ != nullptr)
     this->commissioned_->publish_state(c.commissioned(this->hub_->telemetry()));
 }
@@ -263,8 +265,9 @@ void UltraTelemetryPort::value_(uint8_t which, float v, bool force) {
 void UltraTelemetryPort::update_() {
   const TelemetryPoller &p = this->hub_->telemetry();
   const PortMonitor &m = this->hub_->port_monitor();
-  auto text = [this](uint8_t which, const std::string &v) {
+  auto text = [this](uint8_t which, const std::string &value) {
     text_sensor::TextSensor *s = this->texts_[which];
+    const std::string v = text_state(value);   // (Home Assistant's 255 characters)
     if (s != nullptr && (!s->has_state() || s->state != v))
       s->publish_state(v);
   };

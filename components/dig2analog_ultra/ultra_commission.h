@@ -47,7 +47,7 @@ inline std::string commission_date(uint32_t unix_s) {
   const int32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
   const int32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
   const int32_t d = doy - (153 * mp + 2) / 5 + 1, m = mp < 10 ? mp + 3 : mp - 9;
-  char b[16];
+  char b[40];   // (room for any int the compiler can see: no -Wformat-truncation)
   snprintf(b, sizeof(b), "%04d-%02d-%02d", static_cast<int>(yoe + era * 400 + (m <= 2)), static_cast<int>(m),
            static_cast<int>(d));
   return b;

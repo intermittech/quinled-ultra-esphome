@@ -61,6 +61,9 @@ jobs:
       - name: Ledger test (the lifetime ledger against its frozen reference, stored-copy faults, long runs)
         working-directory: quinled-ultra-esphome
         run: python tests/run_ultra_ledger_test.py
+      - name: Telemetry fuzz test (random, malformed and boundary answers; every text within 255 characters)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_telemetry_fuzz.py
       - name: Diff-Power test (the port power manager's core)
         working-directory: quinled-ultra-esphome
         run: python tests/run_diffpower_test.py

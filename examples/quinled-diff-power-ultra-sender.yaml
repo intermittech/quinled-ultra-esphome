@@ -20,7 +20,7 @@ substitutions:
   port2_enable: GPIO26
   port2_detect: GPIO36
   port2_rx: GPIO39
-  port2_de: GPIO5
+  port2_de: GPIO27
 
 esphome:
   name: ${name}
@@ -71,7 +71,7 @@ api:
   reboot_timeout: 0s   # lights keep running without Home Assistant (the default reboots after 15 min)
 ota:
   - platform: esphome
-    password: !secret ota_password
+    encryption:                # uploads use the api encryption key
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password

@@ -31,6 +31,7 @@
 
 #include "fw_version.h"
 #include "ultra_protocol.h"
+#include "ultra_text.h"
 
 namespace esphome::dig2analog_ultra {
 
@@ -618,30 +619,35 @@ inline std::string telemetry_power_events_text(const ReceiverData &d) {
   return s;
 }
 
-/// Channel health from the last calibration test and the running model: "not tested", "ok", or the findings.
+/// Channel health from the last calibration test and the running model: "not tested", "ok", or the findings, the
+/// channels grouped by finding ("CH1, CH2, CH4 abnormal (far below its test, or no load)"), then the calibration
+/// trend. Within Home Assistant's 255 characters: a trend that wouldn't fit is shortened to its test count, and
+/// text_state() cuts what is still too long.
 inline std::string telemetry_health_text(const ReceiverData &d) {
   if (!d.have_health)
     return "";
-  std::vector<std::string> f;
+  // the abnormal channels by reason: didn't rise, far above, far below (or no load), none given
+  static const char *const WHY[4] = {" (current didn't rise with the level)", " (far above its test)",
+                                     " (far below its test, or no load)", ""};
+  std::string groups[4];
   for (int i = 0; i < 5; i++) {
     const uint8_t c = d.ch_class[i];
     if ((c & 0x0F) != ULTRA_HE_ABNORMAL)
       continue;
-    std::string t = "CH" + std::to_string(i + 1) + " abnormal";
-    if (c & ULTRA_HE_R_NOT_RISING)
-      t += " (current didn't rise with the level)";
-    else if (c & ULTRA_HE_R_ABOVE)
-      t += " (far above the test before)";
-    else if (c & ULTRA_HE_R_BELOW)
-      t += " (far below the test before, or no load)";
-    f.push_back(t);
+    const int g = (c & ULTRA_HE_R_NOT_RISING) ? 0 : (c & ULTRA_HE_R_ABOVE) ? 1 : (c & ULTRA_HE_R_BELOW) ? 2 : 3;
+    groups[g] += (groups[g].empty() ? "CH" : ", CH") + std::to_string(i + 1);
+  }
+  std::vector<std::string> f;
+  for (int g = 0; g < 4; g++) {
+    if (!groups[g].empty())
+      f.push_back(groups[g] + " abnormal" + WHY[g]);
   }
   if (d.he_flags & ULTRA_HE_F_DARK)
-    f.push_back("current with every output off (a FET stuck on?)");
+    f.push_back("current with all outputs off (a FET stuck on?)");
   if (d.he_flags & ULTRA_HE_F_DRIFT)
-    f.push_back("the running model is far off the test on a channel");
+    f.push_back("model far off the test");
   if (receiver_025(d) && (d.he_flags & ULTRA_HE_F_CAL_SUGGESTED))
-    f.push_back("a calibration test is suggested");
+    f.push_back("calibration suggested");
   std::string s;
   if (f.empty()) {
     s = (d.he_flags & ULTRA_HE_F_TESTED) || d.ch_class[0] != ULTRA_HE_UNTESTED ? "ok" : "not tested";
@@ -650,24 +656,26 @@ inline std::string telemetry_health_text(const ReceiverData &d) {
     for (size_t i = 1; i < f.size(); i++)
       s += ", " + f[i];
   }
-  // (0.2.5) the calibration trend: the newest stored test at 100 % against the first
+  // the calibration trend: the newest stored test at 100 % against the first ("CH1 -3, CH3 +1 %")
   if (d.have_faults && d.trend_tests >= 2) {
     std::string t;
     for (int i = 0; i < 5; i++) {
       if (d.trend[i] == ULTRA_HE_NA)
         continue;
       char b[24];
-      snprintf(b, sizeof(b), "%sCH%d %+d %%", t.empty() ? "" : ", ", i + 1, static_cast<int>(d.trend[i]));
+      snprintf(b, sizeof(b), "%sCH%d %+d", t.empty() ? "" : ", ", i + 1, static_cast<int>(d.trend[i]));
       t += b;
     }
     if (!t.empty()) {
-      s += "; trend over " + std::to_string(d.trend_tests) + " tests";
+      std::string head = "; trend (" + std::to_string(d.trend_tests) + " tests";
       if (d.trend_lit_h != 0xFFFF)
-        s += " and " + std::to_string(d.trend_lit_h) + " lit h";
-      s += ": " + t;
+        head += ", " + std::to_string(d.trend_lit_h) + " lit h";
+      head += ")";
+      const std::string full = head + ": " + t + " %";
+      s += s.size() + full.size() <= TEXT_STATE_MAX ? full : head;
     }
   }
-  return s;
+  return text_state(s);
 }
 
 // ---------------------------------------------------------------------------------------------------------- poller

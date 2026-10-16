@@ -37,7 +37,7 @@ api:
   reboot_timeout: 0s   # lights keep running without Home Assistant (the default reboots after 15 min)
 ota:
   - platform: esphome
-    password: !secret ota_password
+    encryption:                # uploads use the api encryption key
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password

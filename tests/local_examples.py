@@ -39,7 +39,7 @@ def main() -> int:
         else (
             'wifi_ssid: "test"\nwifi_password: "testtest"\n'
             'api_encryption_key: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="\n'
-            'ota_password: "testtest"\nfallback_ap_password: "testtest"\n'
+            'fallback_ap_password: "testtest"\n'
         ),
         encoding="utf-8",
     )

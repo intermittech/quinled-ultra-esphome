@@ -863,7 +863,8 @@ class LedgerKeeper {
     Reading reading[PENDING]{};   // ENERGY readings waiting for the next STATUS
     uint32_t boot_last{0};        // the count of the last reading counted (this power-up)
     uint32_t count_ms{0};         // its powered time counted up to here (counting; the hub's clock)
-    uint32_t start_ms{0};         // when it started (its uptime): its readings dated against it
+    uint32_t start_at{0}, start_up_s{0};   // its session's start: the hub's ms then, the board's uptime then (its
+                                           // readings dated against its power-up: start_up_s before start_at)
     uint32_t boot_base{0};        // its first reading counts from this (UINT32_MAX: from that reading on)
     uint32_t on_ms{0};            // the line's power-on (on_known)
     uint32_t en_ms{0}, mw{0};     // its last ENERGY reading counted this session (en_counted): when, its power (mW)
@@ -964,7 +965,8 @@ class LedgerKeeper {
     x.fresh = fresh;
     x.sess_started = true;
     x.restart_due = true;   // (its first reading dated against its start)
-    x.start_ms = now_ms - d.uptime_s * 1000u;
+    x.start_at = now_ms;
+    x.start_up_s = d.uptime_s;
     if (fresh)
       this->ledger_->add_power_up(e);
     this->ledger_->add_time(e, false, part);
@@ -977,10 +979,13 @@ class LedgerKeeper {
   void readings_(Rx &x, LedgerEntry &e) {
     for (uint8_t k = 0; k < x.pending; k++) {
       const Reading &r = x.reading[k];
-      // this session's first reading: read after it started (its uptime is whole seconds: or its count went back)
+      // this session's first reading: read after its power-up (its uptime is whole seconds), or its count went back.
+      // Dated by its age at the session's start against the uptime then, in 64 bits: a reading waits seconds, so its
+      // age never nears the wrap, while the board's uptime can be months (a start dated back that far would wrap)
       bool first = false;
-      if (x.restart_due &&
-          (static_cast<int32_t>(r.ms - x.start_ms) >= 0 || (x.have_boot && r.boot < x.boot_last))) {
+      const int32_t age = static_cast<int32_t>(x.start_at - r.ms);
+      const bool after = age <= 0 || static_cast<uint64_t>(age) <= static_cast<uint64_t>(x.start_up_s) * 1000u;
+      if (x.restart_due && (after || (x.have_boot && r.boot < x.boot_last))) {
         x.boot_last = x.boot_base == UINT32_MAX ? r.boot : x.boot_base;
         x.have_boot = true;
         x.restart_due = false;

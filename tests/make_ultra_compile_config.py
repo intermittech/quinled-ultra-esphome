@@ -425,7 +425,7 @@ light:
     pin: GPIO18
     num_leds: 30
     chipset: ws2812
-    rgb_order: GRB
+    channel_colors: GRB
     rmt_symbols: 64
   - platform: partition              # (its pixels are the hall strip's: the port powers it too)
     id: hall_door
@@ -447,7 +447,7 @@ light:
     pin: GPIO19
     num_leds: 60
     chipset: ws2812
-    rgb_order: GRB
+    channel_colors: GRB
     rmt_symbols: 64
 
 binary_sensor:
@@ -484,7 +484,7 @@ def p4_telemetry_config() -> str:
             lights += (f"  - platform: dig2analog_ultra\n    dig2analog_ultra_id: port{k}\n"
                        f"    name: Port {k} shelf {ch}\n    board: 1\n    channel: {ch}\n")
     return ("esphome:\n  name: d2a-ultra-p4\n  devices:\n" + devices +
-            "\nesp32:\n  board: esp32-p4_r3\n  framework:\n    type: esp-idf\n\n"
+            "\nesp32:\n  board: esp32-p4_r3\n  cpu_frequency: 360MHz\n  framework:\n    type: esp-idf\n\n"
             "external_components:\n  - source:\n      type: local\n      path: ../../../components\n"
             "    components: [dig2analog_ultra, diffpower]\n\nlogger:\n\nuart:\n" + uarts +
             "\ndiffpower:\n" + ports +
@@ -521,7 +521,7 @@ def p4_parlio_config(ports: bool = False) -> str:
             f"      number: {k}\n    detect_pin:\n      mcp23xxx: port_detect\n      number: {k}\n      mode: INPUT\n"
             for k in range(16))
     return ("esphome:\n  name: d2a-ultra-p4-parlio" + ("-ports" if ports else "") + "\n\nesp32:\n  board: esp32-p4_r3\n"
-            "  framework:\n    type: esp-idf\n\n"
+            "  cpu_frequency: 360MHz\n  framework:\n    type: esp-idf\n\n"
             "external_components:\n  - source:\n      type: local\n      path: ../../../components\n"
             "    components: [dig2analog_ultra, dig2analog_ultra_parlio" + (", diffpower" if ports else "") + "]\n\n"
             "logger:\n\n"
@@ -539,8 +539,8 @@ def p4_parlio_lights_config() -> str:
         hubs += f"  - id: port{k + 1}\n    parlio_id: ports\n    lane: {k}\n    num_boards: 1\n"
         lights += (f"  - platform: dig2analog_ultra\n    dig2analog_ultra_id: port{k + 1}\n    name: Port {k + 1} RGBCCT\n"
                    f"    board: 0\n    red: 1\n    green: 2\n    blue: 3\n    cold_white: 4\n    warm_white: 5\n")
-    return ("esphome:\n  name: d2a-ultra-p4-parlio-lights\n\nesp32:\n  board: esp32-p4_r3\n  framework:\n"
-            "    type: esp-idf\n\nexternal_components:\n  - source:\n      type: local\n      path: ../../../components\n"
+    return ("esphome:\n  name: d2a-ultra-p4-parlio-lights\n\nesp32:\n  board: esp32-p4_r3\n  cpu_frequency: 360MHz\n"
+            "  framework:\n    type: esp-idf\n\nexternal_components:\n  - source:\n      type: local\n      path: ../../../components\n"
             "    components: [dig2analog_ultra, dig2analog_ultra_parlio]\n\nlogger:\n\n"
             "dig2analog_ultra_parlio:\n  - id: ports\n    sample_rate: 10MHz\n    pins: ["
             + ", ".join(f"GPIO{i}" for i in range(8)) + "]\n"
@@ -622,7 +622,7 @@ def main() -> None:
     need = (
         'wifi_ssid: "test"\nwifi_password: "testtest"\n'
         'api_encryption_key: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="\n'
-        'ota_password: "testtest"\nfallback_ap_password: "testtest"\n'
+        'fallback_ap_password: "testtest"\n'
     )
     for line in need.splitlines():   # (the examples' secrets: any missing added)
         if line.split(":")[0] + ":" not in have:

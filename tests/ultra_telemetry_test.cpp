@@ -1041,7 +1041,7 @@ static void test_025() {
         "texts: '%s' / '%s' / '%s' / '%s'", telemetry_last_trip(d0).c_str(), telemetry_last_dip(d0).c_str(),
         telemetry_last_reset(d0).c_str(), telemetry_last_reset(p.data(1)).c_str());
   CHECK(telemetry_health_text(d0) ==
-                "CH2 abnormal (current didn't rise with the level); trend over 4 tests and 1200 lit h: CH1 -3 %, CH3 +1 %" &&
+                "CH2 abnormal (current didn't rise with the level); trend (4 tests, 1200 lit h): CH1 -3, CH3 +1 %" &&
             telemetry_health_text(d2) == "CH2 abnormal (current didn't rise with the level)",
         "health: '%s'", telemetry_health_text(d0).c_str());
   // the Status: a channel fault (HEALTH) is a problem; a light on other channels doesn't show it
@@ -1481,6 +1481,135 @@ static void test_ledger_erased() {
 /// power-up's count not again; used while the ESP32 was off: counted; a used board fitted while it was off: the
 /// position goes on; a reading of a new power-up before the STATUS that shows it; a power-off without a cut; the
 /// 32-bit count wrapping.
+/// Channel health within Home Assistant's 255 characters (a longer state becomes `unknown`): five abnormal channels,
+/// every flag and the trend stay whole and readable (the channels grouped by finding); every combination of findings,
+/// flags and trend stays within 255 bytes; text_state() cuts at a character, never inside a UTF-8 sequence.
+static void test_health_text_limit() {
+  ReceiverData d;
+  d.have_identity = d.have_health = d.have_faults = true;
+  d.features = FEATURES_025;
+  d.he_flags = ULTRA_HE_F_TESTED | ULTRA_HE_F_ABNORMAL | ULTRA_HE_F_DARK | ULTRA_HE_F_DRIFT | ULTRA_HE_F_CAL_SUGGESTED;
+  for (int i = 0; i < 5; i++) {
+    d.ch_class[i] = ULTRA_HE_ABNORMAL | ULTRA_HE_R_BELOW;
+    d.trend[i] = static_cast<int8_t>(i % 2 ? -55 : 100);
+  }
+  d.trend_tests = 12;
+  d.trend_lit_h = 3456;
+  const std::string all = telemetry_health_text(d);
+  CHECK(all.size() <= 255 && all.find("CH1, CH2, CH3, CH4, CH5 abnormal (far below its test, or no load)") == 0 &&
+            all.find("a FET stuck on?") != std::string::npos && all.find("calibration suggested") != std::string::npos &&
+            all.find("; trend (12 tests, 3456 lit h): CH1 +100, CH2 -55, CH3 +100, CH4 -55, CH5 +100 %") !=
+                std::string::npos,
+        "5 channels, every flag, the trend: %zu bytes, whole ('%s')", all.size(), all.c_str());
+  // every combination: each channel's finding (none / didn't rise / above / below / no reason), the flags, the trend
+  size_t longest = 0;
+  bool cut_right = true;
+  for (int combo = 0; combo < 3125; combo++) {
+    for (int flags = 0; flags < 8; flags++) {
+      for (int trend = 0; trend < 2; trend++) {
+        ReceiverData e = d;
+        int c = combo;
+        for (int i = 0; i < 5; i++, c /= 5) {
+          static const uint8_t CLS[5] = {ULTRA_HE_NORMAL, ULTRA_HE_ABNORMAL | ULTRA_HE_R_NOT_RISING,
+                                         ULTRA_HE_ABNORMAL | ULTRA_HE_R_ABOVE, ULTRA_HE_ABNORMAL | ULTRA_HE_R_BELOW,
+                                         ULTRA_HE_ABNORMAL};
+          e.ch_class[i] = CLS[c % 5];
+        }
+        e.he_flags = static_cast<uint8_t>(ULTRA_HE_F_TESTED | ((flags & 1) ? ULTRA_HE_F_DARK : 0) |
+                                          ((flags & 2) ? ULTRA_HE_F_DRIFT : 0) |
+                                          ((flags & 4) ? ULTRA_HE_F_CAL_SUGGESTED : 0));
+        e.have_faults = trend != 0;
+        const std::string s = telemetry_health_text(e);
+        longest = std::max(longest, s.size());
+        cut_right &= s.size() <= 255;
+      }
+    }
+  }
+  // the cap: 300 bytes of 2-byte characters cut at a character, "..." at the end
+  std::string wide;
+  for (int i = 0; i < 150; i++)
+    wide += "\xC2\xB7";
+  const std::string capped = text_state(wide), short_one = text_state("ok");
+  const bool whole = capped.size() <= 255 && capped.size() >= 250 && capped.compare(capped.size() - 3, 3, "...") == 0 &&
+                     (static_cast<uint8_t>(capped[capped.size() - 4]) & 0xC0) == 0x80 &&
+                     static_cast<uint8_t>(capped[capped.size() - 5]) == 0xC2;
+  CHECK(cut_right && whole && short_one == "ok",
+        "all 100,000 combinations within 255 bytes (longest %zu); a long text cut at a character (%zu bytes)", longest,
+        capped.size());
+}
+
+/// The ledger when the ESP32 restarts under a receiver powered for months: the session's first reading after the
+/// restart is recognized by its age against the board's uptime (a start dated back past 24.8 days used to wrap), so the
+/// energy from the checkpoint before the restart on is counted: 20 Wh before + 10 Wh after, at any uptime the 24-bit
+/// STATUS can carry.
+struct LongUpPoller : TelemetryPoller {
+  void set(uint16_t i, const ReceiverData &d) {
+    this->rx_[i].d = d;
+    this->rx_[i].have_uid = true;
+    this->rx_[i].uid16 = ultra_crc16(d.uid, 12);
+    this->rx_[i].answering = true;
+  }
+};
+
+static uint64_t ledger_long_uptime(uint32_t uptime_s) {
+  const uint8_t uid[12] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+  LifetimeLedger l;   // as stored before the hub's restart: the board's session checkpoint
+  l.init(4, 4);
+  bool created = false;
+  LedgerEntry *e = l.touch(uid, &created);
+  e->c.mwh = 1000000;
+  e->c.powered = 7200;
+  e->sess = true;
+  e->sess_up = uptime_s - 900;   // its uptime at the last checkpoint, 15 min before the hub's restart
+  e->sess_boot = 500000;
+  e->sess_ups = 5;
+  const uint64_t before = e->c.mwh;
+  LongUpPoller p;
+  p.init(1, ULTRA_RW_RATE_1M, TelemetryIntervals{});
+  LedgerKeeper k;
+  const uint32_t boot_ms = 1000;
+  k.attach(&l, 0x12340000u, 1, boot_ms);
+  uint32_t now = boot_ms + 5000;
+  ReceiverData d;
+  std::memcpy(d.uid, uid, 12);
+  d.have_board = d.have_features = d.have_identity = true;
+  d.features = FEATURES_025 | ULTRA_FEAT_ENERGY | ULTRA_FEAT_LIFE_SYNC;
+  d.have_status = true;
+  d.uptime_s = uptime_s;
+  d.have_lifetime = true;
+  d.lt_powered = 7200;
+  d.lt_records = 10;
+  d.have_energy = true;
+  d.boot_mwh = 500000 + 20000;   // 20 Wh since the checkpoint
+  d.total_wh = 1020;
+  d.power_mw = 80000;
+  p.set(0, d);
+  k.lit_tick(0, true, now);
+  k.on_updates(p, 0, (1u << TP_IDENTITY) | (1u << TP_FEATURES) | (1u << TP_LIFETIME) | (1u << TP_ENERGY) |
+                         (1u << TP_STATUS), now);
+  now += 60000;   // a minute later: another 10 Wh
+  d.uptime_s = uptime_s + 60;
+  d.boot_mwh += 10000;
+  d.total_wh += 10;
+  p.set(0, d);
+  k.on_updates(p, 0, (1u << TP_ENERGY) | (1u << TP_STATUS), now);
+  const LifeCounters *c = k.counters(0);
+  return c != nullptr ? c->mwh - before : 0;
+}
+
+static void test_ledger_long_uptime() {
+  const uint32_t days[] = {10, 24, 25, 30, 50, 60, 150, 194};
+  std::string got;
+  bool ok = true;
+  for (uint32_t n : days) {
+    const uint64_t add = ledger_long_uptime(n * 86400u);
+    ok &= add == 30000;
+    got += " " + std::to_string(n) + " d +" + std::to_string(add);
+  }
+  CHECK(ok, "the ESP32 restarted under a board up for months: the energy from the checkpoint on (+30000 mWh):%s",
+        got.c_str());
+}
+
 static void test_ledger_restart() {
   Chain c(1);
   Model &m = c.rx[0];
@@ -2523,6 +2652,8 @@ int main() {
   test_ledger_boards();
   test_ledger_erased();
   test_ledger_restart();
+  test_ledger_long_uptime();
+  test_health_text_limit();
   test_ledger_misc();
   test_ledger_counters();
   test_pacing();

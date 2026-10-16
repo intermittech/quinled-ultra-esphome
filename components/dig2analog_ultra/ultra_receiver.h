@@ -78,10 +78,11 @@ class UltraIdentifyButton final : public button::Button {
   uint16_t board_{0};
 };
 
-/// A line's buttons (disabled until enabled in Home Assistant): its current calibration, its boards' versions
+/// A line's buttons: its current calibration, its boards' versions (both disabled until enabled in Home Assistant);
+/// its commissioning: Commission, Finalize (wiki: Commissioning)
 class UltraLineButton final : public button::Button {
  public:
-  enum Kind : uint8_t { CALIBRATE = 0, SHOW_VERSION };
+  enum Kind : uint8_t { CALIBRATE = 0, SHOW_VERSION, COMMISSION, FINALIZE };
   void set_hub(UltraHub *hub) { this->hub_ = hub; }
   void set_kind(uint8_t kind) { this->kind_ = kind; }
 
@@ -89,8 +90,10 @@ class UltraLineButton final : public button::Button {
   void press_action() override {
     if (this->kind_ == CALIBRATE)
       this->hub_->calibrate_boards({}, 0);
-    else
+    else if (this->kind_ == SHOW_VERSION)
       this->hub_->show_version(-1);
+    else
+      this->hub_->commission(this->kind_ == FINALIZE);
   }
   UltraHub *hub_{nullptr};
   uint8_t kind_{0};
@@ -128,6 +131,10 @@ class UltraTelemetryPort final : public Component {
       this->texts_[which] = s;
   }
   void set_problem(binary_sensor::BinarySensor *s) { this->problem_ = s; }
+  /// the commissioning's texts (where it is; the last run's report) and whether the line is commissioned
+  void set_commission_status(text_sensor::TextSensor *s) { this->comm_status_ = s; }
+  void set_commission_report(text_sensor::TextSensor *s) { this->comm_report_ = s; }
+  void set_commissioned(binary_sensor::BinarySensor *s) { this->commissioned_ = s; }
   void setup() override;
   void dump_config() override;
   void on_shutdown() override;
@@ -148,6 +155,9 @@ class UltraTelemetryPort final : public Component {
   sensor::Sensor *health_[HEALTH_COUNT]{};
   bool has_health_{false}, health_seen_{false};
   uint32_t health_ms_{0}, answers_was_{0}, missing_was_{0};
+  void publish_commission_();
+  text_sensor::TextSensor *comm_status_{nullptr}, *comm_report_{nullptr};
+  binary_sensor::BinarySensor *commissioned_{nullptr};
 };
 
 /// A light on a receiver with several lights (on its own device): its estimated power (the receiver's measured power

@@ -30,6 +30,7 @@
 #include "../components/dig2analog_ultra/ultra_ledger.h"
 #include "../components/dig2analog_ultra/ultra_parlio.h"
 #include "../components/dig2analog_ultra/ultra_telemetry.h"
+#include "../components/dig2analog_ultra/ultra_commission.h"
 #include "../components/dig2analog_ultra/update_session.h"
 #include "../components/diffpower/diffpower_core.h"
 

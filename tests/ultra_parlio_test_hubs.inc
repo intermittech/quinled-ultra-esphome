@@ -405,6 +405,10 @@ struct UltraHub {
       this->rx_listeners_.add(r, [](uint32_t) {});
     hubs_.push_back(this);
   }
+  // the commissioning (ultra_commission.h: tests/ultra_telemetry_test.cpp runs it)
+  bool comm_on_{false};
+  void service_commission_() {}
+  Commissioning comm_;
 };
 std::vector<UltraHub *> UltraHub::hubs_;
 uint32_t UltraHub::rw_wait_seq_ = 0;

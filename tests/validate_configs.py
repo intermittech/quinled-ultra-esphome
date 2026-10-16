@@ -1285,6 +1285,19 @@ CASES = [
     ("ultra telemetry adaptive_rate false", ULTRA + TELEMETRY + "    adaptive_rate: false\n" + RX_UART, True, None),
     ("ultra telemetry adaptive_rate bogus", ULTRA + TELEMETRY + "    adaptive_rate: sometimes\n" + RX_UART, False,
      "adaptive_rate"),
+    # the commissioning (round 12): its buttons and texts by default, none with commissioning: false; the actions
+    # (a line, or every line without an id) need a line with it
+    ("ultra commissioning entities", ULTRA + TELEMETRY + RX_UART, True, "name: Port finalize"),
+    ("ultra commissioning report text", ULTRA + TELEMETRY + RX_UART, True, "name: Port commissioning report"),
+    ("ultra commissioning off", ULTRA + TELEMETRY + "    commissioning: false\n" + RX_UART, True, "!finalize"),
+    ("ultra commission_min_voltage 40 %", ULTRA + TELEMETRY + "    commission_min_voltage: 40%\n" + RX_UART, False,
+     "commission_min_voltage"),
+    ("ultra commission actions",
+     ULTRA + TELEMETRY + RX_UART + "button:\n  - platform: template\n    name: Commission all\n    on_press:\n"
+     "      - dig2analog_ultra.commission:\n      - dig2analog_ultra.finalize: u\n", True, None),
+    ("ultra commission action without commissioning",
+     ULTRA + TELEMETRY + "    commissioning: false\n" + RX_UART + "button:\n  - platform: template\n    name: C\n"
+     "    on_press:\n      - dig2analog_ultra.commission: u\n", False, "has no telemetry with commissioning"),
     ("ultra telemetry live twins on devices", ULTRA + TELEMETRY + RX_LIST + RX_UART, True, "name: Live power"),
     ("ultra telemetry Port text on a receiver's device", ULTRA + TELEMETRY + RX_LIST + RX_UART, True, "name: Port\n"),
     ("ultra telemetry Identify button", ULTRA + TELEMETRY + RX_LIST + RX_UART, True, "name: Identify"),

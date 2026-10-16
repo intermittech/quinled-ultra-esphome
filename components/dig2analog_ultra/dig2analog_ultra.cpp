@@ -871,6 +871,9 @@ void UltraHub::service_power_() {
   bool lit = this->cal_power_hold_;
   for (auto *l : this->lights_)
     lit |= l->is_lit(now);
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  lit |= this->comm_.hold_power();   // (a commissioning: the supply on while it runs)
+#endif
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
   lit |= this->upd_power_hold_;
   // power_cycle(): released until the supply is really off, then off for 1.5 s, then the normal rule again.
@@ -977,6 +980,14 @@ void UltraHub::setup() {
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   if (this->rw_uart_ != nullptr) {
     this->keeper_.attach(&ultra_ledger(), this->tel_key_, this->poller_.receivers());
+    if (this->comm_on_) {   // the commissioning: its last Finalize's result from flash
+      this->comm_.configure(this->rate_ms_, this->comm_min_v_);
+      this->comm_layer_.hub = this;
+      this->comm_pref_ = global_preferences->make_preference<CommissionRecord>(this->tel_key_ ^ 0x434F4D31u);
+      CommissionRecord rec;
+      if (this->comm_pref_.load(&rec))
+        this->comm_.set_record(rec);
+    }
     ledger_receivers() += this->poller_.receivers() + 1u;   // (its receivers' positions, its port's energy)
     // the POLL slots: the receivers only (the boards behind them take normal slots); the answers' buffer at once
     this->rw_slots_.assign(static_cast<size_t>(ULTRA_SLOT_BYTES) * this->poller_.receivers(), 0);
@@ -1268,7 +1279,7 @@ void UltraHub::attach_port_() {
     this->port_->add_load(l->get_standby_after(), [l](uint32_t now) { return l->is_lit(now); }, l->get_state());
   this->port_->add_load(1, [this](uint32_t now) {
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
-    if (this->standby_hold_(now))
+    if (this->standby_hold_(now) || this->comm_.hold_power())
       return true;
 #endif
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
@@ -1362,6 +1373,98 @@ void UltraHub::service_notice_() {
 }
 #endif
 
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+UltraHub *UltraHub::comm_active_ = nullptr;
+
+// ------------------------------------------------------------------------------------------- the commissioning
+void UltraHub::commission(bool finalize) {
+  if (!this->comm_on_)
+    return;
+  if (!this->comm_.request(finalize ? Commissioning::FINALIZE : Commissioning::COMMISSION)) {
+    ESP_LOGW(TAG, "Telemetry on GPIO%u: a commissioning already runs or waits", this->pin_);
+    return;
+  }
+  ESP_LOGI(TAG, "Telemetry on GPIO%u: %s asked for", this->pin_, finalize ? "Finalize" : "Commission");
+  this->comm_cb_.call();
+}
+
+void UltraHub::commission_all(bool finalize) {
+  for (UltraHub *hub : hubs_)
+    hub->commission(finalize);
+}
+
+// One run on the controller at a time (two load tests at once could overload the sender's supply); the port held
+// powered, the test level on the line's lights, the calibration, the record (wiki: Commissioning)
+void UltraHub::service_commission_() {
+  const uint32_t now = millis();
+  if (this->comm_.queued() && (comm_active_ == nullptr || comm_active_ == this)) {
+    comm_active_ = this;
+    ESP_LOGI(TAG, "Telemetry on GPIO%u: the commissioning starts", this->pin_);
+    this->comm_.start(now);
+  }
+  CommissionPort cp;
+#ifdef USE_DIFFPOWER
+  if (this->port_ != nullptr) {
+    cp.present = true;
+    cp.detect = this->port_->has_detect();
+    cp.off = this->port_->is_off();
+    cp.board = this->port_->core().board();
+    cp.fault = this->port_->state() == diffpower::PS_FAULT;
+  }
+#endif
+  cp.ready = this->boards_powered_();
+  uint32_t unix_s = 0;
+#ifdef USE_TIME
+  if (this->comm_clock_ != nullptr) {
+    const ESPTime t = this->comm_clock_->now();
+    if (t.is_valid())
+      unix_s = static_cast<uint32_t>(t.timestamp);
+  }
+#endif
+#ifdef USE_DIG2ANALOG_ULTRA_UPDATE
+  const bool updating = this->update_running();
+#else
+  const bool updating = false;
+#endif
+  const uint8_t act = this->comm_.poll(now, unix_s, cp, this->poller_, this->port_monitor_,
+                                       this->calibration_running(), updating);
+  if (act & Commissioning::ACT_LEVEL)
+    this->commission_level_(this->comm_.level());
+  if (act & Commissioning::ACT_CALIBRATE)
+    this->calibrate_boards({}, 0);
+  if (act & Commissioning::ACT_STORE) {
+    this->comm_pref_.save(&this->comm_.record());
+    global_preferences->sync();   // (a user's action, rare: kept at once)
+  }
+  if (act & Commissioning::ACT_DONE) {
+    ESP_LOGI(TAG, "Telemetry on GPIO%u: %s. %s", this->pin_, this->comm_.status().c_str(),
+             this->comm_.report().c_str());
+    if (comm_active_ == this)
+      comm_active_ = nullptr;
+  }
+  if (act & Commissioning::ACT_TEXT)
+    this->comm_cb_.call();
+}
+
+// The load test: the commissioning is a layer over every light of the line (its own state stays underneath, a strip
+// shown meanwhile goes on top); level 0: the layer gone, each light back to its own state at once
+void UltraHub::commission_level_(float level) {
+  for (UltraLight *l : this->lights_) {
+    if (level > 0.0f) {
+      if (!l->layer_top(&this->comm_layer_))
+        l->layer_begin(&this->comm_layer_);
+      l->send_test_level(level);
+    } else {
+      l->layer_end(&this->comm_layer_, 0);
+    }
+  }
+}
+
+void UltraHub::CommissionLayer::layer_shown(UltraLight *light) {
+  light->send_test_level(this->hub->comm_.level());
+}
+#endif
+
 void UltraHub::loop() {
 #ifdef USE_DIFFPOWER
   if (this->port_ != nullptr && !this->port_attached_)
@@ -1371,6 +1474,8 @@ void UltraHub::loop() {
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   this->ledger_service_();
   this->ledger_line_();
+  if (this->comm_on_)
+    this->service_commission_();
 #endif
   this->service_calibration_();
 #ifdef USE_POWER_SUPPLY
@@ -1683,6 +1788,8 @@ void UltraHub::dump_config() {
                   this->reply_.adaptive() ? " (slower on broken answers)" : " (pinned)",
                   this->poller_.max_window_us(), this->rw_dir_pin_ != nullptr ? ", direction pin" : "",
                   this->rw_rx_enable_pin_ != nullptr ? ", receiver enable pin (its UART may be shared)" : "");
+    if (this->comm_on_)
+      ESP_LOGCONFIG(TAG, "  Commissioning: %s", this->comm_.status().c_str());
   }
 #endif
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE

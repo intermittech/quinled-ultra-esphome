@@ -239,6 +239,18 @@ static Pace port_pace(uint8_t which, uint32_t rate_ms) {
 
 void UltraTelemetryPort::setup() {
   this->hub_->add_on_window_callback([this]() { this->update_(); });
+  if (this->hub_->has_commissioning())
+    this->hub_->add_on_commission_callback([this]() { this->publish_commission_(); });
+}
+
+void UltraTelemetryPort::publish_commission_() {
+  const Commissioning &c = this->hub_->commissioning();
+  if (this->comm_status_ != nullptr && (!this->comm_status_->has_state() || this->comm_status_->state != c.status()))
+    this->comm_status_->publish_state(c.status());
+  if (this->comm_report_ != nullptr && (!this->comm_report_->has_state() || this->comm_report_->state != c.report()))
+    this->comm_report_->publish_state(c.report());
+  if (this->commissioned_ != nullptr)
+    this->commissioned_->publish_state(c.commissioned(this->hub_->telemetry()));
 }
 
 void UltraTelemetryPort::value_(uint8_t which, float v, bool force) {

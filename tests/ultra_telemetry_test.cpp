@@ -11,6 +11,7 @@
 #include "../components/dig2analog_ultra/ultra_ledger.h"
 #include "../components/dig2analog_ultra/ultra_pacing.h"
 #include "../components/dig2analog_ultra/ultra_telemetry.h"
+#include "../components/dig2analog_ultra/ultra_commission.h"
 
 #include <cmath>
 #include <cstring>
@@ -2179,6 +2180,226 @@ static void test_power_off_cap() {
   CHECK(first_day && !back, "a burst, then 50 days checked every minute: held the first day, never after the wrap");
 }
 
+// --------------------------------------------------------------------------------- the commissioning (round 12)
+/// A line for the commissioning: the chain's receivers on a cable (segment k: r[k] ohm), each drawing 0.02 A plus
+/// full[k] A x the test level's duty (brightness^2.8) at 55 V; the hub's poller and port monitor; the port's state;
+/// a calibration that runs 5 s when asked for
+struct CommWorld {
+  Chain c;
+  TelemetryPoller p;
+  PortMonitor m;
+  Commissioning cm;
+  CommissionPort port{true, true, false, true, false, true};
+  std::vector<float> r, full;
+  bool calibrating{false}, updating{false};
+  uint32_t cal_end{0}, unix_s{1792108800};   // 2026-10-16 00:00 UTC
+  int stores{0}, cal_asks{0};
+  float max_load{0.0f};
+  std::vector<float> levels;   // each ACT_LEVEL's level
+  explicit CommWorld(size_t n, float seg_ohm = 0.1f, float full_a = 0.4f) : c(n), r(n, seg_ohm), full(n, full_a) {
+    this->c.junk = false;
+    this->p.init(static_cast<uint16_t>(n), ULTRA_RW_RATE_1M, TelemetryIntervals{});
+    this->p.locked(this->c.now_ms);   // (the preamble: the first poll 1 s on)
+    PortMonitor::Config mc;
+    mc.supply_v = 55.0f;
+    this->m.configure(mc);
+    this->cm.configure(1000, 0.9f);
+    for (auto &x : this->c.rx) {
+      x.he_flags = ULTRA_HE_F_TESTED;   // (healthy channels)
+      x.ch2_class = ULTRA_HE_NORMAL;
+    }
+  }
+  void cable() {
+    const size_t n = this->c.rx.size();
+    const float lv = this->cm.level(), duty = lv > 0.0f ? std::pow(lv, 2.8f) : 0.0f;
+    std::vector<float> i(n);
+    float through = 0.0f;
+    for (size_t k = 0; k < n; k++)
+      through += i[k] = 0.02f + this->full[k] * duty;
+    float v = 55.0f;
+    for (size_t k = 0; k < n; k++) {
+      v -= this->r[k] * through;
+      through -= i[k];
+      this->c.rx[k].vbus = static_cast<uint16_t>(v * 100.0f + 0.5f);
+      this->c.rx[k].current = static_cast<uint16_t>(i[k] * 1000.0f + 0.5f);
+    }
+  }
+  /// the hub's loop for up to ms: windows when due, the commissioning every 5 ms; true once a run is over (ACT_DONE)
+  bool run(uint32_t ms) {
+    const uint32_t end = this->c.now_ms + ms;
+    while (static_cast<int32_t>(this->c.now_ms - end) < 0) {
+      const uint32_t before = this->c.now_ms / 1000;
+      this->cable();
+      if (this->port.ready && this->p.due(this->c.now_ms)) {
+        this->c.window(this->p);
+        this->m.update(this->c.now_ms, this->p);
+        if (!std::isnan(this->m.load_pct()) && this->m.load_pct() > this->max_load)
+          this->max_load = this->m.load_pct();
+      } else {
+        this->c.now_ms += 5;
+      }
+      for (uint32_t s = before; s < this->c.now_ms / 1000; s++) {
+        for (auto &x : this->c.rx)
+          x.uptime++;
+      }
+      if (this->calibrating && static_cast<int32_t>(this->c.now_ms - this->cal_end) >= 0)
+        this->calibrating = false;
+      const uint8_t act =
+          this->cm.poll(this->c.now_ms, this->unix_s, this->port, this->p, this->m, this->calibrating, this->updating);
+      if (act & Commissioning::ACT_CALIBRATE) {
+        this->cal_asks++;
+        this->calibrating = true;
+        this->cal_end = this->c.now_ms + 5000;
+      }
+      if (act & Commissioning::ACT_LEVEL)
+        this->levels.push_back(this->cm.level());
+      if (act & Commissioning::ACT_STORE)
+        this->stores++;
+      if (act & Commissioning::ACT_DONE)
+        return true;
+    }
+    return false;
+  }
+  /// the line on its cable for ms before a run (the receivers known; the peak load counted from then on)
+  void warm(uint32_t ms) {
+    this->run(ms);
+    this->max_load = 0.0f;
+  }
+  bool commission(bool finalize, uint32_t ms = 120000) {
+    if (!this->cm.request(finalize ? Commissioning::FINALIZE : Commissioning::COMMISSION))
+      return false;
+    this->cm.start(this->c.now_ms);
+    return this->run(ms);
+  }
+};
+
+/// Commission and Finalize on a simulated line (wiki: Commissioning): the steps, their verdicts and texts, the load
+/// test (its ramp, the segments' resistance, the extrapolation), the lights back after it (also when it fails), the
+/// record and "commissioned" (and a receiver replaced since). Controls: what must fail does.
+static void test_commissioning() {
+  std::printf("the commissioning: commission, finalize, the load test, the record\n");
+  CommWorld w(4);
+  w.warm(5000);
+  const bool done = w.commission(false);
+  const std::string &rep = w.cm.report();
+  CHECK(done && w.cm.status() == "Commission passed" && !w.cm.running() && !w.cm.hold_power() && w.cm.level() == 0.0f &&
+            !w.levels.empty() && w.levels.back() == 0.0f && w.stores == 0 && w.cal_asks == 0,
+        "commission on a good line: passed ('%s'), the lights back (%zu levels), nothing stored", w.cm.status().c_str(),
+        w.levels.size());
+  CHECK(rep.find("4/4 answering: R1 ") == 0 && rep.find("; firmware 0.6.8") != std::string::npos &&
+            rep.find("Cable at ") != std::string::npos && rep.find("R4 gets") != std::string::npos &&
+            rep.size() <= Commissioning::REPORT_MAX,
+        "the report: '%s'", rep.c_str());
+  // each segment 100 mOhm: within 15 % where the current changed by 0.5 A or more (segments 1-3); the last one
+  // (~0.25 A) within the error of the 10 mV voltage steps (4 x 5 mV over its change of current: about 80 mOhm)
+  int good = 0;
+  for (int k = 1; k <= 4; k++) {
+    const size_t at = rep.find(" R" + std::to_string(k) + " ", rep.find("Cable at"));
+    if (at != std::string::npos) {
+      const int mohm = std::atoi(rep.c_str() + at + 3 + (k >= 10));
+      good += k < 4 ? mohm >= 85 && mohm <= 115 : mohm >= 20 && mohm <= 180;
+    }
+  }
+  CHECK(good == 4 && w.max_load >= Commissioning::TARGET_LOAD && w.max_load < 80.0f,
+        "4 segments of 100 mOhm measured (%d within 15 %%); the ramp stopped at %.0f %% load (target 40, below 80)",
+        good, w.max_load);
+  // a thin cable: the far receiver would get too little at full load (fails), the lights back all the same
+  CommWorld thin(4, 2.0f, 0.4f);
+  thin.warm(5000);
+  thin.commission(false);
+  CHECK(thin.cm.status().find("Commission failed: R4: ") == 0 &&
+            thin.cm.status().find("cable too long or thin") != std::string::npos && thin.cm.level() == 0.0f &&
+            thin.levels.back() == 0.0f,
+        "a thin cable: '%s'", thin.cm.status().c_str());
+  // receiver 3 silent: where to look
+  CommWorld s(4);
+  s.warm(5000);
+  s.c.rx[2].has_channel = false;
+  s.commission(false);
+  CHECK(s.cm.status() ==
+            "Commission failed: R3 doesn't answer (R1-R2 do): check the cable or power between R2 and R3",
+        "R3 silent: '%s'", s.cm.status().c_str());
+  // the port Off; no board; a trip during the load test (the lights back first)
+  CommWorld o(2);
+  o.port.off = true;
+  o.commission(false, 1000);
+  CommWorld nb(2);
+  nb.port.board = false;
+  nb.port.ready = false;
+  nb.commission(false, 10000);
+  CommWorld t(3, 0.1f, 0.4f);
+  t.warm(5000);
+  t.cm.request(Commissioning::COMMISSION);
+  t.cm.start(t.c.now_ms);
+  while (t.cm.phase() != Commissioning::LOAD && t.run(5))
+    ;
+  t.run(20000 / 4);
+  t.c.rx[1].event(ULTRA_PW_EV_OVERLOAD);
+  t.c.rx[1].state = ULTRA_ST_TRIPPED;
+  t.run(60000);
+  CHECK(o.cm.status() == "Commission failed: The port's power mode is Off" &&
+            nb.cm.status() == "Commission failed: No board on the port" &&
+            t.cm.status() == "Commission failed: R2 tripped or dipped during the load test" && t.cm.level() == 0.0f &&
+            t.levels.back() == 0.0f,
+        "Off: '%s'; no board: '%s'; a trip: '%s'", o.cm.status().c_str(), nb.cm.status().c_str(),
+        t.cm.status().c_str());
+  // Finalize: the calibration, the full read, the record; commissioned until a receiver is replaced
+  CommWorld f(4);
+  f.warm(5000);
+  const bool fin = f.commission(true, 240000);
+  const CommissionRecord &rec = f.cm.record();
+  CHECK(fin && f.cal_asks == 1 && f.stores == 1 && rec.magic == CommissionRecord::MAGIC && rec.passed &&
+            rec.receivers == 4 && rec.date == f.unix_s && rec.uid[1] == f.p.uid16(1) && rec.fw_min == 0x000608 &&
+            rec.fw_max == 0x000608 && f.cm.status() == "Commissioned 2026-10-16" && f.cm.commissioned(f.p),
+        "finalize: '%s', stored %d, %u receivers, commissioned %d", f.cm.status().c_str(), f.stores,
+        static_cast<unsigned>(rec.receivers), f.cm.commissioned(f.p));
+  f.c.rx[1].uid[0] ^= 0x55;   // a receiver replaced
+  f.c.rx[1].restart();
+  bool texts = false;
+  for (int k = 0; k < 4000 && f.cm.commissioned(f.p); k++) {
+    f.c.run(f.p, 5);
+    texts |= (f.cm.poll(f.c.now_ms, f.unix_s, f.port, f.p, f.m, false, false) & Commissioning::ACT_TEXT) != 0;
+  }
+  f.cm.poll(f.c.now_ms, f.unix_s, f.port, f.p, f.m, false, false);
+  CHECK(texts && !f.cm.commissioned(f.p) && f.cm.status() == "Commissioned 2026-10-16, changed since",
+        "R2 replaced: not commissioned, '%s'", f.cm.status().c_str());
+  // a finalize that fails (a trip during the run): stored as failed; a record from flash at boot
+  CommWorld g(2);
+  g.warm(5000);
+  g.cm.request(Commissioning::FINALIZE);
+  g.cm.start(g.c.now_ms);
+  while (g.cm.phase() != Commissioning::CALIBRATE && g.run(5))
+    ;
+  g.c.rx[0].event(ULTRA_PW_EV_SUPPLY_DIP);
+  g.run(240000);
+  CommWorld b(2);
+  b.cm.set_record(g.cm.record());
+  b.cm.poll(0, 0, b.port, b.p, b.m, false, false);
+  CHECK(g.stores == 1 && !g.cm.record().passed && g.cm.status() == "Finalize failed 2026-10-16" &&
+            g.cm.report().find("R1: Supply dips") == 0 && b.cm.status() == "Finalize failed 2026-10-16" &&
+            !b.cm.commissioned(b.p),
+        "finalize with a dip: '%s' ('%s'); at boot: '%s'", g.cm.status().c_str(), g.cm.report().c_str(),
+        b.cm.status().c_str());
+  // one run at a time per line; a big load: the ramp stops at its first step over 40 %, below the warning
+  CommWorld q(2);
+  CommWorld big(3, 0.05f, 2.0f);
+  big.warm(5000);
+  big.commission(false);
+  CHECK(q.cm.request(Commissioning::COMMISSION) && !q.cm.request(Commissioning::FINALIZE) &&
+            big.cm.status() == "Commission passed" && big.max_load < 80.0f && big.levels.size() <= 3,
+        "a second request refused; 6 A at full: the ramp stopped at %.0f %% after %zu level(s)", big.max_load,
+        big.levels.size());
+  // the report within 250 bytes for 16 receivers on several firmware versions; the dates
+  CHECK(commission_date(0) == "date unknown" && commission_date(951782400) == "2000-02-29" &&
+            commission_date(4102444799u) == "2099-12-31" && commission_fw(0x00060A) == "0.6.10",
+        "dates and versions");
+  CommWorld many(16);
+  many.warm(8000);
+  many.commission(false, 300000);
+  CHECK(many.cm.report().size() <= Commissioning::REPORT_MAX && many.cm.report().find("16/16 answering") == 0,
+        "16 receivers: %zu bytes ('%s')", many.cm.report().size(), many.cm.report().c_str());
+}
+
 /// The reply rate (round 12): one rate slower at 4 broken of the last 32 counted windows (3: not; old ones slide out;
 /// windows without any answer don't count, missing answers alone neither), not below 250 k; one rate faster after an
 /// hour of windows without a broken one (a standby gap counts 60 s), never above the configured rate; a failed try
@@ -2271,6 +2492,7 @@ int main() {
   std::printf("ultra telemetry test (the return channel's hub side)\n");
   test_power_off_cap();
   test_reply_rate();
+  test_commissioning();
   test_window_hash();
   test_due_memo();
   test_basic();

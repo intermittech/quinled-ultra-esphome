@@ -79,6 +79,8 @@ class DiffPowerPort final : public Component {
   uint8_t get_mode() const { return this->core_.mode(); }
   /// the power mode Off: the port stays without 55 V (a hub's calibration / update refuse to run)
   bool is_off() const { return this->core_.off(); }
+  /// a detect input (else a board is assumed)
+  bool has_detect() const { return this->detect_pin_ != nullptr; }
 #ifdef USE_DIFFPOWER_DARK
   /// "During dark": the time now from clock; from before_s before sunset to after_s after sunrise
   void set_dark(time::RealTimeClock *clock, uint32_t before_s, uint32_t after_s) {

@@ -741,6 +741,33 @@ class TelemetryPoller {
     this->lock_ms_ = now_ms;
     this->lock_wait_ = true;
   }
+  /// The commissioning (ultra_commission.h): forget which pages were read; with all: every page of every receiver
+  /// due now (read again in turns), else only marked
+  void mark_fresh(uint32_t now_ms, bool all) {
+    for (auto &r : this->rx_) {
+      r.fresh = 0;
+      if (!all)
+        continue;
+      for (uint8_t tp = TP_POWER; tp < TP_COUNT; tp++) {
+        if (tp != TP_SYNC && this->enabled_(r, tp))
+          r.next[tp] = now_ms;
+      }
+    }
+    this->idle_ = false;
+  }
+  /// receiver i's page tp read since mark_fresh()
+  bool fresh(uint16_t i, uint8_t tp) const { return i < this->rx_.size() && (this->rx_[i].fresh & (1u << tp)); }
+  /// every page receiver i has (LIFE_SYNC aside) read since mark_fresh()
+  bool all_fresh(uint16_t i) const {
+    if (i >= this->rx_.size())
+      return false;
+    const Receiver &r = this->rx_[i];
+    for (uint8_t tp = TP_POWER; tp < TP_COUNT; tp++) {
+      if (tp != TP_SYNC && this->enabled_(r, tp) && !(r.fresh & (1u << tp)))
+        return false;
+    }
+    return r.d.have_identity;
+  }
   /// The boards lost their supply (or the line stopped): every receiver unavailable; they restart.
   /// Every receiver's sensors again (take_updates: TU_AVAILABILITY): their status changed with the line's power
   void touch_all() {
@@ -989,6 +1016,7 @@ class TelemetryPoller {
     uint32_t updated{0};
     uint16_t uid16{0};
     uint16_t unsupported{0};   // bit 1 << TP_*: answered UNSUPPORTED (until the board restarts or changes)
+    uint16_t fresh{0};         // bit 1 << TP_*: read since mark_fresh() (the commissioning's waits)
     bool have_uid{false};
     bool answering{false};
     bool reported{false};      // its "unavailable" went out (take_updates TU_AVAILABILITY)
@@ -1161,6 +1189,7 @@ class TelemetryPoller {
     const uint8_t old_state = d.power_state;
     decode_receiver_page(d, TP_PAGE_ID[tp], data, TP_PART[tp]);
     r.updated |= 1u << tp;
+    r.fresh |= static_cast<uint16_t>(1u << tp);
     switch (tp) {
       case TP_IDENTITY:
         r.need_identity = false;

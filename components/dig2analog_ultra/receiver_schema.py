@@ -7,6 +7,7 @@ import logging
 from esphome import pins
 import esphome.codegen as cg
 from esphome.components import binary_sensor, button, sensor, text_sensor, uart
+from esphome.components import time as time_
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_BAUD_RATE,
@@ -17,6 +18,7 @@ from esphome.const import (
     CONF_NAME,
     CONF_RX_BUFFER_SIZE,
     CONF_RX_PIN,
+    CONF_TIME_ID,
     CONF_UART_ID,
     DEVICE_CLASS_CURRENT,
     DEVICE_CLASS_DATA_RATE,
@@ -59,6 +61,8 @@ CONF_POLL_INTERVALS = "poll_intervals"
 CONF_DIAGNOSTICS = "diagnostics"
 CONF_LIGHT_ENTITIES = "light_entities"
 CONF_ADAPTIVE_RATE = "adaptive_rate"
+CONF_COMMISSIONING = "commissioning"
+CONF_COMMISSION_MIN_VOLTAGE = "commission_min_voltage"
 CONF_PORT_ID = "port_id"
 CONF_PORT_LIMIT = "port_limit"
 CONF_SUPPLY_VOLTAGE = "supply_voltage"
@@ -222,8 +226,33 @@ PORT_ENTITIES = {
     "port_answer_contention": ("health", 3, "answer contention", _count("mdi:call-merge")),
     "port_receiver_restarts": ("health", 4, "receiver restarts", _count("mdi:restart")),
     "port_late_releases": ("health", 5, "late releases", _count("mdi:timer-alert-outline")),
-    "port_reply_rate": ("health", 6, "reply rate", _value("kbit/s", 0, DEVICE_CLASS_DATA_RATE, icon="mdi:speedometer")),
+    "port_reply_rate": (
+        "health", 6, "reply rate", _value("kbit/s", 0, DEVICE_CLASS_DATA_RATE, icon="mdi:speedometer")
+    ),
+    # the commissioning (commissioning: true; wiki: Commissioning): its buttons (config), where it is, the last run's
+    # report, and whether the line is commissioned (the stored Finalize passed, the same receivers since)
+    "port_commission": (
+        "button", 2, "commission",
+        button.button_schema(
+            UltraLineButton, icon="mdi:clipboard-check-outline", entity_category=ENTITY_CATEGORY_CONFIG
+        ),
+    ),
+    "port_finalize": (
+        "button", 3, "finalize",
+        button.button_schema(UltraLineButton, icon="mdi:check-decagram", entity_category=ENTITY_CATEGORY_CONFIG),
+    ),
+    "port_commissioning": ("comm_status", 0, "commissioning", _text("mdi:clipboard-text-outline")),
+    "port_commissioning_report": ("comm_report", 0, "commissioning report", _text("mdi:text-box-search-outline")),
+    "port_commissioned": (
+        "comm_binary", 0, "commissioned",
+        binary_sensor.binary_sensor_schema(
+            icon="mdi:check-decagram-outline", entity_category=ENTITY_CATEGORY_DIAGNOSTIC
+        ),
+    ),
 }
+# (the commissioning's entities: only with commissioning: true, the default)
+PORT_COMMISSION = {"port_commission", "port_finalize", "port_commissioning", "port_commissioning_report",
+                   "port_commissioned"}
 # (the health entities: with diagnostics full, or when the YAML lists one)
 PORT_HEALTH = {key for key, spec in PORT_ENTITIES.items() if spec[0] == "health"}
 PORT_DISABLED = {"port_calibrate_current", "port_show_version"} | PORT_HEALTH
@@ -317,6 +346,12 @@ TELEMETRY_SCHEMA = cv.Schema(
         # the receivers answer one rate slower (1 M -> 500 k -> 250 k) once broken answers keep coming (4 of the last
         # 32 windows), faster again after an hour without (never above the UART's baud_rate); false pins that rate
         cv.Optional(CONF_ADAPTIVE_RATE, default=True): cv.boolean,
+        # the commissioning (wiki: Commissioning): Commission / Finalize buttons, its texts; its load test fails when a
+        # receiver would get less than commission_min_voltage of the sender's voltage at the port's full load. The
+        # stored date: time_id, else the only time component (none: "date unknown")
+        cv.Optional(CONF_COMMISSIONING, default=True): cv.boolean,
+        cv.Optional(CONF_COMMISSION_MIN_VOLTAGE, default="90%"): cv.All(cv.percentage, cv.Range(min=0.5, max=0.99)),
+        cv.Optional(CONF_TIME_ID): cv.use_id(time_.RealTimeClock),
         cv.Optional(CONF_POLL_INTERVALS, default={}): cv.Schema(
             dict(
                 [
@@ -395,8 +430,12 @@ def telemetry_defaults(config):
         out.append(item)
     tel[CONF_RECEIVERS] = out
     device = tel.get(CONF_DEVICE_ID)
+    commissioning = tel.get(CONF_COMMISSIONING, True) is not False
     for key, (_kind, _index, name, _schema) in PORT_ENTITIES.items():
         if key in PORT_HEALTH and key not in tel and lvl < 2:
+            continue
+        if key in PORT_COMMISSION and not commissioning:
+            tel.pop(key, None)
             continue
         label = f"{name[0].upper()}{name[1:]}" if device is not None else f"{port} {name}"
         tel[key] = _entity(tel.get(key), label, device, key in PORT_DISABLED)
@@ -413,6 +452,7 @@ RAM_PER_LIGHT = 900
 RAM_PER_ESTIMATE = 200
 RAM_PER_LINE = 1000
 RAM_PER_ENTITY = 60   # (a line's health sensors: round 12, from the full - basic difference per receiver entity)
+RAM_PER_COMMISSION = 900   # a line's commissioning: 5 entities, its record (148 B), its texts, its state
 RAM_LEDGER_ENTRY, RAM_LEDGER_POSITION = 80, 40
 RAM_WARN_CLASSIC = 60 * 1024   # a classic ESP32: ~100-150 KB free with Wi-Fi and the API
 
@@ -434,6 +474,8 @@ def ram_estimate(full):
         level = str(tel.get(CONF_DIAGNOSTICS, "full")).lower()
         parts["receivers"] += RAM_PER_RECEIVER.get(level, RAM_PER_RECEIVER["full"]) * len(recs)
         parts["lines"] += RAM_PER_ENTITY * len(PORT_HEALTH & set(tel))
+        if tel.get(CONF_COMMISSIONING, True):
+            parts["lines"] += RAM_PER_COMMISSION
         counters += len(recs) + 1
         if tel.get(CONF_LIGHT_ENTITIES, True):
             est = sum(n for b, n in counts.items() if b < len(recs) and n > 1)
@@ -548,7 +590,7 @@ def lights_per_board(full, hub_id):
 async def _new(kind, conf):
     if kind in ("sensor", "health"):
         return await sensor.new_sensor(conf)
-    if kind == "text":
+    if kind in ("text", "comm_status", "comm_report"):
         return await text_sensor.new_text_sensor(conf)
     if kind == "button":
         return await button.new_button(conf)
@@ -586,6 +628,14 @@ async def telemetry_to_code(hub, config):
     cg.add(hub.set_telemetry_name(tel[CONF_NAME]))
     if not tel[CONF_ADAPTIVE_RATE]:
         cg.add(hub.set_telemetry_adaptive_rate(False))
+    if tel[CONF_COMMISSIONING]:
+        cg.add(hub.set_commissioning(tel[CONF_COMMISSION_MIN_VOLTAGE]))
+        clock = tel.get(CONF_TIME_ID)
+        times = CORE.config.get("time", []) or []
+        if clock is None and len(times) == 1:
+            clock = times[0][CONF_ID]
+        if clock is not None:
+            cg.add(hub.set_commission_clock(await cg.get_variable(clock)))
     cg.add(hub.set_telemetry_key(ledger_key(config[CONF_ID].id)))
     if CONF_DIRECTION_PIN in tel:
         cg.add(hub.set_telemetry_direction_pin(await cg.gpio_pin_expression(tel[CONF_DIRECTION_PIN])))
@@ -640,6 +690,12 @@ async def telemetry_to_code(hub, config):
                 cg.add(port.set_unpaced(index))
         elif kind == "health":
             cg.add(port.set_health(index, ent))
+        elif kind == "comm_status":
+            cg.add(port.set_commission_status(ent))
+        elif kind == "comm_report":
+            cg.add(port.set_commission_report(ent))
+        elif kind == "comm_binary":
+            cg.add(port.set_commissioned(ent))
         elif kind == "text":
             cg.add(port.set_text(index, ent))
         elif kind == "button":

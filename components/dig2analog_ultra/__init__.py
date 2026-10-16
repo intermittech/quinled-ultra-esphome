@@ -61,6 +61,7 @@ UltraHub = dig2analog_ultra_ns.class_("UltraHub", cg.Component)
 SwitchBoardsToUltraAction = dig2analog_ultra_ns.class_("SwitchBoardsToUltraAction", automation.Action)
 CalibrateCurrentAction = dig2analog_ultra_ns.class_("CalibrateCurrentAction", automation.Action)
 CancelCalibrationAction = dig2analog_ultra_ns.class_("CancelCalibrationAction", automation.Action)
+CommissionAction = dig2analog_ultra_ns.class_("CommissionAction", automation.Action)
 ShowVersionAction = dig2analog_ultra_ns.class_("ShowVersionAction", automation.Action)
 # (dig2analog_ultra_parlio's bus, by name: that component imports this one)
 UltraParlioBus = dig2analog_ultra_ns.class_("UltraParlioBus", cg.Component)
@@ -607,6 +608,7 @@ def _final_validate(configs):
     _validate_lanes(full)
     validate_telemetry_lines(full)
     _validate_ports(full)
+    _validate_commission_actions(full)
     for conf in configs if isinstance(configs, list) else [configs]:
         validate_telemetry(full, conf, conf[CONF_NUM_BOARDS])
         # signal_loss off / fade_off: a board switches off after signal_loss_timeout (sent in 100 ms) without a good
@@ -666,6 +668,56 @@ def _final_validate(configs):
 
 
 FINAL_VALIDATE_SCHEMA = _final_validate
+
+
+# ------------------------------------------------------------------------------------------- the commissioning
+# Commission / Finalize a line with telemetry (wiki: Commissioning), or every one (no id); one line at a time
+def _commission_lines(full):
+    return {str(h[CONF_ID].id) for h in full.get("dig2analog_ultra", []) or []
+            if h.get(CONF_TELEMETRY) and h[CONF_TELEMETRY].get("commissioning", True)}
+
+
+def _validate_commission_actions(full):
+    """Each commission / finalize action's line: one with telemetry and commissioning (else the action does nothing)."""
+    lines = _commission_lines(full)
+    for name, hub in CORE.data.get("dig2analog_ultra_commission_actions", []):
+        if hub is None and not lines:
+            raise cv.Invalid(f"dig2analog_ultra.{name}: no line has telemetry with commissioning")
+        if hub is not None and hub not in lines:
+            raise cv.Invalid(f"dig2analog_ultra.{name}: line '{hub}' has no telemetry with commissioning")
+
+
+def _commission_action(name):
+    def validate(config):
+        hub = config.get(CONF_ID)
+        CORE.data.setdefault("dig2analog_ultra_commission_actions", []).append(
+            (name, str(hub.id) if hub is not None else None)
+        )
+        return config
+
+    return cv.All(automation.maybe_simple_id({cv.Optional(CONF_ID): cv.use_id(UltraHub)}), validate)
+
+
+async def _commission_to_code(config, action_id, template_arg, finalize):
+    var = cg.new_Pvariable(action_id, template_arg)
+    if CONF_ID in config:
+        cg.add(var.set_hub(await cg.get_variable(config[CONF_ID])))
+    cg.add(var.set_finalize(finalize))
+    return var
+
+
+@automation.register_action(
+    "dig2analog_ultra.commission", CommissionAction, _commission_action("commission"), synchronous=True
+)
+async def commission_to_code(config, action_id, template_arg, args):
+    return await _commission_to_code(config, action_id, template_arg, False)
+
+
+@automation.register_action(
+    "dig2analog_ultra.finalize", CommissionAction, _commission_action("finalize"), synchronous=True
+)
+async def finalize_to_code(config, action_id, template_arg, args):
+    return await _commission_to_code(config, action_id, template_arg, True)
 
 
 def _keep_on_time_ms(full_config, psu_id) -> int:

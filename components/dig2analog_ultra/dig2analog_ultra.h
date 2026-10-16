@@ -30,8 +30,14 @@
 
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
 #include "esphome/components/uart/uart_component.h"
+#include "esphome/core/preferences.h"
 #include "ultra_ledger.h"
 #include "ultra_telemetry.h"
+#include "ultra_commission.h"
+#include "ultra_stream.h"
+#ifdef USE_TIME
+#include "esphome/components/time/real_time_clock.h"
+#endif
 #endif
 
 #ifdef USE_DIG2ANALOG_ULTRA_PARLIO
@@ -340,6 +346,25 @@ class UltraHub final : public Component {
   const TelemetryPoller &telemetry() const { return this->poller_; }
   /// the port's name (its telemetry `name:`): the logs say which receiver
   void set_telemetry_name(const char *name) { this->tel_name_ = name; }
+
+  // The commissioning (ultra_commission.h; wiki: Commissioning)
+  /// Commission (false) or Finalize (true) this line: queued, one line of the controller at a time
+  void commission(bool finalize);
+  /// every line with commissioning (the action without an id)
+  static void commission_all(bool finalize);
+  const Commissioning &commissioning() const { return this->comm_; }
+  bool has_commissioning() const { return this->comm_on_; }
+  /// on with commissioning: true; min_voltage: the share of the sender's voltage each receiver keeps at full load
+  void set_commissioning(float min_voltage) {
+    this->comm_on_ = true;
+    this->comm_min_v_ = min_voltage;
+  }
+#ifdef USE_TIME
+  /// the time for the stored date (without: "date unknown")
+  void set_commission_clock(time::RealTimeClock *clock) { this->comm_clock_ = clock; }
+#endif
+  /// the texts or the commissioned state changed (the line's entities)
+  void add_on_commission_callback(std::function<void()> &&cb) { this->comm_cb_.add(std::move(cb)); }
   const char *telemetry_name() const { return this->tel_name_; }
   /// The port's power at the sender now (W; 0 in standby, NAN unknown) and its energy (Wh, kept in the ledger, never
   /// down; < 0 until the ledger is loaded)
@@ -422,6 +447,23 @@ class UltraHub final : public Component {
   volatile int64_t rw_released_us_{0};
   TelemetryPoller poller_;
   ReplyRate reply_;                       // the receivers' reply rate: slower on a cable that breaks their answers
+  // the commissioning: its run, the line's lights at its test level (a layer over them), its record on flash
+  struct CommissionLayer final : public UltraLayer {
+    UltraHub *hub{nullptr};
+    void layer_shown(UltraLight *light) override;
+  };
+  void service_commission_();
+  void commission_level_(float level);
+  Commissioning comm_;
+  CommissionLayer comm_layer_;
+  bool comm_on_{false};
+  float comm_min_v_{0.9f};
+  ESPPreferenceObject comm_pref_;
+  CallbackManager<void()> comm_cb_;
+#ifdef USE_TIME
+  time::RealTimeClock *comm_clock_{nullptr};
+#endif
+  static UltraHub *comm_active_;          // the line whose run goes now (one at a time: the sender's supply)
   PortMonitor port_monitor_;              // the port's load and cable, after each window
   LedgerKeeper keeper_;                   // this line's receivers in the lifetime ledger (ultra_ledger.h)
   const char *tel_name_{"Port"};
@@ -628,6 +670,26 @@ template<typename... Ts> class SwitchBoardsToUltraAction final : public Action<T
 
   void play(const Ts &...x) override { this->parent_->switch_boards_to_ultra(this->boot_protocol_.value(x...)); }
 };
+
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+/// dig2analog_ultra.commission / .finalize: a line, or (no id) every line with commissioning, one after the other
+template<typename... Ts> class CommissionAction final : public Action<Ts...> {
+ public:
+  void set_hub(UltraHub *hub) { this->hub_ = hub; }
+  void set_finalize(bool finalize) { this->finalize_ = finalize; }
+
+  void play(const Ts &...x) override {
+    if (this->hub_ != nullptr)
+      this->hub_->commission(this->finalize_);
+    else
+      UltraHub::commission_all(this->finalize_);
+  }
+
+ protected:
+  UltraHub *hub_{nullptr};
+  bool finalize_{false};
+};
+#endif
 
 }  // namespace esphome::dig2analog_ultra
 

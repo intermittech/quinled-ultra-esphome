@@ -142,6 +142,15 @@ class UltraLight final : public light::LightOutput, public light::LightRemoteVal
   /// board effect runs again, in phase).
   void layer_end(UltraLayer *layer, uint32_t fade_ms);
   bool layer_top(const UltraLayer *layer) const { return !this->layers_.empty() && this->layers_.back() == layer; }
+  /// The commissioning's load test (ultra_commission.h): every channel of this light at level (brightness 0..1), as a
+  /// layer's pixel (the light's own state stays underneath)
+  void send_test_level(float level) {
+    uint16_t m, a[CHANNELS], b[CHANNELS];
+    const ColorValues all{1.0f, level, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+                          static_cast<uint8_t>(CAP_RGB | CAP_WHITE | CAP_COLD_WARM_WHITE)};
+    map_values(this->roles_, all, m, a, b);
+    this->send_pixel(m, a, b, 0, 0, false, 0);
+  }
   /// its own turn-off period on a Diff-Power port (0: the port's)
   void set_standby_after(uint32_t ms) { this->standby_after_ms_ = ms; }
   uint32_t get_standby_after() const { return this->standby_after_ms_; }

@@ -73,6 +73,12 @@ PIECES = {
     ),
     # ... and its own counts of a line's receivers: the port's power-on / cut, their lit time (design review, round 9)
     "hub_ledger_line.inc": ("dig2analog_ultra.cpp", ["void UltraHub::ledger_line_("]),
+    # the commissioning's hub side (round 12): one line at a time, the test level as a layer, its record
+    "hub_commission.inc": (
+        "dig2analog_ultra.cpp",
+        ["void UltraHub::commission(", "void UltraHub::commission_all(", "void UltraHub::service_commission_(",
+         "void UltraHub::commission_level_(", "void UltraHub::CommissionLayer::layer_shown("],
+    ),
     "hub_port.inc": (
         "dig2analog_ultra.cpp",
         ["void UltraHub::attach_port_(", "void UltraHub::send_power_off_notice(", "void UltraHub::pump_notice_(",

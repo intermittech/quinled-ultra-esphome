@@ -17,6 +17,7 @@
 #include "../components/dig2analog_ultra/ultra_ledger.h"
 #include "../components/dig2analog_ultra/ultra_pacing.h"
 #include "../components/dig2analog_ultra/ultra_telemetry.h"
+#include "../components/dig2analog_ultra/ultra_commission.h"
 #include "../components/diffpower/diffpower_core.h"
 
 #include <algorithm>
@@ -545,6 +546,10 @@ struct UltraHub {
   uint32_t last_busy_ms_{0}, last_frame_ms_{0}, refresh_interval_ms_{200};
   bool high_freq_active_{false}, has_sent_{false};
   int channel_{0};
+  // the commissioning (ultra_commission.h: tests/ultra_telemetry_test.cpp runs it)
+  bool comm_on_{false};
+  void service_commission_() {}
+  Commissioning comm_;
 };
 
 #include "hub_loop.inc"
@@ -1325,6 +1330,10 @@ struct UltraHub {
     this->preamble_ = 3;   // the start-up preamble
     hubs_.push_back(this);
   }
+  // the commissioning (ultra_commission.h: tests/ultra_telemetry_test.cpp runs it)
+  bool comm_on_{false};
+  void service_commission_() {}
+  Commissioning comm_;
 };
 std::vector<UltraHub *> UltraHub::hubs_;
 uint32_t UltraHub::rw_wait_seq_ = 0;
@@ -3544,6 +3553,10 @@ struct UltraHub {
   bool preamble_full_{true}, synced_once_{false}, has_sent_{false};
   uint32_t last_frame_ms_{0}, frames_{0}, build_peak_us_{0};
   int channel_{0}, encoder_{0};
+  // the commissioning (ultra_commission.h: tests/ultra_telemetry_test.cpp runs it)
+  bool comm_on_{false};
+  void service_commission_() {}
+  Commissioning comm_;
 };
 #include "hub_port.inc"
 #include "hub_line.inc"
@@ -4338,6 +4351,189 @@ static void test_auto_retry() {
 #undef USE_DIG2ANALOG_ULTRA_TELEMETRY
 }  // namespace update_retry
 
+// The commissioning's hub side (round 12; build/lifecycle/hub_commission.inc): one line of the controller at a time,
+// the port held powered, the test level on every light of the line as a layer (and off it again), the calibration,
+// the record stored. The run itself: tests/ultra_telemetry_test.cpp.
+namespace hub_commission {
+namespace diffpower = ::esphome::diffpower;
+#define USE_DIG2ANALOG_ULTRA_TELEMETRY
+#define USE_DIFFPOWER
+struct UltraLight;
+struct UltraLayer {
+  virtual void layer_shown(UltraLight *light) = 0;
+};
+struct UltraLight {   // what the commissioning uses of it: a layer on top, its test level
+  std::vector<UltraLayer *> layers;
+  std::vector<float> levels;   // each test level sent
+  int ends{0};
+  void layer_begin(UltraLayer *l) { this->layers.push_back(l); }
+  void layer_end(UltraLayer *l, uint32_t) {
+    for (auto it = this->layers.begin(); it != this->layers.end(); ++it) {
+      if (*it == l) {
+        this->layers.erase(it);
+        this->ends++;
+        return;
+      }
+    }
+  }
+  bool layer_top(const UltraLayer *l) const { return !this->layers.empty() && this->layers.back() == l; }
+  void send_test_level(float level) { this->levels.push_back(level); }
+};
+struct PortCoreView {
+  bool board_{true};
+  bool board() const { return this->board_; }
+};
+struct DiffPowerPort {
+  bool detect{true}, off{false};
+  PortCoreView c;
+  diffpower::PortState st{diffpower::PS_ON};
+  bool has_detect() const { return this->detect; }
+  bool is_off() const { return this->off; }
+  const PortCoreView &core() const { return this->c; }
+  diffpower::PortState state() const { return this->st; }
+};
+struct Prefs {
+  int syncs{0};
+  bool sync() {
+    this->syncs++;
+    return true;
+  }
+};
+static Prefs prefs;
+static Prefs *const global_preferences = &prefs;
+struct UltraHub {
+  // the hub's (build/lifecycle/hub_commission.inc)
+  void commission(bool finalize);
+  static void commission_all(bool finalize);
+  void service_commission_();
+  void commission_level_(float level);
+  struct CommissionLayer final : public UltraLayer {
+    UltraHub *hub{nullptr};
+    void layer_shown(UltraLight *light) override;
+  };
+  // stand-ins
+  uint8_t pin_{16};
+  std::vector<UltraLight *> lights_;
+  DiffPowerPort *port_{nullptr};
+  TelemetryPoller poller_;
+  PortMonitor port_monitor_;
+  Commissioning comm_;
+  CommissionLayer comm_layer_;
+  bool comm_on_{true}, powered{true}, cal_running{false};
+  uint32_t cal_until{0};
+  int cal_calls{0}, texts{0};
+  struct {
+    int saves{0};
+    CommissionRecord last;
+    bool save(const CommissionRecord *r) {
+      this->saves++;
+      this->last = *r;
+      return true;
+    }
+  } comm_pref_;
+  struct {
+    UltraHub *hub;
+    void call() { this->hub->texts++; }
+  } comm_cb_{this};
+  static UltraHub *comm_active_;
+  static std::vector<UltraHub *> hubs_;
+  bool boards_powered_() const { return this->powered; }
+  bool calibration_running() const { return this->cal_running; }
+  bool update_running() const { return false; }
+  void calibrate_boards(const std::vector<uint16_t> &, uint8_t) {
+    this->cal_calls++;
+    this->cal_running = true;
+    this->cal_until = now_ms + 3000;
+  }
+  UltraHub() {
+    this->poller_.init(0, ULTRA_RW_RATE_1M, TelemetryIntervals{});   // (no receivers: the run's steps only)
+    this->comm_.configure(1000, 0.9f);
+    this->comm_layer_.hub = this;
+  }
+  void tick() {
+    if (this->cal_running && static_cast<int32_t>(now_ms - this->cal_until) >= 0)
+      this->cal_running = false;
+    this->service_commission_();
+  }
+};
+UltraHub *UltraHub::comm_active_ = nullptr;
+std::vector<UltraHub *> UltraHub::hubs_;
+#include "hub_commission.inc"
+
+static void test_commission_glue() {
+  now_ms = 1000;
+  UltraLight a1, a2, b1;
+  DiffPowerPort pa, pb;
+  UltraHub a, b;
+  a.pin_ = 16;
+  b.pin_ = 17;
+  a.lights_ = {&a1, &a2};
+  b.lights_ = {&b1};
+  a.port_ = &pa;
+  b.port_ = &pb;
+  UltraHub::hubs_ = {&a, &b};
+  UltraHub::commission_all(false);
+  bool both = false, a_first = false, held = false;
+  float a_max = 0.0f;
+  for (int k = 0; k < 20000 && (a.comm_.phase() != Commissioning::IDLE || b.comm_.phase() != Commissioning::IDLE);
+       k++) {
+    now_ms += 5;
+    a.tick();
+    b.tick();
+    both |= a.comm_.running() && b.comm_.running();
+    a_first |= a.comm_.running() && b.comm_.queued();
+    held |= a.comm_.hold_power();
+    if (!a1.levels.empty())
+      a_max = std::max(a_max, a1.levels.back());
+  }
+  CHECK(!both && a_first && held && a.comm_.status() == "Commission passed" && b.comm_.status() == "Commission passed" &&
+            UltraHub::comm_active_ == nullptr,
+        "two lines: one at a time, the port held; both passed ('%s', '%s')", a.comm_.status().c_str(),
+        b.comm_.status().c_str());
+  CHECK(a1.levels.size() == Commissioning::LEVELS && a2.levels.size() == Commissioning::LEVELS && a_max == 1.0f &&
+            b1.levels.size() == Commissioning::LEVELS && a1.layers.empty() && a2.layers.empty() && b1.layers.empty() &&
+            a1.ends == 1 && b1.ends == 1 && a.texts > 0,
+        "the test levels on every light of the line as a layer (%zu levels, up to %.2f), off again after (%d)",
+        a1.levels.size(), a_max, a1.ends);
+  // a strip shown over a light during the test, ended: the test level again on top (layer_shown)
+  UltraLight s;
+  a.lights_ = {&s};
+  a.commission(false);
+  for (int k = 0; k < 600 && a.comm_.level() == 0.0f; k++) {
+    now_ms += 5;
+    a.tick();
+  }
+  const size_t sent = s.levels.size();
+  a.comm_layer_.layer_shown(&s);
+  CHECK(s.levels.size() == sent + 1 && s.levels.back() == a.comm_.level(), "a layer above it ended: the test level again");
+  for (int k = 0; k < 20000 && a.comm_.phase() != Commissioning::IDLE; k++) {
+    now_ms += 5;
+    a.tick();
+  }
+  // finalize: the calibration asked for, the record stored (and synced); the port Off: refused at once
+  const int syncs = prefs.syncs;
+  a.commission(true);
+  for (int k = 0; k < 40000 && a.comm_.phase() != Commissioning::IDLE; k++) {
+    now_ms += 5;
+    a.tick();
+  }
+  pa.off = true;
+  a.commission(false);
+  for (int k = 0; k < 10 && a.comm_.phase() != Commissioning::IDLE; k++) {
+    now_ms += 5;
+    a.tick();
+  }
+  CHECK(a.cal_calls == 1 && a.comm_pref_.saves == 1 && a.comm_pref_.last.passed && prefs.syncs == syncs + 1 &&
+            a.comm_.status() == "Commission failed: The port's power mode is Off",
+        "finalize: calibrated %d, stored %d (passed %d), synced; then Off: '%s'", a.cal_calls, a.comm_pref_.saves,
+        a.comm_pref_.last.passed, a.comm_.status().c_str());
+  UltraHub::hubs_.clear();
+  now_ms = 0;
+}
+#undef USE_DIG2ANALOG_ULTRA_TELEMETRY
+#undef USE_DIFFPOWER
+}  // namespace hub_commission
+
 int main() {
   lights::test_light();
   updates::test_install_queue();
@@ -4373,6 +4569,7 @@ int main() {
   port_power::test_detect_rate();
   port_power::test_port_prepare();
   hub_port::test_hub_port();
+  hub_commission::test_commission_glue();
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "ALL ULTRA LIFECYCLE TESTS PASSED", failures);
   return failures ? 1 : 0;
 }

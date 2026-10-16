@@ -3,8 +3,7 @@
 # when ESPHome takes over, the light cross-fades (default_transition_length) to the state ESPHome restores.
 #   - CH1, CH2: single-colour niches, a candle each (the second one calmer and dimmer).
 #   - CH4 + CH5: a CCT strip, a candle at 2700 K.
-# The board writes a power-on effect to its flash only when it changes. Board firmware 0.6.0 or newer; older firmware
-# shows the power_on_effect's values without the effect.
+# The board writes a power-on effect to its flash only when it changes.
 # ESP32 classic, ESP-IDF.
 
 substitutions:

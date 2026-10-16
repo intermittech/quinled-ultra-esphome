@@ -1476,6 +1476,7 @@ struct MonthRx {
   uint32_t writes{0};
   uint64_t t_on_ms{0}, t_lit_ms{0}, t_uj{0};
   uint32_t t_ups{0};
+  bool round11{false};   // a receiver under round 11's rules: a sync never leaves its energy to the hub (before S6)
 
   void init(const life_rec_t &rec) {
     for (int k = 0; k < 12; k++)
@@ -1585,6 +1586,10 @@ struct MonthRx {
   uint8_t sync(const uint8_t *args, uint32_t now, uint8_t *d) {
     this->run_to(now);
     const uint32_t res = energy_sync(&this->e, args, this->uid16);
+#ifdef ENERGY_SYNC_HUB
+    if (this->round11)
+      this->e.synced = static_cast<uint8_t>(this->e.synced & ~ENERGY_SYNC_HUB);
+#endif
     std::memset(d, 0, 24);
     this->lifetime16(d);
     ultra_put32(d + ULTRA_LS_A_TOTAL_WH, energy_total_wh(&this->e));
@@ -1622,10 +1627,12 @@ struct MonthEnd {
 /// record). The hub: the component's keeper (power_on / lit_tick / prepare / cut, the poller fed the board's pages,
 /// the ESP32 restarted twice in between), or (echo) a naive hub that keeps the highest of its LIFETIME / ENERGY reads
 /// and syncs those back.
-static MonthEnd month_run(const life_rec_t &rec, int wakes, bool long_tenth, bool echo, uint32_t seed) {
+static MonthEnd month_run(const life_rec_t &rec, int wakes, bool long_tenth, bool echo, uint32_t seed,
+                          bool round11 = false) {
   std::mt19937 rng(seed);
   MonthRx b;
   b.init(rec);
+  b.round11 = round11;
   LifetimeLedger led;
   led.init(8, 4);
   TelemetryIntervals iv;   // (the defaults: STATUS 3 s, ENERGY 60 s, LIFETIME 5 min)
@@ -1812,9 +1819,12 @@ static void month_print(const char *what, const MonthEnd &r) {
 /// below a unit at every cut, so the ledger must be the hub's own accounting. 30 days x 100 short wakes of a standby
 /// port (nothing stored on the board): after its next power-up every counter within one unit of the truth, on the
 /// board (energy_sync's merge) and in the hub's ledger; the same with every tenth wake long enough to be stored (the
-/// board's own remainders ride on the hub's units: never counted twice). The negative control: a hub that echoes the
-/// highest of its reads gives back almost nothing (a record without remainders), or misses the truth by far (one with
-/// them: ahead, or behind once the receiver writes the merges it takes).
+/// board's own remainders ride on the hub's units: never counted twice). Round 12 (S6): a receiver synced this boot
+/// leaves its energy to the hub's ledger, so it stores those wakes no more (a few writes a month); the stored-wake
+/// runs and the echo control with remainders use a receiver under round 11's rules (ENERGY_SYNC_HUB cleared after
+/// each sync), and the same month on today's receiver keeps the same accounting with at most 15 writes. The negative
+/// control: a hub that echoes the highest of its reads gives back almost nothing (a record without remainders), or
+/// misses the truth by far (one with them: ahead, or behind once the receiver writes the merges it takes).
 static void sc_month() {
   std::printf("month: 30 days x 100 short wakes of a standby port, the hub's own ledger against the receiver's merge\n");
   life_rec_t used{};   // a used board: 500 h powered (and 300 s), 200 h lit (and 350 s), 2 kWh
@@ -1832,13 +1842,21 @@ static void sc_month() {
         "power-ups %lld, %.0f mWh; ledger: %lld, %lld, %lld, %.0f mWh; %u writes)",
         (long long) a.d_pow, (long long) a.d_lit, (long long) a.d_ups, a.e_board, (long long) a.h_pow,
         (long long) a.h_lit, (long long) a.h_ups, a.e_hub, a.writes);
-  const MonthEnd s = month_run(used, 3000, true, false, 12);
-  month_print("hub ledger, every 10th stored", s);
+  const MonthEnd s = month_run(used, 3000, true, false, 12, true);
+  month_print("hub ledger, every 10th stored (a round-11 receiver)", s);
   CHECK(s.board_ok() && s.hub_ok() && s.writes >= 250 && !s.attention && s.results[ULTRA_LS_R_UID] == 0,
         "month, every tenth wake stored: within a unit, energy never above (board - truth: %lld, %lld, %lld, %.0f mWh; "
         "ledger: %lld, %lld, %lld, %.0f mWh; %u writes)",
         (long long) s.d_pow, (long long) s.d_lit, (long long) s.d_ups, s.e_board, (long long) s.h_pow,
         (long long) s.h_lit, (long long) s.h_ups, s.e_hub, s.writes);
+  // today's receiver (S6): synced each power-up, it doesn't store those wakes; the same accounting, a few writes
+  const MonthEnd s6 = month_run(used, 3000, true, false, 12);
+  month_print("hub ledger, every 10th long (S6: not stored)", s6);
+  CHECK(s6.board_ok() && s6.hub_ok() && s6.writes <= 15 && !s6.attention && s6.results[ULTRA_LS_R_UID] == 0,
+        "month, every tenth wake long, S6: within a unit, energy never above, at most 15 writes (board - truth: %lld, "
+        "%lld, %lld, %.0f mWh; ledger: %lld, %lld, %lld, %.0f mWh; %u writes)",
+        (long long) s6.d_pow, (long long) s6.d_lit, (long long) s6.d_ups, s6.e_board, (long long) s6.h_pow,
+        (long long) s6.h_lit, (long long) s6.h_ups, s6.e_hub, s6.writes);
   // a year of it (design review, round 9: a hub that takes the board's rounded value back during sessions it saw adopts
   // the board's own remainder, ~6 h a year): the truth is summed apart from the ledger (the port's on-times, the lit
   // spans, the integrated power, the boots), so a slow drift shows
@@ -1890,8 +1908,8 @@ static void sc_month() {
   CHECK(gained < 0.1 * due && e.board_lit_h - 200.0 < 0.1 * (e.truth_lit_h - 200.0) &&
             e.board_ups - 900u < (e.truth_ups - 900u) / 10 && e.board_wh - 2000.0 < 0.1 * (e.truth_wh - 2000.0),
         "month, echo control: almost nothing back (%.1f of %.1f h powered)", gained, due);
-  const MonthEnd f = month_run(used, 3000, false, true, 11);
-  month_print("echo hub, remainders (control)", f);
+  const MonthEnd f = month_run(used, 3000, false, true, 11, true);
+  month_print("echo hub, remainders, a round-11 receiver (control)", f);
   CHECK(std::fabs(f.board_h - f.truth_h) > 0.25 * (f.truth_h - 500.0),
         "month, echo control with remainders: far off the truth (%.1f h for %.1f: ahead with receivers that ratchet "
         "its remainders, behind with ones that write the merges they take)",

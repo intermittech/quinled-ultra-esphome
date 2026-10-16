@@ -1324,6 +1324,14 @@ CASES = [
      "name: LED supply\n            device_id: r1\n            disabled_by_default: false"),
     ("ultra telemetry LED supply with basic", ULTRA + TELEMETRY + "    diagnostics: basic\n" + RX_LIST + RX_UART, True,
      "name: LED supply"),
+    # supply dips: a problem below dip_warning (80 %); the Supply note (enabled); the commissioning's 80 %
+    ("ultra telemetry Supply note", ULTRA + TELEMETRY + RX_LIST + RX_UART, True,
+     "name: Supply note\n            device_id: r1\n            disabled_by_default: false"),
+    ("ultra telemetry dip_warning default", ULTRA + TELEMETRY + RX_UART, True, "dip_warning: 0.8"),
+    ("ultra telemetry dip_warning 85%", ULTRA + TELEMETRY + "    dip_warning: 85%\n" + RX_UART, True, "dip_warning: 0.85"),
+    ("ultra telemetry dip_warning 95% (above the receivers' own 90 %)",
+     ULTRA + TELEMETRY + "    dip_warning: 95%\n" + RX_UART, False, "dip_warning"),
+    ("ultra commission_min_voltage default 80 %", ULTRA + TELEMETRY + RX_UART, True, "commission_min_voltage: 0.8"),
     ("ultra telemetry no calibration texts with none",
      ULTRA + TELEMETRY + "    diagnostics: none\n" + RX_LIST + RX_UART, True, "!Last calibrated"),
     (

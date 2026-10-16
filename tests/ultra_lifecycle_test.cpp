@@ -2076,7 +2076,7 @@ struct UltraReceiver {   // as ultra_receiver.h
   };
   enum Text : uint8_t {
     STATUS = 0, STATUS_DETAIL, FIRMWARE, LAST_RESET, LAST_TRIP, LAST_DIP, LINK, CHANNEL_HEALTH, PORT, CALIBRATION,
-    CURRENT_MODEL, TEXT_COUNT,
+    CURRENT_MODEL, SUPPLY_NOTE, TEXT_COUNT,
   };
   void update_(uint32_t updates);
   void value_(uint8_t which, float v, bool force = false);

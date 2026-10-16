@@ -126,7 +126,7 @@ void UltraReceiver::update_(uint32_t updates) {
   const ReceiverStatus st = with_hub_calibration(
       standby                                 ? (this->hub_->port_off() ? RS_PORT_OFF : RS_STANDBY)
       : this->hub_->rx_settling(this->board_) ? RS_WAKING
-                                              : receiver_status(d, answering),
+                                              : receiver_status(d, answering, 0, p.dip_warning()),
       this->hub_->calibrating(this->board_));
   // (a text is built only for its entity: a level the YAML leaves out costs nothing at run time)
   auto has = [this](uint8_t which) { return this->texts_[which] != nullptr; };
@@ -184,6 +184,9 @@ void UltraReceiver::update_(uint32_t updates) {
     return;   // the texts keep what they last said
   if (has(FIRMWARE) && from(PG_IDENTITY | PG_STATUS))
     this->text_(FIRMWARE, telemetry_firmware_text(d));
+  // its supply dips in the last 24 h, against the line's dip_warning (the receiver page's note)
+  if (has(SUPPLY_NOTE) && from(PG_SUPPLY | PG_IDENTITY))
+    this->text_(SUPPLY_NOTE, telemetry_supply_note(d, p.dip_warning()));
   // its current calibration (CALIBRATION, with the hub's record: observed before this call): how its last test ended,
   // the model in use, when its last complete test ended, the connected load (the channels together at 100 %)
   if (d.have_calibration && from(PG_CALIBRATION)) {
@@ -307,9 +310,8 @@ void UltraTelemetryPort::update_() {
     answering += p.answering(i);
     const bool settling = this->hub_->rx_settling(i);
     waking |= settling;
-    problem |= !standby && !settling &&
-               receiver_status_problem(with_hub_calibration(receiver_status(p.data(i), p.answering(i)),
-                                                            this->hub_->calibrating(i)));
+    const ReceiverStatus st = receiver_status(p.data(i), p.answering(i), 0, p.dip_warning());
+    problem |= !standby && !settling && receiver_status_problem(with_hub_calibration(st, this->hub_->calibrating(i)));
   }
   if (this->problem_ != nullptr)
     this->problem_->publish_state(problem);

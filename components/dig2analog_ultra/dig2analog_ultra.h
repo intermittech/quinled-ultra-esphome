@@ -327,6 +327,9 @@ class UltraHub final : public Component {
   /// adaptive_rate: false pins the receivers' reply rate at the UART's baud_rate (else slower on broken answers:
   /// ReplyRate)
   void set_telemetry_adaptive_rate(bool on) { this->reply_.configure(this->reply_.top(), on); }
+  /// dip_warning: a receiver's supply dip is a problem (Status "Supply dips", the port's Problem) below this % of its
+  /// reference; shallower ones only show in its Supply note
+  void set_telemetry_dip_warning(uint8_t pct) { this->poller_.set_dip_warning(pct); }
   const ReplyRate &reply_rate() const { return this->reply_; }
   /// windows where the line was let go of late (the receivers found it still driven: no answers)
   uint32_t late_releases() const { return this->rw_late_; }
@@ -470,7 +473,7 @@ class UltraHub final : public Component {
   Commissioning comm_;
   CommissionLayer comm_layer_;
   bool comm_on_{false};
-  float comm_min_v_{0.9f};
+  float comm_min_v_{0.8f};
   ESPPreferenceObject comm_pref_;
   CallbackManager<void()> comm_cb_;
 #ifdef USE_TIME

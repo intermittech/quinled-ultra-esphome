@@ -62,6 +62,7 @@ CONF_POLL_INTERVALS = "poll_intervals"
 CONF_DIAGNOSTICS = "diagnostics"
 CONF_LIGHT_ENTITIES = "light_entities"
 CONF_ADAPTIVE_RATE = "adaptive_rate"
+CONF_DIP_WARNING = "dip_warning"
 CONF_COMMISSIONING = "commissioning"
 CONF_COMMISSION_MIN_VOLTAGE = "commission_min_voltage"
 CONF_PORT_ID = "port_id"
@@ -147,6 +148,9 @@ RECEIVER_ENTITIES = {
     "last_reset": ("text", 3, 2, "Last reset", _text("mdi:restart")),
     "last_trip": ("text", 4, 2, "Last trip", _text("mdi:flash-alert-outline")),
     "last_dip": ("text", 5, 2, "Last dip", _text("mdi:transmission-tower-off")),
+    # its supply dips in the last 24 h against the line's dip_warning, for the receiver page: "No supply dips in the
+    # last 24 h.", "Supply dips in the last 24 h, the lowest to 46.1 V (84 %): fine down to 80 %."
+    "supply_note": ("text", 11, 1, "Supply note", _text("mdi:transmission-tower")),
     # its lifetime counts (kept across power cuts; protocol 0.2.5, receiver firmware 0.6.9), before that since its
     # power-up
     "trips": ("sensor", 6, 2, "Trips", _count("mdi:flash-off")),
@@ -371,12 +375,15 @@ TELEMETRY_SCHEMA = cv.Schema(
         # the receivers answer one rate slower (1 M -> 500 k -> 250 k) once broken answers keep coming (4 of the last
         # 32 windows), faster again after an hour without (never above the UART's baud_rate); false pins that rate
         cv.Optional(CONF_ADAPTIVE_RATE, default=True): cv.boolean,
+        # a receiver's supply dip is a problem (its Status "Supply dips", the port's Problem) below this share of its
+        # reference (the receivers log every dip below 90 %); shallower ones only show in its Supply note
+        cv.Optional(CONF_DIP_WARNING, default="80%"): cv.All(cv.percentage, cv.Range(min=0.5, max=0.9)),
         # the commissioning (wiki: Commissioning): Commission / Finalize buttons, its texts; its load test fails when a
         # receiver would get less than commission_min_voltage of the sender's voltage at the port's full load. The
         # stored dates (the commissioning's, the receivers' Last calibrated): time_id, else the only time component
         # (none: "date unknown", Last calibrated unknown)
         cv.Optional(CONF_COMMISSIONING, default=True): cv.boolean,
-        cv.Optional(CONF_COMMISSION_MIN_VOLTAGE, default="90%"): cv.All(cv.percentage, cv.Range(min=0.5, max=0.99)),
+        cv.Optional(CONF_COMMISSION_MIN_VOLTAGE, default="80%"): cv.All(cv.percentage, cv.Range(min=0.5, max=0.99)),
         cv.Optional(CONF_TIME_ID): cv.use_id(time_.RealTimeClock),
         cv.Optional(CONF_POLL_INTERVALS, default={}): cv.Schema(
             dict(
@@ -475,8 +482,8 @@ def telemetry_defaults(config):
 # with several lights), a line's own, the UART buffers, the lifetime ledger's reserve (its own sizing rule).
 _LOGGER = logging.getLogger(__name__)
 # (the calibration's: its button and record, 3 more value slots (40 B) at every level, 3 diagnostics with basic, 4 with
-# full: x RAM_PER_ENTITY; basic also has the LED supply)
-RAM_PER_RECEIVER = {"full": 1940, "basic": 1240, "none": 700}
+# full: x RAM_PER_ENTITY; basic also has the LED supply; both the Supply note)
+RAM_PER_RECEIVER = {"full": 2000, "basic": 1300, "none": 700}
 RAM_PER_LIGHT = 900
 RAM_PER_ESTIMATE = 200
 RAM_PER_LINE = 1000
@@ -657,6 +664,7 @@ async def telemetry_to_code(hub, config):
     cg.add(hub.set_telemetry_name(tel[CONF_NAME]))
     if not tel[CONF_ADAPTIVE_RATE]:
         cg.add(hub.set_telemetry_adaptive_rate(False))
+    cg.add(hub.set_telemetry_dip_warning(int(round(tel[CONF_DIP_WARNING] * 100))))
     if tel[CONF_COMMISSIONING]:
         cg.add(hub.set_commissioning(tel[CONF_COMMISSION_MIN_VOLTAGE]))
     # the line's clock: the commissioning's date, the receivers' Last calibrated

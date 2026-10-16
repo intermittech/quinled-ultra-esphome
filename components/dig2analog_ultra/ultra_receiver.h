@@ -31,7 +31,7 @@ class UltraReceiver final : public Component {
   };
   enum Text : uint8_t {
     STATUS = 0, STATUS_DETAIL, FIRMWARE, LAST_RESET, LAST_TRIP, LAST_DIP, LINK, CHANNEL_HEALTH, PORT, CALIBRATION,
-    CURRENT_MODEL, TEXT_COUNT,
+    CURRENT_MODEL, SUPPLY_NOTE, TEXT_COUNT,
   };
   void set_hub(UltraHub *hub) { this->hub_ = hub; }
   void set_board(uint16_t board) { this->board_ = board; }

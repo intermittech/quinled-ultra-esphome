@@ -258,6 +258,12 @@ int main(int argc, char **argv) {
         note_text(telemetry_last_dip(d), "telemetry_last_dip");
         note_text(telemetry_last_reset(d), "telemetry_last_reset");
         note_text(receiver_status_notes(d), "receiver_status_notes");
+        {   // the supply dips against a random dip_warning: the Status, its line, the receiver page's note
+          const uint8_t warn = static_cast<uint8_t>(50 + rnd(41));
+          const ReceiverStatus sw = receiver_status(d, ans, 0, warn);
+          note_text(receiver_status_detail(d, sw, i, cut_at), "receiver_status_detail (dip_warning)");
+          note_text(telemetry_supply_note(d, warn), "telemetry_supply_note");
+        }
         note_text(telemetry_firmware_text(d), "telemetry_firmware_text");
         for (uint8_t v = 0; v < TV_COUNT; v++)
           (void) telemetry_value(d, static_cast<TelemetryValue>(v));

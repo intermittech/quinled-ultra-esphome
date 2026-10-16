@@ -89,6 +89,10 @@ static constexpr uint32_t TU_AVAILABILITY = 1u << 30;  // it started or stopped 
 static constexpr uint32_t TU_RESTART = 1u << 29;       // it restarted (or is a different board now)
 static constexpr uint32_t TU_HUB = 1u << 28;           // the hub's own state of it changed (its calibration run)
 
+/// A supply dip is a problem (Status "Supply dips", the port's Problem) below this % of its reference (YAML
+/// dip_warning); the receivers log every dip below 90 %: one down to here is fine (Supply note)
+static constexpr uint8_t DIP_WARN_PCT = 80;
+
 /// CALIBRATION page DATA (the receiver firmware's layout; the protocol header names byte 1, ULTRA_CA_MODEL): the
 /// stored test's levels (0: none), the model | how the last test ended, the stored tests' count, the age of the last
 /// complete test (s, u24, this power-up; 0xFFFFFF: none), the dark current, CH1-CH5 at 100 %, the connected load (the
@@ -774,6 +778,9 @@ class TelemetryPoller {
   /// the rate its POLLs ask the receivers to answer at (ReplyRate)
   void set_rate(uint8_t rate) { this->rate_ = rate < ULTRA_RW_RATES ? rate : ULTRA_RW_RATE_1M; }
   uint8_t rate() const { return this->rate_; }
+  /// the line's dip_warning: a supply dip is a problem below this % of its reference (receiver_status)
+  void set_dip_warning(uint8_t pct) { this->dip_warn_ = pct; }
+  uint8_t dip_warning() const { return this->dip_warn_; }
   /// The longest window one RW frame can open (us, W): up to 16 answer.
   uint32_t max_window_us() const {
     const size_t n = this->rx_.size() < ULTRA_RW_MAX_SLOTS ? this->rx_.size() : ULTRA_RW_MAX_SLOTS;
@@ -1317,6 +1324,7 @@ class TelemetryPoller {
   std::vector<Asked> win_;
   TelemetryIntervals iv_{};
   uint8_t rate_{ULTRA_RW_RATE_1M};
+  uint8_t dip_warn_{DIP_WARN_PCT};
   bool locked_{false};
   bool lock_wait_{false};   // the lock interval not waited out yet (build() forgets it after)
   mutable bool idle_{false};   // due(): nothing due at idle_ms_ (every change forgets it)
@@ -1354,6 +1362,32 @@ static constexpr int16_t TOO_HOT_C10 = 850;          // a board before 0.2.5 (no
 static constexpr uint32_t TRIP_RECENT_S = 600;       // a trip in the last 10 min still shows (a retrying short)
 static constexpr uint32_t DIPS_RECENT_S = 86400;     // supply dips in the last 24 h
 
+/// The lowest supply dip in the last 24 h (SUPPLY: the newest logged one, the deepest since its power-up): its % of
+/// its reference and its lowest reading (mV); false: none
+inline bool lowest_recent_dip(const ReceiverData &d, uint8_t *pct, uint16_t *mv) {
+  bool any = false;
+  if (d.have_supply && d.dips != 0 && d.logged != 0 && d.dip_age_s < DIPS_RECENT_S && d.dip_pct != 0) {
+    *pct = d.dip_pct;
+    *mv = d.dip_mv;
+    any = true;
+  }
+  if (d.have_supply && d.dips != 0 && d.deep_age_s < DIPS_RECENT_S && d.deep_pct != 0 && (!any || d.deep_pct < *pct)) {
+    *pct = d.deep_pct;
+    *mv = d.deep_mv;
+    any = true;
+  }
+  return any;
+}
+/// A supply dip worth a warning: one below warn_pct % of its reference in the last 24 h; a board without the SUPPLY
+/// page: STATUS's reason (a dip in the last 30 s, its depth unknown)
+inline bool supply_dip_warning(const ReceiverData &d, uint8_t warn_pct) {
+  if (d.have_identity && !(d.features & ULTRA_FEAT_SUPPLY_DIPS))
+    return receiver_why(d) == ULTRA_ST_WHY_SUPPLY;
+  uint8_t pct;
+  uint16_t mv;
+  return lowest_recent_dip(d, &pct, &mv) && pct < warn_pct;
+}
+
 inline const char *receiver_status_name(ReceiverStatus s) {
   static const char *const NAMES[RS_COUNT] = {"No answer",   "Tripped",     "Channel fault",
                                               "Too hot",     "Signal loss", "Supply dips",
@@ -1390,7 +1424,9 @@ inline std::string channel_list(uint8_t mask) {
 
 /// light 0: the receiver's status. Else a light's on it (its channels, bit n = CH n+1): only what dims that light (no
 /// supply dips, temperature or calibration suggestion; a channel fault on its own channels, or the dark current).
-inline ReceiverStatus receiver_status(const ReceiverData &d, bool answering, uint8_t light = 0) {
+/// dip_warn: a supply dip is a problem below this % of its reference (the line's dip_warning)
+inline ReceiverStatus receiver_status(const ReceiverData &d, bool answering, uint8_t light = 0,
+                                      uint8_t dip_warn = DIP_WARN_PCT) {
   if (!answering)
     return RS_NO_ANSWER;
   const uint8_t st = d.have_status ? d.power_state : 0, ou = d.have_outputs ? d.why : 0, why = receiver_why(d);
@@ -1411,7 +1447,7 @@ inline ReceiverStatus receiver_status(const ReceiverData &d, bool answering, uin
   if (why == ULTRA_ST_WHY_SIGNAL_LOSS || (ou & ULTRA_OU_W_SIGNAL_LOSS))
     return RS_SIGNAL_LOSS;
   if (light == 0) {
-    if (why == ULTRA_ST_WHY_SUPPLY || (d.have_supply && d.dips != 0 && d.logged != 0 && d.dip_age_s < DIPS_RECENT_S))
+    if (supply_dip_warning(d, dip_warn))   // (shallower dips: no problem, its Supply note says so)
       return RS_SUPPLY_DIPS;
     if (v025 && (hf & ULTRA_HE_F_CAL_SUGGESTED))
       return RS_CAL_SUGGESTED;
@@ -1515,15 +1551,20 @@ inline std::string receiver_status_detail(const ReceiverData &d, ReceiverStatus 
       return "Its MCU is at 85 \xC2\xB0" "C or more. Check the cooling around the receiver.";
     case RS_SIGNAL_LOSS:
       return "No frames from the hub: the outputs follow its signal_loss setting.";
-    case RS_SUPPLY_DIPS: {
-      if (!(d.have_supply && d.dips != 0 && d.logged != 0 && d.dip_age_s < DIPS_RECENT_S))
+    case RS_SUPPLY_DIPS: {   // (a dip below the line's dip_warning in the last 24 h)
+      uint8_t pct;
+      uint16_t mv;
+      if (!lowest_recent_dip(d, &pct, &mv))
         return "A supply dip in the last 30 s. The supply or its cable may be too weak.";
-      uint32_t recent = 0;   // (the log keeps the last 4)
-      if (d.dip_age_s < DIPS_RECENT_S)
-        recent = d.logged;
-      snprintf(b, sizeof(b), "%u supply dip%s in the last 24 h, the last to %.1f V (%u %%) for %u ms at %.1f A.",
-               static_cast<unsigned>(recent), recent == 1 ? "" : "s", d.dip_mv / 1000.0,
-               static_cast<unsigned>(d.dip_pct), static_cast<unsigned>(d.dip_ms), d.dip_ma / 1000.0);
+      if (d.logged != 0 && d.dip_age_s < DIPS_RECENT_S && d.dip_pct == pct) {   // the newest is the lowest: its details
+        const uint32_t recent = d.logged;                                         // (the log keeps the last 4)
+        snprintf(b, sizeof(b), "%u supply dip%s in the last 24 h, the last to %.1f V (%u %%) for %u ms at %.1f A.",
+                 static_cast<unsigned>(recent), recent == 1 ? "" : "s", d.dip_mv / 1000.0,
+                 static_cast<unsigned>(d.dip_pct), static_cast<unsigned>(d.dip_ms), d.dip_ma / 1000.0);
+      } else {
+        snprintf(b, sizeof(b), "Supply dips in the last 24 h, the lowest to %.1f V (%u %%).", mv / 1000.0,
+                 static_cast<unsigned>(pct));
+      }
       return std::string(b) + " The supply or its cable may be too weak.";
     }
     case RS_CAL_SUGGESTED:
@@ -1591,6 +1632,28 @@ inline std::string telemetry_last_trip(const ReceiverData &d) {
     return t + "before its last power-up)";
   }
   return d.have_power || d.have_faults ? "none" : "";
+}
+
+/// The receiver page's note on its supply (Supply note): "No supply dips in the last 24 h.", "A supply dip in the last
+/// 24 h, to 46.1 V (84 %): fine down to 80 %.", "Supply dips in the last 24 h, the lowest to 43.1 V (78 %): below 80 %,
+/// the supply or its cable may be too weak." ("": SUPPLY not read). Its numbers change with a deeper dip only.
+inline std::string telemetry_supply_note(const ReceiverData &d, uint8_t warn_pct) {
+  if (!d.have_supply)
+    return "";
+  uint8_t pct;
+  uint16_t mv;
+  if (!lowest_recent_dip(d, &pct, &mv))
+    return "No supply dips in the last 24 h.";
+  char b[160];
+  const bool one = d.dips == 1;
+  snprintf(b, sizeof(b), "%s in the last 24 h, %s %.1f V (%u %%): ", one ? "A supply dip" : "Supply dips",
+           one ? "to" : "the lowest to", mv / 1000.0, static_cast<unsigned>(pct));
+  std::string s = b;
+  if (pct < warn_pct)
+    snprintf(b, sizeof(b), "below %u %%, the supply or its cable may be too weak.", static_cast<unsigned>(warn_pct));
+  else
+    snprintf(b, sizeof(b), "fine down to %u %%.", static_cast<unsigned>(warn_pct));
+  return s + b;
 }
 
 /// The last supply dip: this power-up's (SUPPLY: "to 39.80 V (86 %) for 35 ms at 1.00 A"), else the one the board
@@ -1899,7 +1962,7 @@ inline std::string port_status(const PortMonitor &m, const TelemetryPoller &p) {
   ReceiverStatus worst = RS_OK;
   unsigned limiting = 0;
   for (uint16_t k = 0; k < p.receivers(); k++) {
-    const ReceiverStatus s = receiver_status(p.data(k), p.answering(k));
+    const ReceiverStatus s = receiver_status(p.data(k), p.answering(k), 0, p.dip_warning());
     worst = s < worst ? s : worst;
     limiting += s == RS_LIMITING;
   }

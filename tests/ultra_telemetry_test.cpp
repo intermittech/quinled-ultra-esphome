@@ -879,17 +879,55 @@ static void test_status() {
   d.logged = 3;
   d.dip_age_s = 4000;
   d.dip_mv = 39800;
-  d.dip_pct = 86;
+  d.dip_pct = 86;   // down to 80 % is fine (dip_warning): no problem, its Supply note says so
   d.dip_ms = 35;
   d.dip_ma = 1000;
+  CHECK(receiver_status(d, true) == RS_LIMITING &&
+            telemetry_supply_note(d, DIP_WARN_PCT) ==
+                "Supply dips in the last 24 h, the lowest to 39.8 V (86 %): fine down to 80 %." &&
+            receiver_status(d, true, 0, 90) == RS_SUPPLY_DIPS,
+        "a dip to 86 %%: '%s' (with dip_warning 90 %%: %s)", receiver_status_name(receiver_status(d, true)),
+        receiver_status_name(receiver_status(d, true, 0, 90)));
+  d.dip_mv = 34900;
+  d.dip_pct = 76;   // below 80 %: a problem
   CHECK(receiver_status(d, true) == RS_SUPPLY_DIPS && receiver_status_problem(RS_SUPPLY_DIPS) &&
             receiver_status_detail(d, RS_SUPPLY_DIPS, 1, -1) ==
-                "3 supply dips in the last 24 h, the last to 39.8 V (86 %) for 35 ms at 1.0 A. The supply or its "
+                "3 supply dips in the last 24 h, the last to 34.9 V (76 %) for 35 ms at 1.0 A. The supply or its "
                 "cable may be too weak." &&
+            telemetry_supply_note(d, DIP_WARN_PCT) == "Supply dips in the last 24 h, the lowest to 34.9 V (76 %): below "
+                                                      "80 %, the supply or its cable may be too weak." &&
             light_status(d, true, 0x01) == RS_LIMITING,
         "supply dips over limiting: '%s'", receiver_status_detail(d, RS_SUPPLY_DIPS, 1, -1).c_str());
+  d.dip_mv = 40700;   // the newest fine, the deepest since its power-up below the warning: the deepest's
+  d.dip_pct = 88;
+  d.deep_mv = 34000;
+  d.deep_pct = 74;
+  d.deep_age_s = 20000;
+  CHECK(receiver_status(d, true) == RS_SUPPLY_DIPS &&
+            receiver_status_detail(d, RS_SUPPLY_DIPS, 1, -1) ==
+                "Supply dips in the last 24 h, the lowest to 34.0 V (74 %). The supply or its cable may be too weak.",
+        "the deepest dip: '%s'", receiver_status_detail(d, RS_SUPPLY_DIPS, 1, -1).c_str());
   d.dip_age_s = 90000;   // older than a day
-  CHECK(receiver_status(d, true) == RS_LIMITING, "dips older than a day: no longer a problem");
+  d.deep_age_s = 90000;
+  CHECK(receiver_status(d, true) == RS_LIMITING &&
+            telemetry_supply_note(d, DIP_WARN_PCT) == "No supply dips in the last 24 h.",
+        "dips older than a day: no longer a problem ('%s')", telemetry_supply_note(d, DIP_WARN_PCT).c_str());
+  {   // one dip; a board without the SUPPLY page: STATUS's reason (its depth unknown) is the problem
+    ReceiverData one = d;
+    one.dips = 1;
+    one.dip_age_s = 600;
+    ReceiverData old;
+    old.have_identity = true;
+    old.have_status = true;
+    old.power_state = static_cast<uint8_t>(ULTRA_ST_WHY_SUPPLY << ULTRA_ST_WHY_SHIFT);
+    CHECK(telemetry_supply_note(one, DIP_WARN_PCT) == "A supply dip in the last 24 h, to 40.7 V (88 %): fine down to "
+                                                      "80 %." &&
+              receiver_status(old, true) == RS_SUPPLY_DIPS &&
+              receiver_status_detail(old, RS_SUPPLY_DIPS, 0, -1).find("in the last 30 s") != std::string::npos &&
+              telemetry_supply_note(old, DIP_WARN_PCT).empty(),
+          "one dip: '%s'; without the SUPPLY page: %s", telemetry_supply_note(one, DIP_WARN_PCT).c_str(),
+          receiver_status_name(receiver_status(old, true)));
+  }
   d.mcu_temp = 880;
   CHECK(receiver_status(d, true) == RS_TOO_HOT && receiver_status_detail(d, RS_TOO_HOT, 0, -1).find("85 \xC2\xB0" "C or more") != std::string::npos &&
             receiver_status_detail(d, RS_TOO_HOT, 0, -1).find("88") == std::string::npos,
@@ -921,7 +959,7 @@ static void test_status() {
   d.why = ULTRA_OU_W_SIGNAL_LOSS | ULTRA_OU_W_TEST;
   CHECK(receiver_status(d, true) == RS_SIGNAL_LOSS && receiver_status_problem(RS_SIGNAL_LOSS), "signal loss first");
   d.why = ULTRA_OU_W_TEST;
-  CHECK(receiver_status(d, true) == RS_CALIBRATING && telemetry_last_dip(d) == "to 39.80 V (86 %) for 35 ms at 1.00 A",
+  CHECK(receiver_status(d, true) == RS_CALIBRATING && telemetry_last_dip(d) == "to 40.70 V (88 %) for 35 ms at 1.00 A",
         "calibrating; last dip '%s'", telemetry_last_dip(d).c_str());
 
   // a light's estimated power: the measured input power, split by the model's channel currents
@@ -1150,7 +1188,7 @@ static void test_025() {
       {ULTRA_ST_WHY_SHORT, ULTRA_ST_TRIPPED, 0, RS_TRIPPED, "Tripped by a short circuit"},
       {ULTRA_ST_WHY_HOT, 0, 0, RS_TOO_HOT, "over its warning level. Check"},
       {ULTRA_ST_WHY_NONE, 0, ULTRA_HE_F_HOT, RS_TOO_HOT, "over its warning level"},
-      {ULTRA_ST_WHY_SUPPLY, 0, 0, RS_SUPPLY_DIPS, "in the last 30 s"},
+      {ULTRA_ST_WHY_SUPPLY, 0, 0, RS_OK, "OK."},   // (its SUPPLY page has no dip below 80 %: fine)
       {ULTRA_ST_WHY_SIGNAL_LOSS, 0, 0, RS_SIGNAL_LOSS, "signal_loss setting"},
       {ULTRA_ST_WHY_NONE, 0, ULTRA_HE_F_CAL_SUGGESTED, RS_CAL_SUGGESTED, "calibration test is suggested"},
       {ULTRA_ST_WHY_TEST, 0, 0, RS_CALIBRATING, "test jig"},
@@ -2434,7 +2472,7 @@ struct CommWorld {
     PortMonitor::Config mc;
     mc.supply_v = 55.0f;
     this->m.configure(mc);
-    this->cm.configure(1000, 0.9f);
+    this->cm.configure(1000, 0.8f);   // (commission_min_voltage: the default)
     for (auto &x : this->c.rx) {
       x.he_flags = ULTRA_HE_F_TESTED;   // (healthy channels)
       x.ch2_class = ULTRA_HE_NORMAL;
@@ -2555,13 +2593,13 @@ static void test_commissioning() {
         "4 segments of 100 mOhm measured (%d within 15 %%); the ramp stopped at %.0f %% load (target 40, below 80)",
         good, w.max_load);
   // a thin cable: the far receiver would get too little at full load (fails), the lights back all the same
-  CommWorld thin(4, 2.0f, 0.4f);
+  CommWorld thin(4, 2.5f, 0.4f);
   thin.warm(5000);
   thin.commission(false);
   const std::string &thin_rep = thin.cm.report();
   CHECK(thin.cm.status().find("Commission failed: at full load (2.25 A) R4 would get ") == 0 &&
             thin_rep.find("Failed: at full load (2.25 A) R4 would get ") == 0 &&
-            thin_rep.find(" %, needs 90 %). The cable is too long or too thin.\n4 of 4 receivers answer: R1 ") !=
+            thin_rep.find(" %, needs 80 %). The cable is too long or too thin.\n4 of 4 receivers answer: R1 ") !=
                 std::string::npos &&
             thin_rep.find("\nCable test at ") != std::string::npos &&
             thin_rep.find("\nAt full load") == std::string::npos && thin.cm.level() == 0.0f &&

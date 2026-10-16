@@ -249,7 +249,7 @@ class Commissioning {
         // the final checks: no problem, no trip or dip since the start, each calibration test complete
         for (uint16_t i = 0; i < n && this->why_.empty(); i++) {
           const ReceiverData &d = p.data(i);
-          const ReceiverStatus s = receiver_status(d, true);
+          const ReceiverStatus s = receiver_status(d, true, 0, p.dip_warning());
           if (receiver_status_problem(s)) {
             this->why_ = this->rx_(i) + " reports " + receiver_status_name(s);
             this->advice_ = "See its Status detail.";
@@ -538,7 +538,7 @@ class Commissioning {
       return 0;
     }
     for (uint16_t i = 0; i < n; i++) {
-      const ReceiverStatus s = receiver_status(p.data(i), true);
+      const ReceiverStatus s = receiver_status(p.data(i), true, 0, p.dip_warning());
       if (s == RS_TRIPPED || events_(p.data(i)) != this->events0_[i])
         return this->fail_(now_ms, this->rx_(i) + " tripped or had a supply dip during the load test",
                            "Check its outputs' wiring and the supply.");
@@ -606,7 +606,7 @@ class Commissioning {
   Kind kind_{COMMISSION};
   Phase phase_{IDLE};
   uint32_t t_{0}, answer_ms_{20000}, step_ms_{10000}, unix_{0};
-  float min_voltage_{0.9f}, level_{0.0f}, vs0_{NAN};
+  float min_voltage_{0.8f}, level_{0.0f}, vs0_{NAN};
   uint8_t step_{0};
   bool marked_{false}, cal_seen_{false}, changed_{false}, was_commissioned_{false}, idle_due_{true};
   std::string status_{"Not commissioned"}, report_, last_;

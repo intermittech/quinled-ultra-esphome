@@ -114,7 +114,13 @@ class Commissioning {
     this->phase_ = BOARD;
     this->t_ = now_ms;
     this->report_.clear();
-    this->verdict_.clear();
+    this->why_.clear();
+    this->advice_.clear();
+    this->ids_.clear();
+    this->seg_.clear();
+    this->cable_a_ = NAN;
+    this->worst_ = -1;
+    this->cal_ok_ = 0;
     this->level_ = 0;
     this->step_ = 0;
     this->text_("Running: the board");
@@ -157,15 +163,15 @@ class Commissioning {
     }
     const uint16_t n = p.receivers();
     if (port.present && port.off)
-      return this->fail_(now_ms, "The port's power mode is Off");
+      return this->fail_(now_ms, "the port's power mode is Off", "Choose another power mode, then run it again.");
     if (updating)
-      return this->fail_(now_ms, "A firmware update started");
+      return this->fail_(now_ms, "a firmware update started", "Run it again once the update is done.");
     switch (this->phase_) {
       case BOARD:
         if (!port.present || !port.detect || port.board) {
           this->next_(POWER, now_ms, "Running: the 55 V");
         } else if (now_ms - this->t_ > BOARD_MS) {
-          return this->fail_(now_ms, "No board on the port");
+          return this->fail_(now_ms, "no board on the port", "Check the board's connection to the port.");
         }
         break;
       case POWER:
@@ -173,9 +179,10 @@ class Commissioning {
           p.mark_fresh(now_ms, true);   // (every page read now: the trip / dip counts before the run start right)
           this->next_(ANSWER, now_ms, "Running: 0/" + std::to_string(n) + " answering");
         } else if (port.present && port.fault) {
-          return this->fail_(now_ms, "The port lost its board (connection lost)");
+          return this->fail_(now_ms, "the port lost its board (connection lost)",
+                             "Check the board's connection to the port.");
         } else if (now_ms - this->t_ > POWER_MS) {
-          return this->fail_(now_ms, "The port didn't power up");
+          return this->fail_(now_ms, "the port didn't power up", "");
         }
         break;
       case ANSWER: {
@@ -187,11 +194,16 @@ class Commissioning {
               "Running: " + std::to_string(this->answered_(p)) + "/" + std::to_string(n) + " answering";
           if (s != this->status_)
             this->text_(s);
-          if (now_ms - this->t_ > this->answer_ms_)
-            return this->fail_(now_ms, this->silent_(ok));
+          if (now_ms - this->t_ > this->answer_ms_) {
+            this->answers_(p);   // (the ones that do: the report's facts)
+            if (ok == 0)
+              return this->fail_(now_ms, "no receiver answers", "Check the RS-485 wiring at the sender.");
+            return this->fail_(now_ms, this->rx_(ok) + " doesn't answer",
+                               "Check the cable or power between " + this->rx_(ok - 1) + " and " + this->rx_(ok) + ".");
+          }
           break;
         }
-        this->answer_report_(p);
+        this->answers_(p);
         this->events0_.assign(n, 0);
         for (uint16_t i = 0; i < n; i++)
           this->events0_[i] = events_(p.data(i));
@@ -213,7 +225,7 @@ class Commissioning {
         break;
       case RESTORE:
         if (now_ms - this->t_ >= SETTLE_MS)
-          act |= this->finish_(now_ms, unix_s, p, this->verdict_.empty(), this->verdict_);
+          act |= this->finish_(now_ms, unix_s, p, this->why_.empty());
         break;
       case CALIBRATE:
         if (calibrating) {
@@ -222,7 +234,7 @@ class Commissioning {
           p.mark_fresh(now_ms, true);   // every page of every receiver read again
           this->next_(READ, now_ms, "Running: the final read");
         } else if (now_ms - this->t_ > CAL_START_MS) {
-          return this->fail_(now_ms, "The current calibration didn't start");
+          return this->fail_(now_ms, "the current calibration didn't start", "");
         }
         break;
       case READ: {
@@ -231,18 +243,26 @@ class Commissioning {
           ok++;
         if (ok < n) {
           if (now_ms - this->t_ > this->answer_ms_ + 60000)
-            return this->fail_(now_ms, this->rx_(ok) + " didn't answer the final read");
+            return this->fail_(now_ms, this->rx_(ok) + " didn't answer the final read", "Check its cable or power.");
           break;
         }
-        std::string why;
-        for (uint16_t i = 0; i < n && why.empty(); i++) {
-          const ReceiverStatus s = receiver_status(p.data(i), true);
-          if (receiver_status_problem(s))
-            why = this->rx_(i) + ": " + receiver_status_name(s);
-          else if (events_(p.data(i)) != this->events0_[i])
-            why = this->rx_(i) + " tripped or dipped during the run";
+        // the final checks: no problem, no trip or dip since the start, each calibration test complete
+        for (uint16_t i = 0; i < n && this->why_.empty(); i++) {
+          const ReceiverData &d = p.data(i);
+          const ReceiverStatus s = receiver_status(d, true);
+          if (receiver_status_problem(s)) {
+            this->why_ = this->rx_(i) + " reports " + receiver_status_name(s);
+            this->advice_ = "See its Status detail.";
+          } else if (events_(d) != this->events0_[i]) {
+            this->why_ = this->rx_(i) + " tripped or had a supply dip during the calibration";
+            this->advice_ = "Check its outputs' wiring and the supply.";
+          } else if (d.have_calibration && d.cal_end != ULTRA_CA_END_COMPLETE) {
+            this->why_ = this->rx_(i) + "'s calibration test stopped (" + cal_end_why_(d.cal_end) + ")";
+            this->advice_ = "Check its outputs' wiring and the supply, then run Finalize again.";
+          }
+          this->cal_ok_ += d.have_calibration && d.cal_end == ULTRA_CA_END_COMPLETE && d.cal_age_s < CA_AGE_NONE;
         }
-        act |= this->finish_(now_ms, unix_s, p, why.empty(), why);
+        act |= this->finish_(now_ms, unix_s, p, this->why_.empty());
         break;
       }
       default:
@@ -259,12 +279,12 @@ class Commissioning {
   static constexpr float LEVEL[LEVELS] = {0.3f, 0.5f, 0.7f, 0.85f, 1.0f};
 
   std::string rx_(uint16_t i) const { return "R" + std::to_string(i + 1); }
-  /// receiver k is the first that doesn't answer: where to look
-  std::string silent_(uint16_t k) const {
-    if (k == 0)
-      return "No receiver answers: check the RS-485 wiring";
-    return this->rx_(k) + " doesn't answer (" + (k == 1 ? std::string("R1 does") : "R1-" + this->rx_(k - 1) + " do") +
-           "): check the cable or power between " + this->rx_(k - 1) + " and " + this->rx_(k);
+  /// how a calibration test stopped (ULTRA_CA_END_*), for a sentence
+  static const char *cal_end_why_(uint8_t end) {
+    return end == ULTRA_CA_END_TRIP     ? "a trip"
+           : end == ULTRA_CA_END_LIMIT  ? "the current limit"
+           : end == ULTRA_CA_END_SUPPLY ? "a supply dip"
+                                        : "stopped early";
   }
   uint16_t answered_(const TelemetryPoller &p) const {
     uint16_t k = 0;
@@ -285,17 +305,19 @@ class Commissioning {
     this->t_ = now_ms;
     this->text_(s);
   }
-  /// The run failed: the lights back first (a load test), then the verdict
-  uint8_t fail_(uint32_t now_ms, const std::string &why) {
+  /// The run failed (why: the cause, after "failed: "; advice: what to do, a sentence or ""): the lights back first (a
+  /// load test), then the verdict
+  uint8_t fail_(uint32_t now_ms, const std::string &why, const std::string &advice) {
+    this->why_ = why;
+    this->advice_ = advice;
     if (this->level_ > 0.0f) {
       this->level_ = 0.0f;
-      this->verdict_ = why;
       this->next_(RESTORE, now_ms, "Running: the lights back");
       return ACT_LEVEL | ACT_TEXT;
     }
-    return this->finish_(now_ms, this->unix_, *this->last_p_, false, why);
+    return this->finish_(now_ms, this->unix_, *this->last_p_, false);
   }
-  uint8_t finish_(uint32_t now_ms, uint32_t unix_s, const TelemetryPoller &p, bool passed, const std::string &why) {
+  uint8_t finish_(uint32_t now_ms, uint32_t unix_s, const TelemetryPoller &p, bool passed) {
     (void) now_ms;
     uint8_t act = ACT_TEXT | ACT_DONE;
     const bool fin = this->kind_ == FINALIZE;
@@ -320,14 +342,10 @@ class Commissioning {
       this->idle_text_(p);
     } else {
       this->last_ = passed ? std::string("Commission passed")
-                           : std::string(fin ? "Finalize" : "Commission") + " failed: " + why;
+                           : std::string(fin ? "Finalize" : "Commission") + " failed: " + this->why_;
       this->status_ = this->last_;
     }
-    if (!passed)
-      this->report_ = why + (this->report_.empty() ? "" : ". " + this->report_);
-    else if (fin)
-      this->report_ += ". Calibrated, the final checks passed";
-    this->cap_report_();
+    this->report_ = this->compose_(passed, fin, p.receivers());
     this->phase_ = IDLE;
     this->level_ = 0.0f;
     this->was_commissioned_ = this->commissioned(p);
@@ -359,25 +377,129 @@ class Commissioning {
     }
     return true;
   }
-  /// "4/4 answering: R1 9C02, R2 3A11, ...; firmware 0.6.10" (several versions: each one's)
-  void answer_report_(const TelemetryPoller &p) {
-    const uint16_t n = p.receivers();
-    bool same = true;
-    for (uint16_t i = 1; i < n; i++)
-      same &= p.data(i).fw_version == p.data(0).fw_version;
-    std::string s = std::to_string(n) + "/" + std::to_string(n) + " answering:";
-    for (uint16_t i = 0; i < n; i++) {
-      char b[24];
-      snprintf(b, sizeof(b), " R%u %04X", static_cast<unsigned>(i + 1), static_cast<unsigned>(p.uid16(i)));
-      s += b;
-      if (!same)
-        s += " " + commission_fw(p.data(i).fw_version);
-      if (i + 1 < n)
-        s += ",";
+  /// the receivers that answer now (their UID16 and firmware): the report's facts
+  void answers_(const TelemetryPoller &p) {
+    this->ids_.clear();
+    for (uint16_t i = 0; i < p.receivers(); i++) {
+      if (p.answering(i) && p.data(i).have_status)
+        this->ids_.push_back(Answer{p.data(i).fw_version, i, p.uid16(i)});
     }
-    if (same && n > 0)
-      s += "; firmware " + commission_fw(p.data(0).fw_version);
-    this->report_ = s;
+  }
+
+  // ------------------------------------------------------------------------------------------------- the report
+  /// "A, B and C"
+  static std::string and_list_(const std::vector<std::string> &v) {
+    std::string s;
+    for (size_t i = 0; i < v.size(); i++)
+      s += (i == 0 ? "" : i + 1 == v.size() ? " and " : ", ") + v[i];
+    return s;
+  }
+  /// The receivers that answer, full: "3 of 3 receivers answer: R1 9C01, R2 9C02, R3 9C03 (firmware 0.6.10)." (each
+  /// one's version when they differ); short: "All 16 receivers answer (firmware 0.6.9 and 0.6.10).", "R1-R8 answer
+  /// (firmware 0.6.10)."
+  std::string answers_line_(uint16_t n, bool full) const {
+    const size_t k = this->ids_.size();
+    if (k == 0)
+      return "";
+    std::vector<uint32_t> fws;
+    for (const Answer &a : this->ids_) {
+      if (std::find(fws.begin(), fws.end(), a.fw) == fws.end())
+        fws.push_back(a.fw);
+    }
+    std::sort(fws.begin(), fws.end());
+    std::vector<std::string> vs;
+    for (uint32_t v : fws)
+      vs.push_back(commission_fw(v));
+    const std::string firmware = "(firmware " + and_list_(vs) + ")";
+    if (full) {
+      std::string s = std::to_string(k) + " of " + std::to_string(n) + " receivers answer:";
+      for (size_t i = 0; i < k; i++) {
+        char b[16];
+        snprintf(b, sizeof(b), " R%u %04X", static_cast<unsigned>(this->ids_[i].pos + 1),
+                 static_cast<unsigned>(this->ids_[i].uid));
+        s += b;
+        if (fws.size() > 1)
+          s += " (" + commission_fw(this->ids_[i].fw) + ")";
+        if (i + 1 < k)
+          s += ",";
+      }
+      return s + (fws.size() > 1 ? "." : " " + firmware + ".");
+    }
+    if (k == n)
+      return "All " + std::to_string(n) + " receivers answer " + firmware + ".";
+    if (this->ids_.back().pos + 1u == k)   // (a run from R1 on)
+      return (k == 1 ? std::string("R1 answers ") : "R1-" + this->rx_(this->ids_.back().pos) + " answer ") + firmware + ".";
+    return std::to_string(k) + " of " + std::to_string(n) + " receivers answer " + firmware + ".";
+  }
+  /// The cable test, each segment (form 0), their range (1); "" without a load test
+  std::string cable_line_(int form) const {
+    if (std::isnan(this->cable_a_))
+      return "";
+    char b[64];
+    snprintf(b, sizeof(b), "Cable test at %.2f A: ", this->cable_a_);
+    std::string s = b;
+    std::vector<std::string> vals;
+    float lo = NAN, hi = NAN;
+    for (float r : this->seg_) {
+      if (std::isnan(r)) {
+        vals.push_back("n/a");
+        continue;
+      }
+      vals.push_back(std::to_string(static_cast<int>(std::lround(r))));
+      lo = std::isnan(lo) || r < lo ? r : lo;
+      hi = std::isnan(hi) || r > hi ? r : hi;
+    }
+    if (std::isnan(lo))
+      return s + "too little load to measure the cable.";
+    if (form == 0)
+      return s + and_list_(vals) + " m\xCE\xA9 per segment.";
+    if (std::lround(lo) == std::lround(hi))
+      return s + std::to_string(std::lround(lo)) + " m\xCE\xA9 per segment.";
+    return s + std::to_string(std::lround(lo)) + " to " + std::to_string(std::lround(hi)) + " m\xCE\xA9 per segment.";
+  }
+  /// The lowest voltage at the port's full load (a passed load test; a failed one says it in its verdict)
+  std::string load_line_() const {
+    if (this->worst_ < 0 || std::isnan(this->vs_))
+      return "";
+    char b[128];
+    const bool last = this->worst_ + 1 == static_cast<int>(this->seg_.size());
+    snprintf(b, sizeof(b), "At full load (%.2f A) %s%s%s %.1f V (%.0f %%).", this->limit_a_,
+             last ? "the furthest receiver (" : "", this->rx_(this->worst_).c_str(),
+             last ? ") still gets" : " gets the least:", this->worst_v_, this->worst_v_ / this->vs_ * 100.0f);
+    return b;
+  }
+  /// The whole report (wiki: Commissioning): the verdict, then one fact per line ("\n": Home Assistant keeps them,
+  /// the dashboards show lines), within REPORT_MAX bytes: the segments as a range, the receivers without their UIDs,
+  /// then no segments; the verdict and the lowest voltage always stay (cut at a character if still too long).
+  std::string compose_(bool passed, bool finalize, uint16_t n) const {
+    const std::string head = passed ? std::string("Passed.")
+                                    : "Failed: " + this->why_ + "." + (this->advice_.empty() ? "" : " " + this->advice_);
+    std::string calib;
+    if (passed && finalize) {
+      calib = this->cal_ok_ == n && n != 0
+                  ? "Current calibration: OK on " + std::string(n == 1 ? "its receiver" : "all " + std::to_string(n)) +
+                        "; no problems, trips or dips."
+                  : std::string("Current calibration done; no problems, trips or dips.");
+    }
+    const std::string load = passed ? this->load_line_() : "";
+    std::string s;
+    // (answers full / short, cable each / range / none)
+    static const uint8_t LADDER[4][2] = {{1, 0}, {1, 1}, {0, 1}, {0, 2}};
+    for (const auto &step : LADDER) {
+      std::vector<std::string> lines{head, this->answers_line_(n, step[0] != 0),
+                                     step[1] < 2 ? this->cable_line_(step[1]) : "", load, calib};
+      s.clear();
+      for (const std::string &l : lines) {
+        if (!l.empty())
+          s += (s.empty() ? "" : "\n") + l;
+      }
+      if (s.size() <= REPORT_MAX)
+        return s;
+    }
+    size_t cut = REPORT_MAX - 3;
+    while (cut > 0 && (static_cast<uint8_t>(s[cut]) & 0xC0) == 0x80)
+      cut--;
+    return s.substr(0, cut) + "...";
   }
   void snap_(const TelemetryPoller &p, const PortMonitor &m, std::vector<float> &v, std::vector<float> &i, float *vs) {
     const uint16_t n = p.receivers();
@@ -411,13 +533,15 @@ class Commissioning {
       ok++;
     if (ok < n) {
       if (now_ms - this->t_ > this->step_ms_)
-        return this->fail_(now_ms, this->rx_(ok) + " stopped answering during the load test");
+        return this->fail_(now_ms, this->rx_(ok) + " stopped answering during the load test",
+                           "Check its cable or power.");
       return 0;
     }
     for (uint16_t i = 0; i < n; i++) {
       const ReceiverStatus s = receiver_status(p.data(i), true);
       if (s == RS_TRIPPED || events_(p.data(i)) != this->events0_[i])
-        return this->fail_(now_ms, this->rx_(i) + " tripped or dipped during the load test");
+        return this->fail_(now_ms, this->rx_(i) + " tripped or had a supply dip during the load test",
+                           "Check its outputs' wiring and the supply.");
     }
     const float load = m.load_pct();
     if (this->step_ < LEVELS && !(load >= TARGET_LOAD)) {
@@ -436,21 +560,14 @@ class Commissioning {
       t0 += std::isnan(this->i0_[k]) ? 0.0f : this->i0_[k];
       t1 += std::isnan(i1[k]) ? 0.0f : i1[k];
     }
-    char b[96];
-    snprintf(b, sizeof(b), ". Cable at %.2f A:", t1);
-    std::string s = b;
+    this->cable_a_ = t1;
+    this->seg_.assign(n, NAN);
     float worst_v = NAN, through0 = t0, through1 = t1, prev0 = this->vs0_, prev1 = vs;
     int worst = -1;
-    std::string verdict;
     for (uint16_t k = 0; k < n; k++) {
       const float dd = (prev1 - v1[k]) - (prev0 - this->v0_[k]), dt = through1 - through0;
-      if (dt >= MIN_DELTA_A && !std::isnan(dd)) {
-        snprintf(b, sizeof(b), " R%u %.0f", static_cast<unsigned>(k + 1), (dd > 0 ? dd : 0.0f) / dt * 1000.0f);
-      } else {
-        snprintf(b, sizeof(b), " R%u n/a", static_cast<unsigned>(k + 1));
-      }
-      s += b;
-      s += k + 1 < n ? "," : " mOhm";
+      if (dt >= MIN_DELTA_A && !std::isnan(dd))
+        this->seg_[k] = (dd > 0 ? dd : 0.0f) / dt * 1000.0f;   // mOhm
       // this receiver's voltage at the port's full load: its drop's change per ampere of the port, scaled up
       const float d0 = this->vs0_ - this->v0_[k], d1 = vs - v1[k];
       if (t1 - t0 >= MIN_DELTA_A && !std::isnan(d0) && !std::isnan(d1)) {
@@ -465,35 +582,26 @@ class Commissioning {
       through0 -= std::isnan(this->i0_[k]) ? 0.0f : this->i0_[k];
       through1 -= std::isnan(i1[k]) ? 0.0f : i1[k];
     }
-    if (worst < 0 || std::isnan(vs)) {
-      s += "; cable not measured (too little load)";
-    } else {
-      snprintf(b, sizeof(b), "; at full load (%.2f A) %s gets %.1f V (%.0f %%)", limit, this->rx_(worst).c_str(),
-               worst_v, worst_v / vs * 100.0f);
-      s += b;
-      if (worst_v < this->min_voltage_ * vs) {
-        snprintf(b, sizeof(b), "%s: %.1f V at full load (%.0f %%): cable too long or thin", this->rx_(worst).c_str(),
-                 worst_v, worst_v / vs * 100.0f);
-        verdict = b;
-      }
+    this->worst_ = std::isnan(vs) ? -1 : worst;
+    this->worst_v_ = worst_v;
+    this->vs_ = vs;
+    this->limit_a_ = limit;
+    if (this->worst_ >= 0 && worst_v < this->min_voltage_ * vs) {   // (the verdict: the lights back first)
+      char b[128];
+      snprintf(b, sizeof(b), "at full load (%.2f A) %s would get %.1f V (%.0f %%, needs %.0f %%)", limit,
+               this->rx_(worst).c_str(), worst_v, worst_v / vs * 100.0f, this->min_voltage_ * 100.0f);
+      this->why_ = b;
+      this->advice_ = "The cable is too long or too thin.";
     }
-    this->report_ += s;
-    this->verdict_ = verdict;
     this->level_ = 0.0f;
     this->next_(RESTORE, now_ms, "Running: the lights back");
     return ACT_LEVEL;
   }
-  /// the report within REPORT_MAX bytes, cut at a character (UTF-8)
-  void cap_report_() {
-    if (this->report_.size() <= REPORT_MAX)
-      return;
-    size_t cut = REPORT_MAX - 3;
-    while (cut > 0 && (static_cast<uint8_t>(this->report_[cut]) & 0xC0) == 0x80)
-      cut--;
-    this->report_.resize(cut);
-    this->report_ += "...";
-  }
 
+  struct Answer {   // a receiver that answered: its position, UID16, firmware
+    uint32_t fw;
+    uint16_t pos, uid;
+  };
   CommissionRecord record_{};
   Kind kind_{COMMISSION};
   Phase phase_{IDLE};
@@ -501,10 +609,19 @@ class Commissioning {
   float min_voltage_{0.9f}, level_{0.0f}, vs0_{NAN};
   uint8_t step_{0};
   bool marked_{false}, cal_seen_{false}, changed_{false}, was_commissioned_{false}, idle_due_{true};
-  std::string status_{"Not commissioned"}, report_, verdict_, last_;
+  std::string status_{"Not commissioned"}, report_, last_;
   std::vector<float> v0_, i0_;      // the load test's baseline (only while it runs)
   std::vector<uint32_t> events0_;   // each receiver's trips and dips at the start
   const TelemetryPoller *last_p_{nullptr};
+  // the report's facts (the last run): why it failed and what to do, the receivers that answered, the cable test
+  // (the port's current then, each segment's mOhm: NAN n/a), the lowest voltage at full load (worst_ -1: not
+  // measured), the receivers whose calibration test completed
+  std::string why_, advice_;
+  std::vector<Answer> ids_;
+  std::vector<float> seg_;
+  float cable_a_{NAN}, worst_v_{NAN}, vs_{NAN}, limit_a_{NAN};
+  int worst_{-1};
+  uint16_t cal_ok_{0};
 };
 
 }  // namespace esphome::dig2analog_ultra

@@ -47,6 +47,7 @@ struct Model {
   bool outputs_page{true};   // optional page
   int busy_energy{0};        // answers ENERGY BUSY this many times
   uint32_t uptime{100};
+  uint32_t fw{0x000608};     // STATUS's version (major << 16 | minor << 8 | patch)
   uint8_t reset{ULTRA_ST_RST_POWER};
   uint8_t state{0};          // STATUS 8 (POWER_EVENT added while a latch is set)
   uint8_t why{0};            // OUTPUTS 23
@@ -221,7 +222,7 @@ struct Model {
       this->asked[page]++;
     switch (page) {
       case ULTRA_PAGE_STATUS:
-        ultra_put24(d + ULTRA_ST_FW_VERSION, 0x000608);
+        ultra_put24(d + ULTRA_ST_FW_VERSION, this->fw);
         d[ULTRA_ST_HW_ID] = 2;
         ultra_put24(d + ULTRA_ST_UPTIME, this->uptime);
         d[ULTRA_ST_RESET] = this->reset;
@@ -2359,6 +2360,7 @@ struct CommWorld {
   std::vector<float> r, full;
   bool calibrating{false}, updating{false};
   uint32_t cal_end{0}, unix_s{1792108800};   // 2026-10-16 00:00 UTC
+  int cal_stop{-1};   // a receiver whose calibration test stops (a trip); the others (with the feature) complete
   int stores{0}, cal_asks{0};
   float max_load{0.0f};
   std::vector<float> levels;   // each ACT_LEVEL's level
@@ -2416,6 +2418,13 @@ struct CommWorld {
         this->cal_asks++;
         this->calibrating = true;
         this->cal_end = this->c.now_ms + 5000;
+        for (size_t k = 0; k < this->c.rx.size(); k++) {   // (a stopped test stores nothing: only its end)
+          Model &x = this->c.rx[k];
+          if (static_cast<int>(k) == this->cal_stop)
+            x.cal_end = ULTRA_CA_END_TRIP;
+          else
+            x.calibrated();
+        }
       }
       if (act & Commissioning::ACT_LEVEL)
         this->levels.push_back(this->cm.level());
@@ -2452,18 +2461,31 @@ static void test_commissioning() {
             !w.levels.empty() && w.levels.back() == 0.0f && w.stores == 0 && w.cal_asks == 0,
         "commission on a good line: passed ('%s'), the lights back (%zu levels), nothing stored", w.cm.status().c_str(),
         w.levels.size());
-  CHECK(rep.find("4/4 answering: R1 ") == 0 && rep.find("; firmware 0.6.8") != std::string::npos &&
-            rep.find("Cable at ") != std::string::npos && rep.find("R4 gets") != std::string::npos &&
-            rep.size() <= Commissioning::REPORT_MAX,
+  // the report: the verdict, then one fact per line
+  char ids[64];
+  snprintf(ids, sizeof(ids), "R1 %04X, R2 %04X, R3 %04X, R4 %04X", w.p.uid16(0), w.p.uid16(1), w.p.uid16(2),
+           w.p.uid16(3));
+  CHECK(rep.find("Passed.\n4 of 4 receivers answer: " + std::string(ids) + " (firmware 0.6.8).\nCable test at ") ==
+                0 &&
+            rep.find(" m\xCE\xA9 per segment.\nAt full load (2.25 A) the furthest receiver (R4) still gets ") !=
+                std::string::npos &&
+            rep.back() == '.' && rep.size() <= Commissioning::REPORT_MAX,
         "the report: '%s'", rep.c_str());
+  std::printf("  commission passed:\n%s\n", rep.c_str());
   // each segment 100 mOhm: within 15 % where the current changed by 0.5 A or more (segments 1-3); the last one
   // (~0.25 A) within the error of the 10 mV voltage steps (4 x 5 mV over its change of current: about 80 mOhm)
   int good = 0;
-  for (int k = 1; k <= 4; k++) {
-    const size_t at = rep.find(" R" + std::to_string(k) + " ", rep.find("Cable at"));
-    if (at != std::string::npos) {
-      const int mohm = std::atoi(rep.c_str() + at + 3 + (k >= 10));
+  {
+    const char *q = rep.c_str() + rep.find(": ", rep.find("Cable test at ")) + 2;
+    for (int k = 1; k <= 4; k++) {
+      char *end;
+      const long mohm = std::strtol(q, &end, 10);
+      if (end == q)
+        break;
       good += k < 4 ? mohm >= 85 && mohm <= 115 : mohm >= 20 && mohm <= 180;
+      q = end;
+      while (*q == ',' || *q == ' ' || std::strncmp(q, "and ", 4) == 0)
+        q += *q == 'a' ? 4 : 1;
     }
   }
   CHECK(good == 4 && w.max_load >= Commissioning::TARGET_LOAD && w.max_load < 80.0f,
@@ -2473,18 +2495,27 @@ static void test_commissioning() {
   CommWorld thin(4, 2.0f, 0.4f);
   thin.warm(5000);
   thin.commission(false);
-  CHECK(thin.cm.status().find("Commission failed: R4: ") == 0 &&
-            thin.cm.status().find("cable too long or thin") != std::string::npos && thin.cm.level() == 0.0f &&
+  const std::string &thin_rep = thin.cm.report();
+  CHECK(thin.cm.status().find("Commission failed: at full load (2.25 A) R4 would get ") == 0 &&
+            thin_rep.find("Failed: at full load (2.25 A) R4 would get ") == 0 &&
+            thin_rep.find(" %, needs 90 %). The cable is too long or too thin.\n4 of 4 receivers answer: R1 ") !=
+                std::string::npos &&
+            thin_rep.find("\nCable test at ") != std::string::npos &&
+            thin_rep.find("\nAt full load") == std::string::npos && thin.cm.level() == 0.0f &&
             thin.levels.back() == 0.0f,
-        "a thin cable: '%s'", thin.cm.status().c_str());
-  // receiver 3 silent: where to look
+        "a thin cable: '%s' / '%s'", thin.cm.status().c_str(), thin_rep.c_str());
+  std::printf("  a thin cable:\n%s\n", thin_rep.c_str());
+  // receiver 3 silent: where to look; the ones that answer
   CommWorld s(4);
   s.warm(5000);
   s.c.rx[2].has_channel = false;
   s.commission(false);
-  CHECK(s.cm.status() ==
-            "Commission failed: R3 doesn't answer (R1-R2 do): check the cable or power between R2 and R3",
-        "R3 silent: '%s'", s.cm.status().c_str());
+  snprintf(ids, sizeof(ids), "R1 %04X, R2 %04X", s.p.uid16(0), s.p.uid16(1));
+  CHECK(s.cm.status() == "Commission failed: R3 doesn't answer" &&
+            s.cm.report() == "Failed: R3 doesn't answer. Check the cable or power between R2 and R3.\n2 of 4 receivers "
+                             "answer: " + std::string(ids) + " (firmware 0.6.8).",
+        "R3 silent: '%s' / '%s'", s.cm.status().c_str(), s.cm.report().c_str());
+  std::printf("  R3 silent:\n%s\n", s.cm.report().c_str());
   // the port Off; no board; a trip during the load test (the lights back first)
   CommWorld o(2);
   o.port.off = true;
@@ -2503,12 +2534,17 @@ static void test_commissioning() {
   t.c.rx[1].event(ULTRA_PW_EV_OVERLOAD);
   t.c.rx[1].state = ULTRA_ST_TRIPPED;
   t.run(60000);
-  CHECK(o.cm.status() == "Commission failed: The port's power mode is Off" &&
-            nb.cm.status() == "Commission failed: No board on the port" &&
-            t.cm.status() == "Commission failed: R2 tripped or dipped during the load test" && t.cm.level() == 0.0f &&
-            t.levels.back() == 0.0f,
-        "Off: '%s'; no board: '%s'; a trip: '%s'", o.cm.status().c_str(), nb.cm.status().c_str(),
-        t.cm.status().c_str());
+  CHECK(o.cm.status() == "Commission failed: the port's power mode is Off" &&
+            o.cm.report() == "Failed: the port's power mode is Off. Choose another power mode, then run it again." &&
+            nb.cm.status() == "Commission failed: no board on the port" &&
+            nb.cm.report() == "Failed: no board on the port. Check the board's connection to the port." &&
+            t.cm.status() == "Commission failed: R2 tripped or had a supply dip during the load test" &&
+            t.cm.report().find("Failed: R2 tripped or had a supply dip during the load test. Check its outputs' wiring "
+                               "and the supply.\n3 of 3 receivers answer: R1 ") == 0 &&
+            t.cm.report().find("Cable test") == std::string::npos && t.cm.level() == 0.0f && t.levels.back() == 0.0f,
+        "Off: '%s'; no board: '%s'; a trip: '%s'", o.cm.report().c_str(), nb.cm.report().c_str(),
+        t.cm.report().c_str());
+  std::printf("  the port Off:\n%s\n  a trip in the load test:\n%s\n", o.cm.report().c_str(), t.cm.report().c_str());
   // Finalize: the calibration, the full read, the record; commissioned until a receiver is replaced
   CommWorld f(4);
   f.warm(5000);
@@ -2519,6 +2555,10 @@ static void test_commissioning() {
             rec.fw_max == 0x000608 && f.cm.status() == "Commissioned 2026-10-16" && f.cm.commissioned(f.p),
         "finalize: '%s', stored %d, %u receivers, commissioned %d", f.cm.status().c_str(), f.stores,
         static_cast<unsigned>(rec.receivers), f.cm.commissioned(f.p));
+  CHECK(f.cm.report().find("Passed.\n4 of 4 receivers answer: R1 ") == 0 &&
+            f.cm.report().find(" (firmware 0.6.8).\nCurrent calibration done; no problems, trips or dips.") !=
+                std::string::npos,
+        "finalize's report: '%s'", f.cm.report().c_str());
   f.c.rx[1].uid[0] ^= 0x55;   // a receiver replaced
   f.c.rx[1].restart();
   bool texts = false;
@@ -2542,8 +2582,9 @@ static void test_commissioning() {
   b.cm.set_record(g.cm.record());
   b.cm.poll(0, 0, b.port, b.p, b.m, false, false);
   CHECK(g.stores == 1 && !g.cm.record().passed && g.cm.status() == "Finalize failed 2026-10-16" &&
-            g.cm.report().find("R1: Supply dips") == 0 && b.cm.status() == "Finalize failed 2026-10-16" &&
-            !b.cm.commissioned(b.p),
+            g.cm.report().find("Failed: R1 reports Supply dips. See its Status detail.\n2 of 2 receivers answer: ") ==
+                0 &&
+            b.cm.status() == "Finalize failed 2026-10-16" && !b.cm.commissioned(b.p),
         "finalize with a dip: '%s' ('%s'); at boot: '%s'", g.cm.status().c_str(), g.cm.report().c_str(),
         b.cm.status().c_str());
   // one run at a time per line; a big load: the ramp stops at its first step over 40 %, below the warning
@@ -2559,11 +2600,55 @@ static void test_commissioning() {
   CHECK(commission_date(0) == "date unknown" && commission_date(951782400) == "2000-02-29" &&
             commission_date(4102444799u) == "2099-12-31" && commission_fw(0x00060A) == "0.6.10",
         "dates and versions");
+  // 16 receivers: too long with every UID and segment, so the segments as a range and the receivers without their
+  // UIDs; the verdict and the lowest voltage stay
   CommWorld many(16);
   many.warm(8000);
   many.commission(false, 300000);
-  CHECK(many.cm.report().size() <= Commissioning::REPORT_MAX && many.cm.report().find("16/16 answering") == 0,
-        "16 receivers: %zu bytes ('%s')", many.cm.report().size(), many.cm.report().c_str());
+  const std::string &mr = many.cm.report();
+  CHECK(mr.size() <= Commissioning::REPORT_MAX && mr.find("Passed.\nAll 16 receivers answer (firmware 0.6.8).\n") == 0 &&
+            mr.find(" to ") != std::string::npos && mr.find(" m\xCE\xA9 per segment.\nAt full load (2.25 A) ") !=
+                                                       std::string::npos,
+        "16 receivers: %zu bytes ('%s')", mr.size(), mr.c_str());
+  std::printf("  16 receivers (shortened, %zu bytes):\n%s\n", mr.size(), mr.c_str());
+  // mixed firmware: each receiver's version
+  CommWorld mix(3);
+  mix.c.rx[1].fw = 0x00060A;
+  mix.warm(5000);
+  mix.commission(false);
+  snprintf(ids, sizeof(ids), "R1 %04X (0.6.8), R2 %04X (0.6.10), R3 %04X (0.6.8).", mix.p.uid16(0), mix.p.uid16(1),
+           mix.p.uid16(2));
+  CHECK(mix.cm.report().find("Passed.\n3 of 3 receivers answer: " + std::string(ids) + "\nCable test at ") == 0,
+        "mixed firmware: '%s'", mix.cm.report().c_str());
+  std::printf("  mixed firmware:\n%s\n", mix.cm.report().c_str());
+  // 40 receivers, R31 silent: the 30 that answer as a range (with their UIDs over 250 bytes)
+  CommWorld chain(40);
+  chain.warm(5000);
+  chain.c.rx[30].has_channel = false;
+  chain.commission(false, 300000);
+  CHECK(chain.cm.report() == "Failed: R31 doesn't answer. Check the cable or power between R30 and R31.\nR1-R30 "
+                             "answer (firmware 0.6.8).",
+        "40 receivers, R31 silent: '%s'", chain.cm.report().c_str());
+  // Finalize with the receivers' calibration results: every test complete; one stopped (a trip): it fails
+  CommWorld fc(3);
+  for (auto &x : fc.c.rx)
+    x.features |= ULTRA_FEAT_CALIBRATION;
+  fc.warm(5000);
+  fc.commission(true, 240000);
+  CommWorld fs(3);
+  for (auto &x : fs.c.rx)
+    x.features |= ULTRA_FEAT_CALIBRATION;
+  fs.cal_stop = 1;
+  fs.warm(5000);
+  fs.commission(true, 240000);
+  CHECK(fc.cm.status() == "Commissioned 2026-10-16" &&
+            fc.cm.report().find("\nCurrent calibration: OK on all 3; no problems, trips or dips.") != std::string::npos &&
+            fs.cm.status() == "Finalize failed 2026-10-16" &&
+            fs.cm.report().find("Failed: R2's calibration test stopped (a trip). Check its outputs' wiring and the "
+                                "supply, then run Finalize again.\n3 of 3 receivers answer: ") == 0,
+        "finalize with the calibration results: '%s' / '%s'", fc.cm.report().c_str(), fs.cm.report().c_str());
+  std::printf("  finalize passed:\n%s\n  finalize, a test stopped:\n%s\n", fc.cm.report().c_str(),
+              fs.cm.report().c_str());
 }
 
 /// The receivers' current calibration: the CALIBRATION page read at the start (after IDENTITY's features: only from a

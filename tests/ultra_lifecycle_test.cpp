@@ -4599,7 +4599,7 @@ static void test_commission_glue() {
     a.tick();
   }
   CHECK(a.cal_calls == 1 && a.comm_pref_.saves == 1 && a.comm_pref_.last.passed && prefs.syncs == syncs + 1 &&
-            a.comm_.status() == "Commission failed: The port's power mode is Off",
+            a.comm_.status() == "Commission failed: the port's power mode is Off",
         "finalize: calibrated %d, stored %d (passed %d), synced; then Off: '%s'", a.cal_calls, a.comm_pref_.saves,
         a.comm_pref_.last.passed, a.comm_.status().c_str());
   UltraHub::hubs_.clear();

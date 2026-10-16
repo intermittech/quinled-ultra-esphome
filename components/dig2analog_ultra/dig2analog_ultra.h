@@ -199,9 +199,20 @@ class UltraHub final : public Component {
   /// pin's run is in progress; with a power_supply it is switched on for the run. Boards without current sense
   /// ignore the test (they just go dark and back).
   void calibrate_boards(const std::vector<uint16_t> &boards, uint8_t duty_pct = 0);
+  /// One receiver's test (its button): the standard test of that board, the whole pin dark meanwhile. Joins a run
+  /// asked for or in progress on this pin (tested after its boards; CalSequencer::add), else starts one.
+  void calibrate_receiver(uint16_t board);
   /// Stop the run: the pin fades back at once (a test already running finishes on its board, <= 1 s).
   void cancel_calibration();
   bool calibration_running() const { return this->cal_pending_ || this->cal_seq_.running(); }
+  /// The board is in this pin's run: asked for (waiting for the boards' power), or running (to be tested, being
+  /// tested, or held dark until the run is over). Its receiver's Status shows Calibrating (with_hub_calibration).
+  bool calibrating(uint16_t board) const {
+    if (this->cal_pending_)
+      return this->cal_req_boards_.empty() ||
+             std::find(this->cal_req_boards_.begin(), this->cal_req_boards_.end(), board) != this->cal_req_boards_.end();
+    return this->cal_seq_.includes(board);
+  }
   /// progress: the board being tested, its position (1-based; 0 while the pin goes dark or nothing runs), the count
   uint16_t calibration_board() const { return this->cal_seq_.board(); }
   size_t calibration_step() const { return this->cal_seq_.running() && this->cal_started_ ? this->cal_seq_.index() + 1 : 0; }
@@ -360,9 +371,11 @@ class UltraHub final : public Component {
     this->comm_min_v_ = min_voltage;
   }
 #ifdef USE_TIME
-  /// the time for the stored date (without: "date unknown")
-  void set_commission_clock(time::RealTimeClock *clock) { this->comm_clock_ = clock; }
+  /// the time for the stored dates: the commissioning's (without: "date unknown"), the receivers' Last calibrated
+  void set_telemetry_clock(time::RealTimeClock *clock) { this->tel_clock_ = clock; }
 #endif
+  /// Each receiver's last current calibration (Calibration, Current model, Last calibrated; kept on flash)
+  const CalibrationLog &calibration_log() const { return this->cal_log_; }
   /// the texts or the commissioned state changed (the line's entities)
   void add_on_commission_callback(std::function<void()> &&cb) { this->comm_cb_.add(std::move(cb)); }
   const char *telemetry_name() const { return this->tel_name_; }
@@ -461,8 +474,13 @@ class UltraHub final : public Component {
   ESPPreferenceObject comm_pref_;
   CallbackManager<void()> comm_cb_;
 #ifdef USE_TIME
-  time::RealTimeClock *comm_clock_{nullptr};
+  time::RealTimeClock *tel_clock_{nullptr};
 #endif
+  uint32_t tel_unix_() const;             // the clock's unix time (0: none, or not set yet)
+  // the receivers' current calibration: their records (one blob on flash), the run they saw last
+  CalibrationLog cal_log_;
+  ESPPreferenceObject cal_pref_;
+  bool cal_was_{false};
   static UltraHub *comm_active_;          // the line whose run goes now (one at a time: the sender's supply)
   PortMonitor port_monitor_;              // the port's load and cable, after each window
   LedgerKeeper keeper_;                   // this line's receivers in the lifetime ledger (ultra_ledger.h)

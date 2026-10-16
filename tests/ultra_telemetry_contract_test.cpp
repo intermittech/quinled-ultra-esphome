@@ -855,6 +855,34 @@ static void sc_pages() {
   b.check_retried();
   std::printf("  after the test: health '%s', lifetime %.0f Wh, %.1f W\n", telemetry_health_text(d).c_str(),
               telemetry_value(d, TV_ENERGY), telemetry_value(d, TV_INPUT_POWER));
+  // CALIBRATION (read at the start; again right after the hub's run: read_now): the model, how the test ended, its
+  // age, the connected load, as the firmware has them; the hub's record of it ("OK", when it ended)
+  if (b.t.has_025) {
+    CalibrationLog log;
+    log.init(1);
+    b.p.read_now(0, TP_CALIBRATION, ucrx_hub_ms());
+    const uint32_t reads = b.reads[TP_CALIBRATION];
+    b.run_until(2000, [&] { return b.reads[TP_CALIBRATION] > reads; });
+    ucrx_truth_t t;
+    ucrx_truth(&t);
+    const uint32_t unix_s = 1792000000u;
+    const bool stored = log.observe(0, d, b.p.uid16(0), ucrx_hub_ms(), unix_s);
+    CHECK(reads >= 1 && b.reads[TP_CALIBRATION] == reads + 1 && d.have_calibration && t.cal_done &&
+              d.cal_model == t.cal_model && d.cal_model == 2 && d.cal_end == t.cal_end && d.cal_end == 0 &&
+              d.cal_age_s >= 100 && d.cal_age_s <= 130 && d.cal_levels != 0,
+          "pages: CALIBRATION read %u then %u, model %u (firmware %u), end %u (%u), age %u s, levels %u", reads,
+          (unsigned) b.reads[TP_CALIBRATION], d.cal_model, t.cal_model, d.cal_end, t.cal_end, (unsigned) d.cal_age_s,
+          d.cal_levels);
+    CHECK(d.cal_connected_ma == (t.conn_ma > 65535 ? 65535 : t.conn_ma) && d.cal_connected_ma >= 1000,
+          "pages: connected load %u mA, the firmware's %u mA", d.cal_connected_ma, (unsigned) t.conn_ma);
+    CHECK(stored && log.result(0, d) == "OK" && log.last_unix(0) == unix_s - d.cal_age_s &&
+              std::string(calibration_model_text(d.cal_model)) == "Calibrated",
+          "pages: the record %d, '%s', ended %u, model '%s'", stored, log.result(0, d).c_str(),
+          (unsigned) log.last_unix(0), calibration_model_text(d.cal_model));
+    std::printf("  CALIBRATION: %s model, last test %s %u s ago, connected load %.2f A\n",
+                calibration_model_text(d.cal_model), log.result(0, d).c_str(), (unsigned) d.cal_age_s,
+                d.cal_connected_ma / 1000.0);
+  }
   b.summary();
 }
 

@@ -84,6 +84,17 @@ struct Model {
   uint8_t fm_dip_pct{0};
   uint8_t flash_pending{0};  // DIAG 20 (0.2.6: ULTRA_DG_FP_EXHAUSTED)
   uint32_t diag_parts[3]{};  // DIAG POLLs per part (2: any other)
+  // CALIBRATION (feature CALIBRATION): the model, the last test's end, the stored test's levels, the uptime + 1 at the
+  // last complete test (0: none since its power-up), the connected load
+  uint8_t cal_model{1}, cal_end{0}, cal_levels{0};
+  uint32_t cal_done_up{0};
+  uint16_t conn_ma{1850};
+  void calibrated() {   // a complete test now
+    this->cal_model = 2;
+    this->cal_end = 0;
+    this->cal_levels = 4;
+    this->cal_done_up = this->uptime + 1;
+  }
 
   void set025() {
     this->features |= ULTRA_FEAT_LIFETIME | ULTRA_FEAT_DIAG | ULTRA_FEAT_RETRY | ULTRA_FEAT_LOSS_SCENE;
@@ -109,6 +120,8 @@ struct Model {
     this->latched = 0;
     this->boot_mwh = 0;
     this->merged = false;
+    this->cal_done_up = 0;   // (CALIBRATION: no test since its power-up; its stored test stays)
+    this->cal_end = 0;
   }
   /// used energy: its count since power-up and (whole Wh) its lifetime
   void use(uint32_t mwh) {
@@ -342,6 +355,16 @@ struct Model {
           break;
         }
         d[ULTRA_OU_WHY] = this->why;
+        break;
+      case ULTRA_PAGE_CALIBRATION:
+        if (!(this->features & ULTRA_FEAT_CALIBRATION)) {
+          out_page = ULTRA_PAGE_UNSUPPORTED;
+          break;
+        }
+        d[CA_LEVELS] = this->cal_levels;
+        d[ULTRA_CA_MODEL] = static_cast<uint8_t>(this->cal_model | this->cal_end << 4);
+        ultra_put24(d + CA_AGE, this->cal_done_up != 0 ? this->uptime + 1 - this->cal_done_up : CA_AGE_NONE);
+        ultra_put16(d + CA_CONNECTED, this->conn_ma);
         break;
       default:
         out_page = ULTRA_PAGE_UNSUPPORTED;
@@ -2543,6 +2566,127 @@ static void test_commissioning() {
         "16 receivers: %zu bytes ('%s')", many.cm.report().size(), many.cm.report().c_str());
 }
 
+/// The receivers' current calibration: the CALIBRATION page read at the start (after IDENTITY's features: only from a
+/// board with the feature), right after the hub's run (read_now) and with diag's interval; the hub's record of each
+/// (CalibrationLog: a new complete test, the same one read later on a slow clock, a stopped one, the board's power-up,
+/// the ESP32's restart, the clock set late or never, another board); the Status in the hub's run.
+static void test_calibration() {
+  {
+    Chain c(2);
+    c.rx[0].features |= ULTRA_FEAT_CALIBRATION;
+    TelemetryPoller p = started(c, 2);
+    c.run(p, 3000);
+    const ReceiverData &d = p.data(0);
+    CHECK(c.rx[0].asked[ULTRA_PAGE_CALIBRATION] == 1 && c.rx[1].asked[ULTRA_PAGE_CALIBRATION] == 0 &&
+              d.have_calibration && !p.data(1).have_calibration && d.cal_model == 1 && d.cal_levels == 0 &&
+              d.cal_age_s == CA_AGE_NONE && d.cal_connected_ma == 1850,
+          "CALIBRATION at the start: asked %u / %u, model %u, age %u, connected %u mA",
+          (unsigned) c.rx[0].asked[ULTRA_PAGE_CALIBRATION], (unsigned) c.rx[1].asked[ULTRA_PAGE_CALIBRATION],
+          d.cal_model, (unsigned) d.cal_age_s, d.cal_connected_ma);
+    c.rx[0].calibrated();
+    p.read_now(0, TP_CALIBRATION, c.now_ms);
+    c.run_until(p, 1000, [&] { return c.rx[0].asked[ULTRA_PAGE_CALIBRATION] == 2; });
+    CHECK(c.rx[0].asked[ULTRA_PAGE_CALIBRATION] == 2 && d.cal_model == 2 && d.cal_levels == 4 && d.cal_age_s <= 1 &&
+              d.cal_end == ULTRA_CA_END_COMPLETE,
+          "CALIBRATION right after the run: asked %u, model %u, age %u", (unsigned) c.rx[0].asked[ULTRA_PAGE_CALIBRATION],
+          d.cal_model, (unsigned) d.cal_age_s);
+    c.run(p, 301000);
+    CHECK(c.rx[0].asked[ULTRA_PAGE_CALIBRATION] == 3 && d.cal_age_s >= 299 && d.cal_age_s <= 302,
+          "CALIBRATION with diag's interval: asked %u, age %u", (unsigned) c.rx[0].asked[ULTRA_PAGE_CALIBRATION],
+          (unsigned) d.cal_age_s);
+  }
+  {
+    static_assert(sizeof(CalRecord) == 8, "a calibration record is 8 bytes (a line's blob)");
+    const uint32_t T = 1792000000u;   // the clock
+    CalibrationLog log;
+    log.init(2);
+    ReceiverData d;
+    CHECK(log.result(0, d).empty() && !log.observe(0, d, 0x1234, 0, T), "the record: nothing before its page");
+    d.have_calibration = true;
+    d.cal_model = 1;   // a learned model, no test
+    CHECK(log.observe(0, d, 0x1234, 1000, T) && log.result(0, d) == "Not tested" && log.last_unix(0) == 0,
+          "the record: a new board, not tested ('%s')", log.result(0, d).c_str());
+    d.cal_levels = 4;   // a stored test from before its power-up: OK, when unknown
+    d.cal_model = 2;
+    CHECK(!log.observe(0, d, 0x1234, 2000, T) && log.result(0, d) == "OK" && log.last_unix(0) == 0,
+          "the record: a stored test ('%s')", log.result(0, d).c_str());
+    d.cal_age_s = 30;
+    CHECK(log.observe(0, d, 0x1234, 3000, T) && log.last_unix(0) == T - 30, "the record: a test 30 s ago (%u)",
+          (unsigned) (log.last_unix(0) - T));
+    d.cal_age_s = 30 + 291;   // 5 min later, its clock 3 % slow: the same test
+    CHECK(!log.observe(0, d, 0x1234, 303000, T + 300) && log.last_unix(0) == T - 30, "the record: the same test");
+    d.cal_age_s = 10;
+    CHECK(log.observe(0, d, 0x1234, 603000, T + 600) && log.last_unix(0) == T + 590, "the record: a new test");
+    d.cal_end = ULTRA_CA_END_TRIP;   // a test that stopped: its end; the last complete test's time stays
+    d.cal_age_s = 70;
+    CHECK(log.observe(0, d, 0x1234, 663000, T + 660) && log.result(0, d) == "Stopped: a trip" &&
+              log.last_unix(0) == T + 590,
+          "the record: a stopped test ('%s')", log.result(0, d).c_str());
+    d.cal_end = ULTRA_CA_END_COMPLETE;   // its power-up: no test since, the record says how the last one ended
+    d.cal_age_s = CA_AGE_NONE;
+    CHECK(!log.observe(0, d, 0x1234, 700000, T + 700) && log.result(0, d) == "Stopped: a trip",
+          "the record: after its power-up ('%s')", log.result(0, d).c_str());
+    d.cal_age_s = 5;
+    CHECK(log.observe(0, d, 0x1234, 800000, T + 800) && log.result(0, d) == "OK" && log.last_unix(0) == T + 795,
+          "the record: complete again");
+    // the ESP32 restarts: the records from flash, the same test (its age grown with the time since): unchanged
+    CalibrationLog again;
+    again.init(2);
+    again.load(log.records(), log.size());
+    d.cal_age_s = 5 + 3600;
+    CHECK(!again.observe(0, d, 0x1234, 10000, T + 800 + 3600) && again.last_unix(0) == T + 795,
+          "the record after the ESP32's restart: the same test (%d)", static_cast<int>(again.last_unix(0) - T));
+    // ... without its clock yet: decided once it is set (a newer test meanwhile)
+    CalibrationLog late;
+    late.init(2);
+    late.load(log.records(), log.size());
+    d.cal_age_s = 20;
+    CHECK(!late.observe(0, d, 0x1234, 10000, 0) && late.last_unix(0) == T + 795, "the clock not set: waits");
+    CHECK(late.observe(0, d, 0x1234, 40000, T + 5000) && late.last_unix(0) == T + 4980,
+          "the clock set: a newer test (%d)", static_cast<int>(late.last_unix(0) - T));
+    // no clock at all: a test's time unknown, filled in once the clock is set
+    CalibrationLog none;
+    none.init(2);
+    d.cal_age_s = 40;
+    CHECK(none.observe(1, d, 0x5678, 1000, 0) && none.last_unix(1) == 0 && none.result(1, d) == "OK",
+          "no clock: the test, its time unknown");
+    d.cal_age_s = 100;
+    CHECK(none.observe(1, d, 0x5678, 61000, T) && none.last_unix(1) == T - 100, "no clock: its time once set");
+    // another board at the position: a record of its own
+    ReceiverData f;
+    f.have_calibration = true;
+    f.cal_model = 1;
+    CHECK(log.observe(0, f, 0x9999, 900000, T + 900) && log.result(0, f) == "Not tested" && log.last_unix(0) == 0 &&
+              log.record(0).uid16 == 0x9999,
+          "another board: its own record ('%s')", log.result(0, f).c_str());
+    CHECK(std::string(calibration_end_text(ULTRA_CA_END_LIMIT)) == "Stopped: the current limit" &&
+              std::string(calibration_end_text(ULTRA_CA_END_SUPPLY)) == "Stopped: a supply dip" &&
+              std::string(calibration_end_text(9)) == "Stopped" &&
+              std::string(calibration_model_text(0)) == "No model" &&
+              std::string(calibration_model_text(1)) == "Learned" &&
+              std::string(calibration_model_text(2)) == "Calibrated",
+          "the end and model texts");
+  }
+  // the Status in the hub's run: Calibrating instead of what isn't a problem that stays (and Calibration suggested)
+  {
+    std::string got;
+    bool ok = true;
+    for (uint8_t s = 0; s < RS_COUNT; s++) {
+      const ReceiverStatus st = static_cast<ReceiverStatus>(s);
+      const ReceiverStatus want = s >= RS_CAL_SUGGESTED && s != RS_PORT_OFF ? RS_CALIBRATING : st;
+      ok &= with_hub_calibration(st, false) == st && with_hub_calibration(st, true) == want;
+      got += std::string(" ") + receiver_status_name(with_hub_calibration(st, true));
+    }
+    CHECK(ok, "the Status in the hub's run:%s", got.c_str());
+    ReceiverData d;
+    d.have_status = true;
+    d.power_state = static_cast<uint8_t>(ULTRA_ST_WHY_DARK_HOLD << ULTRA_ST_WHY_SHIFT);
+    CHECK(receiver_status_detail(d, RS_CALIBRATING, 1, -1) ==
+              "A current calibration on its line: its outputs stay dark until it is done.",
+          "held dark in the hub's run: '%s'", receiver_status_detail(d, RS_CALIBRATING, 1, -1).c_str());
+  }
+}
+
 /// The reply rate (round 12): one rate slower at 4 broken of the last 32 counted windows (3: not; old ones slide out;
 /// windows without any answer don't count, missing answers alone neither), not below 250 k; one rate faster after an
 /// hour of windows without a broken one (a standby gap counts 60 s), never above the configured rate; a failed try
@@ -2635,6 +2779,7 @@ int main() {
   std::printf("ultra telemetry test (the return channel's hub side)\n");
   test_power_off_cap();
   test_reply_rate();
+  test_calibration();
   test_commissioning();
   test_window_hash();
   test_due_memo();

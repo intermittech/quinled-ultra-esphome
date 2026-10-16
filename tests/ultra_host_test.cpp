@@ -975,12 +975,16 @@ struct CalRun {
   std::vector<CalTrace> tr;
   double done_ms = -1;
   int boards_started = 0;
+  std::vector<uint16_t> order;   // the boards in the order their tests started
+  bool added = false;            // add_board: taken
+  std::vector<uint16_t> in_run;  // ... the boards the run includes right after
 };
 
 // n boards, test `boards` (empty = all); drop: a board whose slots are all lost; cancel_after: cancel once this many
-// boards were started (0 = never); frames: false = the line can't send (no frames at all)
+// boards were started (0 = never); frames: false = the line can't send (no frames at all); add_board: added to the run
+// at its first board's test (a receiver's button while its line runs)
 static CalRun run_cal(int n, const std::vector<uint16_t> &boards, int drop, int cancel_after, bool frames,
-                      Scheduler *other = nullptr, int *other_identify = nullptr) {
+                      Scheduler *other = nullptr, int *other_identify = nullptr, int add_board = -1) {
   Scheduler s;
   s.init(static_cast<uint16_t>(n), 77, 3);
   CalSequencer q;
@@ -1000,8 +1004,20 @@ static CalRun run_cal(int n, const std::vector<uint16_t> &boards, int drop, int 
     const CalSequencer::Event ev = q.poll(s, now);
     if (ev == CalSequencer::EV_BOARD) {
       r.boards_started++;
+      r.order.push_back(q.board());
       if (cancel_after && r.boards_started == cancel_after + 1) {
         q.cancel(s);
+      }
+      if (add_board >= 0 && r.boards_started == 1) {
+        const size_t before = q.count();
+        const bool in = q.includes(static_cast<uint16_t>(add_board));
+        r.added = q.add(static_cast<uint16_t>(add_board));
+        CHECK(q.add(static_cast<uint16_t>(add_board)) == r.added && q.count() == before + (r.added && !in ? 1 : 0),
+              "a board added twice: once in the run (%zu)", q.count());
+        for (int b = 0; b < n; b++) {
+          if (q.includes(static_cast<uint16_t>(b)))
+            r.in_run.push_back(static_cast<uint16_t>(b));
+        }
       }
     }
     if (ev == CalSequencer::EV_DONE)
@@ -1117,6 +1133,31 @@ static void test_cal_sequencer() {
   }
   CHECK(CalSequencer::hold_s(64, 0) >= 80 && CalSequencer::hold_s(4, 0) >= 15 && CalSequencer::hold_s(250, 0) == 255,
         "dark hold covers the whole run (+10 s), at most 255 s");
+  {
+    // a receiver's button while its line runs: board 3 joins the run of board 1, tested after it, the pin dark all
+    // along; a board already in the run isn't tested twice
+    CalRun r = run_cal(N, {1}, -1, 0, true, nullptr, nullptr, 3);
+    CHECK(r.added && r.order == std::vector<uint16_t>({1, 3}) && r.in_run == std::vector<uint16_t>({1, 3}) &&
+              r.tr[3].cal_first > r.tr[1].cal_last && r.tr[0].cal_first < 0 && r.tr[2].cal_first < 0 &&
+              r.tr[3].cal_last < r.tr[0].rel_first && r.done_ms > 0,
+          "a board added to a run: tested after it (order %zu boards)", r.order.size());
+    CalRun same = run_cal(N, {1}, -1, 0, true, nullptr, nullptr, 1);
+    CHECK(same.added && same.order == std::vector<uint16_t>({1}), "a board already in the run: once");
+    // not while idle, not into a one-level run, at most MAX_ADDED (the dark hold's slack)
+    Scheduler s;
+    s.init(8, 77, 3);
+    CalSequencer q;
+    bool ok = !q.add(0) && q.start(s, 8, {0}, 40, 0) && !q.add(1);
+    q.cancel(s);
+    ok &= q.start(s, 8, {0}, 0, 0);
+    for (uint16_t b = 1; b <= CalSequencer::MAX_ADDED; b++)
+      ok &= q.add(b);
+    ok &= !q.add(CalSequencer::MAX_ADDED + 1) && q.count() == 1u + CalSequencer::MAX_ADDED && !q.add(8) &&
+          CalSequencer::hold_s(1, 0) * 1000u >= CalSequencer::FADE_MS + (1u + CalSequencer::MAX_ADDED) *
+                                                    (CalSequencer::board_ms(0) + 100);
+    CHECK(ok, "adding: not while idle, not into a one-level run, at most %u (within the dark hold), not past the pin",
+          static_cast<unsigned>(CalSequencer::MAX_ADDED));
+  }
 }
 
 // 50 boards on one pin (officially supported, research/chain-50-boards.md): frame, timing, preambles, the hub's RAM

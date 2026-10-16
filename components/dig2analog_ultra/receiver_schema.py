@@ -28,6 +28,7 @@ from esphome.const import (
     DEVICE_CLASS_POWER,
     DEVICE_CLASS_PROBLEM,
     DEVICE_CLASS_TEMPERATURE,
+    DEVICE_CLASS_TIMESTAMP,
     DEVICE_CLASS_VOLTAGE,
     ENTITY_CATEGORY_CONFIG,
     ENTITY_CATEGORY_DIAGNOSTIC,
@@ -50,7 +51,7 @@ UltraReceiver = ns.class_("UltraReceiver", cg.Component)
 UltraTelemetryPort = ns.class_("UltraTelemetryPort", cg.Component)
 UltraLightTelemetry = ns.class_("UltraLightTelemetry")   # not a Component: made at codegen, attach()ed
 UltraTotals = ns.class_("UltraTotals", cg.Component)
-UltraIdentifyButton = ns.class_("UltraIdentifyButton", button.Button)
+UltraReceiverButton = ns.class_("UltraReceiverButton", button.Button)
 UltraLineButton = ns.class_("UltraLineButton", button.Button)
 
 CONF_TELEMETRY = "telemetry"
@@ -170,12 +171,35 @@ RECEIVER_ENTITIES = {
         _value(UNIT_HOUR, 1, DEVICE_CLASS_DURATION, STATE_CLASS_TOTAL_INCREASING, "mdi:lightbulb-on-outline"),
     ),
     "power_ups": ("sensor", 16, 2, "Power-ups", _count("mdi:power")),
+    # its current calibration (wiki: Ultra-Current): how its last test ended ("OK", "Stopped: a trip"), what its
+    # channel currents and connected load come from (Calibrated, Learned, No model), when its last complete test ended
+    # (kept on the ESP32; needs a time source: time_id, else the only time component), its channels together at 100 %
+    "calibration": ("text", 9, 1, "Calibration", _text("mdi:tune-vertical")),
+    "current_model": ("text", 10, 1, "Current model", _text("mdi:chart-bell-curve-cumulative")),
+    "last_calibrated": (
+        "sensor", 18, 1, "Last calibrated",
+        sensor.sensor_schema(
+            device_class=DEVICE_CLASS_TIMESTAMP, icon="mdi:calendar-check", entity_category=ENTITY_CATEGORY_DIAGNOSTIC
+        ),
+    ),
+    "connected_load": (
+        "sensor", 19, 2, "Connected load",
+        sensor.sensor_schema(
+            unit_of_measurement=UNIT_AMPERE, accuracy_decimals=2, device_class=DEVICE_CLASS_CURRENT,
+            icon="mdi:current-dc", entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+        ),
+    ),
     # (with a device_id) its port and position, "Port 4 · receiver 2": Home Assistant groups receivers by it
     "port": ("text", 8, 0, "Port", _text("mdi:ethernet")),
-    # it blinks its identify pattern for 10 s: find it on the ceiling
+    # its buttons (the index is the kind): it blinks its identify pattern for 10 s (find it on the ceiling); its
+    # current calibration (the whole line dark ~2 s: the other receivers on it too; joins a run in progress)
     "identify": (
         "button", 0, 0, "Identify",
-        button.button_schema(UltraIdentifyButton, device_class=DEVICE_CLASS_IDENTIFY, entity_category=ENTITY_CATEGORY_CONFIG),
+        button.button_schema(UltraReceiverButton, device_class=DEVICE_CLASS_IDENTIFY, entity_category=ENTITY_CATEGORY_CONFIG),
+    ),
+    "calibrate_current": (
+        "button", 1, 0, "Calibrate current",
+        button.button_schema(UltraReceiverButton, icon="mdi:tune-vertical", entity_category=ENTITY_CATEGORY_CONFIG),
     ),
 }
 # (only on a receiver's own device)
@@ -205,8 +229,8 @@ PORT_ENTITIES = {
     # "OK", "91 % load", "No answer", a receiver's problem, "Peaks 104 %", "2 limiting"; and the plain line under it
     "port_status": ("text", 1, "status", _text("mdi:list-status", diagnostic=False)),
     "port_status_detail": ("text", 2, "status detail", _text("mdi:text-box-outline", diagnostic=False)),
-    # the line's buttons (disabled until enabled in Home Assistant): its current calibration (the whole line goes
-    # dark ~1 s per board), its boards blink their firmware version
+    # the line's buttons: its current calibration (the whole line goes dark ~1.1 s per board), its boards blink their
+    # firmware version (disabled until enabled in Home Assistant)
     "port_calibrate_current": (
         "button", 0, "calibrate current",
         button.button_schema(UltraLineButton, icon="mdi:tune-vertical", entity_category=ENTITY_CATEGORY_CONFIG),
@@ -255,7 +279,7 @@ PORT_COMMISSION = {"port_commission", "port_finalize", "port_commissioning", "po
                    "port_commissioned"}
 # (the health entities: with diagnostics full, or when the YAML lists one)
 PORT_HEALTH = {key for key, spec in PORT_ENTITIES.items() if spec[0] == "health"}
-PORT_DISABLED = {"port_calibrate_current", "port_show_version"} | PORT_HEALTH
+PORT_DISABLED = {"port_show_version"} | PORT_HEALTH
 
 # The controller's totals (its own device: every port's power at its sender, their energy), made once
 TOTAL_ENTITIES = {
@@ -348,7 +372,8 @@ TELEMETRY_SCHEMA = cv.Schema(
         cv.Optional(CONF_ADAPTIVE_RATE, default=True): cv.boolean,
         # the commissioning (wiki: Commissioning): Commission / Finalize buttons, its texts; its load test fails when a
         # receiver would get less than commission_min_voltage of the sender's voltage at the port's full load. The
-        # stored date: time_id, else the only time component (none: "date unknown")
+        # stored dates (the commissioning's, the receivers' Last calibrated): time_id, else the only time component
+        # (none: "date unknown", Last calibrated unknown)
         cv.Optional(CONF_COMMISSIONING, default=True): cv.boolean,
         cv.Optional(CONF_COMMISSION_MIN_VOLTAGE, default="90%"): cv.All(cv.percentage, cv.Range(min=0.5, max=0.99)),
         cv.Optional(CONF_TIME_ID): cv.use_id(time_.RealTimeClock),
@@ -363,7 +388,8 @@ TELEMETRY_SCHEMA = cv.Schema(
                     _poll_interval("energy", "60s", cv.TimePeriod(seconds=10), cv.TimePeriod(hours=1)),
                     _poll_interval("supply", "60s", cv.TimePeriod(seconds=10), cv.TimePeriod(hours=1)),
                     _poll_interval("health", "60s", cv.TimePeriod(seconds=10), cv.TimePeriod(hours=1)),
-                    # (0.2.5) LIFETIME: the odometer; DIAG: the running board, the fault memory (and after a restart)
+                    # (0.2.5) LIFETIME: the odometer; DIAG: the running board, the fault memory (and after a restart);
+                    # CALIBRATION with diag's interval (and right after a calibration run)
                     _poll_interval("lifetime", "5min", cv.TimePeriod(seconds=30), cv.TimePeriod(hours=24)),
                     _poll_interval("diag", "5min", cv.TimePeriod(seconds=30), cv.TimePeriod(hours=24)),
                 ]
@@ -447,7 +473,9 @@ def telemetry_defaults(config):
 # its entities by diagnostics level, per light with its share of its line's state, per estimated light (a receiver
 # with several lights), a line's own, the UART buffers, the lifetime ledger's reserve (its own sizing rule).
 _LOGGER = logging.getLogger(__name__)
-RAM_PER_RECEIVER = {"full": 1600, "basic": 900, "none": 600}
+# (the calibration's: its button and record, 3 more value slots (40 B) at every level, 3 diagnostics with basic, 4 with
+# full: x RAM_PER_ENTITY)
+RAM_PER_RECEIVER = {"full": 1940, "basic": 1180, "none": 700}
 RAM_PER_LIGHT = 900
 RAM_PER_ESTIMATE = 200
 RAM_PER_LINE = 1000
@@ -504,7 +532,7 @@ def warn_ram(full):
     _LOGGER.warning(
         "dig2analog_ultra: these lines take about %.0f KB of the ESP32's RAM (KB: %s). A classic ESP32 has about "
         "100-150 KB free with Wi-Fi and the API, so above ~%d KB it may run short (a crash under load, a failed OTA). "
-        "Use diagnostics: basic on the big lines (0.7 KB less per receiver), fewer lines per ESP32, or an ESP32-S3 / "
+        "Use diagnostics: basic on the big lines (0.8 KB less per receiver), fewer lines per ESP32, or an ESP32-S3 / "
         "P4.",
         total / 1024,
         detail,
@@ -630,12 +658,13 @@ async def telemetry_to_code(hub, config):
         cg.add(hub.set_telemetry_adaptive_rate(False))
     if tel[CONF_COMMISSIONING]:
         cg.add(hub.set_commissioning(tel[CONF_COMMISSION_MIN_VOLTAGE]))
-        clock = tel.get(CONF_TIME_ID)
-        times = CORE.config.get("time", []) or []
-        if clock is None and len(times) == 1:
-            clock = times[0][CONF_ID]
-        if clock is not None:
-            cg.add(hub.set_commission_clock(await cg.get_variable(clock)))
+    # the line's clock: the commissioning's date, the receivers' Last calibrated
+    clock = tel.get(CONF_TIME_ID)
+    times = CORE.config.get("time", []) or []
+    if clock is None and len(times) == 1:
+        clock = times[0][CONF_ID]
+    if clock is not None:
+        cg.add(hub.set_telemetry_clock(await cg.get_variable(clock)))
     cg.add(hub.set_telemetry_key(ledger_key(config[CONF_ID].id)))
     if CONF_DIRECTION_PIN in tel:
         cg.add(hub.set_telemetry_direction_pin(await cg.gpio_pin_expression(tel[CONF_DIRECTION_PIN])))
@@ -675,6 +704,7 @@ async def telemetry_to_code(hub, config):
             elif kind == "button":
                 cg.add(ent.set_hub(hub))
                 cg.add(ent.set_board(k))
+                cg.add(ent.set_kind(index))
             else:
                 cg.add(var.set_problem(ent))
     port = cg.new_Pvariable(tel[CONF_PORT_ID])

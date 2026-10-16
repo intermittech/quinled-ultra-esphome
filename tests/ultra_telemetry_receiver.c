@@ -402,6 +402,10 @@ void ucrx_truth(ucrx_truth_t *t)
     t->bc_up_s = stat.bc.up_s;
     t->supply_z = vdip_z_mohm(&vdip);
     t->flash_err = flash_err;
+    t->cal_end = is.cal_fail;                             /* CALIBRATION: how the last test ended, the model, */
+    t->cal_model = is.calibrated ? 2u : isense_model_ok(&is) ? 1u : 0u;   /* the connected load, a test this boot */
+    t->conn_ma = clim.connected_ma;
+    t->cal_done = cal_done_s != 0u;
 #endif
 }
 

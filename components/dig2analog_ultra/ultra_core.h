@@ -4,6 +4,7 @@
 // together with the board firmware's engine): ESPHome light values -> M / A / B, the frame scheduler and
 // the bit encoder. Protocol: ultra_protocol.h (a copy of the board firmware's master).
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -1091,6 +1092,7 @@ class CalSequencer {
   static constexpr uint32_t TEST_ONE_LEVEL_MS = 180;     // one level only
   static constexpr uint32_t MARGIN_MS = 150;             // after a test, before the next board's command
   static constexpr uint32_t SEND_TIMEOUT_MS = 2000;      // a command that can't get out: move on
+  static constexpr uint8_t MAX_ADDED = 4;                // boards added to a run (add): 4 x 1.2 s within the hold's 10 s
   enum Event : uint8_t { EV_NONE = 0, EV_BOARD, EV_DONE };
 
   /// false: already running (ignored)
@@ -1109,6 +1111,7 @@ class CalSequencer {
     }
     this->num_boards_ = num_boards;
     this->duty_ = duty_pct;
+    this->added_ = 0;
     this->idx_ = 0;
     this->t0_ = this->t_ = now_ms;
     this->sent_ = false;
@@ -1158,6 +1161,23 @@ class CalSequencer {
         return EV_NONE;
     }
   }
+  /// One more board into the run (a receiver's button while its line runs): tested after the others, when it isn't in
+  /// the run yet, the run is the standard test and the dark hold's slack still covers it (MAX_ADDED). false: not added.
+  bool add(uint16_t board) {
+    if (this->phase_ == IDLE || this->includes(board))
+      return this->phase_ != IDLE;
+    if (board >= this->num_boards_ || this->duty_ != 0 || this->added_ >= MAX_ADDED)
+      return false;
+    this->jobs_.push_back(board);
+    this->added_++;
+    return true;
+  }
+  /// the board is in the run (to be tested, being tested, or tested and held dark until the run is over)
+  bool includes(uint16_t board) const {
+    return this->phase_ != IDLE && std::find(this->jobs_.begin(), this->jobs_.end(), board) != this->jobs_.end();
+  }
+  /// the boards of the run (after EV_DONE: the last run's)
+  const std::vector<uint16_t> &jobs() const { return this->jobs_; }
   bool running() const { return this->phase_ != IDLE; }
   /// the board being tested (after EV_BOARD), its position (0-based) and the count
   uint16_t board() const { return this->idx_ < this->jobs_.size() ? this->jobs_[this->idx_] : 0; }
@@ -1190,6 +1210,7 @@ class CalSequencer {
   std::vector<uint16_t> jobs_;
   uint16_t num_boards_{0};
   uint8_t duty_{0};
+  uint8_t added_{0};
   size_t idx_{0};
   Phase phase_{IDLE};
   uint32_t t0_{0}, t_{0};

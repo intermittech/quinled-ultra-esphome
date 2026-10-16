@@ -7,7 +7,7 @@
 // Invariants checked after every window:
 //  - the poller's window list is empty after finish(); misses <= 255; have_identity == have_board && have_features
 //  - every text an entity would show stays <= 255 bytes (Home Assistant drops longer states to "unknown")
-//  - a position's Energy (the ledger) never goes down
+//  - a position's Energy (the ledger) never goes down; Last calibrated never in the future
 //  - the ledger's stored form round-trips: save -> load -> save gives the same bytes
 //  - the commissioning's report stays <= 250 bytes
 #include "ultra_ledger.h"
@@ -89,6 +89,8 @@ int main(int argc, char **argv) {
     mon.configure(mc);
     Commissioning com;
     com.configure(iv.status_ms, 0.9f);
+    CalibrationLog cal;   // the receivers' calibration records (with a clock in most windows)
+    cal.init(n);
     // a stable UID per position, changed now and then (a swapped board)
     std::vector<std::array<uint8_t, 12>> uid(n);
     for (auto &u : uid)
@@ -269,6 +271,14 @@ int main(int argc, char **argv) {
         keeper.lit_tick(i, rnd(2) != 0, now);
         (void) keeper.lit_due(now);
         (void) keeper.on_updates(p, i, u, now);
+        // the calibration record and its texts, the Status in a run of the hub's
+        if (u & (1u << TP_CALIBRATION))
+          (void) cal.observe(i, d, p.uid16(i), now, rnd(4) != 0 ? 1792000000u + now / 1000u : 0u);
+        note_text(cal.result(i, d), "calibration result");
+        note_text(calibration_model_text(d.cal_model), "calibration model");
+        CHECK(cal.last_unix(i) <= 1792000000u + 0xFFFFFFFFu / 1000u,
+              "rx %u: Last calibrated in the future (%u)", i, cal.last_unix(i));
+        note_text(receiver_status_detail(d, with_hub_calibration(s, rnd(2) != 0), i, cut_at), "calibrating detail");
         const double e = keeper.energy_wh(i);
         if (e >= 0 && last_energy[i] >= 0)
           CHECK(e + 1e-9 >= last_energy[i], "rx %u: the position's Energy went down %.6f -> %.6f", i,

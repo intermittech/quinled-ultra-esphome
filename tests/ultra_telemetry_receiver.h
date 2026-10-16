@@ -95,6 +95,8 @@ typedef struct {
     uint16_t bc_pc;
     uint32_t bc_up_s, supply_z;
     uint8_t flash_err;
+    uint8_t cal_end, cal_model, cal_done;   /* CALIBRATION: the last test's end, the model, a complete test this boot */
+    uint32_t conn_ma;                       /* ... the connected load (climit) */
     /* the update path (core/upd_app.h, core/ack.h): transparent, sessions decided, the status LED's pattern */
     uint8_t upd_transparent, ack_active, ack_led_only;
     uint32_t upd_sessions;

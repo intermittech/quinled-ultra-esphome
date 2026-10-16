@@ -1266,10 +1266,10 @@ CASES = [
     # Home Assistant (quinled-ultra-homeassistant esphome-requirements): the update rate, the live twins, the Port text,
     # the Identify button, the controller's totals, DE and /RE tied on a shared UART
     ("ultra telemetry update_rate normal", ULTRA + TELEMETRY + "    update_rate: normal\n" + RX_UART, True, None),
-    # the RAM estimate (a codegen warning above ~60 KB on a classic ESP32): 2 lines x 12 receivers (a light each) with
+    # the RAM estimate (a codegen warning above ~60 KB on a classic ESP32): 2 lines x 10 receivers (a light each) with
     # full diagnostics warn; the same with basic diagnostics, or one small line, don't
-    ("ultra RAM warning: 24 receivers, full diagnostics (~71 KB)", ram_lines(2, 12), True, "of the ESP32's RAM"),
-    ("ultra RAM: 24 receivers, basic diagnostics (~54 KB)", ram_lines(2, 12, "basic"), True, "!of the ESP32's RAM"),
+    ("ultra RAM warning: 20 receivers, full diagnostics (~69 KB)", ram_lines(2, 10), True, "of the ESP32's RAM"),
+    ("ultra RAM: 20 receivers, basic diagnostics (~55 KB)", ram_lines(2, 10, "basic"), True, "!of the ESP32's RAM"),
     ("ultra RAM: one small line", ram_lines(1, 2), True, "!of the ESP32's RAM"),
     ("ultra telemetry update_rate bogus", ULTRA + TELEMETRY + "    update_rate: ludicrous\n" + RX_UART, False,
      "Unknown value"),
@@ -1303,8 +1303,24 @@ CASES = [
     ("ultra telemetry Identify button", ULTRA + TELEMETRY + RX_LIST + RX_UART, True, "name: Identify"),
     ("ultra telemetry no Port text without a device", ULTRA + TELEMETRY + RX_UART, True, "!R1 port"),
     ("ultra telemetry port live power and energy", ULTRA + TELEMETRY + RX_LIST + RX_UART, True, "name: Port 1 energy"),
-    ("ultra telemetry line buttons (disabled)", ULTRA + TELEMETRY + RX_LIST + RX_UART, True,
-     "name: Port 1 calibrate current"),
+    # the current calibration: the line's button and each receiver's, enabled; the receiver's Calibration, Current
+    # model and Last calibrated (basic and full), Connected load (full, disabled until enabled)
+    ("ultra telemetry line calibrate button (enabled)", ULTRA + TELEMETRY + RX_LIST + RX_UART, True,
+     "name: Port 1 calibrate current\n        disabled_by_default: false"),
+    ("ultra telemetry line version button (disabled)", ULTRA + TELEMETRY + RX_LIST + RX_UART, True,
+     "name: Port 1 show firmware version\n        disabled_by_default: true"),
+    ("ultra telemetry receiver calibrate button", ULTRA + TELEMETRY + RX_LIST + RX_UART, True,
+     "name: Calibrate current\n            device_id: r1\n            disabled_by_default: false"),
+    ("ultra telemetry receiver Last calibrated", ULTRA + TELEMETRY + RX_LIST + RX_UART, True,
+     "name: Last calibrated\n            device_id: r2\n            disabled_by_default: false"),
+    ("ultra telemetry receiver Current model (basic)",
+     ULTRA + TELEMETRY + "    diagnostics: basic\n" + RX_LIST + RX_UART, True, "name: Current model"),
+    ("ultra telemetry receiver Connected load (full, disabled)", ULTRA + TELEMETRY + RX_LIST + RX_UART, True,
+     "name: Connected load\n            device_id: r1\n            disabled_by_default: true"),
+    ("ultra telemetry no Connected load with basic",
+     ULTRA + TELEMETRY + "    diagnostics: basic\n" + RX_LIST + RX_UART, True, "!Connected load"),
+    ("ultra telemetry no calibration texts with none",
+     ULTRA + TELEMETRY + "    diagnostics: none\n" + RX_LIST + RX_UART, True, "!Last calibrated"),
     (
         "ultra telemetry 2 lines on one UART, DE and /RE tied",
         tel_lines(2, uarts=[0, 0]).replace(

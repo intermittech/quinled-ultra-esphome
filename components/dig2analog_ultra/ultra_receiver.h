@@ -27,10 +27,11 @@ class UltraReceiver final : public Component {
   enum Value : uint8_t {
     POWER = 0, ENERGY, BUS_VOLTAGE, MCU_TEMPERATURE, INPUT_CURRENT, UPTIME, TRIPS, SUPPLY_DIPS, LIMIT_EVENTS,
     MISSED_POLLS, VOLTAGE_DROP, CABLE_RESISTANCE, LED_SUPPLY, CURRENT_PEAK, SUPPLY_IMPEDANCE, LIT_HOURS, POWER_UPS,
-    LIVE_POWER, VALUE_COUNT,
+    LIVE_POWER, LAST_CALIBRATED, CONNECTED_LOAD, VALUE_COUNT,
   };
   enum Text : uint8_t {
-    STATUS = 0, STATUS_DETAIL, FIRMWARE, LAST_RESET, LAST_TRIP, LAST_DIP, LINK, CHANNEL_HEALTH, PORT, TEXT_COUNT,
+    STATUS = 0, STATUS_DETAIL, FIRMWARE, LAST_RESET, LAST_TRIP, LAST_DIP, LINK, CHANNEL_HEALTH, PORT, CALIBRATION,
+    CURRENT_MODEL, TEXT_COUNT,
   };
   void set_hub(UltraHub *hub) { this->hub_ = hub; }
   void set_board(uint16_t board) { this->board_ = board; }
@@ -66,20 +67,29 @@ class UltraReceiver final : public Component {
 };
 
 #ifdef USE_BUTTON
-/// A receiver's Identify button: it blinks its identify pattern for 10 s
-class UltraIdentifyButton final : public button::Button {
+/// A receiver's buttons: Identify (it blinks its identify pattern for 10 s), Calibrate current (its test, the whole
+/// line dark meanwhile: UltraHub::calibrate_receiver)
+class UltraReceiverButton final : public button::Button {
  public:
+  enum Kind : uint8_t { IDENTIFY = 0, CALIBRATE };
   void set_hub(UltraHub *hub) { this->hub_ = hub; }
   void set_board(uint16_t board) { this->board_ = board; }
+  void set_kind(uint8_t kind) { this->kind_ = kind; }
 
  protected:
-  void press_action() override { this->hub_->identify_for(this->board_, 10000); }
+  void press_action() override {
+    if (this->kind_ == CALIBRATE)
+      this->hub_->calibrate_receiver(this->board_);
+    else
+      this->hub_->identify_for(this->board_, 10000);
+  }
   UltraHub *hub_{nullptr};
   uint16_t board_{0};
+  uint8_t kind_{0};
 };
 
-/// A line's buttons: its current calibration, its boards' versions (both disabled until enabled in Home Assistant);
-/// its commissioning: Commission, Finalize (wiki: Commissioning)
+/// A line's buttons: its current calibration, its boards' versions (disabled until enabled in Home Assistant); its
+/// commissioning: Commission, Finalize (wiki: Commissioning)
 class UltraLineButton final : public button::Button {
  public:
   enum Kind : uint8_t { CALIBRATE = 0, SHOW_VERSION, COMMISSION, FINALIZE };

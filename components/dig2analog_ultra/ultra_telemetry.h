@@ -55,12 +55,14 @@ enum TelemetryPage : uint8_t {
   TP_DIAG,          // 0.2.5: DIAG part 0, the running board (feature DIAG)
   TP_FAULTS,        // 0.2.5: DIAG part 1, the fault memory and the calibration trend
   TP_SYNC,          // 0.2.6: LIFE_SYNC, only when the ledger asks (TelemetryPoller::request_sync)
+  TP_CALIBRATION,   // the current model, how the last calibration test ended (feature CALIBRATION); after a run too
   TP_COUNT,
 };
 static constexpr uint8_t TP_PAGE_ID[TP_COUNT] = {ULTRA_PAGE_IDENTITY, ULTRA_PAGE_IDENTITY, ULTRA_PAGE_POWER,
                                                  ULTRA_PAGE_STATUS,   ULTRA_PAGE_OUTPUTS,  ULTRA_PAGE_SUPPLY,
                                                  ULTRA_PAGE_ENERGY,   ULTRA_PAGE_HEALTH,   ULTRA_PAGE_LIFETIME,
-                                                 ULTRA_PAGE_DIAG,     ULTRA_PAGE_DIAG,     ULTRA_PAGE_LIFE_SYNC};
+                                                 ULTRA_PAGE_DIAG,     ULTRA_PAGE_DIAG,     ULTRA_PAGE_LIFE_SYNC,
+                                                 ULTRA_PAGE_CALIBRATION};
 /// the IDENTITY feature a page needs (0: every receiver, or tried)
 static constexpr uint32_t TP_FEATURE[TP_COUNT] = {0,
                                                   0,
@@ -73,16 +75,25 @@ static constexpr uint32_t TP_FEATURE[TP_COUNT] = {0,
                                                   ULTRA_FEAT_LIFETIME,
                                                   ULTRA_FEAT_DIAG,
                                                   ULTRA_FEAT_DIAG,
-                                                  ULTRA_FEAT_LIFE_SYNC};
+                                                  ULTRA_FEAT_LIFE_SYNC,
+                                                  ULTRA_FEAT_CALIBRATION};
 /// the POLL's argument byte 0 (IDENTITY, DIAG: its part)
 static constexpr uint8_t TP_PART[TP_COUNT] = {ULTRA_ID_PART_BOARD, ULTRA_ID_PART_FEATURES, 0, 0, 0, 0, 0, 0, 0, 0,
-                                              1, 0};
+                                              1, 0, 0};
 /// the features of a 0.2.5 receiver (its ENERGY bytes 15-18 and HEALTH's hot flag are set; before: 0)
 static constexpr uint32_t FEATURES_025 = ULTRA_FEAT_LIFETIME | ULTRA_FEAT_DIAG | ULTRA_FEAT_RETRY | ULTRA_FEAT_LOSS_SCENE;
 
 /// take_updates() bits beyond the pages
 static constexpr uint32_t TU_AVAILABILITY = 1u << 30;  // it started or stopped answering
 static constexpr uint32_t TU_RESTART = 1u << 29;       // it restarted (or is a different board now)
+static constexpr uint32_t TU_HUB = 1u << 28;           // the hub's own state of it changed (its calibration run)
+
+/// CALIBRATION page DATA (the receiver firmware's layout; the protocol header names byte 1, ULTRA_CA_MODEL): the
+/// stored test's levels (0: none), the model | how the last test ended, the stored tests' count, the age of the last
+/// complete test (s, u24, this power-up; 0xFFFFFF: none), the dark current, CH1-CH5 at 100 %, the connected load (the
+/// channels together at 100 %, from the model; 0: not known), the limit in effect, its source | need
+static constexpr uint8_t CA_LEVELS = 0, CA_AGE = 4, CA_CONNECTED = 19;
+static constexpr uint32_t CA_AGE_NONE = 0xFFFFFF;
 
 /// What one receiver said, page by page (big-endian fields decoded; `have_*`: the page was read since the board
 /// answers / since it changed). (The pages in an order, and each one's fields in a size order, that leave no padding.)
@@ -173,6 +184,12 @@ struct ReceiverData {
   uint16_t ovr_captures{0}, ovr_frame_ends{0}, ovr_late_ms{0};
   uint16_t supply_z_mohm{0};             // 0: not known yet
   uint32_t bc_uptime_s{0};
+  // CALIBRATION: the age of the last complete test (this power-up), the connected load, the stored test's levels, the
+  // model in use (0 none, 1 learned, 2 calibrated) and how the last test ended (ULTRA_CA_END_*: until its power-up)
+  uint32_t cal_age_s{CA_AGE_NONE};
+  uint16_t cal_connected_ma{0};
+  bool have_calibration{false};
+  uint8_t cal_levels{0}, cal_model{0}, cal_end{0};
 };
 
 /// A 0.2.5 receiver: its STATUS reason, ENERGY's LED supply and peak, HEALTH's hot flag are set (0 before).
@@ -341,6 +358,14 @@ inline void decode_receiver_page(ReceiverData &d, uint8_t page, const uint8_t *p
       d.ls_applied = p[ULTRA_LS_A_APPLIED];
       d.ls_records16 = static_cast<uint16_t>(ultra_get16(p + ULTRA_LS_A_RECORDS));
       d.have_sync = true;
+      break;
+    case ULTRA_PAGE_CALIBRATION:
+      d.cal_levels = p[CA_LEVELS];
+      d.cal_model = p[ULTRA_CA_MODEL] & 0x0F;
+      d.cal_end = p[ULTRA_CA_MODEL] >> 4;
+      d.cal_age_s = ultra_get24(p + CA_AGE);
+      d.cal_connected_ma = static_cast<uint16_t>(ultra_get16(p + CA_CONNECTED));
+      d.have_calibration = true;
       break;
     default:
       break;
@@ -792,6 +817,11 @@ class TelemetryPoller {
     for (auto &r : this->rx_)
       r.updated |= TU_AVAILABILITY;
   }
+  /// Receiver i's entities again after the next window (bits: TU_HUB, the hub's own state of it changed)
+  void touch(uint16_t i, uint32_t bits) {
+    if (i < this->rx_.size())
+      this->rx_[i].updated |= bits;
+  }
   void unpowered() {
     this->idle_ = false;
     this->locked_ = false;
@@ -1073,6 +1103,7 @@ class TelemetryPoller {
         return this->iv_.lifetime_ms;
       case TP_DIAG:
       case TP_FAULTS:
+      case TP_CALIBRATION:   // (and right after the hub's calibration run: read_now)
         return this->iv_.diag_ms;
       default:
         return 0;
@@ -1386,6 +1417,14 @@ inline ReceiverStatus light_status(const ReceiverData &d, bool answering, uint8_
   return receiver_status(d, answering, channels != 0 ? channels : 0x1F);
 }
 
+/// The hub's own current calibration on the receiver's line includes it (asked for and waiting for the power, its
+/// test, or held dark until the run is over): Calibrating, unless what it says is a problem that stays (no answer, a
+/// trip, a channel fault, too hot, signal loss, supply dips: its Problem doesn't blink off for the run) or its port is
+/// Off. Calibration suggested gives way: the run is the answer to it.
+inline ReceiverStatus with_hub_calibration(ReceiverStatus s, bool calibrating) {
+  return calibrating && s >= RS_CAL_SUGGESTED && s != RS_PORT_OFF ? RS_CALIBRATING : s;
+}
+
 /// "Receivers 1 and 2", "Receiver 1", "Receivers 1-3" (1-based positions before position `pos`, 0-based)
 inline std::string receivers_before(uint16_t pos) {
   if (pos == 1)
@@ -1493,7 +1532,9 @@ inline std::string receiver_status_detail(const ReceiverData &d, ReceiverStatus 
         return "The test jig's mode is on.";
       if (why == ULTRA_ST_WHY_CALIBRATING)
         return "A current calibration test is running.";
-      return "A current calibration (or the test jig) is running.";
+      if (d.have_outputs && (d.why & ULTRA_OU_W_TEST))
+        return "A current calibration (or the test jig) is running.";
+      return "A current calibration on its line: its outputs stay dark until it is done.";   // (the hub's run)
     case RS_SOFT_START:
       return "Soft start: the outputs ramp up after a power-up or a trip.";
     case RS_HELD_DARK:
@@ -1900,6 +1941,124 @@ struct EnergyCounter {
     this->last_w = w;
     this->last_ms = now_ms;
   }
+};
+
+// ------------------------------------------------------------------------------------------- current calibration
+/// How a calibration test ended (ULTRA_CA_END_*): "OK", "Stopped: a trip", ...
+inline const char *calibration_end_text(uint8_t end) {
+  switch (end) {
+    case ULTRA_CA_END_COMPLETE:
+      return "OK";
+    case ULTRA_CA_END_TRIP:
+      return "Stopped: a trip";
+    case ULTRA_CA_END_LIMIT:
+      return "Stopped: the current limit";
+    case ULTRA_CA_END_SUPPLY:
+      return "Stopped: a supply dip";
+    default:
+      return "Stopped";
+  }
+}
+/// What its channel currents and connected load come from (CALIBRATION byte 1, bits 0-3)
+inline const char *calibration_model_text(uint8_t model) {
+  return model == 2 ? "Calibrated" : model == 1 ? "Learned" : model == 0 ? "No model" : "Unknown";
+}
+
+/// The hub's record of a position's current calibration, kept on the ESP32 across restarts (a board forgets when its
+/// last test ran at a power cut, and has no clock): the board it is (UID16), when its last complete test ended (unix
+/// s; 0: not known, no clock then), how its last test ended (ULTRA_CA_END_*). 8 bytes: a line's records are one blob.
+struct CalRecord {
+  uint32_t ok_unix{0};
+  uint16_t uid16{0};
+  uint8_t end{ULTRA_CA_END_COMPLETE};
+  uint8_t flags{0};   // CR_BOARD: uid16 is the board's; CR_TESTED: end is a test's
+};
+static constexpr uint8_t CR_BOARD = 1, CR_TESTED = 2;
+
+/// Each receiver's last current calibration (wiki: Ultra-Current), from its CALIBRATION page and the hub's records:
+/// what its Calibration, Current model and Last calibrated show. Pure (host-tested); the hub stores the records.
+class CalibrationLog {
+ public:
+  void init(size_t receivers) {
+    this->rec_.assign(receivers, CalRecord{});
+    this->seen_.assign(receivers, Seen{});
+  }
+  size_t size() const { return this->rec_.size(); }
+  /// the records as stored (a line's blob, size() of them), and back (from flash: before the first observe)
+  const CalRecord *records() const { return this->rec_.data(); }
+  void load(const CalRecord *r, size_t n) {
+    for (size_t i = 0; i < n && i < this->rec_.size(); i++)
+      this->rec_[i] = r[i];
+  }
+  const CalRecord &record(uint16_t i) const { return this->rec_[i]; }
+
+  /// Receiver i's CALIBRATION page was read (its board's UID16; now_unix 0: no clock yet). True: its record changed
+  /// (store it). A complete test is new when it is younger than the one seen before (its age grows with the hub's
+  /// time; the boards' clocks within 3 %), or, first seen in this run of the ESP32, when it ended at another time
+  /// than the record's (its time unknown: once the clock is set).
+  bool observe(uint16_t i, const ReceiverData &d, uint16_t uid16, uint32_t now_ms, uint32_t now_unix) {
+    if (i >= this->rec_.size() || !d.have_calibration)
+      return false;
+    CalRecord &r = this->rec_[i];
+    Seen &s = this->seen_[i];
+    const CalRecord was = r;
+    if (!(r.flags & CR_BOARD) || r.uid16 != uid16) {   // another board at this position: a record of its own
+      r = CalRecord{};
+      r.uid16 = uid16;
+      r.flags = CR_BOARD;
+      s = Seen{};
+    }
+    if (d.cal_end != ULTRA_CA_END_COMPLETE) {   // its last test stopped (it says so until its power-up)
+      r.end = d.cal_end;
+      r.flags |= CR_TESTED;
+    } else if (d.cal_age_s < CA_AGE_NONE) {    // a complete test, cal_age_s ago (this power-up)
+      const uint32_t age = d.cal_age_s;
+      const uint32_t ended = now_unix > age ? now_unix - age : 0;
+      bool fresh;
+      if (s.age_s < CA_AGE_NONE) {
+        const uint32_t el = (now_ms - s.ms) / 1000;
+        fresh = age + 5 + el / 16 < s.age_s + el;
+      } else if (!(r.flags & CR_TESTED) || r.end != ULTRA_CA_END_COMPLETE || r.ok_unix == 0) {
+        fresh = true;   // (the record has no complete test since a stopped one, or not its time)
+      } else if (ended == 0) {
+        return std::memcmp(&was, &r, sizeof(r)) != 0;   // the record's test or a newer one: once the clock is set
+      } else {
+        fresh = (ended > r.ok_unix ? ended - r.ok_unix : r.ok_unix - ended) > 60 + age / 16;
+      }
+      s.age_s = age;
+      s.ms = now_ms;
+      if (fresh) {
+        r.end = ULTRA_CA_END_COMPLETE;
+        r.flags |= CR_TESTED;
+        r.ok_unix = ended;
+      } else if (r.ok_unix == 0) {
+        r.ok_unix = ended;   // (its time, now that the clock is set)
+      }
+    } else {
+      s = Seen{};   // no complete test since its power-up
+    }
+    return std::memcmp(&was, &r, sizeof(r)) != 0;
+  }
+  /// How its last test ended ("OK", "Stopped: a trip", ...; "Not tested"): its own word for a test since its
+  /// power-up, else the record's, else a stored test's (complete: a stopped test stores nothing). "": not read yet.
+  std::string result(uint16_t i, const ReceiverData &d) const {
+    if (!d.have_calibration)
+      return "";
+    if (d.cal_end != ULTRA_CA_END_COMPLETE || d.cal_age_s < CA_AGE_NONE)
+      return calibration_end_text(d.cal_end);
+    if (i < this->rec_.size() && (this->rec_[i].flags & CR_TESTED))
+      return calibration_end_text(this->rec_[i].end);
+    return d.cal_levels != 0 ? "OK" : "Not tested";
+  }
+  /// When its last complete test ended (unix s); 0: not known (none seen, or no clock then)
+  uint32_t last_unix(uint16_t i) const { return i < this->rec_.size() ? this->rec_[i].ok_unix : 0; }
+
+ protected:
+  struct Seen {   // its last complete test as last read in this run of the ESP32
+    uint32_t age_s{CA_AGE_NONE}, ms{0};
+  };
+  std::vector<CalRecord> rec_;
+  std::vector<Seen> seen_;
 };
 
 }  // namespace esphome::dig2analog_ultra

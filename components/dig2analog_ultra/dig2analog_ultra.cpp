@@ -714,6 +714,13 @@ void UltraHub::rw_publish_() {
     if (lev & LedgerKeeper::EV_SYNCED) {
       ESP_LOGV(TAG, "%s \xC2\xB7 Receiver %u: its lifetime counters synced from the hub", this->tel_name_, i + 1);
     }
+    // its current calibration: a new test (or its end) into the line's records, kept on flash (rare: after a test)
+    if ((u & (1u << TP_CALIBRATION)) && this->cal_log_.observe(i, d, this->poller_.uid16(i), millis(), this->tel_unix_())) {
+      ESP_LOGI(TAG, "%s \xC2\xB7 Receiver %u: current calibration %s (%s model)", this->tel_name_, i + 1,
+               this->cal_log_.result(i, d).c_str(), calibration_model_text(d.cal_model));
+      this->cal_pref_.save(reinterpret_cast<const uint8_t *>(this->cal_log_.records()),
+                           this->cal_log_.size() * sizeof(CalRecord));
+    }
     this->rx_listeners_.call(i, u);
   }
   this->rw_window_callback_.call();
@@ -848,19 +855,70 @@ void UltraHub::service_calibration_() {
                  static_cast<unsigned>(this->cal_seq_.count()));
         this->wake_();
         break;
-      case CalSequencer::EV_DONE:
-        // one-way: the hub knows the commands went out, not what the boards measured
-        ESP_LOGI(TAG,
-                 "Current calibration on GPIO%u: commands sent to %u board(s) in %.1f s (not confirmed: the boards "
-                 "keep their results); the pin fades back",
-                 this->pin_, static_cast<unsigned>(this->cal_seq_.count()), this->cal_seq_.elapsed_ms(now) / 1000.0f);
+      case CalSequencer::EV_DONE: {
+        // the commands are one-way: the receivers' CALIBRATION pages say how each test ended (read now)
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+        for (uint16_t b : this->cal_seq_.jobs())
+          this->poller_.read_now(b, TP_CALIBRATION, now);
+        const bool results = this->has_telemetry();
+#else
+        const bool results = false;
+#endif
+        ESP_LOGI(TAG, "Current calibration on GPIO%u: commands sent to %u board(s) in %.1f s (%s); the pin fades back",
+                 this->pin_, static_cast<unsigned>(this->cal_seq_.count()), this->cal_seq_.elapsed_ms(now) / 1000.0f,
+                 results ? "the receivers' results: read next" : "not confirmed: the boards keep their results");
         this->wake_();
         break;
+      }
       default:
         break;
     }
   }
   this->cal_power_hold_ = this->calibration_running();
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  if (this->cal_power_hold_ != this->cal_was_) {   // a run asked for, or over: its receivers' Status (Calibrating)
+    this->cal_was_ = this->cal_power_hold_;
+    for (uint16_t i = 0; i < this->poller_.receivers(); i++)
+      this->poller_.touch(i, TU_HUB);
+  }
+#endif
+}
+
+void UltraHub::calibrate_receiver(uint16_t board) {
+  if (board >= this->num_boards_)
+    return;
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  if (board < this->poller_.receivers()) {
+    const ReceiverData &d = this->poller_.data(board);
+    if (d.have_identity && !(d.features & ULTRA_FEAT_CALIBRATION)) {
+      ESP_LOGW(TAG, "Current calibration of receiver %u on GPIO%u skipped: it has no current calibration", board + 1,
+               this->pin_);
+      return;
+    }
+  }
+#endif
+  bool joined = false;
+  if (this->cal_pending_) {   // a run asked for, waiting for the boards' power: one more board in it
+    joined = this->cal_req_duty_ == 0;
+    if (joined && !this->cal_req_boards_.empty() &&
+        std::find(this->cal_req_boards_.begin(), this->cal_req_boards_.end(), board) == this->cal_req_boards_.end())
+      this->cal_req_boards_.push_back(board);
+  } else if (this->cal_seq_.running()) {
+    joined = this->cal_seq_.add(board);
+  } else {
+    this->calibrate_boards({board}, 0);
+    return;
+  }
+  if (!joined) {
+    ESP_LOGW(TAG, "Current calibration of receiver %u on GPIO%u: the run on its pin can't take it now, request ignored",
+             board + 1, this->pin_);
+    return;
+  }
+  ESP_LOGI(TAG, "Current calibration on GPIO%u: receiver %u in the run", this->pin_, board + 1);
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  if (board < this->poller_.receivers())
+    this->poller_.touch(board, TU_HUB);
+#endif
 }
 
 void UltraHub::service_power_() {
@@ -988,6 +1046,13 @@ void UltraHub::setup() {
       if (this->comm_pref_.load(&rec))
         this->comm_.set_record(rec);
     }
+    // the receivers' current calibration records (one blob per line: its receivers' count is part of the key)
+    const size_t n = this->poller_.receivers();
+    this->cal_log_.init(n);
+    this->cal_pref_ = global_preferences->make_preference(n * sizeof(CalRecord), this->tel_key_ ^ 0x43414C00u ^ n, true);
+    std::vector<CalRecord> recs(n);
+    if (this->cal_pref_.load(reinterpret_cast<uint8_t *>(recs.data()), n * sizeof(CalRecord)))
+      this->cal_log_.load(recs.data(), n);
     ledger_receivers() += this->poller_.receivers() + 1u;   // (its receivers' positions, its port's energy)
     // the POLL slots: the receivers only (the boards behind them take normal slots); the answers' buffer at once
     this->rw_slots_.assign(static_cast<size_t>(ULTRA_SLOT_BYTES) * this->poller_.receivers(), 0);
@@ -1376,6 +1441,18 @@ void UltraHub::service_notice_() {
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
 UltraHub *UltraHub::comm_active_ = nullptr;
 
+// The line's clock (time_id, else the only time component): the commissioning's date, Last calibrated
+uint32_t UltraHub::tel_unix_() const {
+#ifdef USE_TIME
+  if (this->tel_clock_ != nullptr) {
+    const ESPTime t = this->tel_clock_->now();
+    if (t.is_valid())
+      return static_cast<uint32_t>(t.timestamp);
+  }
+#endif
+  return 0;
+}
+
 // ------------------------------------------------------------------------------------------- the commissioning
 void UltraHub::commission(bool finalize) {
   if (!this->comm_on_)
@@ -1413,14 +1490,7 @@ void UltraHub::service_commission_() {
   }
 #endif
   cp.ready = this->boards_powered_();
-  uint32_t unix_s = 0;
-#ifdef USE_TIME
-  if (this->comm_clock_ != nullptr) {
-    const ESPTime t = this->comm_clock_->now();
-    if (t.is_valid())
-      unix_s = static_cast<uint32_t>(t.timestamp);
-  }
-#endif
+  const uint32_t unix_s = this->tel_unix_();
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
   const bool updating = this->update_running();
 #else

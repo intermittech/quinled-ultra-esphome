@@ -1306,6 +1306,14 @@ struct UltraHub {
     void call() { this->calls++; }
   } rw_window_callback_;
   static std::vector<UltraHub *> hubs_;
+  // the receivers' calibration records (the log itself: tests/ultra_telemetry_test.cpp), their blob's saves
+  CalibrationLog cal_log_;
+  struct {
+    int saves{0};
+    bool save(const uint8_t *, size_t) { return ++this->saves > 0; }
+  } cal_pref_;
+  uint32_t unix_{0};
+  uint32_t tel_unix_() const { return this->unix_; }
 
   /// as setup() with telemetry: 2 receivers at 1 Mbaud, the direction pin high, the reset symbols
   void start(Uart *uart, Pin *pin) {
@@ -2049,6 +2057,13 @@ struct UltraHub {
   uint32_t late{0};
   const ReplyRate &reply_rate() const { return this->reply; }
   uint32_t late_releases() const { return this->late; }
+  // the hub's calibration run (the boards in it) and its receivers' records (observed by rw_publish_ on the hub)
+  std::vector<uint16_t> cal_boards;
+  CalibrationLog cal;
+  bool calibrating(uint16_t board) const {
+    return std::find(this->cal_boards.begin(), this->cal_boards.end(), board) != this->cal_boards.end();
+  }
+  const CalibrationLog &calibration_log() const { return this->cal; }
 };
 
 #include "receiver_consts.inc"
@@ -2057,10 +2072,11 @@ struct UltraReceiver {   // as ultra_receiver.h
   enum Value : uint8_t {
     POWER = 0, ENERGY, BUS_VOLTAGE, MCU_TEMPERATURE, INPUT_CURRENT, UPTIME, TRIPS, SUPPLY_DIPS, LIMIT_EVENTS,
     MISSED_POLLS, VOLTAGE_DROP, CABLE_RESISTANCE, LED_SUPPLY, CURRENT_PEAK, SUPPLY_IMPEDANCE, LIT_HOURS, POWER_UPS,
-    LIVE_POWER, VALUE_COUNT,
+    LIVE_POWER, LAST_CALIBRATED, CONNECTED_LOAD, VALUE_COUNT,
   };
   enum Text : uint8_t {
-    STATUS = 0, STATUS_DETAIL, FIRMWARE, LAST_RESET, LAST_TRIP, LAST_DIP, LINK, CHANNEL_HEALTH, PORT, TEXT_COUNT,
+    STATUS = 0, STATUS_DETAIL, FIRMWARE, LAST_RESET, LAST_TRIP, LAST_DIP, LINK, CHANNEL_HEALTH, PORT, CALIBRATION,
+    CURRENT_MODEL, TEXT_COUNT,
   };
   void update_(uint32_t updates);
   void value_(uint8_t which, float v, bool force = false);
@@ -2160,6 +2176,11 @@ static void answer(const uint8_t *s, uint16_t uid, const ReceiverData &model, ui
     for (int i = 0; i < 5; i++)
       ultra_put16(d + ULTRA_OU_CURRENT + 2 * i, ma[i]);
     d[ULTRA_OU_WHY] = why;
+  } else if (page == ULTRA_PAGE_CALIBRATION) {
+    d[CA_LEVELS] = model.cal_levels;
+    d[ULTRA_CA_MODEL] = static_cast<uint8_t>(model.cal_model | model.cal_end << 4);
+    ultra_put24(d + CA_AGE, model.cal_age_s);
+    ultra_put16(d + CA_CONNECTED, model.cal_connected_ma);
   }
   a[0] = ULTRA_RSP_SYNC;
   a[1] = page;
@@ -2439,6 +2460,14 @@ static void test_receiver_entities() {
   model[1].fm_trip = 1 | 25 << 2;   // a short at 12.5 A, at 1100 lit hours
   model[1].flash_pending = ULTRA_DG_FP_EXHAUSTED;   // (0.2.6) its lifetime record held
   model[1].fm_trip_lit_h = 1100;
+  // ... and its CALIBRATION: calibrated, its last test complete an hour ago, 1.85 A connected
+  model[1].features |= ULTRA_FEAT_CALIBRATION;
+  model[1].cal_model = 2;
+  model[1].cal_levels = 4;
+  model[1].cal_age_s = 3600;
+  model[1].cal_connected_ma = 1850;
+  const uint32_t unix_s = 1792000000u;   // the line's clock
+  hub.cal.init(2);
   uint8_t why = 0;
   bool silent0 = false;
   auto window = [&]() {
@@ -2459,6 +2488,8 @@ static void test_receiver_entities() {
       if (u == 0)
         continue;
       hub.keeper.on_updates(hub.p, k, u, now_ms);
+      if (u & (1u << TP_CALIBRATION))
+        hub.cal.observe(k, hub.p.data(k), hub.p.uid16(k), now_ms, unix_s);
       rx[k].update_(u);
       if (k == 1)
         light.update_(u);
@@ -2591,6 +2622,45 @@ static void test_receiver_entities() {
   run(20000);
   CHECK(texts[0][UltraReceiver::STATUS].state == "OK" && port_receivers.state == "2 of 2 answering",
         "back: '%s', '%s'", texts[0][UltraReceiver::STATUS].state.c_str(), port_receivers.state.c_str());
+
+  // the current calibration: receiver 2's (CALIBRATION, the hub's record); receiver 1 has none (no entity state)
+  using R = UltraReceiver;
+  CHECK(texts[1][R::CALIBRATION].state == "OK" && texts[1][R::CURRENT_MODEL].state == "Calibrated" &&
+            vals[1][R::LAST_CALIBRATED].state == static_cast<float>(unix_s - 3600) &&
+            std::fabs(vals[1][R::CONNECTED_LOAD].state - 1.85f) < 1e-4f && !texts[0][R::CALIBRATION].has_state() &&
+            !vals[0][R::LAST_CALIBRATED].has_state(),
+        "calibration: '%s', '%s', last %.0f, %.2f A", texts[1][R::CALIBRATION].state.c_str(),
+        texts[1][R::CURRENT_MODEL].state.c_str(), vals[1][R::LAST_CALIBRATED].state,
+        vals[1][R::CONNECTED_LOAD].state);
+  // the hub's run on receiver 2 (its button): Calibrating (it was Limiting), its light too, no problem; receiver 1
+  // as it says (its own Status: the receiver's Held dark)
+  hub.cal_boards = {1};
+  hub.p.touch(0, TU_HUB);
+  hub.p.touch(1, TU_HUB);
+  run(3000);
+  CHECK(texts[1][R::STATUS].state == "Calibrating" && !problems[1].state && light_status.state == "Calibrating" &&
+            texts[1][R::STATUS_DETAIL].state.find("A current calibration on its line") == 0 &&
+            texts[0][R::STATUS].state == "OK" && !port_problem.state,
+        "in the hub's run: '%s' ('%s'), light '%s', receiver 1 '%s'", texts[1][R::STATUS].state.c_str(),
+        texts[1][R::STATUS_DETAIL].state.c_str(), light_status.state.c_str(), texts[0][R::STATUS].state.c_str());
+  // the run over: its CALIBRATION right away (a new test: Last calibrated now), the Status as before
+  hub.cal_boards.clear();
+  hub.p.touch(1, TU_HUB);
+  model[1].cal_age_s = 1;
+  hub.p.read_now(1, TP_CALIBRATION, now_ms);
+  run(2000);
+  CHECK(texts[1][R::STATUS].state == "Limiting" && light_status.state == "Limiting" &&
+            texts[1][R::CALIBRATION].state == "OK" && vals[1][R::LAST_CALIBRATED].state == static_cast<float>(unix_s - 1),
+        "after the run: '%s', '%s', last %.0f", texts[1][R::STATUS].state.c_str(), texts[1][R::CALIBRATION].state.c_str(),
+        vals[1][R::LAST_CALIBRATED].state);
+  // a test that stopped (a trip): its end; Last calibrated stays the last complete one's
+  model[1].cal_end = ULTRA_CA_END_TRIP;
+  hub.p.read_now(1, TP_CALIBRATION, now_ms);
+  run(2000);
+  CHECK(texts[1][R::CALIBRATION].state == "Stopped: a trip" &&
+            vals[1][R::LAST_CALIBRATED].state == static_cast<float>(unix_s - 1),
+        "a stopped test: '%s'", texts[1][R::CALIBRATION].state.c_str());
+  model[1].cal_end = ULTRA_CA_END_COMPLETE;
 
   // the line's Diff-Power port in standby: the receivers can't answer, and that's no problem (the hub's rw_due_
   // touches every receiver when the power changes)
@@ -4441,6 +4511,8 @@ struct UltraHub {
   static UltraHub *comm_active_;
   static std::vector<UltraHub *> hubs_;
   bool boards_powered_() const { return this->powered; }
+  uint32_t unix_s{0};   // the line's clock (0: none)
+  uint32_t tel_unix_() const { return this->unix_s; }
   bool calibration_running() const { return this->cal_running; }
   bool update_running() const { return false; }
   void calibrate_boards(const std::vector<uint16_t> &, uint8_t) {

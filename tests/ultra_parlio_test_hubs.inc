@@ -354,6 +354,12 @@ struct UltraHub {
     void call() { this->calls++; }
   } rw_window_callback_;
   static std::vector<UltraHub *> hubs_;
+  // the receivers' calibration records (the log itself: tests/ultra_telemetry_test.cpp)
+  CalibrationLog cal_log_;
+  struct {
+    bool save(const uint8_t *, size_t) { return true; }
+  } cal_pref_;
+  uint32_t tel_unix_() const { return 0; }
   uint32_t windows{0};       // (the test's) windows read
   int64_t last_window_us{0}, longest_wait_us{0};
 

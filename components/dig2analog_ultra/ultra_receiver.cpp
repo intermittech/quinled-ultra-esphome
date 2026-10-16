@@ -15,7 +15,8 @@ static constexpr uint32_t ALL_NEW = TU_AVAILABILITY | TU_RESTART;
 static constexpr uint32_t PG_STATUS = 1u << TP_STATUS, PG_POWER = 1u << TP_POWER, PG_ENERGY = 1u << TP_ENERGY,
                           PG_SUPPLY = 1u << TP_SUPPLY, PG_OUTPUTS = 1u << TP_OUTPUTS, PG_HEALTH = 1u << TP_HEALTH,
                           PG_IDENTITY = 1u << TP_IDENTITY | 1u << TP_FEATURES, PG_LIFETIME = 1u << TP_LIFETIME,
-                          PG_DIAG = 1u << TP_DIAG, PG_FAULTS = 1u << TP_FAULTS, PG_SYNC = 1u << TP_SYNC;
+                          PG_DIAG = 1u << TP_DIAG, PG_FAULTS = 1u << TP_FAULTS, PG_CALIBRATION = 1u << TP_CALIBRATION,
+                          PG_SYNC = 1u << TP_SYNC;
 
 /// a live value's pace: its deadband at the update rate (a little less: the STATUS reads come with some jitter)
 static Pace live_pace(uint32_t rate_ms) { return Pace{PACE_LIVE_W.abs, PACE_LIVE_W.rel, rate_ms - rate_ms / 4}; }
@@ -120,10 +121,13 @@ void UltraReceiver::update_(uint32_t updates) {
     return telemetry_value(d, tv);
   };
 
-  // the status: worst first, with its plain line and the Problem (just woken, not heard yet: Waking)
-  const ReceiverStatus st = standby                                 ? (this->hub_->port_off() ? RS_PORT_OFF : RS_STANDBY)
-                            : this->hub_->rx_settling(this->board_) ? RS_WAKING
-                                                                    : receiver_status(d, answering);
+  // the status: worst first, with its plain line and the Problem (just woken, not heard yet: Waking; in the hub's
+  // calibration run: Calibrating)
+  const ReceiverStatus st = with_hub_calibration(
+      standby                                 ? (this->hub_->port_off() ? RS_PORT_OFF : RS_STANDBY)
+      : this->hub_->rx_settling(this->board_) ? RS_WAKING
+                                              : receiver_status(d, answering),
+      this->hub_->calibrating(this->board_));
   // (a text is built only for its entity: a level the YAML leaves out costs nothing at run time)
   auto has = [this](uint8_t which) { return this->texts_[which] != nullptr; };
   this->text_(STATUS, receiver_status_name(st));
@@ -180,6 +184,16 @@ void UltraReceiver::update_(uint32_t updates) {
     return;   // the texts keep what they last said
   if (has(FIRMWARE) && from(PG_IDENTITY | PG_STATUS))
     this->text_(FIRMWARE, telemetry_firmware_text(d));
+  // its current calibration (CALIBRATION, with the hub's record: observed before this call): how its last test ended,
+  // the model in use, when its last complete test ended, the connected load (the channels together at 100 %)
+  if (d.have_calibration && from(PG_CALIBRATION)) {
+    const CalibrationLog &cl = this->hub_->calibration_log();
+    this->text_(CALIBRATION, cl.result(this->board_, d));
+    this->text_(CURRENT_MODEL, calibration_model_text(d.cal_model));
+    const uint32_t ok = cl.last_unix(this->board_);
+    this->value_(LAST_CALIBRATED, ok != 0 ? static_cast<float>(ok) : NAN, all);
+    this->value_(CONNECTED_LOAD, d.cal_connected_ma != 0 ? d.cal_connected_ma / 1000.0f : NAN, all);
+  }
 #ifdef USE_DIG2ANALOG_ULTRA_DIAG_TEXTS
   // (0.2.5: DIAG's breadcrumbs and fault memory, across power cuts; their builders are compiled only when a receiver
   // has one of these texts: diagnostics: full, or the entity given)
@@ -293,7 +307,9 @@ void UltraTelemetryPort::update_() {
     answering += p.answering(i);
     const bool settling = this->hub_->rx_settling(i);
     waking |= settling;
-    problem |= !standby && !settling && receiver_status_problem(receiver_status(p.data(i), p.answering(i)));
+    problem |= !standby && !settling &&
+               receiver_status_problem(with_hub_calibration(receiver_status(p.data(i), p.answering(i)),
+                                                            this->hub_->calibrating(i)));
   }
   if (this->problem_ != nullptr)
     this->problem_->publish_state(problem);
@@ -384,10 +400,11 @@ void UltraLightTelemetry::update_(uint32_t updates) {
     this->port_->publish_state(std::string(this->hub_->telemetry_name()) + " \xC2\xB7 receiver " +
                                std::to_string(this->board_ + 1));
   if (this->status_ != nullptr) {
-    const std::string s = receiver_status_name(
+    const std::string s = receiver_status_name(with_hub_calibration(
         this->hub_->port_standby()             ? (this->hub_->port_off() ? RS_PORT_OFF : RS_STANDBY)
         : this->hub_->rx_settling(this->board_) ? RS_WAKING
-                                                : light_status(d, answering, this->mask_));
+                                                : light_status(d, answering, this->mask_),
+        this->hub_->calibrating(this->board_)));
     if (!this->status_->has_state() || this->status_->state != s)
       this->status_->publish_state(s);
   }

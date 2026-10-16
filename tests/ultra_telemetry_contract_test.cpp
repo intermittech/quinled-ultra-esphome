@@ -1476,7 +1476,7 @@ struct MonthRx {
   uint32_t writes{0};
   uint64_t t_on_ms{0}, t_lit_ms{0}, t_uj{0};
   uint32_t t_ups{0};
-  bool round11{false};   // a receiver under round 11's rules: a sync never leaves its energy to the hub (before S6)
+  bool round11{false};   // under round 11's rules: a sync never leaves its energy to the hub (before round 12)
 
   void init(const life_rec_t &rec) {
     for (int k = 0; k < 12; k++)
@@ -1819,7 +1819,7 @@ static void month_print(const char *what, const MonthEnd &r) {
 /// below a unit at every cut, so the ledger must be the hub's own accounting. 30 days x 100 short wakes of a standby
 /// port (nothing stored on the board): after its next power-up every counter within one unit of the truth, on the
 /// board (energy_sync's merge) and in the hub's ledger; the same with every tenth wake long enough to be stored (the
-/// board's own remainders ride on the hub's units: never counted twice). Round 12 (S6): a receiver synced this boot
+/// board's own remainders ride on the hub's units: never counted twice). Since round 12 a receiver synced this boot
 /// leaves its energy to the hub's ledger, so it stores those wakes no more (a few writes a month); the stored-wake
 /// runs and the echo control with remainders use a receiver under round 11's rules (ENERGY_SYNC_HUB cleared after
 /// each sync), and the same month on today's receiver keeps the same accounting with at most 15 writes. The negative
@@ -1849,12 +1849,12 @@ static void sc_month() {
         "ledger: %lld, %lld, %lld, %.0f mWh; %u writes)",
         (long long) s.d_pow, (long long) s.d_lit, (long long) s.d_ups, s.e_board, (long long) s.h_pow,
         (long long) s.h_lit, (long long) s.h_ups, s.e_hub, s.writes);
-  // today's receiver (S6): synced each power-up, it doesn't store those wakes; the same accounting, a few writes
+  // today's receiver (round 12): synced each power-up, it doesn't store those wakes; the same accounting, a few writes
   const MonthEnd s6 = month_run(used, 3000, true, false, 12);
-  month_print("hub ledger, every 10th long (S6: not stored)", s6);
+  month_print("hub ledger, every 10th long (today's receiver: not stored)", s6);
   CHECK(s6.board_ok() && s6.hub_ok() && s6.writes <= 15 && !s6.attention && s6.results[ULTRA_LS_R_UID] == 0,
-        "month, every tenth wake long, S6: within a unit, energy never above, at most 15 writes (board - truth: %lld, "
-        "%lld, %lld, %.0f mWh; ledger: %lld, %lld, %lld, %.0f mWh; %u writes)",
+        "month, every tenth wake long, today's receiver: within a unit, energy never above, at most 15 writes "
+        "(board - truth: %lld, %lld, %lld, %.0f mWh; ledger: %lld, %lld, %lld, %.0f mWh; %u writes)",
         (long long) s6.d_pow, (long long) s6.d_lit, (long long) s6.d_ups, s6.e_board, (long long) s6.h_pow,
         (long long) s6.h_lit, (long long) s6.h_ups, s6.e_hub, s6.writes);
   // a year of it (design review, round 9: a hub that takes the board's rounded value back during sessions it saw adopts

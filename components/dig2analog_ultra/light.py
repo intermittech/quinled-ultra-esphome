@@ -473,10 +473,19 @@ async def to_code(config: ConfigType) -> None:
         elif key in HARD_EFFECTS and glide == "auto":
             cg.add(var.set_effect_kind(index, EFFECT_HARD))
     await light.register_light(var, config)
+    kind = _TYPES[frozenset(k for k in ROLE_KEYS if k in config)]
     if (poe := config.get(CONF_POWER_ON_EFFECT)) is not None:
-        kind = _TYPES[frozenset(k for k in ROLE_KEYS if k in config)]
         effect = await cg.get_variable(_find_effect(config, poe[CONF_EFFECT])[CONF_TYPE_ID])
         cg.add(var.set_power_on_effect(effect, _power_on_values(config, kind)))
+    # the power-on effects Home Assistant can choose (set_receiver_setting poe): its ultra_* effects but strobe, on the
+    # YAML's power-on values, else at full brightness with every channel on
+    options = [e for e in config.get(CONF_EFFECTS, []) if _effect_key(e).startswith("ultra_")
+               and _effect_key(e) != "ultra_strobe"]
+    for e in options:
+        cg.add(var.add_power_on_option(await cg.get_variable(e[CONF_TYPE_ID])))
+    if options and poe is None:
+        cg.add(var.set_power_on_default_values(
+            _power_on_values({**config, CONF_POWER_ON_EFFECT: {CONF_BRIGHTNESS: 1.0}}, kind)))
     # a light on a Diff-Power receiver with several lights: its estimated power / energy and status
     await light_telemetry_to_code(var, config, sum(1 << config[k] for k in ROLE_KEYS if k in config))
 

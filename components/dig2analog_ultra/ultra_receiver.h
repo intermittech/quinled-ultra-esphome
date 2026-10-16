@@ -12,9 +12,19 @@
 #ifdef USE_BUTTON
 #include "esphome/components/button/button.h"
 #endif
+#ifdef USE_NUMBER
+#include "esphome/components/number/number.h"
+#endif
+#ifdef USE_SELECT
+#include "esphome/components/select/select.h"
+#endif
+#ifdef USE_SWITCH
+#include "esphome/components/switch/switch.h"
+#endif
 
 #include "dig2analog_ultra.h"
 #include "ultra_pacing.h"
+#include "ultra_settings.h"
 
 namespace esphome::dig2analog_ultra {
 
@@ -31,7 +41,7 @@ class UltraReceiver final : public Component {
   };
   enum Text : uint8_t {
     STATUS = 0, STATUS_DETAIL, FIRMWARE, LAST_RESET, LAST_TRIP, LAST_DIP, LINK, CHANNEL_HEALTH, PORT, CALIBRATION,
-    CURRENT_MODEL, SUPPLY_NOTE, TEXT_COUNT,
+    CURRENT_MODEL, SUPPLY_NOTE, SETTINGS, TEXT_COUNT,
   };
   void set_hub(UltraHub *hub) { this->hub_ = hub; }
   void set_board(uint16_t board) { this->board_ = board; }
@@ -227,6 +237,99 @@ class UltraTotals final : public Component {
   sensor::Sensor *values_[VALUE_COUNT]{};
   Paced paced_[VALUE_COUNT]{};
   MeanPaced power_mean_;
+};
+
+// ------------------------------------------------------------------------------ the controller's settings entities
+/// The controller's settings (wiki: Controller-Settings), one per ESP32, each applied to every line with telemetry:
+/// set in Home Assistant, kept on the ESP32 (SettingRecord: a changed YAML default wins once), applied at boot after
+/// the lines' setup and at once on a change.
+enum ControllerSetting : uint8_t {
+  CS_UPDATE_RATE = 0,   // select: fast / normal / slow (1 / 2 / 5 s)
+  CS_ADAPTIVE_RATE,     // switch
+  CS_LOAD_WARNING,      // %
+  CS_LOAD_PROBLEM,      // %
+  CS_LOAD_PROBLEM_TIME, // s
+  CS_PORT_LIMIT,        // A
+  CS_DIP_WARNING,       // %
+  CS_COMMISSION_MIN_V,  // %
+  CS_SUPPLY_RATING,     // W (the dashboards' headroom; nothing in ESPHome)
+  CS_COUNT,
+};
+static constexpr uint32_t UPDATE_RATE_MS[3] = {1000, 2000, 5000};
+/// the setting applied to every line with telemetry
+void apply_controller_setting(uint8_t kind, float value);
+/// the stored choice (SettingRecord) of a setting: value at boot, store a change
+class SettingStore {
+ public:
+  void init(uint8_t kind, float yaml);
+  float boot_value() const { return this->boot_; }
+  void store(float value);
+
+ protected:
+  ESPPreferenceObject pref_;
+  float yaml_{0.0f}, boot_{0.0f};
+};
+
+#ifdef USE_NUMBER
+class UltraSettingNumber final : public number::Number, public Component {
+ public:
+  void set_kind(uint8_t kind) { this->kind_ = kind; }
+  void set_default(float yaml) { this->yaml_ = yaml; }
+  void setup() override;
+  float get_setup_priority() const override { return setup_priority::LATE; }   // (after the lines' setup)
+
+ protected:
+  void control(float value) override;
+  SettingStore store_;
+  float yaml_{0.0f};
+  uint8_t kind_{0};
+};
+#endif
+#ifdef USE_SELECT
+/// Telemetry update rate: fast / normal / slow
+class UltraSettingSelect final : public select::Select, public Component {
+ public:
+  void set_kind(uint8_t kind) { this->kind_ = kind; }
+  void set_default(float yaml) { this->yaml_ = yaml; }
+  void setup() override;
+  float get_setup_priority() const override { return setup_priority::LATE; }
+
+ protected:
+  void control(size_t index) override;
+  SettingStore store_;
+  float yaml_{0.0f};
+  uint8_t kind_{0};
+};
+#endif
+#ifdef USE_SWITCH
+/// Adaptive reply rate
+class UltraSettingSwitch final : public switch_::Switch, public Component {
+ public:
+  void set_kind(uint8_t kind) { this->kind_ = kind; }
+  void set_default(float yaml) { this->yaml_ = yaml; }
+  void setup() override;
+  float get_setup_priority() const override { return setup_priority::LATE; }
+
+ protected:
+  void write_state(bool state) override;
+  SettingStore store_;
+  float yaml_{0.0f};
+  uint8_t kind_{0};
+};
+#endif
+/// Telemetry diagnostics: the lines' compile-time diagnostics level, published once
+class UltraSettingText final : public Component {
+ public:
+  void set_text(text_sensor::TextSensor *t, const char *value) {
+    this->text_ = t;
+    this->value_ = value;
+  }
+  void setup() override { this->text_->publish_state(this->value_); }
+  float get_setup_priority() const override { return setup_priority::LATE; }
+
+ protected:
+  text_sensor::TextSensor *text_{nullptr};
+  const char *value_{""};
 };
 
 }  // namespace esphome::dig2analog_ultra

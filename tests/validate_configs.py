@@ -949,6 +949,12 @@ CASES = [
     ("ultra telemetry minimal (receivers: every board, on the hub's device)", ULTRA + TELEMETRY + RX_UART, True, None),
     # Diff-Power ports
     ("diffpower port minimal", DP_PORT.replace("    detect_pin: GPIO27\n", ""), True, None),
+    # its settings entities: Turn-off period and Wake timeout (each can be left out), the controller's dark offsets
+    ("diffpower turn-off period entity", DP_PORT, True, "name: Port 1 turn-off period"),
+    ("diffpower wake timeout entity", DP_PORT, True, "name: Port 1 wake timeout"),
+    ("diffpower settings entities left out",
+     DP_PORT + "    standby_after_number: false\n    wake_timeout_number: false\n    settings: false\n", True,
+     "!turn-off period"),
     (
         "diffpower port: a plain light with its own turn-off period, options",
         DP_PORT + "    standby_after: 5min\n    hotplug_delay: 2s\n    boot_margin: 300ms\n    notice_time: 250ms\n"
@@ -1045,10 +1051,11 @@ CASES = [
     (
         "diffpower two ports with one name",
         DP_PORT + "    status: false\n    problem: false\n    standby_cycles: false\n    standby_hours: false\n"
-        "    detect_drops: false\n    power_mode_select: false\n    wake: false\n"
+        "    detect_drops: false\n    power_mode_select: false\n    wake: false\n    standby_after_number: false\n"
+        "    wake_timeout_number: false\n"
         "  - id: p2\n    name: Port 1\n    enable_pin: GPIO32\n    detect_pin: GPIO33\n    status: false\n"
         "    problem: false\n    standby_cycles: false\n    standby_hours: false\n    detect_drops: false\n"
-        "    power_mode_select: false\n    wake: false\n",
+        "    power_mode_select: false\n    wake: false\n    standby_after_number: false\n    wake_timeout_number: false\n",
         True,
         None,
     ),
@@ -1266,10 +1273,10 @@ CASES = [
     # Home Assistant (quinled-ultra-homeassistant esphome-requirements): the update rate, the live twins, the Port text,
     # the Identify button, the controller's totals, DE and /RE tied on a shared UART
     ("ultra telemetry update_rate normal", ULTRA + TELEMETRY + "    update_rate: normal\n" + RX_UART, True, None),
-    # the RAM estimate (a codegen warning above ~60 KB on a classic ESP32): 2 lines x 10 receivers (a light each) with
+    # the RAM estimate (a codegen warning above ~60 KB on a classic ESP32): 2 lines x 9 receivers (a light each) with
     # full diagnostics warn; the same with basic diagnostics, or one small line, don't
-    ("ultra RAM warning: 20 receivers, full diagnostics (~69 KB)", ram_lines(2, 10), True, "of the ESP32's RAM"),
-    ("ultra RAM: 20 receivers, basic diagnostics (~56 KB)", ram_lines(2, 10, "basic"), True, "!of the ESP32's RAM"),
+    ("ultra RAM warning: 18 receivers, full diagnostics (~65 KB)", ram_lines(2, 9), True, "of the ESP32's RAM"),
+    ("ultra RAM: 18 receivers, basic diagnostics (~54 KB)", ram_lines(2, 9, "basic"), True, "!of the ESP32's RAM"),
     ("ultra RAM: one small line", ram_lines(1, 2), True, "!of the ESP32's RAM"),
     ("ultra telemetry update_rate bogus", ULTRA + TELEMETRY + "    update_rate: ludicrous\n" + RX_UART, False,
      "Unknown value"),
@@ -1332,6 +1339,17 @@ CASES = [
     ("ultra telemetry dip_warning 95% (above the receivers' own 90 %)",
      ULTRA + TELEMETRY + "    dip_warning: 95%\n" + RX_UART, False, "dip_warning"),
     ("ultra commission_min_voltage default 80 %", ULTRA + TELEMETRY + RX_UART, True, "commission_min_voltage: 0.8"),
+    # the controller's settings (made at codegen: their options here), the receivers' Settings text, Position and
+    # UID shown (the event log's replacements)
+    ("ultra telemetry settings false", ULTRA + TELEMETRY + "    settings: false\n" + RX_UART, True, "settings: false"),
+    ("ultra telemetry supply_rating", ULTRA + TELEMETRY + "    supply_rating: 480W\n" + RX_UART, True,
+     "supply_rating: 480.0"),
+    ("ultra telemetry supply_rating bogus", ULTRA + TELEMETRY + "    supply_rating: -5W\n" + RX_UART, False,
+     "supply_rating"),
+    ("ultra telemetry receiver Settings text", ULTRA + TELEMETRY + RX_LIST + RX_UART, True,
+     "name: Settings\n            device_id: r1\n            disabled_by_default: false"),
+    ("ultra telemetry Position and UID shown", ULTRA + TELEMETRY + RX_LIST + RX_UART, True,
+     "name: Position and UID\n            device_id: r2\n            disabled_by_default: false"),
     ("ultra telemetry no calibration texts with none",
      ULTRA + TELEMETRY + "    diagnostics: none\n" + RX_LIST + RX_UART, True, "!Last calibrated"),
     (

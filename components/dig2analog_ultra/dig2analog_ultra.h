@@ -7,6 +7,7 @@
 #include "esphome/core/helpers.h"
 
 #include "ultra_core.h"
+#include "ultra_settings.h"
 
 #ifdef USE_DIFFPOWER
 #include "esphome/components/diffpower/diffpower.h"
@@ -176,6 +177,23 @@ class UltraHub final : public Component {
     this->set_board_config(board, ULTRA_CFG_BOARD_MAX, clamp_u16_(amps * 1000.0f + 0.5f, 0, 65535));
   }
 
+  // The receivers' settings from Home Assistant (wiki: Controller-Settings; the action set_receiver_setting)
+  /// key / value as in the Settings text (ultra_settings.h: pwm, dither, stagger, loss, loss_timeout, limit, retries,
+  /// retry_interval, dtw, poe; reset: the YAML's again); board -1: every board. Kept on the ESP32 (one record per
+  /// board), sent at once and with every refresh (a board that restarts or is replaced gets them again). false: a bad
+  /// key or value, or no light of the board takes it (logged)
+  bool set_receiver_setting(int board, const std::string &key, const std::string &value);
+  /// a board's settings as its Settings text shows them
+  std::string receiver_settings_text(uint16_t board) const;
+  /// the line's id: the action's port is its telemetry name or this
+  void set_line_id(const char *id) { this->line_id_ = id; }
+  bool is_line(const std::string &name) const;
+  /// after a board's settings changed (-1: every board's)
+  void add_on_settings_callback(std::function<void(int)> &&cb) { this->settings_cb_.add(std::move(cb)); }
+  /// the action set_receiver_setting: the lines named port ("all": every line), receivers 1-based (empty: every board)
+  static void receiver_setting_action(const std::string &port, const std::vector<int32_t> &receivers,
+                                      const std::string &key, const std::string &value);
+
   /// Blink the identify pattern on a board (on), or stop it.
   void identify(uint16_t board, bool on = true) {
     this->sched_.identify(board, on);
@@ -330,6 +348,28 @@ class UltraHub final : public Component {
   /// dip_warning: a receiver's supply dip is a problem (Status "Supply dips", the port's Problem) below this % of its
   /// reference; shallower ones only show in its Supply note
   void set_telemetry_dip_warning(uint8_t pct) { this->poller_.set_dip_warning(pct); }
+  /// At runtime (the controller's settings, wiki: Controller-Settings): the update rate (STATUS and the live values,
+  /// ms), the port's load warning / problem (%), how long a problem load lasts (ms), its limit (A), the
+  /// commissioning's minimum voltage (a share of the sender's)
+  void set_update_rate_ms(uint32_t ms) {
+    this->rate_ms_ = ms;
+    this->poller_.set_status_interval(ms);
+    if (this->comm_on_)
+      this->comm_.configure(ms, this->comm_min_v_);
+  }
+  void set_port_levels(float warning_pct, float problem_pct, uint32_t problem_ms, float limit_a) {
+    PortMonitor::Config c = this->port_monitor_.config();
+    c.warning_pct = std::isnan(warning_pct) ? c.warning_pct : warning_pct;
+    c.problem_pct = std::isnan(problem_pct) ? c.problem_pct : problem_pct;
+    c.problem_ms = problem_ms == UINT32_MAX ? c.problem_ms : problem_ms;
+    c.limit_a = std::isnan(limit_a) ? c.limit_a : limit_a;
+    this->port_monitor_.configure(c);
+  }
+  void set_commission_min_voltage(float share) {
+    this->comm_min_v_ = share;
+    if (this->comm_on_)
+      this->comm_.configure(this->rate_ms_, share);
+  }
   const ReplyRate &reply_rate() const { return this->reply_; }
   /// windows where the line was let go of late (the receivers found it still driven: no answers)
   uint32_t late_releases() const { return this->rw_late_; }
@@ -437,6 +477,17 @@ class UltraHub final : public Component {
   }
   void service_power_();
   void service_calibration_();
+  // the receivers' settings from Home Assistant: per board, kept on the ESP32 (RxOverride), over the YAML's values
+  void rx_settings_setup_();    // in setup(): loaded, the YAML's values kept, the CONFIG ones applied
+  void rx_settings_lights_();   // at the first loop (the lights are there): dim to warm, the power-on effects
+  void rx_settings_save_();
+  std::vector<RxOverride> rx_ovr_;
+  ESPPreferenceObject rx_pref_;
+  uint16_t rx_yaml_[8]{};
+  uint8_t rx_yaml_have_{0};
+  bool rx_lights_done_{false};
+  const char *line_id_{""};
+  CallbackManager<void(int)> settings_cb_;
   bool any_lit_(uint32_t now) const;
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   bool rw_due_(bool urgent);

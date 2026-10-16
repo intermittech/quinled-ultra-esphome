@@ -18,6 +18,7 @@
 #include "../components/dig2analog_ultra/ultra_pacing.h"
 #include "../components/dig2analog_ultra/ultra_telemetry.h"
 #include "../components/dig2analog_ultra/ultra_commission.h"
+#include "../components/dig2analog_ultra/ultra_settings.h"
 #include "../components/diffpower/diffpower_core.h"
 
 #include <algorithm>
@@ -125,6 +126,7 @@ struct UltraLight {
   void send_scene_effect_() {
     this->hub_->scheduler().light_scene_effect(this->board_, this->index_, ULTRA_FX_NONE, nullptr, 0);
   }
+  void send_power_on_effect_scene_();   // (light_methods.inc)
   void stop_effect() {
     this->hub_->scheduler().light_effect(this->board_, this->index_, ULTRA_FX_NONE, nullptr, 0,
                                          this->hub_->start_time_us());
@@ -516,6 +518,8 @@ struct UltraHub {
     void stop() {}
   } high_freq_;
   void service_calibration_() {}
+  bool rx_lights_done_{true};       // (the receivers' settings from Home Assistant: hub_rx below)
+  void rx_settings_lights_() {}
   void resync() {   // preamble, PING burst, dark tail
     this->preamble_ = 2;
     this->ping_left_ = 2;
@@ -1225,6 +1229,8 @@ struct UltraHub {
   } high_freq_;
   void enable_loop() {}
   void service_calibration_() {}
+  bool rx_lights_done_{true};       // (the receivers' settings from Home Assistant: hub_rx below)
+  void rx_settings_lights_() {}
   void resync() { this->preamble_ = 3; }
   bool boards_powered_() const { return this->powered; }
   bool status_has_warning() const { return this->warning_; }
@@ -4609,6 +4615,195 @@ static void test_commission_glue() {
 #undef USE_DIFFPOWER
 }  // namespace hub_commission
 
+// The receivers' settings from Home Assistant (build/lifecycle/hub_rx.inc): the action set_receiver_setting by line
+// (its telemetry name, its id, all) and position, every key, a bad key / value changing nothing, the Settings text,
+// the record on flash over the YAML's after a restart, reset (the YAML's again; an id the YAML doesn't set no longer
+// sent), a stored power-on effect the YAML no longer has dropped.
+namespace hub_rx {
+#define USE_DIG2ANALOG_ULTRA_TELEMETRY
+static std::map<uint32_t, std::vector<uint8_t>> stored;
+static int saves = 0;
+struct ESPPreferenceObject {
+  uint32_t key{0};
+  bool load(uint8_t *out, size_t size) {
+    auto it = stored.find(this->key);
+    if (it == stored.end() || it->second.size() != size)
+      return false;
+    std::copy(it->second.begin(), it->second.end(), out);
+    return true;
+  }
+  bool save(const uint8_t *in, size_t size) {
+    stored[this->key] = std::vector<uint8_t>(in, in + size);
+    saves++;
+    return true;
+  }
+};
+struct Preferences {
+  ESPPreferenceObject make_preference(size_t, uint32_t key, bool) { return ESPPreferenceObject{key}; }
+};
+static Preferences prefs;
+static Preferences *const global_preferences = &prefs;
+static uint32_t fnv1_hash(const std::string &s) {
+  uint32_t h = 2166136261u;
+  for (char c : s) {
+    h *= 16777619u;
+    h ^= static_cast<uint8_t>(c);
+  }
+  return h;
+}
+struct UltraLight {   // what the settings use of a light
+  uint16_t board{0};
+  uint8_t index{0};
+  bool dtw_avail{false}, dtw_on{false};
+  std::string poe{"none"}, poe_yaml{"none"};
+  std::vector<std::string> options;
+  uint16_t get_board() const { return this->board; }
+  uint8_t get_light_index() const { return this->index; }
+  bool dim_to_warm_available() const { return this->dtw_avail; }
+  void set_dim_to_warm(bool on) { this->dtw_on = this->dtw_avail && on; }
+  bool get_dim_to_warm() const { return this->dtw_on; }
+  bool set_power_on_effect_name(const std::string &name) {
+    if (strcasecmp(name.c_str(), "none") == 0) {
+      this->poe = "none";
+      return true;
+    }
+    for (const auto &o : this->options) {
+      if (strcasecmp(o.c_str(), name.c_str()) == 0) {
+        this->poe = o;
+        return true;
+      }
+    }
+    return false;
+  }
+  std::string power_on_effect_name() const { return this->poe; }
+  std::string power_on_effect_yaml_name() const { return this->poe_yaml; }
+  std::string power_on_option_name(uint16_t hash) const {
+    for (const auto &o : this->options) {
+      if (effect_hash(o.c_str()) == hash)
+        return o;
+    }
+    return "";
+  }
+};
+struct UltraHub {
+  // the hub's (build/lifecycle/hub_rx.inc)
+  void rx_settings_setup_();
+  void rx_settings_lights_();
+  void rx_settings_save_();
+  bool set_receiver_setting(int board, const std::string &key, const std::string &value);
+  std::string receiver_settings_text(uint16_t board) const;
+  bool is_line(const std::string &name) const;
+  static void receiver_setting_action(const std::string &port, const std::vector<int32_t> &receivers,
+                                      const std::string &key, const std::string &value);
+  // stand-ins
+  uint8_t pin_{16};
+  uint16_t num_boards_{3};
+  Scheduler sched_;
+  std::vector<RxOverride> rx_ovr_;
+  ESPPreferenceObject rx_pref_;
+  uint16_t rx_yaml_[8]{};
+  uint8_t rx_yaml_have_{0};
+  bool rx_lights_done_{false};
+  const char *line_id_{"line1"};
+  const char *tel_name_{"Port 1"};
+  std::vector<UltraLight *> lights_;
+  struct {
+    std::vector<int> calls;
+    void call(int b) { this->calls.push_back(b); }
+  } settings_cb_;
+  int wakes{0};
+  void wake_() { this->wakes++; }
+  bool has_telemetry() const { return true; }
+  static std::vector<UltraHub *> hubs_;
+  /// as setup(): the YAML's settings on every board (no trip_retries), then the record over them; the first loop
+  void start(std::vector<UltraLight *> lights) {
+    this->sched_.init(this->num_boards_, 7, 3);
+    for (uint16_t b = 0; b < this->num_boards_; b++) {
+      this->sched_.set_config(b, ULTRA_CFG_PWM_PRESET, 8);   // 25 kHz
+      this->sched_.set_config(b, ULTRA_CFG_PWM_PERIOD, 0);
+      this->sched_.set_config(b, ULTRA_CFG_DITHER, 0);
+      this->sched_.set_config(b, ULTRA_CFG_STAGGER, 4);
+      this->sched_.set_config(b, ULTRA_CFG_LOSS, 0);
+      this->sched_.set_config(b, ULTRA_CFG_LOSS_TIMEOUT, 30);
+    }
+    this->lights_ = std::move(lights);
+    this->rx_settings_setup_();
+    this->sched_.flush_config();
+    this->rx_settings_lights_();
+    hubs_ = {this};
+  }
+};
+std::vector<UltraHub *> UltraHub::hubs_;
+#include "hub_rx.inc"
+
+static void test_receiver_settings() {
+  stored.clear();
+  const std::string yaml0 = "pwm=25k dither=on stagger=adaptive_spread loss=hold loss_timeout=3s limit=none "
+                            "retries=board retry_interval=board dtw=on|n/a poe=none|none";
+  auto lights = [](UltraLight *l) {   // board 0: a CCT light with dim to warm and effects, a plain one; board 2: one
+    l[0] = UltraLight{0, 0, true, true, "none", "none", {"Candle", "Slow loop"}};
+    l[1] = UltraLight{0, 1, false, false, "none", "none", {}};
+    l[2] = UltraLight{2, 0, true, true, "Candle", "Candle", {"Candle"}};
+  };
+  UltraLight l[3];
+  lights(l);
+  UltraHub h;
+  h.start({&l[0], &l[1], &l[2]});
+  CHECK(h.receiver_settings_text(0) == yaml0 && h.settings_cb_.calls == std::vector<int>({-1}),
+        "the YAML's settings: '%s'", h.receiver_settings_text(0).c_str());
+  // by the telemetry name, the id and all; positions 1-based, none: every board
+  UltraHub::receiver_setting_action("port 1", {1}, "pwm", "50 kHz");
+  UltraHub::receiver_setting_action("line1", {}, "stagger", "fixed");
+  UltraHub::receiver_setting_action("all", {1, 3}, "retries", "forever");
+  UltraHub::receiver_setting_action("Port 1", {1}, "retry_interval", "3s");
+  UltraHub::receiver_setting_action("Port 1", {3}, "limit", "2.5A");
+  UltraHub::receiver_setting_action("Port 1", {1}, "loss", "fade_off");
+  UltraHub::receiver_setting_action("Port 1", {1}, "loss_timeout", "500ms");
+  UltraHub::receiver_setting_action("Port 1", {1}, "dither", "off_at_low_levels");
+  UltraHub::receiver_setting_action("Port 1", {1}, "dtw", "off");
+  UltraHub::receiver_setting_action("Port 1", {1}, "poe", "slow loop");
+  const std::string set0 = "pwm=50k dither=off_at_low_levels stagger=fixed loss=fade_off loss_timeout=0.5s limit=none "
+                           "retries=forever retry_interval=3s dtw=off|n/a poe=Slow loop|none";
+  const std::string set2 = "pwm=25k dither=on stagger=fixed loss=hold loss_timeout=3s limit=2.5A retries=forever "
+                           "retry_interval=1s dtw=on poe=Candle";
+  CHECK(h.receiver_settings_text(0) == set0 && h.receiver_settings_text(2) == set2 &&
+            h.sched_.get_config(1, ULTRA_CFG_STAGGER) == 1 && h.sched_.get_config(1, ULTRA_CFG_PWM_PRESET) == 8 &&
+            !h.sched_.has_config(1, ULTRA_CFG_RETRY) && h.sched_.get_config(0, ULTRA_CFG_RETRY) == (255 | 3 << 8) &&
+            h.sched_.get_config(2, ULTRA_CFG_BOARD_MAX) == 2500,
+        "set: '%s' / '%s'", h.receiver_settings_text(0).c_str(), h.receiver_settings_text(2).c_str());
+  // a bad key or value, an effect no light of the board has, dim to warm on a board without it: nothing changes
+  const int saves0 = saves;
+  CHECK(!h.set_receiver_setting(0, "pwm", "1 kHz") && !h.set_receiver_setting(0, "bogus", "1") &&
+            !h.set_receiver_setting(0, "poe", "Fireworks") && !h.set_receiver_setting(1, "dtw", "on") &&
+            !h.set_receiver_setting(0, "retries", "300") && !h.set_receiver_setting(0, "dtw", "maybe") &&
+            h.receiver_settings_text(0) == set0 && saves == saves0,
+        "bad ones change nothing: '%s'", h.receiver_settings_text(0).c_str());
+  // the ESP32 restarts: the record on flash over the YAML's
+  lights(l);
+  UltraHub h2;
+  h2.start({&l[0], &l[1], &l[2]});
+  CHECK(h2.receiver_settings_text(0) == set0 && h2.receiver_settings_text(2) == set2 && l[0].poe == "Slow loop" &&
+            !l[0].dtw_on,
+        "after a restart: '%s'", h2.receiver_settings_text(0).c_str());
+  // reset: the YAML's again (trip_retries, which the YAML doesn't set, no longer sent: the board keeps its own)
+  CHECK(h2.set_receiver_setting(0, "reset", "") && h2.receiver_settings_text(0) == yaml0 &&
+            !h2.sched_.has_config(0, ULTRA_CFG_RETRY) && l[0].poe == "none" && l[0].dtw_on &&
+            h2.receiver_settings_text(2) == set2,
+        "reset: '%s'", h2.receiver_settings_text(0).c_str());
+  // a stored power-on effect the YAML no longer has: dropped (the light keeps the YAML's)
+  h2.set_receiver_setting(2, "poe", "none");
+  h2.set_receiver_setting(0, "poe", "Candle");
+  lights(l);
+  l[0].options = {"Slow loop"};   // (another YAML: Candle gone)
+  UltraHub h3;
+  h3.start({&l[0], &l[1], &l[2]});
+  CHECK(l[0].poe == "none" && !(h3.rx_ovr_[0].poe_set & 1) && l[2].poe == "none",
+        "a power-on effect gone from the YAML: dropped ('%s')", h3.receiver_settings_text(0).c_str());
+  UltraHub::hubs_.clear();
+}
+#undef USE_DIG2ANALOG_ULTRA_TELEMETRY
+}  // namespace hub_rx
+
 int main() {
   lights::test_light();
   updates::test_install_queue();
@@ -4645,6 +4840,7 @@ int main() {
   port_power::test_port_prepare();
   hub_port::test_hub_port();
   hub_commission::test_commission_glue();
+  hub_rx::test_receiver_settings();
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "ALL ULTRA LIFECYCLE TESTS PASSED", failures);
   return failures ? 1 : 0;
 }

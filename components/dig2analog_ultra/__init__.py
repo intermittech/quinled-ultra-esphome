@@ -52,7 +52,7 @@ def AUTO_LOAD(config=None):
     """The entity types of the Diff-Power receivers' telemetry, only for a line with telemetry: (no config: all)."""
     confs = config if isinstance(config, list) else [config]
     if config is None or any(isinstance(c, dict) and c.get(CONF_TELEMETRY) for c in confs):
-        return ["sensor", "binary_sensor", "text_sensor", "button"]
+        return ["sensor", "binary_sensor", "text_sensor", "button", "number", "select", "switch"]
     return []
 
 
@@ -732,6 +732,12 @@ async def to_code(config: ConfigType) -> None:
 
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
+    # the receivers' settings from Home Assistant (wiki: Controller-Settings): the line's id (their record on the
+    # ESP32, the action's port) and the action set_receiver_setting (with api:, one for every line)
+    cg.add(var.set_line_id(str(config[CONF_ID].id)))
+    if "api" in CORE.config:
+        cg.add_define("USE_API_USER_DEFINED_ACTIONS")
+        cg.add_define("USE_API_CUSTOM_SERVICES")
 
     timing = tuple(
         int(config[k].total_nanoseconds)

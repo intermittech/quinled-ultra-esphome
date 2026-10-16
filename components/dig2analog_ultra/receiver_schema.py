@@ -6,7 +6,7 @@ import logging
 
 from esphome import pins
 import esphome.codegen as cg
-from esphome.components import binary_sensor, button, sensor, text_sensor, uart
+from esphome.components import binary_sensor, button, number, select, sensor, switch, text_sensor, uart
 from esphome.components import time as time_
 import esphome.config_validation as cv
 from esphome.const import (
@@ -53,6 +53,10 @@ UltraLightTelemetry = ns.class_("UltraLightTelemetry")   # not a Component: made
 UltraTotals = ns.class_("UltraTotals", cg.Component)
 UltraReceiverButton = ns.class_("UltraReceiverButton", button.Button)
 UltraLineButton = ns.class_("UltraLineButton", button.Button)
+UltraSettingNumber = ns.class_("UltraSettingNumber", number.Number, cg.Component)
+UltraSettingSelect = ns.class_("UltraSettingSelect", select.Select, cg.Component)
+UltraSettingSwitch = ns.class_("UltraSettingSwitch", switch.Switch, cg.Component)
+UltraSettingText = ns.class_("UltraSettingText", cg.Component)
 
 CONF_TELEMETRY = "telemetry"
 CONF_RECEIVERS = "receivers"
@@ -63,6 +67,8 @@ CONF_DIAGNOSTICS = "diagnostics"
 CONF_LIGHT_ENTITIES = "light_entities"
 CONF_ADAPTIVE_RATE = "adaptive_rate"
 CONF_DIP_WARNING = "dip_warning"
+CONF_SETTINGS = "settings"
+CONF_SUPPLY_RATING = "supply_rating"
 CONF_COMMISSIONING = "commissioning"
 CONF_COMMISSION_MIN_VOLTAGE = "commission_min_voltage"
 CONF_PORT_ID = "port_id"
@@ -151,6 +157,9 @@ RECEIVER_ENTITIES = {
     # its supply dips in the last 24 h against the line's dip_warning, for the receiver page: "No supply dips in the
     # last 24 h.", "Supply dips in the last 24 h, the lowest to 46.1 V (84 %): fine down to 80 %."
     "supply_note": ("text", 11, 1, "Supply note", _text("mdi:transmission-tower")),
+    # its board settings, "pwm=25k dither=on stagger=adaptive_spread ... dtw=on poe=Candle" (wiki: Controller-Settings;
+    # changed with the action set_receiver_setting)
+    "settings": ("text", 12, 1, "Settings", _text("mdi:tune")),
     # its lifetime counts (kept across power cuts; protocol 0.2.5, receiver firmware 0.6.9), before that since its
     # power-up
     "trips": ("sensor", 6, 2, "Trips", _count("mdi:flash-off")),
@@ -159,8 +168,9 @@ RECEIVER_ENTITIES = {
     "limit_events": ("sensor", 8, 2, "Limit events", _count("mdi:speedometer-slow")),
     # the hub's own statistic: polls without an answer, % since the ESP started
     "missed_polls": ("sensor", 9, 2, "Missed polls", _value(UNIT_PERCENT, 1, icon="mdi:access-point-network-off")),
-    # its position on the port and its chip's UID16 ("2 · UID 9C02")
-    "link": ("text", 6, 2, "Position and UID", _text("mdi:identifier")),
+    # its position on the port and its chip's UID16 ("2 · UID 9C02"): shown, its history says when a receiver was
+    # replaced (the dashboards' event log)
+    "link": ("text", 6, 1, "Position and UID", _text("mdi:identifier")),
     "channel_health": ("text", 7, 2, "Channel health", _text("mdi:heart-pulse")),
     # along the port's cable: the sender's voltage minus this one's; the segment before it (smoothed, from 0.3 A on)
     "voltage_drop": ("sensor", 10, 2, "Voltage drop", _value(UNIT_VOLT, 2, DEVICE_CLASS_VOLTAGE)),
@@ -378,6 +388,13 @@ TELEMETRY_SCHEMA = cv.Schema(
         # a receiver's supply dip is a problem (its Status "Supply dips", the port's Problem) below this share of its
         # reference (the receivers log every dip below 90 %); shallower ones only show in its Supply note
         cv.Optional(CONF_DIP_WARNING, default="80%"): cv.All(cv.percentage, cv.Range(min=0.5, max=0.9)),
+        # the controller's settings entities (wiki: Controller-Settings; the first line with telemetry decides): these
+        # options as numbers / selects / switches in Home Assistant, applied to every line; false: YAML only
+        cv.Optional(CONF_SETTINGS, default=True): cv.boolean,
+        # the supply feeding the ports (W; 0: not set): the dashboards' headroom (its entity: Supply rating)
+        cv.Optional(CONF_SUPPLY_RATING, default="0W"): cv.All(
+            cv.float_with_unit("power", "(w|W)?"), cv.Range(min=0, max=10000)
+        ),
         # the commissioning (wiki: Commissioning): Commission / Finalize buttons, its texts; its load test fails when a
         # receiver would get less than commission_min_voltage of the sender's voltage at the port's full load. The
         # stored dates (the commissioning's, the receivers' Last calibrated): time_id, else the only time component
@@ -482,8 +499,9 @@ def telemetry_defaults(config):
 # with several lights), a line's own, the UART buffers, the lifetime ledger's reserve (its own sizing rule).
 _LOGGER = logging.getLogger(__name__)
 # (the calibration's: its button and record, 3 more value slots (40 B) at every level, 3 diagnostics with basic, 4 with
-# full: x RAM_PER_ENTITY; basic also has the LED supply; both the Supply note)
-RAM_PER_RECEIVER = {"full": 2000, "basic": 1300, "none": 700}
+# full: x RAM_PER_ENTITY; basic also has the LED supply and Position and UID; both the Supply note; the Settings text
+# with its string and the board's settings record (32 B, also with none): ~160 B)
+RAM_PER_RECEIVER = {"full": 2160, "basic": 1520, "none": 740}
 RAM_PER_LIGHT = 900
 RAM_PER_ESTIMATE = 200
 RAM_PER_LINE = 1000
@@ -646,6 +664,75 @@ async def _totals_to_code():
         cg.add(var.set_value(index, ent))
 
 
+# The controller's settings (wiki: Controller-Settings): key -> (ControllerSetting, name, min, max, step, unit, icon,
+# the first line's YAML value); select / switch: min / max / step unused. Applied to every line with telemetry.
+def _setting_specs(tel):
+    return {
+        "update_rate": (0, "Telemetry update rate", 0, 2, 1, None, "mdi:timer-sync-outline",
+                        list(UPDATE_RATES).index(tel[CONF_UPDATE_RATE])),
+        "adaptive_rate": (1, "Adaptive reply rate", 0, 1, 1, None, "mdi:speedometer-slow",
+                          1.0 if tel[CONF_ADAPTIVE_RATE] else 0.0),
+        "load_warning": (2, "Load warning", 50, 100, 5, UNIT_PERCENT, "mdi:gauge", tel[CONF_LOAD_WARNING] * 100.0),
+        "load_problem": (3, "Load problem", 50, 100, 5, UNIT_PERCENT, "mdi:gauge-full", tel[CONF_LOAD_PROBLEM] * 100.0),
+        "load_problem_time": (4, "Load problem time", 0, 600, 5, UNIT_SECOND, "mdi:timer-alert-outline",
+                              tel[CONF_LOAD_PROBLEM_TIME].total_milliseconds / 1000.0),
+        "port_limit": (5, "Port limit", 0.5, 10, 0.05, UNIT_AMPERE, "mdi:current-dc", tel[CONF_PORT_LIMIT]),
+        "dip_warning": (6, "Dip warning", 50, 90, 1, UNIT_PERCENT, "mdi:transmission-tower",
+                        tel[CONF_DIP_WARNING] * 100.0),
+        "commission_min_voltage": (7, "Commission min voltage", 50, 99, 1, UNIT_PERCENT, "mdi:clipboard-check-outline",
+                                   tel[CONF_COMMISSION_MIN_VOLTAGE] * 100.0),
+        "supply_rating": (8, "Supply rating", 0, 10000, 10, UNIT_WATT, "mdi:power-plug-outline",
+                          float(tel[CONF_SUPPLY_RATING])),
+    }
+
+
+def _diagnostics_text():
+    """The lines' diagnostics levels: "full", or per line when they differ ("Port 1 full, Port 2 basic")"""
+    lines = [h[CONF_TELEMETRY] for h in CORE.config.get("dig2analog_ultra", []) or [] if h.get(CONF_TELEMETRY)]
+    levels = [str(t.get(CONF_DIAGNOSTICS, "full")).lower() for t in lines]
+    if len(set(levels)) <= 1:
+        return levels[0] if levels else "full"
+    return ", ".join(f"{t[CONF_NAME]} {lvl}" for t, lvl in zip(lines, levels))
+
+
+async def _settings_to_code(tel):
+    """The controller's settings entities, once (the first line with telemetry; settings: false leaves them out)"""
+    if CORE.data.get("dig2analog_ultra_settings"):
+        return
+    CORE.data["dig2analog_ultra_settings"] = True
+    if not tel[CONF_SETTINGS]:
+        return
+    for key, (kind, name, lo, hi, step, unit, icon, yaml) in _setting_specs(tel).items():
+        conf = {CONF_ID: f"dig2analog_ultra_setting_{key}", CONF_NAME: name}
+        if key == "update_rate":
+            ent = await select.new_select(
+                select.select_schema(UltraSettingSelect, icon=icon, entity_category=ENTITY_CATEGORY_CONFIG)(conf),
+                options=list(UPDATE_RATES),
+            )
+        elif key == "adaptive_rate":
+            ent = await switch.new_switch(
+                switch.switch_schema(UltraSettingSwitch, icon=icon, entity_category=ENTITY_CATEGORY_CONFIG)(conf)
+            )
+        else:
+            kw = {"icon": icon, "entity_category": ENTITY_CATEGORY_CONFIG}
+            if unit:
+                kw["unit_of_measurement"] = unit
+            ent = await number.new_number(
+                number.number_schema(UltraSettingNumber, **kw)(conf), min_value=lo, max_value=hi, step=step
+            )
+        CORE.component_ids.add(conf[CONF_ID])   # (made here, not in the configuration)
+        await cg.register_component(ent, {})
+        cg.add(ent.set_kind(kind))
+        cg.add(ent.set_default(yaml))
+    text = await text_sensor.new_text_sensor(
+        _text("mdi:tune-variant")({CONF_ID: "dig2analog_ultra_setting_diagnostics", CONF_NAME: "Telemetry diagnostics"})
+    )
+    holder = cg.new_Pvariable(ID("dig2analog_ultra_setting_text", is_declaration=True, type=UltraSettingText))
+    CORE.component_ids.add("dig2analog_ultra_setting_text")
+    await cg.register_component(holder, {})
+    cg.add(holder.set_text(text, _diagnostics_text()))
+
+
 async def telemetry_to_code(hub, config):
     """The hub's telemetry: the poller, the receivers' entities, the port's summary."""
     tel = config[CONF_TELEMETRY]
@@ -743,6 +830,7 @@ async def telemetry_to_code(hub, config):
         else:
             cg.add(port.set_problem(ent))
     await _totals_to_code()
+    await _settings_to_code(tel)
 
 
 async def light_telemetry_to_code(light_var, config, channels_mask):

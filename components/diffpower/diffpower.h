@@ -18,6 +18,9 @@
 #ifdef USE_BUTTON
 #include "esphome/components/button/button.h"
 #endif
+#ifdef USE_NUMBER
+#include "esphome/components/number/number.h"
+#endif
 #ifdef USE_SELECT
 #include "esphome/components/select/select.h"
 #endif
@@ -54,6 +57,7 @@ class DiffPowerPort final : public Component {
   void set_name(const char *name) { this->name_ = name; }
   /// the key of its counters on the ESP32 (from its id: unique, and a new name keeps them)
   void set_stats_key(const char *key) { this->stats_key_ = key; }
+  const char *stats_key() const { return this->stats_key_; }
   void set_timing(uint32_t hotplug_ms, uint32_t boot_margin_ms, uint32_t notice_ms, uint32_t min_off_ms,
                   uint32_t min_on_ms, uint32_t standby_after_ms) {
     PortConfig c = this->core_.config();
@@ -64,6 +68,23 @@ class DiffPowerPort final : public Component {
     c.min_on_ms = min_on_ms;
     c.standby_after_ms = standby_after_ms;
     this->core_.configure(c);
+  }
+  /// At runtime (its settings entities, wiki: Controller-Settings): the turn-off period of its lights without their own
+  /// and of its power mode; the Wake button's time; the dark window's offsets (from the next check on, at once)
+  void set_standby_after(uint32_t ms) {
+    PortConfig c = this->core_.config();
+    c.standby_after_ms = ms;
+    this->core_.configure(c);
+  }
+  uint32_t min_on_ms() const { return this->core_.config().min_on_ms; }
+  void set_wake_timeout(uint32_t ms) { this->wake_timeout_ms_ = ms; }
+  uint32_t wake_timeout() const { return this->wake_timeout_ms_; }
+  void set_dark_offsets(int64_t before_s, int64_t after_s) {
+    if (before_s >= 0)
+      this->before_s_ = static_cast<uint32_t>(before_s);
+    if (after_s >= 0)
+      this->after_s_ = static_cast<uint32_t>(after_s);
+    this->dark_checked_ = false;
   }
   /// During dark without a valid time: powered (else Standby)
   void set_unknown_on(bool on) {
@@ -205,6 +226,7 @@ class DiffPowerPort final : public Component {
 #endif
   float lat_{0}, lon_{0};
   uint32_t before_s_{0}, after_s_{0};
+  uint32_t wake_timeout_ms_{120000};
   uint32_t dark_ms_{0};
   bool dark_checked_{false};
   bool sun_{false};   // ESPHome's sun (lat_ / lon_)
@@ -252,12 +274,38 @@ class PowerModeSelect final : public select::Select, public Component {
 class WakeButton final : public button::Button {
  public:
   void set_port(DiffPowerPort *port) { this->port_ = port; }
-  void set_timeout(uint32_t ms) { this->timeout_ms_ = ms; }
 
  protected:
-  void press_action() override { this->port_->wake(this->timeout_ms_); }
+  void press_action() override { this->port_->wake(this->port_->wake_timeout()); }
   DiffPowerPort *port_{nullptr};
-  uint32_t timeout_ms_{120000};
+};
+#endif
+
+#ifdef USE_NUMBER
+/// A Diff-Power setting from Home Assistant (wiki: Controller-Settings), in minutes: a port's turn-off period or Wake
+/// time, or (the controller's, every port) the dark window's offsets. Kept on the ESP32; a changed YAML default wins
+/// once (the stored choice holds only while the YAML default is the one it was set against).
+class DiffPowerNumber final : public number::Number, public Component {
+ public:
+  enum Kind : uint8_t { TURN_OFF = 0, WAKE_TIMEOUT, DARK_BEFORE, DARK_AFTER };
+  struct Record {
+    static constexpr uint32_t MAGIC = 0x53455431;   // "SET1"
+    uint32_t magic{0};
+    float yaml{0.0f}, value{0.0f};
+  };
+  void set_port(DiffPowerPort *port) { this->port_ = port; }
+  void set_kind(uint8_t kind) { this->kind_ = kind; }
+  void set_default(float minutes) { this->yaml_ = minutes; }
+  void setup() override;
+  float get_setup_priority() const override { return setup_priority::DATA; }
+
+ protected:
+  void control(float value) override;
+  void apply_(float minutes);
+  DiffPowerPort *port_{nullptr};   // (none: every port)
+  ESPPreferenceObject pref_;
+  float yaml_{0.0f};
+  uint8_t kind_{0};
 };
 #endif
 

@@ -27,6 +27,11 @@
 #include "esphome/components/uart/uart_component_esp_idf.h"
 #include <driver/uart.h>
 #endif
+#ifdef USE_API_CUSTOM_SERVICES
+#include "esphome/components/api/api_server.h"
+#include "esphome/components/api/user_services.h"
+#endif
+#include <strings.h>
 
 namespace esphome::dig2analog_ultra {
 
@@ -98,6 +103,215 @@ void UltraHub::set_pwm_frequency(int board, float hz) {
   this->sched_.flush_config();
   this->wake_();
 }
+
+// ------------------------------------------------------------------- the receivers' settings from Home Assistant
+// (wiki: Controller-Settings) Per board on top of the YAML's values: kept on the ESP32, sent with the board's settings
+// (host-managed: at boot and with every refresh, so a board that restarts or is replaced gets them again).
+
+void UltraHub::rx_settings_setup_() {
+  const size_t n = this->num_boards_;
+  for (uint8_t k = 0; k < 8; k++) {   // the YAML's (it sets every board alike: board 0's)
+    if (n != 0 && this->sched_.has_config(0, RX_CFG[k])) {
+      this->rx_yaml_[k] = this->sched_.get_config(0, RX_CFG[k]);
+      this->rx_yaml_have_ |= static_cast<uint8_t>(1u << k);
+    }
+  }
+  this->rx_ovr_.assign(n, RxOverride{});
+  this->rx_pref_ = global_preferences->make_preference(
+      n * sizeof(RxOverride), fnv1_hash(std::string("dig2analog_ultra_rx:") + this->line_id_) ^ n, true);
+  if (n == 0 || !this->rx_pref_.load(reinterpret_cast<uint8_t *>(this->rx_ovr_.data()), n * sizeof(RxOverride))) {
+    this->rx_ovr_.assign(n, RxOverride{});
+    return;
+  }
+  for (uint16_t b = 0; b < n; b++) {
+    const RxOverride &o = this->rx_ovr_[b];
+    for (uint8_t k = 0; k < 8; k++) {
+      if (o.mask & (1u << k))
+        this->sched_.set_config(b, RX_CFG[k], o.cfg[k]);
+    }
+  }
+}
+
+void UltraHub::rx_settings_lights_() {
+  this->rx_lights_done_ = true;
+  bool dropped = false;
+  for (UltraLight *l : this->lights_) {
+    const uint16_t b = l->get_board();
+    const uint8_t bit = static_cast<uint8_t>(1u << l->get_light_index());
+    if (b >= this->rx_ovr_.size())
+      continue;
+    RxOverride &o = this->rx_ovr_[b];
+    if ((o.dtw_set & bit) && l->dim_to_warm_available())
+      l->set_dim_to_warm((o.dtw_on & bit) != 0);
+    if (o.poe_set & bit) {
+      const uint16_t h = o.poe[l->get_light_index()];
+      const std::string name = h == 0 ? std::string("none") : l->power_on_option_name(h);
+      if (name.empty() || !l->set_power_on_effect_name(name)) {   // (the YAML has no such effect any more)
+        o.poe_set &= static_cast<uint8_t>(~bit);
+        dropped = true;
+      }
+    }
+  }
+  if (dropped)
+    this->rx_settings_save_();
+  this->settings_cb_.call(-1);
+}
+
+void UltraHub::rx_settings_save_() {
+  if (!this->rx_ovr_.empty())
+    this->rx_pref_.save(reinterpret_cast<const uint8_t *>(this->rx_ovr_.data()),
+                        this->rx_ovr_.size() * sizeof(RxOverride));
+}
+
+bool UltraHub::set_receiver_setting(int board, const std::string &key, const std::string &value) {
+  const int k = rx_key(key);
+  if (k < 0) {
+    ESP_LOGW(TAG, "Receiver setting on GPIO%u: no key '%s'", this->pin_, key.c_str());
+    return false;
+  }
+  bool on = false;
+  if (k == RK_DTW && !parse_on_off(value, &on)) {
+    ESP_LOGW(TAG, "Receiver setting on GPIO%u: dtw '%s' isn't on / off", this->pin_, value.c_str());
+    return false;
+  }
+  bool ok = false;
+  for (uint16_t b = 0; b < this->num_boards_ && b < this->rx_ovr_.size(); b++) {
+    if (board >= 0 && board != b)
+      continue;
+    RxOverride &o = this->rx_ovr_[b];
+    if (k == RK_RESET) {   // the YAML's again (an id it doesn't set: no longer sent, the board keeps its own)
+      o = RxOverride{};
+      for (uint8_t i = 0; i < 8; i++) {
+        if (this->rx_yaml_have_ & (1u << i))
+          this->sched_.set_config(b, RX_CFG[i], this->rx_yaml_[i]);
+        else
+          this->sched_.unset_config(b, RX_CFG[i]);
+      }
+      for (UltraLight *l : this->lights_) {
+        if (l->get_board() != b)
+          continue;
+        if (l->dim_to_warm_available())
+          l->set_dim_to_warm(true);
+        l->set_power_on_effect_name(l->power_on_effect_yaml_name());
+      }
+      ok = true;
+    } else if (k == RK_DTW || k == RK_POE) {   // per light of the board
+      for (UltraLight *l : this->lights_) {
+        if (l->get_board() != b)
+          continue;
+        const uint8_t idx = l->get_light_index(), bit = static_cast<uint8_t>(1u << idx);
+        if (k == RK_DTW) {
+          if (!l->dim_to_warm_available())
+            continue;
+          l->set_dim_to_warm(on);
+          o.dtw_set |= bit;
+          o.dtw_on = static_cast<uint8_t>(on ? o.dtw_on | bit : o.dtw_on & ~bit);
+        } else {
+          if (!l->set_power_on_effect_name(value))
+            continue;
+          o.poe_set |= bit;
+          o.poe[idx] = strcasecmp(value.c_str(), "none") == 0 ? 0 : effect_hash(value.c_str());
+        }
+        ok = true;
+      }
+    } else {
+      const uint16_t retry = this->sched_.has_config(b, ULTRA_CFG_RETRY) ? this->sched_.get_config(b, ULTRA_CFG_RETRY)
+                                                                         : static_cast<uint16_t>(10 | 1 << 8);
+      RxOverride t = o;
+      if (!rx_override_cfg(t, k, value, retry)) {
+        ESP_LOGW(TAG, "Receiver setting on GPIO%u: %s '%s' isn't valid", this->pin_, key.c_str(), value.c_str());
+        return false;
+      }
+      o = t;
+      for (uint8_t i = 0; i < 8; i++) {
+        if (o.mask & (1u << i))
+          this->sched_.set_config(b, RX_CFG[i], o.cfg[i]);
+      }
+      ok = true;
+    }
+  }
+  if (!ok) {
+    ESP_LOGW(TAG, "Receiver setting on GPIO%u: %s '%s' taken by no board / light", this->pin_, key.c_str(),
+             value.c_str());
+    return false;
+  }
+  ESP_LOGI(TAG, "Receiver setting on GPIO%u, board %d: %s %s", this->pin_, board < 0 ? -1 : board + 1, key.c_str(),
+           value.c_str());
+  this->sched_.flush_config();
+  this->wake_();
+  this->rx_settings_save_();
+  this->settings_cb_.call(board);
+  return true;
+}
+
+std::string UltraHub::receiver_settings_text(uint16_t board) const {
+  RxSettingsView v;
+  for (uint8_t id = 0; id < ULTRA_CFG_COUNT; id++) {
+    v.cfg[id] = this->sched_.get_config(board, id);
+    if (this->sched_.has_config(board, id))
+      v.have |= 1u << id;
+  }
+  std::vector<const UltraLight *> ls;   // the board's lights in their order (light index)
+  for (const UltraLight *l : this->lights_) {
+    if (l->get_board() == board)
+      ls.push_back(l);
+  }
+  std::sort(ls.begin(), ls.end(),
+            [](const UltraLight *a, const UltraLight *b) { return a->get_light_index() < b->get_light_index(); });
+  for (size_t i = 0; i < ls.size(); i++) {
+    v.dtw += (i == 0 ? "" : "|") + std::string(!ls[i]->dim_to_warm_available() ? "n/a"
+                                               : ls[i]->get_dim_to_warm()       ? "on"
+                                                                                : "off");
+    v.poe += (i == 0 ? "" : "|") + ls[i]->power_on_effect_name();
+  }
+  return rx_settings_text(v);
+}
+
+bool UltraHub::is_line(const std::string &name) const {
+  if (strcasecmp(name.c_str(), this->line_id_) == 0)
+    return true;
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  if (this->has_telemetry() && strcasecmp(name.c_str(), this->tel_name_) == 0)
+    return true;
+#endif
+  return false;
+}
+
+void UltraHub::receiver_setting_action(const std::string &port, const std::vector<int32_t> &receivers,
+                                       const std::string &key, const std::string &value) {
+  const bool all = strcasecmp(port.c_str(), "all") == 0;
+  bool any = false;
+  for (UltraHub *hub : hubs_) {
+    if (!all && !hub->is_line(port))
+      continue;
+    any = true;
+    if (receivers.empty()) {
+      hub->set_receiver_setting(-1, key, value);
+      continue;
+    }
+    for (int32_t r : receivers) {
+      if (r >= 1 && r <= hub->num_boards_)
+        hub->set_receiver_setting(r - 1, key, value);
+    }
+  }
+  if (!any)
+    ESP_LOGW(TAG, "set_receiver_setting: no line '%s' (a telemetry name, a line's id, or all)", port.c_str());
+}
+
+#ifdef USE_API_CUSTOM_SERVICES
+/// The action set_receiver_setting(port, receivers, key, value): Home Assistant's esphome.<device>_set_receiver_setting
+class ReceiverSettingService final
+    : public api::UserServiceDynamic<std::string, std::vector<int32_t>, std::string, std::string> {
+ public:
+  ReceiverSettingService() : UserServiceDynamic("set_receiver_setting", {"port", "receivers", "key", "value"}) {}
+
+ protected:
+  void execute(uint32_t, bool, std::string port, std::vector<int32_t> receivers, std::string key,
+               std::string value) override {
+    UltraHub::receiver_setting_action(port, receivers, key, value);
+  }
+};
+#endif
 
 // A board forwards Ultra frames only once it is locked: a preamble of DARK frames (preamble_frames()) lets the
 // whole chain lock (boards that were locked to a WS protocol show dark meanwhile) before the commands come.
@@ -984,7 +1198,15 @@ void UltraHub::setup() {
   }
   this->early_config_.clear();
   this->early_config_.shrink_to_fit();
+  this->rx_settings_setup_();   // (the receivers' settings from Home Assistant over the YAML's)
   this->sched_.flush_config();
+#ifdef USE_API_CUSTOM_SERVICES
+  static bool service_added = false;   // (one action for every line)
+  if (!service_added && api::global_api_server != nullptr) {
+    service_added = true;
+    api::global_api_server->register_user_service(new ReceiverSettingService());   // NOLINT (lives forever)
+  }
+#endif
   // light indices without a light in the YAML: cleared on the boards (an earlier configuration may have used them)
   for (uint16_t b = 0; b < this->num_boards_; b++)
     this->sched_.clear_unused_lights(b, b < this->light_counts_.size() ? this->light_counts_[b] : 0);
@@ -1536,6 +1758,8 @@ void UltraHub::CommissionLayer::layer_shown(UltraLight *light) {
 #endif
 
 void UltraHub::loop() {
+  if (!this->rx_lights_done_)
+    this->rx_settings_lights_();
 #ifdef USE_DIFFPOWER
   if (this->port_ != nullptr && !this->port_attached_)
     this->attach_port_();

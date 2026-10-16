@@ -22,7 +22,8 @@ PIECES = {
         "ultra_light.cpp",
         ["static uint8_t scene_fade(", "static uint16_t mired10(", "void UltraLight::setup_state(",
          "void UltraLight::send_opt_(", "void UltraLight::transition_done_(", "void UltraLight::lit_(",
-         "void UltraLight::send_pixel(", "void UltraLight::start_effect("],
+         "void UltraLight::send_pixel(", "void UltraLight::start_effect(",
+         "void UltraLight::send_power_on_effect_scene_("],
     ),
     "update_methods.inc": (
         "fw_update.cpp",
@@ -78,6 +79,13 @@ PIECES = {
         "dig2analog_ultra.cpp",
         ["void UltraHub::commission(", "void UltraHub::commission_all(", "void UltraHub::service_commission_(",
          "void UltraHub::commission_level_(", "void UltraHub::CommissionLayer::layer_shown("],
+    ),
+    # the receivers' settings from Home Assistant (the action set_receiver_setting, the Settings text)
+    "hub_rx.inc": (
+        "dig2analog_ultra.cpp",
+        ["void UltraHub::rx_settings_setup_(", "void UltraHub::rx_settings_lights_(", "void UltraHub::rx_settings_save_(",
+         "bool UltraHub::set_receiver_setting(", "std::string UltraHub::receiver_settings_text(",
+         "bool UltraHub::is_line(", "void UltraHub::receiver_setting_action("],
     ),
     "hub_port.inc": (
         "dig2analog_ultra.cpp",

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <strings.h>
 
 namespace esphome::dig2analog_ultra {
 
@@ -106,22 +107,7 @@ void UltraLight::setup_state(light::LightState *state) {
   this->send_opt_();
   this->stop_effect();
   if (this->power_on_effect_ != nullptr) {
-    // power_on_effect: a fixed power-on scene (its values) and the effect the board runs on it. Fixed, so the board
-    // writes them once, not with every change of the light.
-    light::LightColorValues v = this->power_on_values_;
-    const float ct = v.get_color_temperature(), lo = this->cold_white_temperature_, hi = this->warm_white_temperature_;
-    if (ct > 0.0f && hi > lo) {
-      // as a light call with only a colour temperature (LightCall): the linear CW / WW fractions, gamma-uncorrected
-      // (the board's exact gamma gets the fractions back)
-      const float ww = (std::min(std::max(ct, lo), hi) - lo) / (hi - lo), cw = 1.0f - ww, top = std::max(ww, cw);
-      const float g = state->get_gamma_correct(), inv = g > 0.0f ? 1.0f / g : 1.0f;
-      v.set_cold_white(std::pow(cw / top, inv));
-      v.set_warm_white(std::pow(ww / top, inv));
-    }
-    uint16_t m, a[CHANNELS], b[CHANNELS];
-    this->map(v, m, a, b);
-    this->hub_->scheduler().light_scene(this->board_, this->index_, 1, scene_fade(state), m, a, b);
-    this->send_scene_effect_();
+    this->send_power_on_effect_scene_();
   } else if (this->scene_mode_ == SCENE_NONE) {
     // not in the board's power-on scene (also clears what an earlier configuration stored there)
     static const uint16_t z[CHANNELS] = {0, 0, 0, 0, 0}, one[CHANNELS] = {65535, 65535, 65535, 65535, 65535};
@@ -174,7 +160,8 @@ void UltraLight::set_dim_to_warm(bool on) {
 // The power-on scene is what ESPHome will restore at its next boot (restore_mode / initial_state); the board stores
 // it (writes debounced, small changes at most every 10 min) and shows it from its own power-up until the host is back.
 void UltraLight::on_light_remote_values_update() {
-  if (this->scene_mode_ == SCENE_NONE || (this->scene_mode_ == SCENE_FIXED && this->scene_sent_))
+  if (this->scene_mode_ == SCENE_NONE || (this->scene_mode_ == SCENE_FIXED && this->scene_sent_) ||
+      this->power_on_effect_ != nullptr)   // (a power-on effect chosen in Home Assistant brings its own scene)
     return;
   light::LightColorValues v = this->state_->remote_values;
   if (this->scene_mode_ == SCENE_FOLLOW_ON)
@@ -197,6 +184,68 @@ void UltraLight::on_light_remote_values_update() {
   this->hub_->scheduler().light_scene(this->board_, this->index_, 1, f, m, a, b);
   this->send_scene_effect_();  // none, after the first SCENE (queued once)
   this->hub_->wake_();
+}
+
+// power_on_effect: a fixed power-on scene (its values) and the effect the board runs on it. Fixed, so the board writes
+// them once, not with every change of the light.
+void UltraLight::send_power_on_effect_scene_() {
+  light::LightColorValues v = this->power_on_values_;
+  const float ct = v.get_color_temperature(), lo = this->cold_white_temperature_, hi = this->warm_white_temperature_;
+  if (ct > 0.0f && hi > lo) {
+    // as a light call with only a colour temperature (LightCall): the linear CW / WW fractions, gamma-uncorrected
+    // (the board's exact gamma gets the fractions back)
+    const float ww = (std::min(std::max(ct, lo), hi) - lo) / (hi - lo), cw = 1.0f - ww, top = std::max(ww, cw);
+    const float g = this->state_->get_gamma_correct(), inv = g > 0.0f ? 1.0f / g : 1.0f;
+    v.set_cold_white(std::pow(cw / top, inv));
+    v.set_warm_white(std::pow(ww / top, inv));
+  }
+  uint16_t m, a[CHANNELS], b[CHANNELS];
+  this->map(v, m, a, b);
+  this->hub_->scheduler().light_scene(this->board_, this->index_, 1, scene_fade(this->state_), m, a, b);
+  this->send_scene_effect_();
+}
+
+bool UltraLight::set_power_on_effect_name(const std::string &name) {
+  UltraEffect *e = nullptr;
+  if (strcasecmp(name.c_str(), "none") != 0) {
+    for (auto *o : this->poe_options_) {
+      if (strcasecmp(o->get_name().c_str(), name.c_str()) == 0)
+        e = o;
+    }
+    if (e == nullptr)
+      return false;
+  }
+  if (e == this->power_on_effect_)
+    return true;
+  this->power_on_effect_ = e;
+  if (this->state_ == nullptr)
+    return true;   // (before its setup: setup_state sends it)
+  if (e != nullptr) {
+    this->send_power_on_effect_scene_();
+  } else if (this->scene_mode_ == SCENE_NONE) {
+    static const uint16_t z[CHANNELS] = {0, 0, 0, 0, 0}, one[CHANNELS] = {65535, 65535, 65535, 65535, 65535};
+    this->hub_->scheduler().light_scene(this->board_, this->index_, 0, 0, 0, z, one);   // none stored
+    this->send_scene_effect_();
+  } else {
+    this->scene_sent_ = false;   // the YAML's power_on_scene again (its state now)
+    this->on_light_remote_values_update();
+  }
+  this->hub_->wake_();
+  return true;
+}
+
+std::string UltraLight::power_on_effect_name() const {
+  return this->power_on_effect_ != nullptr ? this->power_on_effect_->get_name().c_str() : "none";
+}
+std::string UltraLight::power_on_effect_yaml_name() const {
+  return this->power_on_yaml_ != nullptr ? this->power_on_yaml_->get_name().c_str() : "none";
+}
+std::string UltraLight::power_on_option_name(uint16_t hash) const {
+  for (auto *o : this->poe_options_) {
+    if (effect_hash(o->get_name().c_str()) == hash)
+      return o->get_name().c_str();
+  }
+  return "";
 }
 
 // The power-on effect (SCENE_EFFECT) for every light, after its SCENE: the configured one, else none, which also

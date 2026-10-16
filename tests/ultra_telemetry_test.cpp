@@ -12,6 +12,7 @@
 #include "../components/dig2analog_ultra/ultra_pacing.h"
 #include "../components/dig2analog_ultra/ultra_telemetry.h"
 #include "../components/dig2analog_ultra/ultra_commission.h"
+#include "../components/dig2analog_ultra/ultra_settings.h"
 
 #include <cmath>
 #include <cstring>
@@ -2873,6 +2874,83 @@ static void test_calibration() {
   }
 }
 
+/// Settings from Home Assistant (ultra_settings.h): the stored choice at boot (a changed YAML default wins), the
+/// receivers' keys and values (every form the action takes, the bad ones), the Settings text (a preset, an exact
+/// frequency, the retries the board keeps, per light, within 255 bytes); the update rate at runtime (STATUS's interval).
+static void test_settings() {
+  SettingRecord r;
+  r.magic = SettingRecord::MAGIC;
+  r.yaml = 80.0f;
+  r.value = 75.0f;
+  SettingRecord bad = r;
+  bad.magic = 0;
+  CHECK(setting_boot_value(r, true, 80.0f) == 75.0f && setting_boot_value(r, true, 85.0f) == 85.0f &&
+            setting_boot_value(r, false, 80.0f) == 80.0f && setting_boot_value(bad, true, 80.0f) == 80.0f,
+        "the stored choice at boot: kept while its YAML default is the same");
+  RxOverride o;
+  const uint16_t retry = 10 | 1 << 8;
+  bool ok = rx_key("PWM") == RK_PWM && rx_key("Loss_Timeout") == RK_LOSS_TIMEOUT && rx_key("bogus") < 0;
+  ok &= rx_override_cfg(o, RK_PWM, "25 kHz", retry) && o.cfg[RX_PWM_PRESET] == 8 && o.cfg[RX_PWM_PERIOD] == 0;
+  ok &= rx_override_cfg(o, RK_PWM, "12.43k", retry) && o.cfg[RX_PWM_PRESET] == 5 && o.cfg[RX_PWM_PERIOD] == 0;
+  ok &= rx_override_cfg(o, RK_PWM, "31250", retry) && o.cfg[RX_PWM_PERIOD] == 4608;   // (no preset within 0.5 %)
+  ok &= !rx_override_cfg(o, RK_PWM, "1k", retry) && !rx_override_cfg(o, RK_PWM, "fast", retry) &&
+        !rx_override_cfg(o, RK_PWM, "25 MHz", retry) && o.cfg[RX_PWM_PERIOD] == 4608;
+  ok &= rx_override_cfg(o, RK_DITHER, "Off", retry) && o.cfg[RX_DITHER] == 2 &&
+        !rx_override_cfg(o, RK_DITHER, "sometimes", retry);
+  ok &= rx_override_cfg(o, RK_STAGGER, "spread", retry) && o.cfg[RX_STAGGER] == 4 &&
+        rx_override_cfg(o, RK_STAGGER, "fixed_spread", retry) && o.cfg[RX_STAGGER] == 2;
+  ok &= rx_override_cfg(o, RK_LOSS, "scene", retry) && o.cfg[RX_LOSS] == 3;
+  ok &= rx_override_cfg(o, RK_LOSS_TIMEOUT, "3s", retry) && o.cfg[RX_LOSS_TIMEOUT] == 30 &&
+        rx_override_cfg(o, RK_LOSS_TIMEOUT, "1 min", retry) && o.cfg[RX_LOSS_TIMEOUT] == 600 &&
+        !rx_override_cfg(o, RK_LOSS_TIMEOUT, "0.4", retry) && !rx_override_cfg(o, RK_LOSS_TIMEOUT, "61s", retry);
+  ok &= rx_override_cfg(o, RK_LIMIT, "2.0A", retry) && o.cfg[RX_LIMIT] == 2000 &&
+        rx_override_cfg(o, RK_LIMIT, "None", retry) && o.cfg[RX_LIMIT] == 0 && !rx_override_cfg(o, RK_LIMIT, "-1", retry);
+  RxOverride q;   // the retries: each half on top of what's in effect
+  ok &= rx_override_cfg(q, RK_RETRY_INTERVAL, "5s", retry) && q.cfg[RX_RETRY] == (10 | 5 << 8) &&
+        rx_override_cfg(q, RK_RETRIES, "0", retry) && q.cfg[RX_RETRY] == (0 | 5 << 8) &&
+        rx_override_cfg(q, RK_RETRIES, "forever", retry) && q.cfg[RX_RETRY] == (255 | 5 << 8) &&
+        !rx_override_cfg(q, RK_RETRIES, "2.5", retry) && !rx_override_cfg(q, RK_RETRY_INTERVAL, "256s", retry) &&
+        !rx_override_cfg(q, RK_RETRY_INTERVAL, "1.5", retry);
+  ok &= o.mask == 0x7F && effect_hash("Candle") == effect_hash("CANDLE") && effect_hash("") != 0 &&
+        sizeof(RxOverride) == 32;
+  CHECK(ok, "the receivers' keys and values: mask %02X", o.mask);
+  RxSettingsView v;
+  v.cfg[ULTRA_CFG_PWM_PRESET] = 8;
+  v.cfg[ULTRA_CFG_STAGGER] = 4;
+  v.cfg[ULTRA_CFG_LOSS_TIMEOUT] = 30;
+  v.have = 1u << ULTRA_CFG_PWM_PRESET | 1u << ULTRA_CFG_PWM_PERIOD | 1u << ULTRA_CFG_STAGGER;
+  const std::string t1 = rx_settings_text(v);
+  v.cfg[ULTRA_CFG_PWM_PERIOD] = 4608;
+  v.cfg[ULTRA_CFG_BOARD_MAX] = 2250;
+  v.cfg[ULTRA_CFG_RETRY] = 255 | 2 << 8;
+  v.have |= 1u << ULTRA_CFG_BOARD_MAX | 1u << ULTRA_CFG_RETRY;
+  v.dtw = "on|n/a";
+  v.poe = "Candle|none";
+  const std::string t2 = rx_settings_text(v);
+  v.poe = std::string(300, 'x');
+  const std::string t3 = rx_settings_text(v);
+  CHECK(t1 == "pwm=25k dither=on stagger=adaptive_spread loss=hold loss_timeout=3s limit=none retries=board "
+              "retry_interval=board" &&
+            t2 == "pwm=31250 dither=on stagger=adaptive_spread loss=hold loss_timeout=3s limit=2.25A retries=forever "
+                  "retry_interval=2s dtw=on|n/a poe=Candle|none" &&
+            t3.size() <= 255 && t3.compare(t3.size() - 3, 3, "...") == 0,
+        "the Settings text: '%s' / '%s' (%zu bytes)", t1.c_str(), t2.c_str(), t3.size());
+  // the update rate at runtime: STATUS read at its new interval
+  Chain c(1);
+  TelemetryPoller p = started(c, 1);
+  c.run(p, 10000);
+  const uint32_t s0 = c.rx[0].asked[ULTRA_PAGE_STATUS];
+  c.run(p, 30000);
+  const uint32_t fast = c.rx[0].asked[ULTRA_PAGE_STATUS] - s0;
+  p.set_status_interval(5000);
+  c.run(p, 10000);
+  const uint32_t s1 = c.rx[0].asked[ULTRA_PAGE_STATUS];
+  c.run(p, 30000);
+  const uint32_t slow = c.rx[0].asked[ULTRA_PAGE_STATUS] - s1;
+  CHECK(fast >= 9 && fast <= 11 && slow >= 5 && slow <= 7,
+        "the update rate at runtime: STATUS %u times in 30 s at 3 s, %u at 5 s", fast, slow);
+}
+
 /// The reply rate (round 12): one rate slower at 4 broken of the last 32 counted windows (3: not; old ones slide out;
 /// windows without any answer don't count, missing answers alone neither), not below 250 k; one rate faster after an
 /// hour of windows without a broken one (a standby gap counts 60 s), never above the configured rate; a failed try
@@ -2965,6 +3043,7 @@ int main() {
   std::printf("ultra telemetry test (the return channel's hub side)\n");
   test_power_off_cap();
   test_reply_rate();
+  test_settings();
   test_calibration();
   test_commissioning();
   test_window_hash();

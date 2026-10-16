@@ -248,6 +248,8 @@ struct UltraHub {
     void stop() {}
   } high_freq_;
   void service_calibration_() {}
+  bool rx_lights_done_{true};       // (the receivers' settings: tests/ultra_lifecycle_test.cpp hub_rx)
+  void rx_settings_lights_() {}
   void wake_() {}
   void loop_fast_() {}
   void arm_ping_burst_() {}

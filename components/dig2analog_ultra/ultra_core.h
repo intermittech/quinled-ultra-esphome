@@ -283,6 +283,16 @@ class Scheduler {
     b.cfg_have |= 1u << id;
     b.cfg_dirty = true;
   }
+  /// A setting no longer sent (the board keeps what it has; the next flush_config sends the others)
+  void unset_config(uint16_t board, uint8_t id) {
+    if (board >= this->boards_.size() || id >= ULTRA_CFG_COUNT)
+      return;
+    Board &b = this->boards_[board];
+    if (b.cfg_have & (1u << id)) {
+      b.cfg_have &= ~(1u << id);
+      b.cfg_dirty = true;
+    }
+  }
   uint16_t get_config(uint16_t board, uint8_t id) const {
     return board < this->boards_.size() && id < ULTRA_CFG_COUNT ? this->boards_[board].cfg[id] : 0;
   }

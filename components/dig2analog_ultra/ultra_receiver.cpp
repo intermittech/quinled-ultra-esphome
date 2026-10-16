@@ -72,6 +72,13 @@ void UltraReceiver::setup() {
   this->hub_->add_on_receiver_callback(this->board_, [this](uint32_t updates) { this->update_(updates); });
   // its port and position: "Port 4 · receiver 2" (the system health groups receivers by it)
   this->text_(PORT, std::string(this->hub_->telemetry_name()) + " \xC2\xB7 receiver " + std::to_string(this->board_ + 1));
+  // its settings (the hub's first loop has applied the ones from Home Assistant; each change since)
+  if (this->texts_[SETTINGS] != nullptr) {
+    this->hub_->add_on_settings_callback([this](int board) {
+      if (board < 0 || board == this->board_)
+        this->text_(SETTINGS, this->hub_->receiver_settings_text(this->board_));
+    });
+  }
 }
 
 void UltraReceiver::value_(uint8_t which, float v, bool force) {
@@ -459,6 +466,101 @@ void UltraTotals::update_(bool force) {
   if (energy)
     this->value_(ENERGY, static_cast<float>(wh), force);
 }
+
+// ------------------------------------------------------------------------------ the controller's settings entities
+void apply_controller_setting(uint8_t kind, float v) {
+  for (UltraHub *hub : UltraHub::hubs()) {
+    if (!hub->has_telemetry())
+      continue;
+    switch (kind) {
+      case CS_UPDATE_RATE:
+        hub->set_update_rate_ms(UPDATE_RATE_MS[static_cast<size_t>(v) < 3 ? static_cast<size_t>(v) : 0]);
+        break;
+      case CS_ADAPTIVE_RATE:
+        hub->set_telemetry_adaptive_rate(v != 0.0f);
+        break;
+      case CS_LOAD_WARNING:
+        hub->set_port_levels(v, NAN, UINT32_MAX, NAN);
+        break;
+      case CS_LOAD_PROBLEM:
+        hub->set_port_levels(NAN, v, UINT32_MAX, NAN);
+        break;
+      case CS_LOAD_PROBLEM_TIME:
+        hub->set_port_levels(NAN, NAN, static_cast<uint32_t>(v * 1000.0f + 0.5f), NAN);
+        break;
+      case CS_PORT_LIMIT:
+        hub->set_port_levels(NAN, NAN, UINT32_MAX, v);
+        break;
+      case CS_DIP_WARNING:
+        hub->set_telemetry_dip_warning(static_cast<uint8_t>(v + 0.5f));
+        break;
+      case CS_COMMISSION_MIN_V:
+        hub->set_commission_min_voltage(v / 100.0f);
+        break;
+      default:   // (Supply rating: for the dashboards only)
+        break;
+    }
+  }
+}
+
+void SettingStore::init(uint8_t kind, float yaml) {
+  this->yaml_ = yaml;
+  this->pref_ = global_preferences->make_preference<SettingRecord>(fnv1_hash("dig2analog_ultra_setting") ^ kind);
+  SettingRecord r;
+  const bool loaded = this->pref_.load(&r);
+  this->boot_ = setting_boot_value(r, loaded, yaml);
+}
+
+void SettingStore::store(float value) {
+  SettingRecord r;
+  r.magic = SettingRecord::MAGIC;
+  r.yaml = this->yaml_;
+  r.value = value;
+  this->pref_.save(&r);
+}
+
+#ifdef USE_NUMBER
+void UltraSettingNumber::setup() {
+  this->store_.init(this->kind_, this->yaml_);
+  const float v = this->store_.boot_value();
+  if (v != this->yaml_)   // (the YAML's value is in the lines already)
+    apply_controller_setting(this->kind_, v);
+  this->publish_state(v);
+}
+void UltraSettingNumber::control(float value) {
+  apply_controller_setting(this->kind_, value);
+  this->store_.store(value);
+  this->publish_state(value);
+}
+#endif
+#ifdef USE_SELECT
+void UltraSettingSelect::setup() {
+  this->store_.init(this->kind_, this->yaml_);
+  const float v = this->store_.boot_value();
+  if (v != this->yaml_)
+    apply_controller_setting(this->kind_, v);
+  this->publish_state(static_cast<size_t>(v));
+}
+void UltraSettingSelect::control(size_t index) {
+  apply_controller_setting(this->kind_, static_cast<float>(index));
+  this->store_.store(static_cast<float>(index));
+  this->publish_state(index);
+}
+#endif
+#ifdef USE_SWITCH
+void UltraSettingSwitch::setup() {
+  this->store_.init(this->kind_, this->yaml_);
+  const float v = this->store_.boot_value();
+  if (v != this->yaml_)
+    apply_controller_setting(this->kind_, v);
+  this->publish_state(v != 0.0f);
+}
+void UltraSettingSwitch::write_state(bool state) {
+  apply_controller_setting(this->kind_, state ? 1.0f : 0.0f);
+  this->store_.store(state ? 1.0f : 0.0f);
+  this->publish_state(state);
+}
+#endif
 
 void UltraTotals::dump_config() {
   ESP_LOGCONFIG(TAG, "QuinLED Ultra totals (every port at its sender):");

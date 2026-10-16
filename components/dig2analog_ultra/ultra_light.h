@@ -82,8 +82,25 @@ class UltraLight final : public light::LightOutput, public light::LightRemoteVal
   /// power-on scene; color_temperature > 0 sets cold / warm white as a light call would) until ESPHome takes over
   void set_power_on_effect(UltraEffect *effect, const light::LightColorValues &values) {
     this->power_on_effect_ = effect;
+    this->power_on_yaml_ = effect;
     this->power_on_values_ = values;
   }
+  /// The power-on effects Home Assistant can choose (its ultra_* effects but strobe), and the values a chosen one runs
+  /// on when the YAML gives none
+  void add_power_on_option(UltraEffect *effect) { this->poe_options_.push_back(effect); }
+  void set_power_on_default_values(const light::LightColorValues &values) { this->power_on_values_ = values; }
+  /// At runtime (set_receiver_setting poe): a power-on effect by name (case-insensitive), or "none" (then the YAML's
+  /// power_on_scene again, if it has one). The board stores it within its write budget (4, then one per 6 h). false:
+  /// the light has no such effect
+  bool set_power_on_effect_name(const std::string &name);
+  /// its power-on effect's name, "none"; the YAML's (reset)
+  std::string power_on_effect_name() const;
+  std::string power_on_effect_yaml_name() const;
+  /// the power-on option whose name has this effect_hash ("": none of them)
+  std::string power_on_option_name(uint16_t hash) const;
+  /// dim to warm: configured (dim_to_warm: in the YAML, on from boot), and its light index on the board
+  bool dim_to_warm_available() const { return this->dtw_available_; }
+  uint8_t get_light_index() const { return this->index_; }
   /// dim_to_warm: in the YAML (warm end in mireds, red assist 0..1); on from boot unless set_dim_to_warm(false)
   void set_dim_to_warm_config(float warm_mireds, float red_assist) {
     this->dtw_available_ = true;
@@ -205,6 +222,9 @@ class UltraLight final : public light::LightOutput, public light::LightRemoteVal
   void send_scene_effect_();
   UltraEffect *power_on_effect_{nullptr};
   light::LightColorValues power_on_values_;
+  UltraEffect *power_on_yaml_{nullptr};
+  std::vector<UltraEffect *> poe_options_;
+  void send_power_on_effect_scene_();
 
   bool sent_{false};
   bool on_{false};

@@ -778,6 +778,11 @@ class TelemetryPoller {
   /// the rate its POLLs ask the receivers to answer at (ReplyRate)
   void set_rate(uint8_t rate) { this->rate_ = rate < ULTRA_RW_RATES ? rate : ULTRA_RW_RATE_1M; }
   uint8_t rate() const { return this->rate_; }
+  /// STATUS's interval (the update rate, ms; at runtime: the controller's Telemetry update rate)
+  void set_status_interval(uint32_t ms) {
+    this->iv_.status_ms = ms;
+    this->idle_ = false;
+  }
   /// the line's dip_warning: a supply dip is a problem below this % of its reference (receiver_status)
   void set_dip_warning(uint8_t pct) { this->dip_warn_ = pct; }
   uint8_t dip_warning() const { return this->dip_warn_; }

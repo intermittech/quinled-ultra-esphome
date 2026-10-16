@@ -5,9 +5,11 @@ be on a port, and a dig2analog_ultra hub on it (its `port:`) adds its lights its
 (ESPHome's power_supply can't be the base: its PowerSupply is final, its requests aren't virtual, and its enable_time
 blocks the loop.)"""
 
+import math
+
 from esphome import automation, pins
 import esphome.codegen as cg
-from esphome.components import binary_sensor, button, light, select, sensor, sun, text_sensor
+from esphome.components import binary_sensor, button, light, number, select, sensor, sun, text_sensor
 from esphome.components import time as time_
 import esphome.config_validation as cv
 from esphome.const import (
@@ -24,6 +26,7 @@ from esphome.const import (
     ENTITY_CATEGORY_DIAGNOSTIC,
     STATE_CLASS_TOTAL_INCREASING,
     UNIT_HOUR,
+    UNIT_MINUTE,
 )
 from esphome.core import CORE
 import esphome.final_validate as fv
@@ -32,7 +35,7 @@ CODEOWNERS = ["@intermittech"]
 MULTI_CONF = True
 
 
-AUTO_LOAD = ["binary_sensor", "button", "light", "select", "sensor", "text_sensor"]
+AUTO_LOAD = ["binary_sensor", "button", "light", "number", "select", "sensor", "text_sensor"]
 
 
 diffpower_ns = cg.esphome_ns.namespace("diffpower")
@@ -40,6 +43,7 @@ DiffPowerPort = diffpower_ns.class_("DiffPowerPort", cg.Component)
 PowerModeSelect = diffpower_ns.class_("PowerModeSelect", select.Select, cg.Component)
 WakeAction = diffpower_ns.class_("WakeAction", automation.Action)
 WakeButton = diffpower_ns.class_("WakeButton", button.Button)
+DiffPowerNumber = diffpower_ns.class_("DiffPowerNumber", number.Number, cg.Component)
 
 CONF_ENABLE_PIN = "enable_pin"
 CONF_DETECT_PIN = "detect_pin"
@@ -65,6 +69,9 @@ CONF_DETECT_DROPS = "detect_drops"
 CONF_POWER_MODE_SELECT = "power_mode_select"
 CONF_WAKE = "wake"
 CONF_WAKE_TIMEOUT = "wake_timeout"
+CONF_STANDBY_AFTER_NUMBER = "standby_after_number"
+CONF_WAKE_TIMEOUT_NUMBER = "wake_timeout_number"
+CONF_SETTINGS = "settings"
 
 # PowerMode (diffpower_core.h), and the select's options in that order. Off: never powered (working on the strips)
 POWER_MODES = {"standby": 0, "during_dark": 1, "always_on": 2, "off": 3}
@@ -147,6 +154,30 @@ PORT_ENTITIES = {
     ),
     # a press wakes the port for wake_timeout (each press again from then on): motion automations press it
     CONF_WAKE: ("button", "wake", button.button_schema(WakeButton, icon="mdi:power-plug")),
+    # its settings (wiki: Controller-Settings), in minutes: standby_after and wake_timeout from Home Assistant (kept on
+    # the ESP32; a changed YAML default wins once)
+    CONF_STANDBY_AFTER_NUMBER: (
+        "number",
+        "turn-off period",
+        number.number_schema(
+            DiffPowerNumber, unit_of_measurement=UNIT_MINUTE, icon="mdi:timer-off-outline",
+            entity_category=ENTITY_CATEGORY_CONFIG,
+        ).extend(cv.COMPONENT_SCHEMA),
+    ),
+    CONF_WAKE_TIMEOUT_NUMBER: (
+        "number",
+        "wake timeout",
+        number.number_schema(
+            DiffPowerNumber, unit_of_measurement=UNIT_MINUTE, icon="mdi:timer-play-outline",
+            entity_category=ENTITY_CATEGORY_CONFIG,
+        ).extend(cv.COMPONENT_SCHEMA),
+    ),
+}
+# the controller's (every port): the dark window's offsets, with the first port that has one (its settings: false
+# leaves them out)
+DARK_NUMBERS = {
+    CONF_DARK_BEFORE: (2, "Dark before sunset", "mdi:weather-sunset-down"),
+    CONF_DARK_AFTER: (3, "Dark after sunrise", "mdi:weather-sunset-up"),
 }
 
 
@@ -284,6 +315,9 @@ PORT_SCHEMA = cv.All(
             # During dark without sun times: until the ESP32 has a valid time, or with Home Assistant's missing or
             # stale (more than 10 min past) and no sun_id
             cv.Optional(CONF_TIME_UNKNOWN, default="always_on"): cv.one_of(*TIME_UNKNOWN, lower=True),
+            # the controller's Dark before sunset / Dark after sunrise numbers (the first port with a dark window
+            # decides; false: YAML only)
+            cv.Optional(CONF_SETTINGS, default=True): cv.boolean,
             # the lights on this port (any ESPHome light; a dig2analog_ultra hub with `port:` adds its own)
             cv.Optional(CONF_LIGHTS, default=[]): cv.ensure_list(_light_entry),
             **{cv.Optional(key): spec[2] for key, spec in PORT_ENTITIES.items()},
@@ -373,6 +407,24 @@ def _final_validate(config):
 FINAL_VALIDATE_SCHEMA = _final_validate
 
 
+async def _dark_numbers_to_code(config):
+    """The controller's dark window offsets (every port), once: with the first port that has a dark window"""
+    if CORE.data.get("diffpower_dark_numbers"):
+        return
+    CORE.data["diffpower_dark_numbers"] = True
+    if not config[CONF_SETTINGS]:
+        return
+    for key, (kind, name, icon) in DARK_NUMBERS.items():
+        conf = number.number_schema(
+            DiffPowerNumber, unit_of_measurement=UNIT_MINUTE, icon=icon, entity_category=ENTITY_CATEGORY_CONFIG
+        )({CONF_ID: f"diffpower_setting_{key}", CONF_NAME: name})
+        CORE.component_ids.add(str(conf[CONF_ID].id))   # (made here, not in the configuration)
+        num = await number.new_number(conf, min_value=0, max_value=720, step=5)
+        await cg.register_component(num, {})
+        cg.add(num.set_kind(kind))
+        cg.add(num.set_default(config[key].total_seconds / 60))
+
+
 async def to_code(config):
     cg.add_define("USE_DIFFPOWER")
     var = cg.new_Pvariable(config[CONF_ID])
@@ -429,10 +481,24 @@ async def to_code(config):
         cg.add(var.set_hours_sensor(await sensor.new_sensor(conf)))
     if conf := config.get(CONF_DETECT_DROPS):
         cg.add(var.set_drops_sensor(await sensor.new_sensor(conf)))
+    cg.add(var.set_wake_timeout(int(config[CONF_WAKE_TIMEOUT].total_milliseconds)))
     if conf := config.get(CONF_WAKE):
         btn = await button.new_button(conf)
         cg.add(btn.set_port(var))
-        cg.add(btn.set_timeout(int(config[CONF_WAKE_TIMEOUT].total_milliseconds)))
+    # its settings in minutes (at least min_on_time, which floors both)
+    low = max(1, math.ceil(config[CONF_MIN_ON_TIME].total_milliseconds / 60000))
+    for key, kind, value in (
+        (CONF_STANDBY_AFTER_NUMBER, 0, config[CONF_STANDBY_AFTER].total_milliseconds / 60000),
+        (CONF_WAKE_TIMEOUT_NUMBER, 1, config[CONF_WAKE_TIMEOUT].total_milliseconds / 60000),
+    ):
+        if conf := config.get(key):
+            num = await number.new_number(conf, min_value=low, max_value=1440, step=1)
+            await cg.register_component(num, conf)
+            cg.add(num.set_port(var))
+            cg.add(num.set_kind(kind))
+            cg.add(num.set_default(value))
+    if ha or sun_conf is not None:
+        await _dark_numbers_to_code(config)
     if conf := config.get(CONF_POWER_MODE_SELECT):
         sel = await select.new_select(conf, options=_mode_options(config, CORE.config))
         await cg.register_component(sel, conf)

@@ -368,4 +368,44 @@ void PowerModeSelect::control(size_t index) {
 }
 #endif
 
+#ifdef USE_NUMBER
+void DiffPowerNumber::setup() {
+  const std::string key = this->port_ != nullptr ? std::string("diffpower_setting:") + this->port_->stats_key()
+                                                 : std::string("diffpower_setting");
+  this->pref_ = global_preferences->make_preference<Record>(fnv1_hash(key) ^ this->kind_);
+  Record r;
+  const bool loaded = this->pref_.load(&r);
+  const float v = loaded && r.magic == Record::MAGIC && r.yaml == this->yaml_ ? r.value : this->yaml_;
+  if (v != this->yaml_)   // (the YAML's value is in the ports already)
+    this->apply_(v);
+  this->publish_state(v);
+}
+
+void DiffPowerNumber::control(float value) {
+  this->apply_(value);
+  Record r;
+  r.magic = Record::MAGIC;
+  r.yaml = this->yaml_;
+  r.value = value;
+  this->pref_.save(&r);
+  this->publish_state(value);
+}
+
+void DiffPowerNumber::apply_(float minutes) {
+  const uint32_t ms = static_cast<uint32_t>(minutes * 60000.0f + 0.5f);
+  switch (this->kind_) {
+    case TURN_OFF:
+      this->port_->set_standby_after(ms);
+      break;
+    case WAKE_TIMEOUT:
+      this->port_->set_wake_timeout(ms);
+      break;
+    default:   // the dark window's offsets: every port
+      for (auto *p : DiffPowerPort::ports())
+        p->set_dark_offsets(this->kind_ == DARK_BEFORE ? ms / 1000 : -1, this->kind_ == DARK_AFTER ? ms / 1000 : -1);
+      break;
+  }
+}
+#endif
+
 }  // namespace esphome::diffpower

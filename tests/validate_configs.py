@@ -1269,7 +1269,7 @@ CASES = [
     # the RAM estimate (a codegen warning above ~60 KB on a classic ESP32): 2 lines x 10 receivers (a light each) with
     # full diagnostics warn; the same with basic diagnostics, or one small line, don't
     ("ultra RAM warning: 20 receivers, full diagnostics (~69 KB)", ram_lines(2, 10), True, "of the ESP32's RAM"),
-    ("ultra RAM: 20 receivers, basic diagnostics (~55 KB)", ram_lines(2, 10, "basic"), True, "!of the ESP32's RAM"),
+    ("ultra RAM: 20 receivers, basic diagnostics (~56 KB)", ram_lines(2, 10, "basic"), True, "!of the ESP32's RAM"),
     ("ultra RAM: one small line", ram_lines(1, 2), True, "!of the ESP32's RAM"),
     ("ultra telemetry update_rate bogus", ULTRA + TELEMETRY + "    update_rate: ludicrous\n" + RX_UART, False,
      "Unknown value"),
@@ -1319,6 +1319,11 @@ CASES = [
      "name: Connected load\n            device_id: r1\n            disabled_by_default: true"),
     ("ultra telemetry no Connected load with basic",
      ULTRA + TELEMETRY + "    diagnostics: basic\n" + RX_LIST + RX_UART, True, "!Connected load"),
+    # the LED supply: a shown diagnostic (enabled, with basic too), next to the bus voltage
+    ("ultra telemetry LED supply enabled", ULTRA + TELEMETRY + RX_LIST + RX_UART, True,
+     "name: LED supply\n            device_id: r1\n            disabled_by_default: false"),
+    ("ultra telemetry LED supply with basic", ULTRA + TELEMETRY + "    diagnostics: basic\n" + RX_LIST + RX_UART, True,
+     "name: LED supply"),
     ("ultra telemetry no calibration texts with none",
      ULTRA + TELEMETRY + "    diagnostics: none\n" + RX_LIST + RX_UART, True, "!Last calibrated"),
     (

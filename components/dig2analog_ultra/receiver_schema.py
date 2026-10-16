@@ -161,9 +161,10 @@ RECEIVER_ENTITIES = {
     # along the port's cable: the sender's voltage minus this one's; the segment before it (smoothed, from 0.3 A on)
     "voltage_drop": ("sensor", 10, 2, "Voltage drop", _value(UNIT_VOLT, 2, DEVICE_CLASS_VOLTAGE)),
     "cable_resistance": ("sensor", 11, 2, "Cable resistance", _value("m\u03a9", 0, icon="mdi:omega")),
-    # protocol 0.2.5 (receiver firmware 0.6.9): the LED supply after its buck; its highest input current (~100 ms)
-    # between two reads (about a minute); the supply / cable impedance it measured; its odometer
-    "led_supply": ("sensor", 12, 2, "LED supply", _value(UNIT_VOLT, 2, DEVICE_CLASS_VOLTAGE)),
+    # protocol 0.2.5 (receiver firmware 0.6.9): the LED supply after its buck (shown, next to the bus voltage); its
+    # highest input current (~100 ms) between two reads (about a minute); the supply / cable impedance it measured; its
+    # odometer
+    "led_supply": ("sensor", 12, 1, "LED supply", _value(UNIT_VOLT, 2, DEVICE_CLASS_VOLTAGE)),
     "input_current_peak": ("sensor", 13, 2, "Input current peak", _value(UNIT_AMPERE, 3, DEVICE_CLASS_CURRENT)),
     "supply_impedance": ("sensor", 14, 2, "Supply impedance", _value("m\u03a9", 0, icon="mdi:omega")),
     "lit_hours": (
@@ -474,8 +475,8 @@ def telemetry_defaults(config):
 # with several lights), a line's own, the UART buffers, the lifetime ledger's reserve (its own sizing rule).
 _LOGGER = logging.getLogger(__name__)
 # (the calibration's: its button and record, 3 more value slots (40 B) at every level, 3 diagnostics with basic, 4 with
-# full: x RAM_PER_ENTITY)
-RAM_PER_RECEIVER = {"full": 1940, "basic": 1180, "none": 700}
+# full: x RAM_PER_ENTITY; basic also has the LED supply)
+RAM_PER_RECEIVER = {"full": 1940, "basic": 1240, "none": 700}
 RAM_PER_LIGHT = 900
 RAM_PER_ESTIMATE = 200
 RAM_PER_LINE = 1000

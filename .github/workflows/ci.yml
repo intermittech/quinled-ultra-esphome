@@ -79,6 +79,9 @@ jobs:
       - name: Ultra-Digital test (PIXEL_FX, the pixel CONFIG, page 0x81, the light's own code, the catalogue copy, the digital port's wire and the receiver's delay line)
         working-directory: quinled-ultra-esphome
         run: python tests/run_ultra_digital_test.py
+      - name: Chain reset floor (the reset of a normal line whose first board is an Ultra-Digital receiver)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_chain_reset_test.py
       - name: Schema tests
         working-directory: quinled-ultra-esphome
         run: python tests/validate_configs.py

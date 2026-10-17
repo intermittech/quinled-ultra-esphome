@@ -821,8 +821,9 @@ enum {
  * is answered in the Ultra window (ULTRA_RW_FIRST_US + index x pitch after t0, no marker, no release). The effect clock is
  * the header TIME of every frame. AUTO (the factory default) decides once per power-up, in RAM, with the strip held dark:
  * two plain frames in a row whose header (MAGIC, VERSION, CRC-8) and length (256 x n + 64 bits, n >= 1) are right are CHAIN;
- * a marker, or half a second of line activity that is no Ultra frame, or two seconds of silence are STREAM. A change of
- * CONFIG 140 takes effect at once. Without a hardware gate (this firmware) the board answers as the LAST board of its line
+ * a marker, or half a second of line activity that is no Ultra frame, are STREAM. Silence decides nothing (a hub may start
+ * late): after two seconds the strip is let go (the stored power-on effect may run, else it stays dark), the board stays
+ * undecided and the same evidence decides whenever it comes. A change of CONFIG 140 takes effect at once. Without a hardware gate (this firmware) the board answers as the LAST board of its line
  * and does not forward: it is a chain end (n > 1 frames are counted, ULTRA_PXL_F_LONG). In CHAIN a pixel stream is no Ultra
  * frame and is never shown (the strip keeps its effect or stays dark); the board counts it (ULTRA_PXL_F_NONULTRA) and shows it
  * on its status LED. Marker frames (a digital-port hub) are still understood, so a
@@ -833,7 +834,7 @@ enum {
 /* page ULTRA_PAGE_HW_FX part 3, the line (24 bytes, big-endian) */
 #define ULTRA_PXG_PART_LINE     3u
 #define ULTRA_PXL_CONFIG        0u     /* u8: CONFIG 140 as stored (ULTRA_PXLM_*) */
-#define ULTRA_PXL_MODE          1u     /* u8: the mode in effect: 0 undecided (AUTO, deciding: the strip held), 1 STREAM, 2 CHAIN */
+#define ULTRA_PXL_MODE          1u     /* u8: the mode in effect: 0 undecided (AUTO: no evidence yet; the strip is held for the first 2 s), 1 STREAM, 2 CHAIN */
 #define ULTRA_PXL_FLAGS         2u     /* u8: ULTRA_PXL_F_* */
 #define ULTRA_PXL_SLOTS         3u     /* u8: slots in the last Ultra frame ((bits - 64) / 256; 0 none; saturating) */
 #define ULTRA_PXL_FRAMES        4u     /* u16: Ultra frames with a right header and length since power-up (wraps) */
@@ -841,7 +842,7 @@ enum {
 #define ULTRA_PXL_LONG          8u     /* u16: Ultra frames of more than one slot (the board can not forward them; wraps) */
 #define ULTRA_PXL_WINDOWS       10u    /* u16: RW windows this board took part in (a valid POLL for it; wraps) */
 #define ULTRA_PXL_ANSWERS       12u    /* u16: ... answered (wraps) */
-#define ULTRA_PXL_MISSED        14u    /* u16: ... a POLL for this board that could not be answered in its slot (late, flash; wraps) */
+#define ULTRA_PXL_MISSED        14u    /* u16: ... a POLL for this board that could not be answered in its slot (late, flash, the clock's rate not measured yet; wraps) */
 #define ULTRA_PXL_BITS          16u    /* u24: bits of the last Ultra frame */
 #define ULTRA_PXL_MARKERS       19u    /* u16: marker frames seen while CHAIN (a pixel-line hub talking to a chain board; wraps) */
 #define ULTRA_PXL_F_LOCKED      0x01u  /* CHAIN: a right Ultra frame within the last 2 s */

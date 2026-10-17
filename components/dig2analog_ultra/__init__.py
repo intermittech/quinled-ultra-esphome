@@ -31,6 +31,7 @@ from esphome.const import (
 from esphome.core import CORE
 from esphome.types import ConfigType
 
+from .chain_reset import CHAIN_FIRST_RESET_NS, reset_with_floor_ns
 from .parlio_timing import layout as parlio_layout
 from .receiver_schema import (
     CONF_DIRECTION_PIN,
@@ -821,6 +822,15 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_rmt_symbols(config[CONF_RMT_SYMBOLS]))
     if CONF_USE_DMA in config:
         cg.add(var.set_use_dma(config[CONF_USE_DMA]))
+    if CONF_PARLIO_ID not in config:
+        floor = reset_with_floor_ns(timing[4], config, CORE.config.get("light"))
+        if floor != timing[4]:
+            _LOGGER.info(
+                "%s: reset_time raised from %d us to %d us: an ultra_digital receiver is the first board of this line "
+                "(chain mode: it classifies a frame while the next one is coming; behind another board the gap is 320 us longer)",
+                config[CONF_ID], timing[4] // 1000, CHAIN_FIRST_RESET_NS // 1000,
+            )
+            timing = timing[:4] + (floor,)
     cg.add(var.set_timing(*timing))
     cg.add(var.set_refresh_interval(config[CONF_REFRESH_INTERVAL].total_milliseconds))
     if CONF_DIGITAL in config:

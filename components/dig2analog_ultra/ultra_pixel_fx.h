@@ -1,21 +1,33 @@
 #pragma once
 
-// The hub's side of the QuinLED Diff-Power Ultra-Digital receiver's local pixel effects (PIXEL_FX, CONFIG 129-139,
-// page 0x81; ultra_protocol.h ULTRA_PX_* / ULTRA_PXG_*). Pure logic, no ESPHome or ESP-IDF dependency (host-tested:
-// tests/ultra_digital_test.cpp): what page 0x81 says (PixelState), the chips and colour orders, and how the light's
-// state becomes a PIXEL_FX.
+// The hub's side of the QuinLED Diff-Power Ultra-Digital receiver's local pixel effects (PIXEL_FX, CONFIG 129-140,
+// page 0x81; ultra_protocol.h ULTRA_PX_* / ULTRA_PXG_* / ULTRA_PXL_*). Pure logic, no ESPHome or ESP-IDF dependency
+// (host-tested: tests/ultra_digital_test.cpp): what page 0x81 says (PixelState, its part 3 the line: PixelLineState and
+// what it means for the line the receiver is on), the chips and colour orders, and how the light's state becomes a
+// PIXEL_FX.
 
 #include "ultra_protocol.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 namespace esphome::dig2analog_ultra {
 
 // ---------------------------------------------------------------------------------------------------- page 0x81
+/// Part 3, the line the receiver sits on (protocol 0.2.9, ULTRA_PXL_*): its mode (CONFIG 140 as stored, the mode in
+/// effect), whether it sees Ultra frames, and how many windows it took part in
+struct PixelLineState {
+  bool have{false};
+  uint8_t config{0}, mode{0}, flags{0}, slots{0};   // mode: 0 undecided, ULTRA_PXLM_STREAM, ULTRA_PXLM_CHAIN
+  uint16_t frames{0}, non_ultra{0}, long_frames{0}, windows{0}, answers{0}, missed{0}, markers{0};
+  uint32_t bits{0};
+};
+
 /// What a receiver's page 0x81 (ULTRA_PAGE_HW_FX) says, part by part (the parts are read on their own: state every
-/// few seconds, the effect and palette maps once after the receiver starts)
+/// few seconds, the effect and palette maps once after the receiver starts, the line every few seconds on a normal
+/// Ultra line)
 struct PixelState {
   // part 0, the state
   bool have_state{false};
@@ -24,6 +36,8 @@ struct PixelState {
   uint8_t mode{ULTRA_PXM_STREAM};
   uint8_t running[ULTRA_PX_SEGMENTS]{}, seq[ULTRA_PX_SEGMENTS]{};
   uint8_t load{0}, limit{255}, late{0};
+  // part 3, the line
+  PixelLineState line;
   // part 1, 2: bit (id & 7) of byte id >> 3 (ids 0-191)
   bool have_effects{false}, have_palettes{false};
   uint8_t effect_map[24]{}, palette_map[24]{};
@@ -47,6 +61,23 @@ inline void decode_pixel_page(PixelState &s, uint8_t part, const uint8_t *p) {
       std::memcpy(s.palette_map, p, sizeof s.palette_map);
       s.have_palettes = true;
       break;
+    case ULTRA_PXG_PART_LINE: {
+      PixelLineState &l = s.line;
+      l.config = p[ULTRA_PXL_CONFIG];
+      l.mode = p[ULTRA_PXL_MODE];
+      l.flags = p[ULTRA_PXL_FLAGS];
+      l.slots = p[ULTRA_PXL_SLOTS];
+      l.frames = static_cast<uint16_t>(ultra_get16(p + ULTRA_PXL_FRAMES));
+      l.non_ultra = static_cast<uint16_t>(ultra_get16(p + ULTRA_PXL_NONULTRA));
+      l.long_frames = static_cast<uint16_t>(ultra_get16(p + ULTRA_PXL_LONG));
+      l.windows = static_cast<uint16_t>(ultra_get16(p + ULTRA_PXL_WINDOWS));
+      l.answers = static_cast<uint16_t>(ultra_get16(p + ULTRA_PXL_ANSWERS));
+      l.missed = static_cast<uint16_t>(ultra_get16(p + ULTRA_PXL_MISSED));
+      l.bits = ultra_get24(p + ULTRA_PXL_BITS);
+      l.markers = static_cast<uint16_t>(ultra_get16(p + ULTRA_PXL_MARKERS));
+      l.have = true;
+      break;
+    }
     default:
       s.catalogue = static_cast<uint16_t>(ultra_get16(p + ULTRA_PXG_CATALOGUE));
       s.effects = p[ULTRA_PXG_EFFECTS];
@@ -65,6 +96,68 @@ inline void decode_pixel_page(PixelState &s, uint8_t part, const uint8_t *p) {
       s.have_state = true;
       break;
   }
+}
+
+// ----------------------------------------------------------------------------------------------- the line (chain mode)
+/// What the YAML says about the receiver's line mode (the `mode:` option), and what the line needs
+///  - mode: auto | stream | chain, as CONFIG 140 (ULTRA_PXLM_*); the hub sends it with the other CONFIG ids
+///  - the line: a digital port needs a receiver in STREAM mode, a normal Ultra line one in CHAIN mode
+inline const char *pixel_mode_name(uint8_t mode) {
+  switch (mode) {
+    case ULTRA_PXLM_STREAM: return "stream";
+    case ULTRA_PXLM_CHAIN: return "chain";
+    default: return "undecided";
+  }
+}
+
+/// What is wrong with the receiver's line, as plain text ("" = nothing): the mode in effect is not the one the line needs,
+/// it saw a frame of more than one slot (it is not the last board: phase 1 forwards nothing), frames that are no Ultra
+/// frames or marker frames on a chain line, a share of the windows it missed. expected: the mode the line needs (ULTRA_PXLM_CHAIN on a
+/// normal Ultra line). Undecided (AUTO deciding after a power-up) is not a fault. Parts joined with "; ".
+inline std::string pixel_line_issues(const PixelLineState &l, uint8_t expected) {
+  std::string t;
+  auto add = [&t](const std::string &what) { t += (t.empty() ? "" : "; ") + what; };
+  if (!l.have)
+    return t;
+  if (l.mode != 0 && l.mode != expected) {
+    add(std::string("Wrong mode: the receiver is in ") + pixel_mode_name(l.mode) + " mode, this line needs " +
+        pixel_mode_name(expected) + " mode");
+  }
+  if (expected == ULTRA_PXLM_CHAIN) {
+    if (l.flags & ULTRA_PXL_F_LONG)
+      add("Not the last board of its line (it saw frames of more than one slot)");
+    if ((l.flags & ULTRA_PXL_F_NONULTRA) && l.mode == ULTRA_PXLM_CHAIN)
+      add(std::to_string(l.non_ultra) + " frames that are no Ultra frames");
+    if ((l.flags & ULTRA_PXL_F_MARKERS) && l.mode == ULTRA_PXLM_CHAIN)
+      add("Marker frames on the line (a digital port's hub is talking to it)");
+    // a window now and then is lost for good reasons (a flash write on the receiver while it is dark); a share of them is a fault
+    if (l.missed >= 3 && static_cast<uint32_t>(l.missed) * 50u > l.windows)
+      add("Missed " + std::to_string(l.missed) + " of " + std::to_string(l.windows) + " windows");
+  }
+  return t;
+}
+
+/// The receiver's line in one text (the Line status entity of a receiver on a normal Ultra line): the mode in effect and
+/// whether it is locked to the line's Ultra frames, then what is wrong with it. have_identity / hw_caps: what IDENTITY said.
+inline std::string pixel_line_status(bool have_identity, uint32_t hw_caps, const PixelState &ps, uint8_t expected) {
+  if (!have_identity)
+    return "Waiting for the receiver";
+  if (!(hw_caps & ULTRA_HWCAP_CHAIN))
+    return "No chain mode (firmware too old)";
+  const PixelLineState &l = ps.line;
+  if (!l.have)
+    return "Waiting for the receiver";
+  std::string t;
+  if (l.mode == 0)
+    t = "Deciding";
+  else if (l.mode == ULTRA_PXLM_CHAIN)
+    t = (l.flags & ULTRA_PXL_F_LOCKED) ? "Chain, locked" : "Chain, not locked";
+  else
+    t = "Stream";
+  const std::string issues = pixel_line_issues(l, expected);
+  if (!issues.empty())
+    t += " - " + issues;
+  return t;
 }
 
 // ------------------------------------------------------------------------------------------------------ the chips

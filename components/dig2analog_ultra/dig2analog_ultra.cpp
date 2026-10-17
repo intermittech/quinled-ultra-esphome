@@ -1334,6 +1334,13 @@ void UltraHub::setup() {
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   if (this->rw_uart_ != nullptr) {
     this->keeper_.attach(&ultra_ledger(), this->tel_key_, this->poller_.receivers());
+    // an Ultra-Digital receiver on a normal Ultra line (chain mode) is asked for its line too (page 0x81 part 3); on a
+    // digital port it is not (a chain board does not answer in the digital window)
+#ifdef USE_DIG2ANALOG_ULTRA_DIGITAL
+    this->poller_.set_line_pages(!this->digital_);
+#else
+    this->poller_.set_line_pages(true);
+#endif
     if (this->comm_on_) {   // the commissioning: its last Finalize's result from flash
       this->comm_.configure(this->rate_ms_, this->comm_min_v_);
       this->comm_layer_.hub = this;

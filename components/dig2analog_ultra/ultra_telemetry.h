@@ -61,6 +61,7 @@ enum TelemetryPage : uint8_t {
   TP_PX_STATE,      // 0.2.8: page 0x81 part 0, an Ultra-Digital receiver's local effects (HWCAP PIXEL_FX): mode, running
   TP_PX_EFFECTS,    // ... part 1: the effects the firmware has (once after it starts)
   TP_PX_PALETTES,   // ... part 2: its palettes
+  TP_PX_LINE,       // 0.2.9: ... part 3, the line it sits on (HWCAP CHAIN; only on a normal Ultra line: set_line_pages)
   TP_COUNT,
 };
 static constexpr bool tp_is_pixel(uint8_t tp) { return tp >= TP_PX_STATE; }
@@ -69,7 +70,7 @@ static constexpr uint8_t TP_PAGE_ID[TP_COUNT] = {ULTRA_PAGE_IDENTITY, ULTRA_PAGE
                                                  ULTRA_PAGE_ENERGY,   ULTRA_PAGE_HEALTH,   ULTRA_PAGE_LIFETIME,
                                                  ULTRA_PAGE_DIAG,     ULTRA_PAGE_DIAG,     ULTRA_PAGE_LIFE_SYNC,
                                                  ULTRA_PAGE_CALIBRATION, ULTRA_PAGE_HW_FX,    ULTRA_PAGE_HW_FX,
-                                                 ULTRA_PAGE_HW_FX};
+                                                 ULTRA_PAGE_HW_FX,       ULTRA_PAGE_HW_FX};
 /// the IDENTITY feature a page needs (0: every receiver, or tried)
 static constexpr uint32_t TP_FEATURE[TP_COUNT] = {0,
                                                   0,
@@ -86,11 +87,12 @@ static constexpr uint32_t TP_FEATURE[TP_COUNT] = {0,
                                                   ULTRA_FEAT_CALIBRATION,
                                                   0,
                                                   0,
+                                                  0,
                                                   0};
 /// the POLL's argument byte 0 (IDENTITY, DIAG: its part)
 static constexpr uint8_t TP_PART[TP_COUNT] = {ULTRA_ID_PART_BOARD, ULTRA_ID_PART_FEATURES, 0, 0, 0, 0, 0, 0, 0, 0,
                                               1, 0, 0, ULTRA_PXG_PART_STATE, ULTRA_PXG_PART_EFFECTS,
-                                              ULTRA_PXG_PART_PALETTES};
+                                              ULTRA_PXG_PART_PALETTES, ULTRA_PXG_PART_LINE};
 /// the maps of page 0x81 (parts 1, 2) don't change while the firmware runs: read again after this long
 static constexpr uint32_t PX_MAP_INTERVAL_MS = 12u * 3600000u;
 /// the features of a 0.2.5 receiver (its ENERGY bytes 15-18 and HEALTH's hot flag are set; before: 0)
@@ -787,6 +789,9 @@ class TelemetryPoller {
       this->rx_[i].seq = static_cast<uint8_t>(seed + 37 * i);
   }
   uint16_t receivers() const { return static_cast<uint16_t>(this->rx_.size()); }
+  /// The line is a normal Ultra line (not a digital port): an Ultra-Digital receiver on it that can run in chain mode
+  /// (ULTRA_HWCAP_CHAIN) is asked for page 0x81 part 3, the line. A chain board does not answer in a digital port's window.
+  void set_line_pages(bool on) { this->line_pages_ = on; }
   /// the rate its POLLs ask the receivers to answer at (ReplyRate)
   void set_rate(uint8_t rate) { this->rate_ = rate < ULTRA_RW_RATES ? rate : ULTRA_RW_RATE_1M; }
   uint8_t rate() const { return this->rate_; }
@@ -1103,9 +1108,9 @@ class TelemetryPoller {
     uint32_t status_ms{0};     // when its last STATUS was read (restart detection)
     uint32_t polls{0}, missed{0};   // POLLs that asked it for an answer, and the ones without one
     uint32_t updated{0};
+    uint32_t unsupported{0};   // bit 1 << TP_*: answered UNSUPPORTED (until the board restarts or changes)
+    uint32_t fresh{0};         // bit 1 << TP_*: read since mark_fresh() (the commissioning's waits)
     uint16_t uid16{0};
-    uint16_t unsupported{0};   // bit 1 << TP_*: answered UNSUPPORTED (until the board restarts or changes)
-    uint16_t fresh{0};         // bit 1 << TP_*: read since mark_fresh() (the commissioning's waits)
     bool have_uid{false};
     bool answering{false};
     bool reported{false};      // its "unavailable" went out (take_updates TU_AVAILABILITY)
@@ -1147,6 +1152,7 @@ class TelemetryPoller {
       case TP_CALIBRATION:   // (and right after the hub's calibration run: read_now)
         return this->iv_.diag_ms;
       case TP_PX_STATE:
+      case TP_PX_LINE:
         return this->iv_.power_ms;
       case TP_PX_EFFECTS:
       case TP_PX_PALETTES:
@@ -1168,6 +1174,8 @@ class TelemetryPoller {
       return false;
     if (tp == TP_OUTPUTS && !r.outputs)
       return false;
+    if (tp == TP_PX_LINE)   // page 0x81 part 3: a receiver that can run on a normal Ultra line, on a line that is one
+      return this->line_pages_ && (r.d.hw_caps & ULTRA_HWCAP_PIXEL_FX) != 0 && (r.d.hw_caps & ULTRA_HWCAP_CHAIN) != 0;
     if (tp_is_pixel(tp))   // page 0x81: only the receivers that run local pixel effects
       return (r.d.hw_caps & ULTRA_HWCAP_PIXEL_FX) != 0;
     if (tp == TP_SYNC && !r.sync_due)
@@ -1277,7 +1285,7 @@ class TelemetryPoller {
       return true;
     }
     if (page == ULTRA_PAGE_UNSUPPORTED) {
-      r.unsupported |= static_cast<uint16_t>(1u << tp);
+      r.unsupported |= 1u << tp;
       if (tp == TP_IDENTITY)
         r.need_identity = false;
       if (tp == TP_FEATURES)
@@ -1306,7 +1314,7 @@ class TelemetryPoller {
       decode_receiver_page(d, TP_PAGE_ID[tp], data, TP_PART[tp]);
     }
     r.updated |= 1u << tp;
-    r.fresh |= static_cast<uint16_t>(1u << tp);
+    r.fresh |= 1u << tp;
     switch (tp) {
       case TP_IDENTITY:   // part 0, the board: its features next (part 1)
         r.need_identity = false;
@@ -1365,6 +1373,7 @@ class TelemetryPoller {
   uint8_t dip_warn_{DIP_WARN_PCT};
   bool locked_{false};
   bool lock_wait_{false};   // the lock interval not waited out yet (build() forgets it after)
+  bool line_pages_{false};  // page 0x81 part 3 is asked for (a normal Ultra line, not a digital port)
   mutable bool idle_{false};   // due(): nothing due at idle_ms_ (every change forgets it)
   uint32_t lock_ms_{0};
   bool sent_any_{false};

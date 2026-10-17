@@ -388,7 +388,7 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_flags(_flags(config)))
     # the strip's frame on the wire: a hand-back to the stream waits for the receiver to finish its frame
     bytes_per_led = CHIPS[config[CONF_CHIP]][1]
-    bit_ns = 2500 if config[CONF_CHIP] == "ws2811_400k" else 1250
+    bit_ns = 2667 if config[CONF_CHIP] == "ws2811_400k" else 1334   # (the receiver's local frames: 48 samples a bit, 6.7 % longer than 1.25 us)
     cg.add(var.set_strip_frame_us(config[CONF_NUM_LEDS] * bytes_per_led * 8 * bit_ns // 1000))
     siblings = [
         c for c in _pixel_lights(CORE.config)

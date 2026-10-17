@@ -682,6 +682,16 @@ static void test_local_effect_and_handback() {
     }
   }
   CHECK(first_px >= 0, "the stream is back");
+  {
+    // the receiver goes back to the stream only after a LOW as long as its chip's latch: one marker frame first
+    int nops = 0, before_px = 0;
+    for (size_t i = n1; i < g_tx.size(); i++) {
+      if (g_tx[i].start_us >= t_back + 18000 + 300 && g_tx[i].marker && (first_px < 0 || static_cast<int>(i) < first_px))
+        before_px++;
+      nops += g_tx[i].marker && g_tx[i].start_us >= t_back + 18000;
+    }
+    CHECK(before_px == 1 && nops >= 1, "a marker frame (a NOP) after the receiver's frame and before the first pixel frame (%d)", before_px);
+  }
   if (first_px >= 0)
     CHECK(g_tx[first_px].bytes == r.pixbuf, "the stream's newest picture goes out first (the light draws only on a change)");
   if (first_px >= 0)

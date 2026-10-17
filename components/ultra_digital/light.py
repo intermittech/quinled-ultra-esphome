@@ -161,6 +161,10 @@ def _with_catalogue_effects(value):
 
 
 def _validate_range(config: ConfigType) -> ConfigType:
+    chip = config[CONF_CHIP]
+    limit = {3: 600, 4: 500, 5: 400}[CHIPS[chip][1]]
+    if config[CONF_NUM_LEDS] > limit:
+        raise cv.Invalid(f"num_leds for {chip} must be at most {limit} per receiver", [CONF_NUM_LEDS])
     start, length = config[CONF_SEGMENT_START], config[CONF_SEGMENT_LENGTH]
     if length and start + length > config[CONF_NUM_LEDS]:
         raise cv.Invalid(
@@ -169,7 +173,6 @@ def _validate_range(config: ConfigType) -> ConfigType:
         )
     if start >= config[CONF_NUM_LEDS]:
         raise cv.Invalid(f"segment_start {start} is beyond num_leds ({config[CONF_NUM_LEDS]})", [CONF_SEGMENT_START])
-    chip = config[CONF_CHIP]
     config[CONF_COLOR_ORDER] = _color_order(chip, config.get(CONF_COLOR_ORDER, CHIPS[chip][2]))
     if config.get(CONF_COLD_WHITE_SHARE) is not None and chip != "ws2805":
         raise cv.Invalid("cold_white_share is for the WS2805 (warm and cold white)", [CONF_COLD_WHITE_SHARE])
@@ -188,9 +191,8 @@ CONFIG_SCHEMA = cv.All(
             # over a lower one
             cv.Optional(CONF_SEGMENT, default=0): cv.int_range(min=0, max=PIXEL_FX_SEGMENTS - 1),
             cv.Required(CONF_CHIP): cv.one_of(*CHIPS, lower=True),
-            # the strip's pixels (every light of the receiver says the same); the receiver's limit follows from the
-            # chip's bytes and the line's rate (page 0x81 reports it)
-            cv.Required(CONF_NUM_LEDS): cv.int_range(min=1, max=2500),
+            # per receiver: 600 RGB / 500 RGBW / 400 RGBCCT; checked by chip below (page 0x81 reports it)
+            cv.Required(CONF_NUM_LEDS): cv.int_range(min=1),
             # the wire order of the chip's channels, e.g. GRB, RGBW, WRGB; WS2805: RGBWC (W warm, C cold)
             cv.Optional(CONF_COLOR_ORDER): cv.string_strict,
             cv.Optional(CONF_SEGMENT_START, default=0): cv.int_range(min=0, max=2499),
@@ -205,7 +207,7 @@ CONFIG_SCHEMA = cv.All(
             # smooth dimming (CONFIG 141): auto (default: 16 bit, dithered from 50 fps and wire level 4, bench items), round, dither or off (the 8-bit path);
             # a receiver of an older firmware ignores it
             cv.Optional(CONF_PIXEL_SMOOTHING): _smoothing,
-            cv.Optional(CONF_MAX_FPS): cv.int_range(min=0, max=1000),   # 0 = as many as the line allows
+            cv.Optional(CONF_MAX_FPS): cv.int_range(min=0, max=1000),   # default 60; 0 = back to back; wire/reset always limit it
             # the strip's LED current per channel at full (for the current limit), and the limit: 0 = the link's
             cv.Optional(CONF_LED_CURRENT): cv.All(cv.current, cv.Range(min=0.001, max=0.1)),
             cv.Optional(CONF_CURRENT_LIMIT): cv.Any(
@@ -410,7 +412,7 @@ def _receiver_config(config: ConfigType, siblings: list) -> list:
         (CFG_CHIP, CHIPS[chip][3]),
         (CFG_ORDER, order),
         (CFG_PIXELS, config[CONF_NUM_LEDS]),
-        (CFG_FPS, pick(CONF_MAX_FPS, 0)),
+        (CFG_FPS, pick(CONF_MAX_FPS, 60)),
         (CFG_MA_CH, int(round(pick(CONF_LED_CURRENT, 0.020) * 10000))),   # 0.1 mA
         (CFG_LIMIT_MA, 0 if limit == 0 else int(round(limit * 1000))),
         (CFG_WHITE, white),

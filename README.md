@@ -20,6 +20,10 @@ every millisecond, in 16 bit, in step with every other board on the line.
 
 ## Install
 
+The `ultra_digital` light validates `num_leds` per receiver: at most **600 RGB / 500 RGBW / 400 RGBCCT**.
+`max_fps` defaults to **60**. Higher values up to 1000, or 0 for back-to-back frames, are allowed; complete wire frames
+and the chip reset always limit the actual rate. Settings shared by segments apply to their whole receiver.
+
 ```yaml
 external_components:
   - source: github://intermittech/quinled-ultra-esphome@main

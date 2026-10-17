@@ -1563,7 +1563,7 @@ CASES = [
          extra="    store_after: 30s\n    standalone:\n      power_on: true\n      on_signal_loss: true\n      signal_loss_timeout: 5s\n"),
      True, None),
     ("ultra_digital store_after under 5 s", ULTRA_DP + "light:\n" + ud_light(extra="    store_after: 1s\n"), False, "5"),
-    ("ultra_digital too many pixels", ULTRA_DP + "light:\n" + ud_light(leds=3000), False, "2500"),
+    ("ultra_digital too many pixels", ULTRA_DP + "light:\n" + ud_light(leds=3000), False, "600"),
     ("ultra_digital the action",
      ULTRA_DP + "light:\n" + ud_light(extra="    id: strip\n") + UD_ACTION.format(
          id="strip", fields="          color_2: 0xFF0000\n          speed: 200\n          palette: Ocean\n"), True, None),
@@ -1660,6 +1660,13 @@ CASES = [
 ]
 
 
+for chip, limit in (("ws2812b", 600), ("ws2812b_classic", 600), ("sk6812", 600), ("sk6812_rgbw", 500),
+                    ("ws2814", 500), ("ws2805", 400), ("ws2815", 600), ("ws2811_400k", 600)):
+    for count in (limit - 1, limit, limit + 1):
+        CASES.append((f"pixel cap {chip} {count}", ULTRA_DP + "light:\n" + ud_light(chip=chip, leds=count),
+                      count <= limit, None if count <= limit else str(limit)))
+
+
 def run_case(idx, name, body, expect_ok, needle, board="esp32dev"):
     WORK.mkdir(parents=True, exist_ok=True)
     path = WORK / f"case{idx:02d}.yaml"
@@ -1744,6 +1751,16 @@ def main() -> int:
     cases = list(enumerate(CASES))
     if filters:
         cases = [(i, c) for i, c in cases if any(f in c[0].lower() for f in filters)]
+    sys.path.insert(0, str(ROOT / "components"))
+    import esphome.components
+    esphome.components.__path__.insert(0, str(ROOT / "components"))
+    from ultra_digital.light import _receiver_config
+    conf = {"chip": "sk6812_rgbw", "color_order": ("GRBW", 0), "num_leds": 320}
+    assert dict(_receiver_config(conf, []))[132] == 60
+    for fps in (0, 60, 120, 1000):
+        assert dict(_receiver_config(dict(conf, max_fps=fps), []))[132] == fps
+        assert dict(_receiver_config(conf, [{"max_fps": fps}]))[132] == fps
+    print("ok   nominal 60 fps default, explicit 0/higher, shared receiver setting")
     budget_ok = filters != [] or (check_group_budget() & check_update_hardware())
     results = [run_case(i, *case) for i, case in cases]
     failed = results.count(False)

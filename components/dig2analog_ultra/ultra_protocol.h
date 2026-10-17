@@ -673,8 +673,8 @@ enum {
     /* hardware 3 (the Ultra-Digital receiver): the local pixel effects' settings, all persisted (ULTRA_PX_* below) */
     ULTRA_CFG_PX_CHIP = 129,           /* the strip's chip (ULTRA_PXC_*): its timing, bytes per pixel and colour order */
     ULTRA_CFG_PX_ORDER = 130,          /* the wire order of the channels (ULTRA_PX_ORDER; 0 = the chip's own) */
-    ULTRA_CFG_PX_PIXELS = 131,         /* pixels on the strip (0 = none yet: no local effect runs) */
-    ULTRA_CFG_PX_FPS = 132,            /* frames per second at most (0 = as many as the line allows) */
+    ULTRA_CFG_PX_PIXELS = 131,         /* pixels on the strip (0 = none); clamped to ULTRA_PX_MAX_* by chip format */
+    ULTRA_CFG_PX_FPS = 132,            /* frames per second at most (default 60; 0 = as many as the line allows) */
     ULTRA_CFG_PX_MA_CH = 133,          /* LED current of one channel at 255, 0.1 mA, at the strip's supply (0 = 20 mA): the
                                           limiter's estimate */
     ULTRA_CFG_PX_LIMIT_MA = 134,       /* the limit of the receiver's bus-side input current, mA, as it measures and reports
@@ -731,6 +731,14 @@ enum {
  *   CUSTOM1, CUSTOM2  u8 each: the effect's extra sliders (the catalogue names them)
  */
 #define ULTRA_PX_SEGMENTS     4u
+/* Per Ultra-Digital receiver, by wire format; independent of the virtual strip's length.
+ * CONFIG keeps the requested count for its CRC; the effective count/page maximum is clamped.
+ * 60 fps is the nominal target, limited by complete wire frames plus reset. Higher requests
+ * (up to 1000) and explicit 0 (back to back) are allowed; neither shortens bits or reset. */
+#define ULTRA_PX_MAX_RGB      600u
+#define ULTRA_PX_MAX_RGBW     500u
+#define ULTRA_PX_MAX_RGBCCT   400u
+#define ULTRA_PX_DEFAULT_FPS  60u
 #define ULTRA_PX_EFFECT       3u
 #define ULTRA_PX_START        4u
 #define ULTRA_PX_SPEED        8u

@@ -101,6 +101,12 @@ LINE_MODES = {"auto": 0, "stream": 1, "chain": 2}
 # brightness / auto-white, dithered at 50 frames a second or more and rounded below; round; dither; off = the 8-bit path of protocol 0.2.8
 CFG_SMOOTH = 141
 PIXEL_SMOOTHING = {"auto": 0, "round": 1, "dither": 2, "off": 3}
+
+
+def _smoothing(value):
+    """auto | round | dither | off (YAML reads an unquoted `off` as false)"""
+    return "off" if value is False else cv.one_of(*PIXEL_SMOOTHING, lower=True)(value)
+
 # the auto-white modes (ULTRA_PXW_*)
 AUTO_WHITE = {"default": 0, "off": 1, "accurate": 2, "bright": 3}
 # ULTRA_PXF_* (PIXEL_FX FLAGS)
@@ -196,7 +202,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_AUTO_WHITE): cv.one_of(*[k for k in AUTO_WHITE if k != "default"], lower=True),
             cv.Optional(CONF_COLD_WHITE_SHARE): cv.percentage,   # WS2805: the share of the cold white (default even)
             # smooth dimming (CONFIG 141): auto (default), round, dither or off (the 8-bit path); a receiver of an older firmware ignores it
-            cv.Optional(CONF_PIXEL_SMOOTHING): cv.one_of(*PIXEL_SMOOTHING, lower=True),
+            cv.Optional(CONF_PIXEL_SMOOTHING): _smoothing,
             cv.Optional(CONF_MAX_FPS): cv.int_range(min=0, max=1000),   # 0 = as many as the line allows
             # the strip's LED current per channel at full (for the current limit), and the limit: 0 = the link's
             cv.Optional(CONF_LED_CURRENT): cv.All(cv.current, cv.Range(min=0.001, max=0.1)),

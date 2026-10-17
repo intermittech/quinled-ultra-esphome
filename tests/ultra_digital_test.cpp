@@ -428,12 +428,15 @@ static void test_config() {
         cfg_other_board);
   s.replay(0);
   CHECK(s.queued(1) == 2 && s.queued(0) == 1, "replay: both pages of board 1, the one of board 0");
-  // the hardware-specific ids pass the builder (and 25-127 still don't)
+  // the builders: the official one leaves the hardware-specific ids out, the pixel one takes only 129-139
   uint8_t slot[ULTRA_SLOT_BYTES];
-  const uint8_t ids2[3] = {26, 129, 200};
-  const uint16_t vals[3] = {1, 2, 3};
-  ultra_slot_config(slot, 1, ids2, vals, 3);
-  CHECK(slot[ULTRA_PAYLOAD] == 129 && slot[ULTRA_PAYLOAD + 3] == 200 && slot[ULTRA_PAYLOAD + 6] == 0, "builder: 26 out, 129 and 200 in");
+  const uint8_t ids2[4] = {26, 129, 139, 200};
+  const uint16_t vals[4] = {1, 2, 3, 4};
+  ultra_slot_config(slot, 1, ids2, vals, 4);
+  CHECK(slot[ULTRA_PAYLOAD] == 0 && slot[ULTRA_PAYLOAD + 3] == 0, "ultra_slot_config: official ids only (26, 129, 139, 200 all out)");
+  ultra_slot_config_px(slot, 1, ids2, vals, 4);
+  CHECK(slot[ULTRA_PAYLOAD] == 129 && slot[ULTRA_PAYLOAD + 3] == 139 && slot[ULTRA_PAYLOAD + 6] == 0,
+        "ultra_slot_config_px: 129 and 139 in, 26 and 200 out");
   std::printf("  CONFIG 129-139: their own slots, copies, refresh, replay; other boards unchanged\n");
 }
 

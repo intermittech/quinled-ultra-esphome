@@ -350,7 +350,7 @@ class Scheduler {
         if (!it.valid)
           continue;
         const uint8_t seq = this->next_seq_(b, ULTRA_LIGHT_BOARD, ULTRA_CONFIG);
-        ultra_slot_config(it.slot, seq, ids, vals, n);
+        ultra_slot_config_px(it.slot, seq, ids, vals, n);
         it.start_us = NO_START;
         this->queue_(b, key_(ULTRA_LIGHT_BOARD, ULTRA_CONFIG, static_cast<uint8_t>(CONFIG_PAGES + page)));
       }

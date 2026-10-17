@@ -56,6 +56,9 @@ dig2analog_ultra:
   num_boards: 2
 """
 
+# a normal Ultra line of three boards (chain mode: the Ultra-Digital receiver is its last board)
+ULTRA_CH = ULTRA.replace("num_boards: 2", "num_boards: 3")
+
 # a digital port: one Ultra-Digital receiver in a pixel strip's data path
 ULTRA_DP = """\
 dig2analog_ultra:
@@ -1565,7 +1568,59 @@ CASES = [
      ULTRA_DP + "light:\n" + ud_light(extra="    id: strip\n") + UD_ACTION.format(
          id="strip", fields="          color_2: 0xFF0000\n          speed: 200\n          palette: Ocean\n"), True, None),
     ("ultra_digital the action on something that is no light", ULTRA_DP + UD + UD_ACTION.format(id="u", fields=""), False, "u"),
-    ("ultra_digital without digital: on the line", ULTRA + UD, False, "is not a digital port"),
+    ("ultra_digital on a normal line, not the last board", ULTRA + UD, False, "is its last board, board: 1"),
+    # ---- chain mode (protocol 0.2.9): the receiver as the last board of a normal Ultra line, CONFIG 140 `mode:`
+    ("chain: the receiver last of 3, mode chain",
+     ULTRA_CH + "light:\n" + ULTRA_MONO.format(name="m0", board=0, channel=1) + ud_light(board=2, extra="    mode: chain\n"), True, None),
+    ("chain: mode auto, the default",
+     ULTRA_CH + "light:\n" + ULTRA_MONO.format(name="m0", board=0, channel=1) + ud_light(board=2), True, None),
+    ("chain: mode auto written", ULTRA_CH + "light:\n" + ud_light(board=2, extra="    mode: auto\n"), True, None),
+    ("chain: the receiver alone on a normal line", ULTRA.replace("num_boards: 2", "num_boards: 1") + UD, True, None),
+    ("chain: Dig2Analog-Ultra lights in front (boards 0 and 1)",
+     ULTRA_CH + "light:\n" + ULTRA_MONO.format(name="m0", board=0, channel=1) + ULTRA_MONO.format(name="m1", board=1, channel=2) +
+     ud_light(board=2, extra="    mode: chain\n"), True, None),
+    ("chain: 4 segments of the last board",
+     ULTRA_CH + "light:\n" + "".join(
+         ud_light(name=f"s{k}", board=2, segment=k, extra=f"    segment_start: {k * 15}\n    segment_length: 15\n") for k in range(4)),
+     True, None),
+    ("chain: the mode on one segment, the others silent",
+     ULTRA_CH + "light:\n" + ud_light(name="a", board=2, extra="    mode: chain\n") + ud_light(name="b", board=2, segment=1), True, None),
+    ("chain: the mode agreeing on two segments",
+     ULTRA_CH + "light:\n" + ud_light(name="a", board=2, extra="    mode: chain\n") +
+     ud_light(name="b", board=2, segment=1, extra="    mode: chain\n"), True, None),
+    ("chain: the mode disagreeing on two segments",
+     ULTRA_CH + "light:\n" + ud_light(name="a", board=2, extra="    mode: chain\n") +
+     ud_light(name="b", board=2, segment=1, extra="    mode: auto\n"), False, "say it on one light"),
+    ("chain: standalone power-on and store",
+     ULTRA_CH + "light:\n" + ud_light(board=2, extra="    store_after: 30s\n    standalone:\n      power_on: true\n      on_signal_loss: true\n"),
+     True, None),
+    ("chain: with telemetry on the line (3 receivers)",
+     ULTRA_CH + TELEMETRY + "    name: Port 1\n    receivers:\n      - device_id: r1\n      - device_id: r2\n      - device_id: shelf_1\n" +
+     RX_UART + "light:\n" + ud_light(board=2, extra="    device_id: shelf_1\n    mode: chain\n"), True, None),
+    ("chain: telemetry covers the first receivers only (the receiver is not polled)",
+     ULTRA_CH + TELEMETRY + "    name: Port 1\n    receivers:\n      - device_id: r1\n      - device_id: r2\n" + RX_UART + "light:\n" +
+     ud_light(board=2, extra="    mode: chain\n"), True, None),
+    ("chain: not the last board (board 1 of 3)", ULTRA_CH + "light:\n" + ud_light(board=1), False, "last board, board: 2"),
+    ("chain: the first board of 3", ULTRA_CH + "light:\n" + ud_light(board=0, extra="    mode: chain\n"), False, "last board, board: 2"),
+    ("chain: two receivers on one line",
+     ULTRA_CH + "light:\n" + ud_light(name="a", board=1, extra="    mode: chain\n") + ud_light(name="b", board=2, extra="    mode: chain\n"),
+     False, "only one on a line"),
+    ("chain: board out of range", ULTRA_CH + "light:\n" + ud_light(board=3), False, "boards are 0-based"),
+    ("chain: next to a dig2analog_ultra light on its own board",
+     ULTRA_CH + "light:\n" + ULTRA_MONO.format(name="m", board=2, channel=1) + ud_light(board=2), False, "is a dig2analog_ultra light's"),
+    ("chain: mode stream needs a digital port", ULTRA_CH + "light:\n" + ud_light(board=2, extra="    mode: stream\n"), False,
+     "mode: stream needs a digital port"),
+    ("chain: mode chain on a digital port", ULTRA_DP + "light:\n" + ud_light(extra="    mode: chain\n"), False,
+     "mode: chain is for a normal Ultra line"),
+    ("chain: exclusive_with has no stream light to share with",
+     ULTRA_CH + "light:\n" + UD_STREAM + ud_light(board=2, extra="    exclusive_with: streamer\n"), False,
+     "exclusive_with is for a digital port"),
+    ("chain: stream_wins has no meaning",
+     ULTRA_CH + "light:\n" + ud_light(board=2, extra="    standalone:\n      stream_wins: true\n"), False, "stream_wins"),
+    ("chain: an unknown mode", ULTRA_CH + "light:\n" + ud_light(board=2, extra="    mode: bogus\n"), False, "bogus"),
+    ("chain: a digital port, mode stream", ULTRA_DP + "light:\n" + ud_light(extra="    mode: stream\n"), True, None),
+    ("chain: a digital port, mode auto", ULTRA_DP + "light:\n" + ud_light(extra="    mode: auto\n"), True, None),
+    ("chain: a stream light needs a digital port", ULTRA_CH + "light:\n" + UDS, False, "not a digital port"),
     # ---- the digital port itself
     ("digital port minimal", ULTRA_DP, True, None),
     ("digital port with a reset time", ULTRA_DP.replace("  digital:\n", "  digital:\n    reset_time: 80us\n"), True, None),

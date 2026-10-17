@@ -96,6 +96,7 @@ jobs:
           - ultra/ultra-p4-telemetry.yaml
           - ultra/ultra-diffpower.yaml
           - ultra/ultra-digital.yaml
+          - ultra/ultra-chain.yaml
           - ultra/ultra-p4-parlio.yaml
           - ultra/ultra-p4-parlio-lights.yaml
           - ultra/ultra-p4-parlio-ports.yaml
@@ -106,6 +107,7 @@ jobs:
           - examples-local/quinled-dig2analog-ultra-strip-partition.yaml
           - examples-local/quinled-diff-power-ultra-sender.yaml
           - examples-local/quinled-diff-power-ultra-digital.yaml
+          - examples-local/quinled-diff-power-ultra-chain.yaml
     env:
       ESPHOME_ESP_IDF_PREFIX: /home/runner/esphome-idf   # ESPHome's ESP-IDF install, kept between runs
     steps:

@@ -6,8 +6,9 @@ and the downlight notification pattern; tests/build/ultra/ultra-telemetry.yaml: 
 telemetry (the UART, the direction pin, every receiver sensor and text); tests/build/ultra/ultra-p4-telemetry.yaml (4
 RMT lines with telemetry on a P4), ultra-p4-parlio.yaml (16 PARLIO lanes, 4 shared UARTs),
 ultra-p4-parlio-ports.yaml (the same, each lane on a Diff-Power port), ultra-p4-parlio-lights.yaml (8 lanes at 10
-MHz, no telemetry) and ultra-digital.yaml (two digital ports without telemetry: four local-effect segments and a stream light on one,
-a WS2805 strip on the other). The examples themselves:
+MHz, no telemetry), ultra-digital.yaml (two digital ports without telemetry: four local-effect segments and a stream light on one,
+a WS2805 strip on the other) and ultra-chain.yaml (a normal Ultra line with telemetry whose last board is an Ultra-Digital
+receiver in chain mode, next to a digital port with one: both transports in one build). The examples themselves:
 tests/local_examples.py.
 
 Usage: .venv/Scripts/python tests/make_ultra_compile_config.py
@@ -695,6 +696,130 @@ button:
 """
 
 
+CHAIN_CONFIG = """# tests/build/ultra/ultra-chain.yaml: an Ultra-Digital receiver in chain mode, the last board of a normal Ultra line with
+# telemetry (two Ultra-Analog receivers in front: lights as always; the Ultra-Digital one with two segments, its sliders, the
+# Line status, the action), and, on a second line, a digital port with a receiver (the stream transport next to it)
+esphome:
+  name: d2a-ultra-chain
+  areas:
+    - id: garden
+      name: Garden
+  devices:
+    - id: p1_r1
+      name: Port 1 R1
+    - id: p1_r2
+      name: Port 1 R2
+    - id: p1_r3
+      name: Port 1 R3
+      area_id: garden
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+external_components:
+  - source:
+      type: local
+      path: ../../../components
+    components: [dig2analog_ultra, ultra_digital, ultra_digital_stream]
+logger:
+api:
+  encryption:
+    key: !secret api_encryption_key
+ota:
+  - platform: esphome
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+uart:
+  - id: rs485
+    rx_pin: GPIO34
+    baud_rate: 1000000
+    rx_buffer_size: 1024
+
+dig2analog_ultra:
+  - id: ultra
+    pin: GPIO16
+    num_boards: 3
+    rmt_symbols: 128
+    telemetry:
+      uart_id: rs485
+      name: Port 1
+      direction_pin: GPIO4
+      receivers:
+        - device_id: p1_r1
+        - device_id: p1_r2
+        - device_id: p1_r3
+  - id: ultra_bar
+    pin: GPIO17
+    num_boards: 1
+    digital:
+
+light:
+  - platform: dig2analog_ultra
+    dig2analog_ultra_id: ultra
+    name: Cove
+    device_id: p1_r1
+    board: 0
+    cold_white: 1
+    warm_white: 2
+  - platform: dig2analog_ultra
+    dig2analog_ultra_id: ultra
+    name: Shelf
+    device_id: p1_r2
+    board: 1
+    channel: 1
+  - platform: ultra_digital
+    id: roof
+    dig2analog_ultra_id: ultra
+    name: Roof
+    device_id: p1_r3
+    board: 2
+    mode: chain
+    segment: 0
+    chip: sk6812_rgbw
+    num_leds: 200
+    segment_length: 100
+    color_order: GRBW
+    custom_controls: true
+    store_after: 30s
+    standalone:
+      power_on: true
+      on_signal_loss: true
+  - platform: ultra_digital
+    id: roof_edge
+    dig2analog_ultra_id: ultra
+    name: Roof edge
+    device_id: p1_r3
+    board: 2
+    segment: 1
+    chip: sk6812_rgbw
+    num_leds: 200
+    segment_start: 100
+    reverse: true
+    controls: false        # (the segments of one device share its entities: the first light has them)
+    status: false
+  - platform: ultra_digital
+    id: bar
+    name: Bar
+    dig2analog_ultra_id: ultra_bar
+    board: 0
+    mode: auto
+    chip: ws2812b
+    num_leds: 90
+
+button:
+  - platform: template
+    name: Warm
+    on_press:
+      - ultra_digital.effect_params:
+          id: roof
+          color_2: 0xFF8000
+          speed: 200
+          palette: Ocean
+"""
+
+
 def main() -> None:
     src = (ROOT / "examples" / "quinled-dig2analog-ultra-rgbcct.yaml").read_text(encoding="utf-8")
     src = src.replace(
@@ -746,6 +871,7 @@ def main() -> None:
     (OUT / "ultra-p4-telemetry.yaml").write_text(p4_telemetry_config(), encoding="utf-8")
     (OUT / "ultra-diffpower.yaml").write_text(DIFFPOWER_CONFIG, encoding="utf-8")
     (OUT / "ultra-digital.yaml").write_text(DIGITAL_CONFIG, encoding="utf-8")
+    (OUT / "ultra-chain.yaml").write_text(CHAIN_CONFIG, encoding="utf-8")
     (OUT / "ultra-p4-parlio.yaml").write_text(p4_parlio_config(), encoding="utf-8")
     (OUT / "ultra-p4-parlio-lights.yaml").write_text(p4_parlio_lights_config(), encoding="utf-8")
     (OUT / "ultra-p4-parlio-ports.yaml").write_text(p4_parlio_config(ports=True), encoding="utf-8")

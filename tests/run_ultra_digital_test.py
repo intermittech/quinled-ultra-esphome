@@ -31,7 +31,8 @@ PIECES = ["PixelLight *PixelLight::find(", "void PixelLight::transition_requeste
           "void PixelLight::queue_fx_(", "void PixelLight::release_(", "void PixelLight::write_state(", "uint8_t PixelLight::shown_effect_(",
           "void PixelLight::loop(", "void PixelLight::send_(", "void PixelLight::set_param(",
           "uint8_t PixelLight::get_param(", "void PixelLight::set_palette_index(", "void PixelLight::set_color2(",
-          "void PixelLight::set_color3(", "void PixelLight::pixel_page_("]
+          "void PixelLight::set_color3(", "void PixelLight::pixel_page_(", "void PixelLight::send_line_mode_(",
+          "void PixelLight::line_identity_(", "std::string PixelLight::line_text_(", "std::string PixelLight::status_text_("]
 
 
 def definition(text: str, signature: str) -> str:
@@ -168,6 +169,14 @@ def main() -> int:
         good = vec is not None and known.get("slot_pixel_fx_restart") == re.search(r'"([0-9a-f]+)"', vec).group(1)
         print(f"{'ok  ' if good else 'FAIL'} the golden RESTART slot is the protocol test vector slot_pixel_fx_restart")
         bad |= not good
+        # 0.2.9: the chain mode's CONFIG slot, and the two page 0x81 answers the test decodes (the strings in the test are
+        # the repository's)
+        for marker, name in (("VEC_SLOT_CONFIG_PIXEL_LINE_MODE", "slot_config_pixel_line_mode"),
+                             ("VEC_ANSWER_PIXEL_STATE", "answer_pixel_state"), ("VEC_ANSWER_PIXEL_LINE", "answer_pixel_line")):
+            line = next((l for l in run.stdout.splitlines() if l.startswith(marker + " =")), None)
+            good = line is not None and known.get(name) == re.search(r'"([0-9a-f]+)"', line).group(1)
+            print(f"{'ok  ' if good else 'FAIL'} the test's {name} is the protocol test vector")
+            bad |= not good
     return 1 if bad else 0
 
 

@@ -3,7 +3,9 @@
 // file compiles them with small stand-ins for ESPHome's light, the hub and the page 0x81 poller. Covers the boot state, an
 // effect change (a new anchor, the crossfade), a change of speed / palette / colour 2 (the same anchor), off and on with
 // the transition, an effect the receiver lacks (Solid), the hand-back to a streaming light and its exclusivity both ways,
-// STORE, the 20 day anchor, the lit time for the power, and page 0x81's news. The pure parts are in ultra_digital_test.cpp.
+// STORE, the 20 day anchor, the lit time for the power, and page 0x81's news; the line mode (CONFIG 140: sent at once without
+// telemetry, held until IDENTITY says ULTRA_HWCAP_CHAIN, never to a receiver without it, sent unchecked after a minute) and
+// the status texts. The pure parts are in ultra_digital_test.cpp.
 
 #include "../components/dig2analog_ultra/ultra_core.h"
 #include "../components/dig2analog_ultra/ultra_pixel_fx.h"
@@ -150,13 +152,14 @@ using UltraHub = dig2analog_ultra::FakeHub;
 
 // as ultra_digital.cpp's constants
 static constexpr uint32_t PARAM_RAMP_MS = 250;
+static constexpr uint32_t LINE_WAIT_MS = 60000;
 
 enum PixelParam : uint8_t { PARAM_SPEED = 0, PARAM_INTENSITY, PARAM_CUSTOM1, PARAM_CUSTOM2, PARAM_COUNT };
 class PixelLight;
 
 class PixelFxEffect {
  public:
-  PixelFxEffect(const char *name, uint8_t id) : name_(name), id_(id) {}
+  PixelFxEffect(const char *name, uint8_t id) : name_(name), id_(id), name_s_(name) {}
   void start();
   void stop();
   uint8_t id() const { return this->id_; }
@@ -164,7 +167,8 @@ class PixelFxEffect {
   light::LightState *state_{nullptr};
   uint8_t id_;
   PixelLight *light_() const;
-  const std::string get_name() const { return this->name_; }
+  std::string name_s_;
+  const std::string &get_name() const { return this->name_s_; }
 };
 
 class ExclusiveWatcher final : public light::LightRemoteValuesListener {
@@ -198,6 +202,10 @@ class PixelLight final : public light::LightOutput, public light::LightRemoteVal
   void send_();
   uint8_t shown_effect_();
   void pixel_page_();
+  void send_line_mode_();
+  void line_identity_();
+  std::string line_text_() const;
+  std::string status_text_() const;
   // stand-ins
   void request_send_() {
     this->dirty_ = true;
@@ -233,6 +241,11 @@ class PixelLight final : public light::LightOutput, public light::LightRemoteVal
   PixelLightState state_in_;
   uint32_t standby_after_ms_{0};
   uint32_t store_after_ms_{0};
+  uint8_t line_mode_{ULTRA_PXLM_AUTO}, line_expected_{ULTRA_PXLM_STREAM};
+  bool line_sent_{false};
+  bool line_waiting_{false};
+  uint32_t line_wait_ms_{0};
+  std::string line_last_, line_issue_logged_;
   PixelFxTracker track_;
   bool dirty_{false};
   bool effect_changed_{false};
@@ -536,11 +549,195 @@ static void test_store_and_anchor() {
   std::printf("  light: STORE once after the delay, not with a change, the anchor after 20 days\n");
 }
 
+/// CONFIG 140 as the hub holds it for board 0 (-1: not set)
+static int line_config(const dig2analog_ultra::FakeHub &hub) {
+  int v = -1;
+  for (const auto &c : hub.configs) {
+    if (c.first == ULTRA_CFG_PX_LINE_MODE)
+      v = c.second;
+  }
+  return v;
+}
+
+static void test_line_mode() {
+  // without telemetry: CONFIG 140 goes with the others, at once (the receiver cannot be asked)
+  {
+    warnings.clear();
+    now_ms = 500000;
+    Rig r;
+    r.hub.telemetry_on = false;
+    r.l.line_mode_ = ULTRA_PXLM_CHAIN;
+    r.l.line_expected_ = ULTRA_PXLM_CHAIN;
+    r.l.setup();
+    CHECK(line_config(r.hub) == ULTRA_PXLM_CHAIN && r.hub.flushes == 1, "no telemetry: CONFIG 140 = CHAIN at setup, flushed once");
+    CHECK(r.hub.callbacks.empty(), "... and no page hook");
+  }
+  // a receiver beyond the telemetry's receivers (not asked): at once too
+  {
+    now_ms = 510000;
+    Rig r;
+    r.l.board_ = 3;                              // the fake telemetry has one receiver
+    r.l.line_mode_ = ULTRA_PXLM_CHAIN;
+    r.l.line_expected_ = ULTRA_PXLM_CHAIN;
+    r.l.setup();
+    CHECK(line_config(r.hub) == ULTRA_PXLM_CHAIN, "a receiver telemetry doesn't cover: CONFIG 140 at once");
+  }
+  // with telemetry: held until IDENTITY shows ULTRA_HWCAP_CHAIN, then sent once (the page news is the trigger)
+  {
+    warnings.clear();
+    now_ms = 520000;
+    Rig r;
+    r.hub.tel.rd.have_identity = false;
+    r.l.line_mode_ = ULTRA_PXLM_CHAIN;
+    r.l.line_expected_ = ULTRA_PXLM_CHAIN;
+    r.l.setup();
+    CHECK(line_config(r.hub) == -1 && r.hub.flushes == 1, "telemetry: CONFIG 140 waits for the receiver's capabilities");
+    r.l.pixel_page_();
+    CHECK(line_config(r.hub) == -1, "... an IDENTITY that isn't there yet: still waiting");
+    r.hub.tel.rd.have_identity = true;
+    r.hub.tel.rd.hw_caps = ULTRA_HWCAP_PIXEL_FX | ULTRA_HWCAP_CHAIN;
+    r.l.pixel_page_();
+    CHECK(line_config(r.hub) == ULTRA_PXLM_CHAIN && r.hub.flushes == 2, "IDENTITY with ULTRA_HWCAP_CHAIN: CONFIG 140 = CHAIN, flushed");
+    r.l.pixel_page_();
+    size_t n = 0;
+    for (const auto &c : r.hub.configs)
+      n += c.first == ULTRA_CFG_PX_LINE_MODE;
+    CHECK(n == 1 && r.hub.flushes == 2, "... once");
+    CHECK(warnings.empty(), "no warnings (%zu)", warnings.size());
+    // the wait is over: the minute never sends it again
+    now_ms += ultra_digital::LINE_WAIT_MS + 1000;
+    r.l.loop();
+    CHECK(r.hub.flushes == 2, "... and not again after a minute");
+  }
+  // a receiver without ULTRA_HWCAP_CHAIN on a line that needs it: never sent, a clear warning
+  {
+    warnings.clear();
+    now_ms = 530000;
+    Rig r;
+    r.hub.tel.rd.have_identity = false;
+    r.l.line_mode_ = ULTRA_PXLM_CHAIN;
+    r.l.line_expected_ = ULTRA_PXLM_CHAIN;
+    r.l.setup();
+    r.hub.tel.rd.have_identity = true;
+    r.hub.tel.rd.hw_caps = ULTRA_HWCAP_PIXEL_FX;   // an older receiver: no chain mode
+    r.l.pixel_page_();
+    CHECK(line_config(r.hub) == -1, "no ULTRA_HWCAP_CHAIN: CONFIG 140 is not sent");
+    bool said = false;
+    for (const auto &w : warnings)
+      said |= w.find("no chain mode") != std::string::npos && w.find("update its firmware") != std::string::npos;
+    CHECK(said, "... and the log says why (%zu warnings)", warnings.size());
+    now_ms += ultra_digital::LINE_WAIT_MS + 1000;
+    r.l.loop();
+    CHECK(line_config(r.hub) == -1, "... not even after a minute");
+  }
+  // an older receiver on a digital port (auto / stream): nothing to say, nothing sent, no warning
+  {
+    warnings.clear();
+    now_ms = 540000;
+    Rig r;
+    r.hub.tel.rd.have_identity = false;
+    r.l.line_mode_ = ULTRA_PXLM_STREAM;
+    r.l.line_expected_ = ULTRA_PXLM_STREAM;
+    r.l.setup();
+    r.hub.tel.rd.have_identity = true;
+    r.hub.tel.rd.hw_caps = ULTRA_HWCAP_PIXEL_FX;
+    r.l.pixel_page_();
+    CHECK(line_config(r.hub) == -1 && warnings.empty(), "an older receiver on a digital port: no CONFIG 140, no warning (%zu)", warnings.size());
+  }
+  // a receiver on a digital port with the capability: the YAML's mode goes out (AUTO too: a forced board returns to AUTO)
+  for (uint8_t mode : {uint8_t{ULTRA_PXLM_AUTO}, uint8_t{ULTRA_PXLM_STREAM}}) {
+    now_ms = 550000;
+    Rig r;
+    r.hub.tel.rd.have_identity = false;
+    r.l.line_mode_ = mode;
+    r.l.line_expected_ = ULTRA_PXLM_STREAM;
+    r.l.setup();
+    r.hub.tel.rd.have_identity = true;
+    r.hub.tel.rd.hw_caps = ULTRA_HWCAP_PIXEL_FX | ULTRA_HWCAP_CHAIN;
+    r.l.pixel_page_();
+    CHECK(line_config(r.hub) == mode, "digital port: CONFIG 140 = %u after IDENTITY (%d)", mode, line_config(r.hub));
+  }
+  // a receiver that is not heard for a minute gets it unchecked
+  {
+    warnings.clear();
+    now_ms = 560000;
+    Rig r;
+    r.hub.tel.rd.have_identity = false;
+    r.l.line_mode_ = ULTRA_PXLM_CHAIN;
+    r.l.line_expected_ = ULTRA_PXLM_CHAIN;
+    r.l.setup();
+    now_ms += ultra_digital::LINE_WAIT_MS - 1000;
+    r.l.loop();
+    CHECK(line_config(r.hub) == -1, "not heard for 59 s: still waiting");
+    now_ms += 2000;
+    r.l.loop();
+    CHECK(line_config(r.hub) == ULTRA_PXLM_CHAIN && r.hub.flushes == 2, "not heard for a minute: sent unchecked, flushed");
+    r.l.loop();
+    CHECK(r.hub.flushes == 2, "... once");
+  }
+  // the status texts
+  {
+    now_ms = 570000;
+    Rig r;
+    r.l.line_expected_ = ULTRA_PXLM_CHAIN;
+    r.hub.tel.rd.have_identity = true;
+    r.hub.tel.rd.hw_caps = ULTRA_HWCAP_PIXEL_FX | ULTRA_HWCAP_CHAIN;
+    CHECK(r.l.line_text_() == "Waiting for the receiver", "the line page isn't read yet: %s", r.l.line_text_().c_str());
+    uint8_t d[24] = {};
+    d[ULTRA_PXL_CONFIG] = ULTRA_PXLM_CHAIN;
+    d[ULTRA_PXL_MODE] = ULTRA_PXLM_CHAIN;
+    d[ULTRA_PXL_FLAGS] = ULTRA_PXL_F_LOCKED;
+    d[ULTRA_PXL_SLOTS] = 1;
+    ultra_put16(d + ULTRA_PXL_WINDOWS, 100);
+    ultra_put16(d + ULTRA_PXL_ANSWERS, 100);
+    dig2analog_ultra::decode_pixel_page(r.hub.tel.ps, ULTRA_PXG_PART_LINE, d);
+    CHECK(r.l.line_text_() == "Chain, locked", "chain, locked: %s", r.l.line_text_().c_str());
+    d[ULTRA_PXL_FLAGS] = ULTRA_PXL_F_LOCKED | ULTRA_PXL_F_LONG;
+    d[ULTRA_PXL_SLOTS] = 3;
+    dig2analog_ultra::decode_pixel_page(r.hub.tel.ps, ULTRA_PXG_PART_LINE, d);
+    CHECK(r.l.line_text_().find("Not the last board") != std::string::npos, "not the last board: %s", r.l.line_text_().c_str());
+    d[ULTRA_PXL_FLAGS] = 0;
+    d[ULTRA_PXL_MODE] = ULTRA_PXLM_STREAM;
+    dig2analog_ultra::decode_pixel_page(r.hub.tel.ps, ULTRA_PXG_PART_LINE, d);
+    CHECK(r.l.line_text_().find("Wrong mode") != std::string::npos && r.l.line_text_().find("stream mode") != std::string::npos,
+          "wrong mode: %s", r.l.line_text_().c_str());
+    r.hub.tel.rd.hw_caps = ULTRA_HWCAP_PIXEL_FX;
+    CHECK(r.l.line_text_() == "No chain mode (firmware too old)", "an older receiver: %s", r.l.line_text_().c_str());
+    // the local effect status: no effect running on a normal line is "Off" (the strip is dark), on a digital port "Stream"
+    r.hub.tel.rd.hw_caps = ULTRA_HWCAP_PIXEL_FX | ULTRA_HWCAP_CHAIN;
+    uint8_t st[24] = {};
+    st[ULTRA_PXG_MODE] = ULTRA_PXM_STREAM;
+    dig2analog_ultra::decode_pixel_page(r.hub.tel.ps, ULTRA_PXG_PART_STATE, st);
+    CHECK(r.l.status_text_() == "Off", "chain, no effect: %s", r.l.status_text_().c_str());
+    r.l.line_expected_ = ULTRA_PXLM_STREAM;
+    CHECK(r.l.status_text_() == "Stream", "digital port, no effect: %s", r.l.status_text_().c_str());
+    r.l.line_expected_ = ULTRA_PXLM_CHAIN;
+    st[ULTRA_PXG_MODE] = ULTRA_PXM_LOCAL;
+    st[ULTRA_PXG_RUNNING] = 13;
+    ultra_put16(st + ULTRA_PXG_FPS10, 600);
+    dig2analog_ultra::decode_pixel_page(r.hub.tel.ps, ULTRA_PXG_PART_STATE, st);
+    CHECK(r.l.status_text_().rfind("Local: Aurora, 60.0 fps", 0) == 0, "chain, Aurora: %s", r.l.status_text_().c_str());
+    // pixel_page_ logs what is wrong with the line, once
+    warnings.clear();
+    d[ULTRA_PXL_MODE] = ULTRA_PXLM_CHAIN;
+    d[ULTRA_PXL_FLAGS] = ULTRA_PXL_F_LOCKED | ULTRA_PXL_F_LONG;
+    dig2analog_ultra::decode_pixel_page(r.hub.tel.ps, ULTRA_PXG_PART_LINE, d);
+    r.l.pixel_page_();
+    r.l.pixel_page_();
+    size_t last = 0;
+    for (const auto &w : warnings)
+      last += w.find("Not the last board") != std::string::npos;
+    CHECK(last == 1, "the log says it once (%zu)", last);
+  }
+  std::printf("  light: CONFIG 140 (at once, held for IDENTITY, never to an older receiver, unchecked after a minute), the status texts\n");
+}
+
 int main() {
   test_boot_and_effects();
   test_missing_effect();
   test_exclusive();
   test_store_and_anchor();
+  test_line_mode();
   if (failures == 0)
     std::printf("ALL ULTRA DIGITAL LIGHT TESTS PASSED (0 failures)\n");
   else

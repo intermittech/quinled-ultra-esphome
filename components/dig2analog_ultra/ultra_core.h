@@ -481,7 +481,12 @@ class Scheduler {
     if (!li.pixfx)
       li.pixfx.reset(new Item());
     Item &it = *li.pixfx;
-    ultra_slot_pixel_fx(it.slot, segment, this->next_seq_(b, segment, ULTRA_PIXEL_FX), &fx);
+    // RESTART is an action, not a state: the command's copies carry it, the stored slot (the refresh, a replay) does not,
+    // or every refresh would start the effect over
+    ultra_pixel_fx_t stored = fx;
+    stored.flags = static_cast<uint8_t>(stored.flags & ~ULTRA_PXF_RESTART);
+    it.restart = (fx.flags & ULTRA_PXF_RESTART) != 0;
+    ultra_slot_pixel_fx(it.slot, segment, this->next_seq_(b, segment, ULTRA_PIXEL_FX), &stored);
     it.valid = true;
     it.start_us = start_us;
     it.stream = false;
@@ -705,8 +710,10 @@ class Scheduler {
           this->queue_(b, key_(l, ULTRA_SCENE, 0));
         if (li.scene_fx.valid)
           this->queue_(b, key_(l, ULTRA_SCENE_EFFECT, 0));
-        if (li.pixfx && li.pixfx->valid)
+        if (li.pixfx && li.pixfx->valid) {
+          li.pixfx->restart = false;   // (a replay is a state: the RESTART was an action, done)
           this->queue_(b, key_(l, ULTRA_PIXEL_FX, 0));   // (its START is kept: the effect continues in phase)
+        }
         for (size_t i = 0; i < li.steps.size(); i++)
           this->queue_(b, key_(l, ULTRA_STEP, static_cast<uint8_t>(i)));
       }
@@ -835,6 +842,7 @@ class Scheduler {
     uint32_t period_ms{0};  // EFFECT: its repeat period (0 = not periodic)
     uint32_t glide_ms{0};   // streamed SET: the glide asked for
     bool stream{false};     // streamed SET: sent once, never starts before it arrives
+    bool restart{false};    // PIXEL_FX: its copies carry ULTRA_PXF_RESTART (the stored slot does not)
     bool valid{false};
   };
   struct Cmd {
@@ -1082,6 +1090,10 @@ class Scheduler {
     Cmd &c = b.queue[best];
     const Item item = queued_item_(b, c.key);
     std::memcpy(s, item.slot, ULTRA_SLOT_BYTES);
+    if (item.restart && s[0] == ULTRA_PIXEL_FX) {
+      s[ULTRA_PX_FLAGS] = static_cast<uint8_t>(s[ULTRA_PX_FLAGS] | ULTRA_PXF_RESTART);
+      ultra_slot_seal(s);
+    }
     this->starts_[slot] = recent_start_(item, now_us);
     if (item.stream) {
       LightItems &li = li_(b, static_cast<uint8_t>((s[1] >> 4) % ULTRA_LIGHTS));

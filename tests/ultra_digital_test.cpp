@@ -248,27 +248,27 @@ static void test_tracker() {
   t.touched(5000);
   CHECK(t.store(5000 + 30000, 30000, &so), "a touch (a light change) starts the timer again");
   // the same slot with only a new START is what the receiver takes as a seamless renewal: the 20-day renewal sends exactly
-  // that, a user's choice of the effect (again) must differ (the slot has no seed: a nonce in colour 3's blue)
+  // that; a user's choice of the effect (again) carries RESTART, in that one PIXEL_FX only
   {
     PixelFxTracker r;
     PixelFxTracker::Out a, b, c, d;
     PixelLightState q = sample();
     q.transition_ms = 0;
-    CHECK(r.update(q, true, 800, T0, 100, &a), "restart: the first send");
-    CHECK(r.update(q, true, 800, T0 + 1000000, 200, &b) && b.anchor_us == T0 + 1000000 && pixel_fx_same(a.fx, b.fx),
-          "an automatic renewal: the same slot with a new START");
-    CHECK(r.update(q, true, 800, T0 + 2000000, 300, &c, true) && c.anchor_us == T0 + 2000000 && !pixel_fx_same(b.fx, c.fx) &&
-              c.fx.c[2][2] == (b.fx.c[2][2] ^ 1) && c.fx.effect == b.fx.effect && c.fx.speed == b.fx.speed,
-          "the user chose the effect again: a new START and a slot that differs (a nonce), nothing visible changed");
-    CHECK(r.update(q, true, 800, T0 + 3000000, 400, &d, true) && !pixel_fx_same(c.fx, d.fx), "and again: it differs again");
+    CHECK(r.update(q, true, 800, T0, 100, &a) && !(a.fx.flags & ULTRA_PXF_RESTART), "restart: the first send, no RESTART");
+    CHECK(r.update(q, true, 800, T0 + 1000000, 200, &b) && b.anchor_us == T0 + 1000000 && pixel_fx_same(a.fx, b.fx) &&
+              !(b.fx.flags & ULTRA_PXF_RESTART),
+          "an automatic renewal: the same slot with a new START, no RESTART");
+    CHECK(r.update(q, true, 800, T0 + 2000000, 300, &c, true) && c.anchor_us == T0 + 2000000 &&
+              (c.fx.flags & ULTRA_PXF_RESTART) && c.fx.effect == b.fx.effect && c.fx.speed == b.fx.speed,
+          "the user chose the effect again: a new START and RESTART");
     q.speed = 77;
     PixelFxTracker::Out e;
-    CHECK(r.update(q, false, 800, T0 + 3500000, 450, &e) && e.anchor_us == T0 + 3000000 && e.fx.c[2][2] == d.fx.c[2][2],
-          "a parameter change after it keeps the START and the nonce");
-    q.effect = 9;
-    PixelFxTracker::Out f;
-    CHECK(r.update(q, true, 800, T0 + 4000000, 500, &f, true) && f.fx.effect == 9 && f.fx.c[2][2] == e.fx.c[2][2],
-          "a different effect needs no nonce");
+    CHECK(r.update(q, false, 800, T0 + 3500000, 450, &e) && e.anchor_us == T0 + 2000000 && !(e.fx.flags & ULTRA_PXF_RESTART),
+          "a parameter change after it keeps the START and does not restart again");
+    PixelFxTracker::Out st;
+    CHECK(r.store(450 + 30000, 30000, &st) && !(st.fx.flags & ULTRA_PXF_RESTART) && (st.fx.flags & ULTRA_PXF_STORE),
+          "the STORE copy never carries it");
+    (void) d;
   }
   // 20 days: a new anchor
   CHECK(!t.reanchor_due(T0 + 19LL * 86400 * 1000000) && t.reanchor_due(T0 + 61000 + PixelFxTracker::REANCHOR_US),
@@ -389,6 +389,47 @@ static void test_scheduler() {
   u.light_pixel_fx(0, 0, rel, 1000000);
   u.build_frame(900000, g.data());
   CHECK(slot_of(g, 0)[0] == ULTRA_PIXEL_FX && slot_of(g, 0)[ULTRA_PX_EFFECT] == 0, "effect 0 goes out like any other");
+
+  // RESTART is an action: the command's copies carry it, the refresh and a replay do not
+  Scheduler r;
+  r.init(1, 9, 3);
+  std::vector<uint8_t> h(r.frame_bytes());
+  PixelLightState rs = sample();
+  rs.transition_ms = 0;
+  ultra_pixel_fx_t rfx = pixel_fx_of(rs);
+  rfx.flags = static_cast<uint8_t>(rfx.flags | ULTRA_PXF_RESTART | ULTRA_PXF_LOCK);
+  r.light_pixel_fx(0, 0, rfx, 4000000);
+  int with = 0, without = 0;
+  bool replayed = false;
+  for (int i = 0; i < 300; i++) {
+    r.build_frame(3000000 + 3000 * i, h.data());
+    const uint8_t *sl = slot_of(h, 0);
+    if (sl[0] != ULTRA_PIXEL_FX)
+      continue;
+    CHECK(ultra_slot_check(sl) == 0 && (sl[ULTRA_PX_FLAGS] & ULTRA_PXF_LOCK), "sealed, the other flags stay");
+    (sl[ULTRA_PX_FLAGS] & ULTRA_PXF_RESTART ? with : without)++;
+    if (with == 3 && without >= 2 && !replayed) {
+      replayed = true;
+      r.replay(5000000);
+    }
+  }
+  CHECK(with == 3 && without >= 4, "3 copies carry RESTART, the refresh and the replay do not (%d / %d)", with, without);
+  // the golden (the protocol repository's test vector slot_pixel_fx_restart is the same bytes)
+  {
+    ultra_pixel_fx_t v;
+    std::memset(&v, 0, sizeof v);
+    v.effect = 20;
+    v.speed = 128;
+    v.intensity = 128;
+    v.palette = 0xFFu;
+    v.c[0][0] = v.c[0][1] = v.c[0][2] = 255;
+    v.brightness = 255;
+    v.flags = ULTRA_PXF_RESTART | ULTRA_PXF_LOCK;
+    uint8_t vs[ULTRA_SLOT_BYTES];
+    ultra_slot_pixel_fx(vs, 1, 0x0B, &v);
+    CHECK(vs[ULTRA_PX_FLAGS] == 0x60, "FLAGS RESTART | LOCK = 0x60");
+    std::printf("VEC_SLOT_PIXEL_FX_RESTART = \"%s\"\n", hex(vs, ULTRA_SLOT_BYTES).c_str());
+  }
 }
 
 static void test_config() {

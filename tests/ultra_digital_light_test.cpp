@@ -515,20 +515,23 @@ static void test_store_and_anchor() {
     std::vector<uint8_t> prev = r.wire.fx[k - 2], cur = r.wire.fx[k - 1];
     prev[ULTRA_PX_START] = prev[ULTRA_PX_START + 1] = prev[ULTRA_PX_START + 2] = prev[ULTRA_PX_START + 3] = 0;
     cur[ULTRA_PX_START] = cur[ULTRA_PX_START + 1] = cur[ULTRA_PX_START + 2] = cur[ULTRA_PX_START + 3] = 0;
-    CHECK(prev[ULTRA_PX_EFFECT] == cur[ULTRA_PX_EFFECT] && prev[ULTRA_PX_C3 + 2] == cur[ULTRA_PX_C3 + 2],
-          "the automatic renewal: no nonce (the slot is the last one's but for its START and SEQ)");
+    CHECK(prev[ULTRA_PX_EFFECT] == cur[ULTRA_PX_EFFECT] && prev[ULTRA_PX_FLAGS] == cur[ULTRA_PX_FLAGS] &&
+              !(cur[ULTRA_PX_FLAGS] & ULTRA_PXF_RESTART),
+          "the automatic renewal: no RESTART (the slot is the last one's but for its START and SEQ)");
   }
   // the user chooses the effect again (in Home Assistant): a time-driven effect starts over: the slot differs
   {
     const size_t k = r.wire.fx.size();
-    const uint8_t c3 = r.wire.fx.back()[ULTRA_PX_C3 + 2], fx = r.wire.fx.back()[ULTRA_PX_EFFECT];
+    const uint8_t fx = r.wire.fx.back()[ULTRA_PX_EFFECT];
     r.e_solid.start();
     r.run();
-    CHECK(r.wire.fx.size() == k + 1 && r.wire.fx.back()[ULTRA_PX_EFFECT] == fx && r.wire.fx.back()[ULTRA_PX_C3 + 2] == (c3 ^ 1),
-          "the same effect chosen again: a new START and a slot that differs (a nonce), so the receiver starts it over");
-    r.e_solid.start();
+    CHECK(r.wire.fx.size() == k + 1 && r.wire.fx.back()[ULTRA_PX_EFFECT] == fx &&
+              (r.wire.fx.back()[ULTRA_PX_FLAGS] & ULTRA_PXF_RESTART),
+          "the same effect chosen again: a new START and RESTART, so the receiver starts it over");
+    r.l.set_param(ultra_digital::PARAM_SPEED, 33);
     r.run();
-    CHECK(r.wire.fx.size() == k + 2 && r.wire.fx.back()[ULTRA_PX_C3 + 2] == c3, "and again: it differs from the last one again");
+    CHECK(r.wire.fx.size() == k + 2 && !(r.wire.fx.back()[ULTRA_PX_FLAGS] & ULTRA_PXF_RESTART),
+          "a parameter change after it does not carry RESTART");
   }
   std::printf("  light: STORE once after the delay, not with a change, the anchor after 20 days\n");
 }

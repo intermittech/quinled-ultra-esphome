@@ -113,7 +113,7 @@ static const char *slot_undefined(const uint8_t *s) {
       return "PIXEL_FX segment";
     if (fl != 0)
       return "slot flags";
-    return (s[ULTRA_PX_FLAGS] & 0xC0) ? "PIXEL_FX reserved flags" : nullptr;
+    return (s[ULTRA_PX_FLAGS] & 0x80) ? "PIXEL_FX reserved flags" : nullptr;
   }
   if (type >= ULTRA_TYPES || type == ULTRA_POLL)
     return "type";
@@ -224,7 +224,7 @@ static void test_defined_values() {
         for (int i = 0; i < 9; i++)
           fx.c[i / 3][i % 3] = r8();
         fx.brightness = r8();
-        fx.flags = r8();   // (bits 6-7 are reserved: the builder sends 0)
+        fx.flags = r8();   // (bit 7 is reserved: the builder sends 0; bit 6 is RESTART)
         fx.custom1 = r8();
         fx.custom2 = r8();
         fx.start_ms = 0;

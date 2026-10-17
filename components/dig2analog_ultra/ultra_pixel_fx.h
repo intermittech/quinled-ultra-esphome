@@ -191,10 +191,10 @@ class PixelFxTracker {
   /// The state wanted now. effect_changed: a new effect (or the first send, or a new anchor asked for): START now
   /// (start_us: where a command queued now starts), the crossfade over default_transition_ms when the wanted transition
   /// is 0. false: nothing to tell the receiver (it is there already); else out is the PIXEL_FX to send.
-  /// restart: the user chose the effect (again): a time-driven effect (Sunrise, Sunset) starts over. A receiver keeps its
-  /// phase when the same slot comes with only a new START (that is what the automatic renewal after 20 days relies on), and
-  /// the slot has no seed field, so an explicit choice that would be the same slot carries a nonce: the low bit of colour 3's
-  /// blue is flipped (every restart flips it: 1/255 of a channel nobody can see, and the slot differs from the last one).
+  /// restart: the user chose the effect (again): the PIXEL_FX carries ULTRA_PXF_RESTART (with the new START effect_changed
+  /// gives): the random effects are re-seeded, a time-driven effect (Sunrise, Sunset) begins again. A receiver keeps its
+  /// phase when the same slot comes with only a new START (that is what the automatic renewal after 20 days relies on). The
+  /// bit is an action: it is in out->fx only, not in the state kept (the STORE copy and the comparison).
   bool update(const PixelLightState &want, bool effect_changed, uint32_t default_transition_ms, int64_t start_us,
               uint32_t now_ms, Out *out, bool restart = false) {
     if (this->released_) {
@@ -206,12 +206,7 @@ class PixelFxTracker {
     PixelLightState s = want;
     if (effect_changed && this->sent_ && s.transition_ms == 0)
       s.transition_ms = static_cast<uint16_t>(std::min<uint32_t>(default_transition_ms, 0xFFFF));   // the crossfade
-    ultra_pixel_fx_t f = pixel_fx_of(s);
-    f.c[2][2] = static_cast<uint8_t>(f.c[2][2] ^ this->nonce_);
-    if (restart && this->sent_ && effect_changed && pixel_fx_same(f, this->last_)) {
-      this->nonce_ ^= 1;
-      f.c[2][2] = static_cast<uint8_t>(f.c[2][2] ^ 1);
-    }
+    const ultra_pixel_fx_t f = pixel_fx_of(s);
     if (this->sent_ && !effect_changed && pixel_fx_same(f, this->last_))
       return false;
     if (effect_changed || !this->sent_)
@@ -229,6 +224,8 @@ class PixelFxTracker {
     this->changed_ms_ = now_ms;
     this->store_due_ = true;
     out->fx = f;
+    if (restart)
+      out->fx.flags = static_cast<uint8_t>(out->fx.flags | ULTRA_PXF_RESTART);
     out->anchor_us = this->anchor_us_;
     return true;
   }
@@ -280,7 +277,6 @@ class PixelFxTracker {
  protected:
   ultra_pixel_fx_t last_{};
   int64_t anchor_us_{0};
-  uint8_t nonce_{0};   // the bit an explicit restart flips (update)
   uint32_t off_until_ms_{0}, changed_ms_{0};
   bool sent_{false}, released_{false}, on_{false}, fading_out_{false}, store_due_{false};
 };

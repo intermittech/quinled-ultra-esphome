@@ -156,13 +156,17 @@ def main() -> int:
     print(f"ok   catalogue {cat.version}: {len(cat.effects)} effects, {len(cat.palettes)} palettes, Solid = {cat.solid_id}")
 
     # 3. the golden slot is the protocol repository's test vector
-    vec = next((l for l in run.stdout.splitlines() if l.startswith("VEC_SLOT_PIXEL_FX")), None)
+    vec = next((l for l in run.stdout.splitlines() if l.startswith("VEC_SLOT_PIXEL_FX =")), None)
     vectors = PROTOCOL / "test-vectors/vectors.json"
     if vec and vectors.exists():
         hexstr = re.search(r'"([0-9a-f]+)"', vec).group(1)
         known = {v["name"]: v["hex"] for v in json.loads(vectors.read_text(encoding="utf-8"))["vectors"]}
         good = known.get("slot_pixel_fx") == hexstr
         print(f"{'ok  ' if good else 'FAIL'} the golden slot is the protocol test vector slot_pixel_fx")
+        bad |= not good
+        vec = next((l for l in run.stdout.splitlines() if l.startswith("VEC_SLOT_PIXEL_FX_RESTART")), None)
+        good = vec is not None and known.get("slot_pixel_fx_restart") == re.search(r'"([0-9a-f]+)"', vec).group(1)
+        print(f"{'ok  ' if good else 'FAIL'} the golden RESTART slot is the protocol test vector slot_pixel_fx_restart")
         bad |= not good
     return 1 if bad else 0
 

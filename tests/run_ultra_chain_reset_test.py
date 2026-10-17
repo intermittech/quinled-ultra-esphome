@@ -1,8 +1,8 @@
 """The reset floor of a normal Ultra line whose first board is an ultra_digital receiver (components/dig2analog_ultra/chain_reset.py): the hub's
-reset_time is raised to 500 us in that case and left alone in every other (a receiver behind another board, a digital port, a PARLIO lane,
-no receiver, a larger reset). Plain Python: the module has no ESPHome imports.
+reset_time is raised to 500 us in that case and left alone in every other (a receiver behind another board, a digital port,
+no receiver, a larger reset; an RMT line and a PARLIO lane both get it). Plain Python: the module has no ESPHome imports.
 
-then the codegen of three small configurations (esphome compile --only-generate: the hub's set_timing in main.cpp). Needs ESPHome for
+then the codegen of four small configurations (one of them a PARLIO lane on an ESP32-P4) (esphome compile --only-generate: the hub's set_timing in main.cpp). Needs ESPHome for
 the second part (the venv); --no-codegen leaves it out.
 
 Run: python tests/run_ultra_chain_reset_test.py [--no-codegen]"""
@@ -56,7 +56,8 @@ check(cr.reset_with_floor_ns(300000, hub(), [rx("u", 0, "dig2analog_ultra")]) ==
 check(cr.reset_with_floor_ns(300000, hub(), []) == 300000, "no receiver: nothing changes")
 check(cr.reset_with_floor_ns(300000, hub(), None) == 300000, "no lights at all: nothing changes")
 check(cr.reset_with_floor_ns(300000, hub(digital={"reset_time": 300000}), [rx("u", 0)]) == 300000, "a digital port (the receiver is in a strip's data path): nothing changes")
-check(cr.reset_with_floor_ns(300000, hub(parlio_id=Id("bus")), [rx("u", 0)]) == 300000, "a PARLIO lane (its timing is the bus' grid): nothing changes")
+check(cr.reset_with_floor_ns(300000, hub(parlio_id=Id("bus")), [rx("u", 0)]) == 500000, "a PARLIO lane is a normal Ultra line: 500 us too")
+check(cr.reset_with_floor_ns(300000, hub(parlio_id=Id("bus")), [rx("u", 1)]) == 300000, "... and board 1 of a lane stays")
 check(cr.chain_first_receiver(hub(), [rx("u", 1), rx("u", 0)]), "any of the hub's receivers on board 0 counts")
 
 CONFIG = """esphome:
@@ -99,10 +100,54 @@ def codegen(name, boards, board, reset_us, expect_ns):
     check(run.returncode == 0 and f", {expect_ns});" in line, f"{name}: the hub's set_timing ends with {expect_ns} ns ({line.strip() or run.stdout[-300:] + run.stderr[-300:]})")
 
 
+PARLIO_CONFIG = """esphome:
+  name: parlio_alone
+esp32:
+  board: esp32-p4_r3
+  framework:
+    type: esp-idf
+external_components:
+  - source:
+      type: local
+      path: {components}
+    components: [dig2analog_ultra, dig2analog_ultra_parlio, ultra_digital]
+logger:
+dig2analog_ultra_parlio:
+  - id: ports
+    pins: [GPIO0]
+dig2analog_ultra:
+  - id: ultra
+    parlio_id: ports
+    lane: 0
+    num_boards: 1
+light:
+  - platform: ultra_digital
+    id: bar
+    name: Bar
+    dig2analog_ultra_id: ultra
+    board: 0
+    chip: ws2812b
+    num_leds: 90
+"""
+
+
+def codegen_parlio():
+    work = HERE / "build" / "chain_reset" / "parlio_alone"
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "parlio_alone.yaml").write_text(PARLIO_CONFIG.format(components=(HERE.parent / "components").as_posix()), encoding="utf-8")
+    run = subprocess.run([sys.executable, "-m", "esphome", "compile", "parlio_alone.yaml", "--only-generate"], cwd=work, capture_output=True, text=True,
+                         timeout=600)
+    main_cpp = next((work / ".esphome" / "build").glob("*/src/main.cpp"), None) if (work / ".esphome" / "build").exists() else None
+    line = next((l for l in main_cpp.read_text(encoding="utf-8").splitlines() if "ultra->set_timing(" in l), "") if main_cpp else ""
+    ns = int(line.rsplit(",", 1)[1].strip().rstrip(");").strip()) if line else 0   # (the lane's reset on the bus' grid: whole groups, rounded up)
+    check(run.returncode == 0 and 500000 <= ns < 600000, f"a PARLIO lane: the reset on the bus grid is {ns} ns (500000 .. 600000) ({line.strip() or run.stdout[-300:] + run.stderr[-300:]})")
+
+
 if "--no-codegen" not in sys.argv:
     codegen("alone", 1, 0, None, 500000)
     codegen("alone_long", 1, 0, 800, 800000)
     codegen("behind", 3, 2, None, 300000)
+    codegen_parlio()
 
 print("chain reset floor: %s" % ("FAIL, %d" % failures if failures else "ok"))
 sys.exit(1 if failures else 0)

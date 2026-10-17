@@ -2,10 +2,15 @@
 
 The receiver classifies a frame (its slot and its header) while the next one may already be on the way: its main loop shares the 50 us
 tick with the frame capture. Behind other boards the gap it sees is 320 us longer for each of them (each removes its slot from the front
-of the frame); alone on its line it sees the hub's reset and nothing more. Its firmware takes a frame that starts 150 us after the last
-one ended (test/test_ud_chain_budget.py in the firmware repository), so the default reset of 300 us has a margin of 150 us. A receiver
-that is the first board gets at least CHAIN_FIRST_RESET_NS between the frames whatever reset_time says: a margin of 350 us, for a
-burst of queued commands that is about 12 % fewer frames a second.
+of the frame); alone on its line it sees the hub's reset and nothing more. The firmware frees its capture 126 .. 189 us after a frame's
+last edge while a light effect runs (a 40-pixel Rainbow: it takes a frame that starts 150 us after the last one ended,
+test/test_ud_chain_budget.py in the firmware repository). A heavy effect (Pacifica on 300 or 1,080 pixels renders about 27 k cycles
+between two looks at the line) holds the capture longer and drops frames at some phases of the 50 us tick when the reset is 300 us; at
+500 us it does not (ud-fx-verify, round 2, N1). A receiver that is the first board therefore gets at least CHAIN_FIRST_RESET_NS between
+the frames whatever reset_time says: for a burst of queued commands that is about 12 % fewer frames a second.
+
+The floor is applied to the hub's validated reset_time (final validation), so an RMT line and a PARLIO lane (whose bus layout reads the
+hubs' reset_time) both get it.
 
 Pure Python (no ESPHome imports): tests/run_ultra_chain_reset_test.py loads this file on its own."""
 
@@ -13,8 +18,8 @@ CHAIN_FIRST_RESET_NS = 500000
 
 
 def chain_first_receiver(hub_conf, lights) -> bool:
-    """True if an ultra_digital light is board 0 of this hub, which is a normal Ultra line (no digital: and no PARLIO lane)"""
-    if "digital" in hub_conf or "parlio_id" in hub_conf:
+    """True if an ultra_digital light is board 0 of this hub, which is a normal Ultra line (no digital:; an RMT line or a PARLIO lane)"""
+    if "digital" in hub_conf:
         return False
     hub_id = str(hub_conf["id"])
     return any(

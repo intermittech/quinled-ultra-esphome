@@ -1,0 +1,122 @@
+# QuinLED Diff-Power sender as it arrives pre-flashed: the controller's own parts (pins, ports, telemetry, time, API) and ONE
+# marked spot for the house: which receivers and lights are on which port, their names and rooms. The QuinLED Setup page
+# (the setup card in Home Assistant, or the standalone page) writes the block for that spot (areas, devices, receivers,
+# lights) from the receivers it finds; replace everything between the two QuinLED Setup lines with it and Install.
+# Names follow quinled-diff-power-ultra-sender.yaml, the hand-written version of the same thing.
+# ESP32 classic, ESP-IDF. Set the pins to your sender's wiring.
+substitutions:
+  name: sender-1
+  friendly_name: Sender 1
+  port1_data: GPIO16      # port 1's Ultra data line
+  port1_enable: GPIO25    # its ChannelEnable (the sender switches the 55 V: this AND its own board detection)
+  port1_detect: GPIO35    # its Detect output (3.3 V; Sender-1 revisions that have it): a placeholder pin
+  port1_rx: GPIO34        # its RS-485 receiver output (the answers)
+  port1_de: GPIO4         # its RS-485 driver enable (DE)
+  port2_data: GPIO17
+  port2_enable: GPIO26
+  port2_detect: GPIO36
+  port2_rx: GPIO39
+  port2_de: GPIO27
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  project:
+    name: quinled.diff-power-sender
+    version: "0.1.0"
+  devices:
+    - id: port_1
+      name: ${friendly_name} · Port 1
+    - id: port_2
+      name: ${friendly_name} · Port 2
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+external_components:
+  # @main until the first release; then pin one (@v0.x.y, wiki: Installation)
+  - source: github://intermittech/quinled-ultra-esphome@main
+    components: [dig2analog_ultra, diffpower]
+    # Developing the component itself? Use the local copy instead:
+    # source:
+    #   type: local
+    #   path: ../components
+
+logger:
+api:
+  encryption:
+    key: !secret api_encryption_key
+  reboot_timeout: 0s   # lights keep running without Home Assistant (the default reboots after 15 min)
+ota:
+  - platform: esphome
+    encryption:                # uploads use the api encryption key
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:                 # the fallback hotspot (captive portal) if the Wi-Fi is gone
+    password: !secret fallback_ap_password
+captive_portal:
+
+# The time now, for the ports' "During dark" power mode (its sunrise / sunset come from Home Assistant's sun.sun: no
+# coordinates needed; without Home Assistant, or as its backup, add ESPHome's sun and a sun_id per port: wiki,
+# Power modes). Two time sources: the ports name theirs (time_id).
+time:
+  - platform: homeassistant
+    id: ha_time
+  - platform: sntp       # (the time also after a reboot while Home Assistant is down)
+    id: sntp_time
+
+uart:
+  - id: rs485_1
+    rx_pin: ${port1_rx}
+    baud_rate: 1000000
+    rx_buffer_size: 1024
+  - id: rs485_2
+    rx_pin: ${port2_rx}
+    baud_rate: 1000000
+    rx_buffer_size: 1024
+
+# The ports' power: on while a light on them is lit (and its turn-off period), standby otherwise; each with a Wake
+# button (motion automations press it) and a Power mode select (Standby, During dark, Always on)
+diffpower:
+  - id: port1
+    name: Port 1
+    device_id: port_1
+    enable_pin: ${port1_enable}
+    time_id: sntp_time
+    detect_pin: ${port1_detect}     # Sender-1 revision with the Detect output; leave it out for the first revision
+  - id: port2
+    name: Port 2
+    device_id: port_2
+    enable_pin: ${port2_enable}
+    time_id: sntp_time
+    detect_pin: ${port2_detect}     # (as port 1)
+
+dig2analog_ultra:
+  - id: line1
+    pin: ${port1_data}
+    num_boards: 1   # the QuinLED Setup block below sets the real number
+    rmt_symbols: 128
+    port: port1
+    telemetry:
+      uart_id: rs485_1
+      name: Port 1
+      device_id: port_1
+      direction_pin: ${port1_de}
+  - id: line2
+    pin: ${port2_data}
+    num_boards: 1   # the QuinLED Setup block below sets the real number
+    rmt_symbols: 128
+    port: port2
+    telemetry:
+      uart_id: rs485_2
+      name: Port 2
+      device_id: port_2
+      direction_pin: ${port2_de}
+
+# --- QuinLED Setup: begin (replace everything from this line to the end line) ---
+packages:
+  house: {}
+# --- QuinLED Setup: end ---

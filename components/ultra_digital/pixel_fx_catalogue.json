@@ -1153,7 +1153,7 @@
    "speed": true,
    "speed_label": "Speed",
    "intensity": true,
-   "intensity_label": "Hold (0: none, 255: three sweeps long)",
+   "intensity_label": "Hold (0: none, 255: three quarters of the cycle)",
    "palette": true,
    "custom1": "Colours (0-127: Colour 1 and 2 alternate, 128-255: a new palette colour each wipe)",
    "custom2": null,
@@ -1439,13 +1439,13 @@
   {
    "id": 21,
    "name": "Warm White",
-   "origin": "own, made for this firmware (GPL-3.0-or-later) (2200 K - 3200 K whites; on RGBW strips the white LED does the work)",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (warm whites, about 1900 K - 3000 K; on RGBW strips the white LED carries little of them: auto-white takes min(r, g, b), and a warm white has almost no blue)",
    "cyclic": true
   },
   {
    "id": 22,
    "name": "Daylight",
-   "origin": "own, made for this firmware (GPL-3.0-or-later) (2700 K - 6500 K whites)",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (whites from 2700 K to 6500 K, colour temperatures from the common black-body RGB table; the cool end puts ~30 % of its light on the white LED of RGBW strips)",
    "cyclic": true
   },
   {

@@ -119,7 +119,9 @@ NEGATIVE = [
      "const int64_t bit_start = (lane->cur_start_ + lane->cur_bytes_) * this->group_samples() - this->period_;",
      "const int64_t bit_start = (lane->cur_start_ + lane->cur_bytes_ - 1) * this->group_samples() - this->period_;"),
     ("the direction pin let go of 200 us after the RW frame's end", "ultra_parlio.h",
-     "static constexpr uint32_t PARLIO_RELEASE_NS = 2000;", "static constexpr uint32_t PARLIO_RELEASE_NS = 200000;"),
+     "static constexpr uint32_t PARLIO_RELEASE_NS = 80000;", "static constexpr uint32_t PARLIO_RELEASE_NS = 200000;"),
+    ("the direction pin let go of 2 us after the RW frame's end (a chain receiver cannot close the frame)", "ultra_parlio.h",
+     "static constexpr uint32_t PARLIO_RELEASE_NS = 80000;", "static constexpr uint32_t PARLIO_RELEASE_NS = 2000;"),
 ]
 
 FEATURES = ("USE_DIG2ANALOG_ULTRA_TELEMETRY", "USE_DIG2ANALOG_ULTRA_PARLIO", "USE_DIG2ANALOG_ULTRA_UPDATE",

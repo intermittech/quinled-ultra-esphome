@@ -48,6 +48,16 @@ static uint32_t rmt_resolution_hz() {
   return freq;
 }
 
+/// An RW frame ends with this much LOW before the hub lets go of the line (the protocol: ULTRA_RW_RELEASE_MIN_US .. ULTRA_RW_RELEASE_US after its
+/// last edge; the aim is the lower bound + 20 us). A receiver that closes a frame by its LOW run (the Ultra-Digital receiver on a normal line) needs it:
+/// the pair floats HIGH after the release (the GM3088's fail-safe), and a 2 us LOW between the last pulse and that HIGH is no frame end for it.
+static constexpr uint32_t RW_RELEASE_HOLD_NS = (ULTRA_RW_RELEASE_MIN_US + 20u) * 1000u;
+static_assert(RW_RELEASE_HOLD_NS >= ULTRA_RW_RELEASE_MIN_US * 1000u && RW_RELEASE_HOLD_NS + 50000u <= ULTRA_RW_RELEASE_US * 1000u,
+              "the hold leaves the RMT interrupt's latency inside the protocol's release window");
+#ifdef USE_DIG2ANALOG_ULTRA_PARLIO
+static_assert(PARLIO_RELEASE_NS == RW_RELEASE_HOLD_NS, "a lane and an RMT line hold the pair LOW the same time");
+#endif
+
 static uint32_t ns_to_ticks(uint32_t ns, uint32_t res_hz) {
   return static_cast<uint32_t>((static_cast<uint64_t>(ns) * res_hz + 500000000ULL) / 1000000000ULL);
 }
@@ -803,7 +813,7 @@ void UltraHub::rw_drop_turn_() {
     this->rw_rx_enable_pin_->digital_write(false);
 }
 
-// The RMT's interrupt after an RW frame's last symbol: let go of the line (ULTRA_RW_RELEASE_US after its last bit).
+// The RMT's interrupt after an RW frame's last symbol (its LOW of RW_RELEASE_HOLD_NS): let go of the line, within ULTRA_RW_RELEASE_US of its last bit.
 bool IRAM_ATTR UltraHub::rw_done_isr_(rmt_channel_handle_t, const rmt_tx_done_event_data_t *, void *arg) {
   auto *hub = static_cast<UltraHub *>(arg);
   if (hub->rw_release_) {
@@ -1467,10 +1477,10 @@ bool UltraHub::setup_rmt_() {
   this->reset_symbol_ = this->enc_.symbols.reset;
   this->rw_reset_symbol_ = this->reset_symbol_;
   if (this->rw_uart_ != nullptr && this->rw_dir_pin_ != nullptr) {
-    // an RW frame ends with a 2 us low, then the RMT's interrupt lets go of the line: the window is its reset
-    // (a digital port: the tail LOW of the poll's transmission, ultra_dp_next)
-    const uint32_t us1 = ns_to_ticks(1000, res);
-    this->rw_reset_symbol_ = make_symbol(us1, 0, us1, 0);
+    // an RW frame ends with a LOW of RW_RELEASE_HOLD_NS (80 us, two halves of one symbol), then the RMT's interrupt lets go of the line: the window
+    // is its reset (a digital port: the tail LOW of the poll's transmission, ultra_dp_next)
+    const uint32_t half = ns_to_ticks(RW_RELEASE_HOLD_NS / 2, res);
+    this->rw_reset_symbol_ = make_symbol(half, 0, half, 0);
     rmt_tx_event_callbacks_t cbs;
     memset(&cbs, 0, sizeof(cbs));
     cbs.on_trans_done = UltraHub::rw_done_isr_;

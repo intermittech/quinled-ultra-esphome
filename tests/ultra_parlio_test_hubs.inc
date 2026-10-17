@@ -681,14 +681,14 @@ static void test_sixteen_lanes() {
         tel.collisions);
   CHECK(across > 0, "windows of lanes on different UARTs overlap (%d pairs): the 4 groups answer at the same time",
         across);
-  // the direction pins: each RW frame on the wire released 2-10 us after its last bit; no release without one
+  // the direction pins: each RW frame on the wire released 80-91 us after its last bit (PARLIO_RELEASE_NS); no release without one
   int64_t worst = 0, least = INT64_MAX;
   size_t matched = 0, stray = 0;
   for (const Stream::Fired &f : bus.fired) {
     bool hit = false;
     for (const Telemetry::Window &w : tel.windows) {
       const int64_t d = f.at - w.t0_us * 1000;
-      if (w.line == f.lane && d >= 0 && d <= 11000) {
+      if (w.line == f.lane && d >= 0 && d <= static_cast<int64_t>(PARLIO_RELEASE_NS) + 11000) {
         hit = true;
         worst = std::max(worst, d);
         least = std::min(least, d);
@@ -698,7 +698,8 @@ static void test_sixteen_lanes() {
     matched += hit;
     stray += !hit;
   }
-  CHECK(tel.late == 0 && stray == 0 && matched + 2 >= tel.windows.size() && least >= 1000 && worst <= 11000,
+  CHECK(tel.late == 0 && stray == 0 && matched + 2 >= tel.windows.size() &&
+            least >= static_cast<int64_t>(PARLIO_RELEASE_NS) - 1000 && worst <= static_cast<int64_t>(PARLIO_RELEASE_NS) + 11000,
         "every RW frame's direction pin dropped %.1f-%.1f us after its last bit (%u of %u), none late, none for a "
         "frame that didn't complete (%u)", least / 1000.0, worst / 1000.0, static_cast<unsigned>(matched),
         static_cast<unsigned>(tel.windows.size()), static_cast<unsigned>(stray));

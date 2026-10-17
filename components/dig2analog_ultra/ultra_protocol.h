@@ -115,7 +115,11 @@ enum {
  * with the shared clock's measured rate). During the window the forwarding gate is held CLOSED (DOUT LOW, not high-Z):
  * DIN sees the relayed answers, and a re-armed plan would forward them downstream. Host: no RW frame before the chain
  * is locked (after the DARK preamble) and has sent headers for ULTRA_RW_LOCK_MS, none during an update session, never
- * with UPD, and never with EXT (until an extension defines it). In one RW frame every POLL carries the same R and rate;
+ * with UPD, and never with EXT (until an extension defines it). On a normal Ultra line the host drives the line LOW from t0 for at least
+ * ULTRA_RW_RELEASE_MIN_US and has stopped driving by t0 + ULTRA_RW_RELEASE_US; the pair then floats HIGH (the receivers' fail-safe) until a
+ * board answers or the host takes the line back. A board that closes a frame by its LOW run (the Ultra-Digital receiver on a normal Ultra line,
+ * alone on it) needs that LOW: 2 us between the last pulse and the release HIGH is no frame end for it. (A digital port: below.) In one RW
+ * frame every POLL carries the same R and rate;
  * the answer indices are unique, < R and rise along the chain, and the boards between the hub and an answering board
  * get ULTRA_POLL_RELAY_ONLY. Behind the last board that answers or relays, the slots may be of any type (those boards
  * don't take part and don't turn around). The next frame >= W + ULTRA_RW_HOLDOFF_US after t0, answers or not; a missing
@@ -134,7 +138,8 @@ enum {
  * a framing error or a CRC failure (ultra_answer_check). */
 #define ULTRA_POLL_RELAY_ONLY 0xFFu    /* POLL index: relay, don't answer (the page and its arguments are ignored) */
 #define ULTRA_RW_MAX_SLOTS    16u      /* INDEX is a nibble in the answer */
-#define ULTRA_RW_RELEASE_US   150u     /* host / sender has stopped driving */
+#define ULTRA_RW_RELEASE_US   150u     /* host / sender has stopped driving (at the latest) ... */
+#define ULTRA_RW_RELEASE_MIN_US 60u    /* ... and not before this (a normal Ultra line): LOW from the RW frame's last falling edge for at least this long (the aim: +20 us) */
 #define ULTRA_RW_DIR_MIN_US   250u     /* boards turn around between MIN and MAX */
 #define ULTRA_RW_DIR_MAX_US   900u
 #define ULTRA_RW_CHECK_US     920u     /* the turnaround check, 920-977 us (after DIR_MAX, before slot 0) */

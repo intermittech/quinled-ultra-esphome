@@ -33,8 +33,9 @@ namespace esphome::dig2analog_ultra {
 
 static constexpr uint8_t PARLIO_MAX_LANES = 16;
 /// The direction pin drops this long after an RW frame's last bit (an alarm from the stream's timing; the RMT's lines:
-/// their done interrupt after a 2 us low).
-static constexpr uint32_t PARLIO_RELEASE_NS = 2000;
+/// their done interrupt after the same LOW, RW_RELEASE_HOLD_NS): the protocol's ULTRA_RW_RELEASE_MIN_US (60) + 20 us. The pair then floats HIGH;
+/// a receiver that closes a frame by its LOW run needs the LOW.
+static constexpr uint32_t PARLIO_RELEASE_NS = 80000;
 /// A (re)start's time is known within this (the first transmit call's duration): a slower one is tried again.
 static constexpr uint32_t PARLIO_START_SKEW_NS = 50000;
 

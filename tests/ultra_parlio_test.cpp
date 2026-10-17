@@ -666,8 +666,10 @@ static void test_windows() {
   }
   CHECK(quiet && others && windows > 20, "%u RW windows: lane 6 low for W + hold-off (%u us) after each, the other 15 "
         "lanes send meanwhile (%u edges)", static_cast<unsigned>(windows), window, static_cast<unsigned>(other_edges));
-  CHECK(order && least >= static_cast<int64_t>(PARLIO_RELEASE_NS) && worst <= 10000, "the direction pin drops %.1f-%.1f "
-        "us after the RW frame's last falling edge (within 10 us, never before it)", least / 1000.0, worst / 1000.0);
+  CHECK(order && least >= static_cast<int64_t>(PARLIO_RELEASE_NS) && worst <= static_cast<int64_t>(PARLIO_RELEASE_NS) + 10000 &&
+            PARLIO_RELEASE_NS >= 60000 && PARLIO_RELEASE_NS + 50000 <= 150000,
+        "the direction pin drops %.1f-%.1f us after the RW frame's last falling edge (80 us, never before 60, within 10 us of the aim, "
+        "and inside the protocol's 150 us)", least / 1000.0, worst / 1000.0);
   std::printf("  windows: lane 6 quiet through %u windows while 15 lanes send; direction pin %.1f-%.1f us after the last "
               "bit\n", static_cast<unsigned>(windows), least / 1000.0, worst / 1000.0);
 }
@@ -810,7 +812,7 @@ static void test_late_render() {
 // ================================================================================================ 5. late interrupts
 /// The switch interrupt 700 us late (but the task's handover still in time): no kill, no refusal, every frame's TIME
 /// right, every release on time: no time is taken from an interrupt's timestamp. Then late renders with RW frames in
-/// flight: every release that fires belongs to an RW frame on the wire, 2-10 us after its last edge; the releases of
+/// flight: every release that fires belongs to an RW frame on the wire, 80-90 us after its last edge; the releases of
 /// the frames a kill cut never fire (a release is never moved).
 static void test_late_interrupts() {
   const Grid g = default_grid(16);
@@ -840,7 +842,7 @@ static void test_late_interrupts() {
       x = LaneRun();
     lanes_for_lateness(s, lr, g);
     run_lateness(s, lr, g, 400, [](uint8_t) { return true; }, "late renders, RW frames on every lane");
-    // each release: an RW frame on the wire on its lane, 2-10 us before
+    // each release: an RW frame on the wire on its lane, 80-90 us before (PARLIO_RELEASE_NS .. + 10 us)
     size_t matched = 0, stray = 0;
     int64_t worst = 0, least = INT64_MAX;
     std::vector<Decoder> dec;
@@ -850,7 +852,7 @@ static void test_late_interrupts() {
       bool hit = false;
       for (const Decoder::Frame &fr : dec[f.lane].frames) {
         const int64_t d = f.at - s.time_of(fr.t0);
-        if (valid_ultra(fr.bytes) && d >= 0 && d <= 10000) {
+        if (valid_ultra(fr.bytes) && d >= 0 && d <= static_cast<int64_t>(PARLIO_RELEASE_NS) + 10000) {
           hit = true;
           worst = std::max(worst, d);
           least = std::min(least, d);
@@ -860,8 +862,9 @@ static void test_late_interrupts() {
       matched += hit;
       stray += !hit;
     }
-    CHECK(stray == 0 && matched > 500 && least >= 2000 && worst <= 10000 && s.restarts >= 10,
-          "through %lld kills: %u releases, each 2-10 us after an RW frame's last edge on its lane (%.1f-%.1f us), %u "
+    CHECK(stray == 0 && matched > 500 && least >= static_cast<int64_t>(PARLIO_RELEASE_NS) &&
+              worst <= static_cast<int64_t>(PARLIO_RELEASE_NS) + 10000 && s.restarts >= 10,
+          "through %lld kills: %u releases, each 80-90 us after an RW frame's last edge on its lane (%.1f-%.1f us), %u "
           "for frames that didn't complete", static_cast<long long>(s.restarts), static_cast<unsigned>(matched),
           least / 1000.0, worst / 1000.0, static_cast<unsigned>(stray));
     std::printf("  late interrupts: a 700 us late switch changes nothing; through %lld kills %u releases, all on time, "
@@ -998,7 +1001,7 @@ static void test_start_origin() {
               "repeat, no early release; a slow start tried again\n");
 }
 
-/// A poll frame that ends just before the stream stops (the release 2 us after its last bit falls after the deadline):
+/// A poll frame that ends just before the stream stops (the release 80 us after its last bit falls after the deadline):
 /// the frame is out whole, so its direction pin is released (at the stop), never left driven. Swept over the deadline's place in a group (the clock before the start, 0-11 us), 10 and 20 MHz.
 static void test_release_at_stop() {
   int runs = 0, complete = 0, missing = 0, early = 0;
@@ -1050,7 +1053,7 @@ static void test_release_at_stop() {
         if (edge >= 0) {
           missing += released != 1;
           for (const Stream::Fired &r : s.fired)
-            early += r.at < edge || r.at > edge + 12000;
+            early += r.at < edge || r.at > edge + static_cast<int64_t>(PARLIO_RELEASE_NS) + 12000;
         }   // (a release for a cut frame is harmless: its line idles anyway)
       }
     }

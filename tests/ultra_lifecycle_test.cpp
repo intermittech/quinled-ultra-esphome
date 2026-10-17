@@ -1331,7 +1331,7 @@ struct UltraHub {
     this->tx_buf_ = this->buf_.data();
     rmt_symbol_word_t rst{}, rw{};
     rst.duration0 = rst.duration1 = 12000;   // 300 us at 80 MHz
-    rw.duration0 = rw.duration1 = 80;        // 2 us
+    rw.duration0 = rw.duration1 = 3200;      // 80 us (RW_RELEASE_HOLD_NS: two halves of 40 us at 80 MHz)
     this->enc_.symbols.reset = rst;
     this->reset_symbol_ = rst;
     this->rw_reset_symbol_ = pin != nullptr ? rw : rst;
@@ -1619,7 +1619,7 @@ static void test_telemetry_window() {
       continue;
     }
     rw_frames++;
-    frames_ok &= s.reset_ticks == 160 && ultra_poll_valid(s.frame.data()) == 0 &&
+    frames_ok &= s.reset_ticks == 6400 && ultra_poll_valid(s.frame.data()) == 0 &&
                  ultra_poll_valid(s.frame.data() + 32) == 0 && ultra_poll_valid(s.frame.data() + 64) != 0 &&
                  ultra_poll_valid(s.frame.data() + 96) != 0;
     // the next frame no earlier than the window's end: 1000 + 2 x 460 + 200 us after this frame's last bit

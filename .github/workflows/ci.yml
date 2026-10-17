@@ -76,6 +76,9 @@ jobs:
       - name: PARLIO test (16 lanes, the shared-UART coordinator, negative controls, the render's cost)
         working-directory: quinled-ultra-esphome
         run: python tests/run_ultra_parlio_test.py
+      - name: Ultra-Digital test (PIXEL_FX, the pixel CONFIG, page 0x81, the light's own code, the catalogue copy)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_digital_test.py
       - name: Schema tests
         working-directory: quinled-ultra-esphome
         run: python tests/validate_configs.py
@@ -92,6 +95,7 @@ jobs:
           - ultra/ultra-telemetry.yaml
           - ultra/ultra-p4-telemetry.yaml
           - ultra/ultra-diffpower.yaml
+          - ultra/ultra-digital.yaml
           - ultra/ultra-p4-parlio.yaml
           - ultra/ultra-p4-parlio-lights.yaml
           - ultra/ultra-p4-parlio-ports.yaml
@@ -101,6 +105,7 @@ jobs:
           - examples-local/quinled-dig2analog-ultra-strip.yaml
           - examples-local/quinled-dig2analog-ultra-strip-partition.yaml
           - examples-local/quinled-diff-power-ultra-sender.yaml
+          - examples-local/quinled-diff-power-ultra-digital.yaml
     env:
       ESPHOME_ESP_IDF_PREFIX: /home/runner/esphome-idf   # ESPHome's ESP-IDF install, kept between runs
     steps:

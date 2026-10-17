@@ -113,6 +113,31 @@ static void test_slot() {
   CHECK(static_cast<int32_t>(ultra_get32(slot + ULTRA_PX_START)) == -1234, "START");
   // the golden (the protocol repository's test vector slot_pixel_fx is the same bytes: tests/run_ultra_digital_test.py)
   std::printf("VEC_SLOT_PIXEL_FX = \"%s\"\n", hex(slot, ULTRA_SLOT_BYTES).c_str());
+  // the receiver firmware's own self-test vector (ud-fx-core, HANDOFF-protocol.md): an independent encoder agrees
+  {
+    ultra_pixel_fx_t h;
+    std::memset(&h, 0, sizeof h);
+    h.effect = 9;
+    h.start_ms = -1500;
+    h.speed = 1;
+    h.intensity = 2;
+    h.palette = ULTRA_PX_PAL_COLORS;
+    for (int i = 0; i < 9; i++)
+      h.c[i / 3][i % 3] = static_cast<uint8_t>(10 + i);
+    h.brightness = 200;
+    h.transition_ms = 700;
+    h.seg_start = 12;
+    h.seg_len = 300;
+    h.flags = ULTRA_PXF_STORE | ULTRA_PXF_MIRROR | (ULTRA_PXW_BRIGHT << ULTRA_PXF_WHITE_SHIFT);
+    h.custom1 = 5;
+    h.custom2 = 6;
+    uint8_t hs[ULTRA_SLOT_BYTES];
+    ultra_slot_pixel_fx(hs, 2, 77, &h);
+    CHECK(hex(hs, ULTRA_SLOT_BYTES) == "0b204d09fffffa240102fe0a0b0c0d0e0f101112c802bc000c012c1e050660d2",
+          "the firmware's self-test vector: %s", hex(hs, ULTRA_SLOT_BYTES).c_str());
+    const uint16_t zeros[ULTRA_CFG_PX_COUNT] = {};
+    CHECK(ultra_px_config_crc(zeros) == 0xecdd, "ultra_px_config_crc of eleven zeros (%04x)", ultra_px_config_crc(zeros));
+  }
   // the other side reads it back (the receiver's parser)
   ultra_pixel_fx_t g;
   CHECK(ultra_pixel_fx_parse(slot, &g) == 2 && g.effect == 7 && g.start_ms == -1234 && g.brightness == 128 &&

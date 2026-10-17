@@ -148,6 +148,9 @@ class PixelLight final : public light::LightOutput,
   void transition_requested(uint32_t length_ms);
   void transition_done(PixelTransition *t);
 
+  /// an exclusive (streaming) light switched on or changed: hand the strip back to its stream
+  void other_changed_(light::LightState *other);
+
   /// the light behind a light output, nullptr for other platforms (no RTTI in ESPHome)
   static PixelLight *find(light::LightOutput *output);
   light::LightState *get_state() const { return this->state_; }
@@ -169,7 +172,6 @@ class PixelLight final : public light::LightOutput,
   }
   void send_();
   void release_();                               // the hub's pixels pass (PIXEL_FX effect 0)
-  void other_changed_(light::LightState *other);  // an exclusive light switched on
   void pixel_page_();                            // page 0x81 news
   std::string status_text_() const;
   uint8_t shown_effect_();                       // the effect to send: the chosen one, Solid when the receiver lacks it

@@ -23,6 +23,45 @@ ZIG = [sys.executable, "-m", "ziglang"]
 PROTOCOL = ROOT.parent / "quinled-ultra-protocol"
 
 
+# the light's own methods, cut unchanged from components/ultra_digital/ultra_digital.cpp for tests/ultra_digital_light_test.cpp
+PIECES = ["PixelLight *PixelLight::find(", "void PixelLight::transition_requested(", "PixelLight *PixelFxEffect::light_(",
+          "void PixelFxEffect::start(", "void PixelFxEffect::stop(", "void PixelLight::effect_started(",
+          "void PixelLight::effect_stopped(", "void PixelLight::setup() {", "void PixelLight::on_light_remote_values_update(",
+          "void ExclusiveWatcher::on_light_remote_values_update(", "void PixelLight::other_changed_(",
+          "void PixelLight::release_(", "void PixelLight::write_state(", "uint8_t PixelLight::shown_effect_(",
+          "void PixelLight::loop(", "void PixelLight::send_(", "void PixelLight::set_param(",
+          "uint8_t PixelLight::get_param(", "void PixelLight::set_palette_index(", "void PixelLight::set_color2(",
+          "void PixelLight::set_color3(", "void PixelLight::pixel_page_("]
+
+
+def definition(text: str, signature: str) -> str:
+    """The definition that starts with signature, through its closing brace (the methods cut here have no braces in
+    comments or strings)"""
+    start = text.index(signature)
+    i, depth = text.index("{", start), 0
+    while True:
+        depth += {"{": 1, "}": -1}.get(text[i], 0)
+        i += 1
+        if depth == 0:
+            return text[start:i]
+
+
+def light_test() -> int:
+    out = BUILD / "digital"
+    out.mkdir(parents=True, exist_ok=True)
+    text = (ROOT / "components" / "ultra_digital" / "ultra_digital.cpp").read_text(encoding="utf-8")
+    body = "\n\n".join(definition(text, s) for s in PIECES) + "\n"
+    (out / "light_methods.inc").write_text(body, encoding="utf-8")
+    exe = out / ("ultra_digital_light_test.exe" if sys.platform == "win32" else "ultra_digital_light_test")
+    subprocess.run(ZIG + ["c++", "-std=c++17", "-O1", "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-unused-function",
+                          "-Wno-nullability-completeness", "-fsanitize=undefined", "-fno-sanitize-recover=all", f"-I{out}",
+                          str(HERE / "ultra_digital_light_test.cpp"), "-o", str(exe)], check=True)
+    run = subprocess.run([str(exe)], capture_output=True, text=True)
+    sys.stdout.write(run.stdout)
+    sys.stderr.write(run.stderr)
+    return run.returncode
+
+
 def main() -> int:
     BUILD.mkdir(exist_ok=True)
     exe = BUILD / ("ultra_digital_test.exe" if sys.platform == "win32" else "ultra_digital_test")
@@ -33,6 +72,7 @@ def main() -> int:
     sys.stdout.write("".join(l + "\n" for l in run.stdout.splitlines() if not l.startswith(("CHIP ", "VEC_"))))
     sys.stderr.write(run.stderr)
     bad = run.returncode != 0
+    bad |= light_test() != 0
 
     # 1. the chips: the YAML's table against the header's
     sys.path.insert(0, str(ROOT / "components"))

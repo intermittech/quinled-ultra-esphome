@@ -5,8 +5,8 @@ the hub's code. Also tests/build/ultra/ultra-strip.yaml: the dig2analog_ultra_st
 and the downlight notification pattern; tests/build/ultra/ultra-telemetry.yaml: ultra-example with Diff-Power receiver
 telemetry (the UART, the direction pin, every receiver sensor and text); tests/build/ultra/ultra-p4-telemetry.yaml (4
 RMT lines with telemetry on a P4), ultra-p4-parlio.yaml (16 PARLIO lanes, 4 shared UARTs),
-ultra-p4-parlio-ports.yaml (the same, each lane on a Diff-Power port) and ultra-p4-parlio-lights.yaml (8 lanes at 10
-MHz, no telemetry). The examples themselves:
+ultra-p4-parlio-ports.yaml (the same, each lane on a Diff-Power port), ultra-p4-parlio-lights.yaml (8 lanes at 10
+MHz, no telemetry) and ultra-digital.yaml (local pixel effects without telemetry: four segments, a streaming light, WS2805). The examples themselves:
 tests/local_examples.py.
 
 Usage: .venv/Scripts/python tests/make_ultra_compile_config.py
@@ -564,6 +564,118 @@ def telemetry_config(example: str) -> str:
     return src.rstrip("\n") + "\n" + TELEMETRY_EXTRA
 
 
+DIGITAL_CONFIG = """\
+# tests/build/ultra/ultra-digital.yaml: local pixel effects without telemetry (the page 0x81 code compiled out): a line of
+# two receivers, one with four segments, one WS2805 with the custom sliders, a streaming light on the first strip
+# (exclusive), the action, a stored power-on effect
+esphome:
+  name: d2a-ultra-digital
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+external_components:
+  - source:
+      type: local
+      path: ../../../components
+    components: [dig2analog_ultra, ultra_digital]
+logger:
+api:
+  encryption:
+    key: !secret api_encryption_key
+ota:
+  - platform: esphome
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+dig2analog_ultra:
+  id: ultra
+  pin: GPIO16
+  num_boards: 2
+  refresh_interval: 500ms
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: streamer
+    name: Streamer
+    pin: GPIO18
+    num_leds: 60
+    chipset: ws2812
+    rgb_order: GRB
+  - platform: ultra_digital
+    id: seg0
+    name: Roof
+    board: 0
+    segment: 0
+    chip: ws2812b
+    num_leds: 120
+    segment_length: 60
+    exclusive_with: streamer
+    store_after: 30s
+    standalone:
+      power_on: true
+      on_signal_loss: true
+  - platform: ultra_digital
+    id: seg1
+    name: Roof back
+    board: 0
+    segment: 1
+    chip: ws2812b
+    num_leds: 120
+    segment_start: 60
+    reverse: true
+    mirror: true
+    lock: true
+    controls: false
+    status: false
+  - platform: ultra_digital
+    id: seg2
+    name: Roof edge
+    board: 0
+    segment: 2
+    chip: ws2812b
+    num_leds: 120
+    segment_start: 100
+    segment_length: 20
+    catalogue_effects: false
+    effects:
+      - ultra_digital_fx:
+          name: Mine
+          fx: 130
+      - random:
+  - platform: ultra_digital
+    id: bar
+    name: Bar
+    board: 1
+    chip: ws2805
+    num_leds: 90
+    color_order: RGBWC
+    cold_white_share: 30%
+    auto_white: bright
+    custom_controls: true
+    led_current: 18mA
+    current_limit: 3A
+    max_fps: 60
+    virtual_offset: 100
+    virtual_length: 200
+
+button:
+  - platform: template
+    name: Warm
+    on_press:
+      - ultra_digital.effect_params:
+          id: seg0
+          color_2: 0xFF8000
+          color_3: [0, 64, 255]
+          speed: 200
+          intensity: 90
+          custom1: 10
+          custom2: 20
+          palette: Ocean
+"""
+
+
 def main() -> None:
     src = (ROOT / "examples" / "quinled-dig2analog-ultra-rgbcct.yaml").read_text(encoding="utf-8")
     src = src.replace(
@@ -614,6 +726,7 @@ def main() -> None:
     (OUT / "ultra-telemetry.yaml").write_text(telemetry_config(src), encoding="utf-8")
     (OUT / "ultra-p4-telemetry.yaml").write_text(p4_telemetry_config(), encoding="utf-8")
     (OUT / "ultra-diffpower.yaml").write_text(DIFFPOWER_CONFIG, encoding="utf-8")
+    (OUT / "ultra-digital.yaml").write_text(DIGITAL_CONFIG, encoding="utf-8")
     (OUT / "ultra-p4-parlio.yaml").write_text(p4_parlio_config(), encoding="utf-8")
     (OUT / "ultra-p4-parlio-lights.yaml").write_text(p4_parlio_lights_config(), encoding="utf-8")
     (OUT / "ultra-p4-parlio-ports.yaml").write_text(p4_parlio_config(ports=True), encoding="utf-8")

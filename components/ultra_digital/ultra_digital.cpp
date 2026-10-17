@@ -391,7 +391,7 @@ void PixelLight::pixel_page_() {
 // ------------------------------------------------------------------------------------------------------ entities
 #ifdef USE_NUMBER
 void PixelNumber::setup() {
-  this->pref_ = global_preferences->make_preference<float>(this->get_preference_hash());
+  this->pref_ = this->make_entity_preference<float>();
   float v;
   if (!this->pref_.load(&v))
     v = this->light_->get_param(this->which_);
@@ -410,7 +410,7 @@ void PixelNumber::control(float value) {
 
 #ifdef USE_SELECT
 void PixelPalette::setup() {
-  this->pref_ = global_preferences->make_preference<float>(this->get_preference_hash());
+  this->pref_ = this->make_entity_preference<float>();
   float v;
   size_t index = this->light_->get_palette_index();
   if (this->pref_.load(&v) && v >= 0.0f && static_cast<size_t>(v) < this->size())

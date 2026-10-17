@@ -15,6 +15,7 @@ from esphome.components.light.effects import register_rgb_effect
 from esphome.components.light.types import LightEffect
 import esphome.config_validation as cv
 from esphome.const import (
+    CONF_DEVICE_ID,
     CONF_EFFECTS,
     CONF_ID,
     CONF_NAME,
@@ -179,19 +180,19 @@ CONFIG_SCHEMA = cv.All(
             # a plain pixel stream from the controller doesn't take the strip back from this light's effect
             cv.Optional(CONF_LOCK, default=False): cv.boolean,
             # the white of RGBW and RGBCCT strips from the colour: off, accurate (taken out of R G B), bright
-            cv.Optional(CONF_AUTO_WHITE, default="accurate"): cv.one_of(*[k for k in AUTO_WHITE if k != "default"], lower=True),
+            cv.Optional(CONF_AUTO_WHITE): cv.one_of(*[k for k in AUTO_WHITE if k != "default"], lower=True),
             cv.Optional(CONF_COLD_WHITE_SHARE): cv.percentage,   # WS2805: the share of the cold white (default even)
-            cv.Optional(CONF_MAX_FPS, default=0): cv.int_range(min=0, max=1000),   # 0 = as many as the line allows
+            cv.Optional(CONF_MAX_FPS): cv.int_range(min=0, max=1000),   # 0 = as many as the line allows
             # the strip's LED current per channel at full (for the current limit), and the limit: 0 = the link's
-            cv.Optional(CONF_LED_CURRENT, default="20mA"): cv.All(cv.current, cv.Range(min=0.001, max=0.1)),
-            cv.Optional(CONF_CURRENT_LIMIT, default=0): cv.Any(
+            cv.Optional(CONF_LED_CURRENT): cv.All(cv.current, cv.Range(min=0.001, max=0.1)),
+            cv.Optional(CONF_CURRENT_LIMIT): cv.Any(
                 cv.one_of(0), cv.All(cv.current, cv.Range(min=0.1, max=65.0))
             ),
             # an effect continuing over several strips: this strip starts at virtual_offset of a virtual strip
-            cv.Optional(CONF_VIRTUAL_OFFSET, default=0): cv.int_range(min=0, max=65535),
-            cv.Optional(CONF_VIRTUAL_LENGTH, default=0): cv.int_range(min=0, max=65535),
+            cv.Optional(CONF_VIRTUAL_OFFSET): cv.int_range(min=0, max=65535),
+            cv.Optional(CONF_VIRTUAL_LENGTH): cv.int_range(min=0, max=65535),
             # standalone: what the receiver does without the controller (stored with the light's state)
-            cv.Optional(CONF_STANDALONE, default={}): cv.Schema(
+            cv.Optional(CONF_STANDALONE): cv.Schema(
                 {
                     cv.Optional(CONF_POWER_ON, default=False): cv.boolean,
                     cv.Optional(CONF_ON_SIGNAL_LOSS, default=False): cv.boolean,
@@ -277,12 +278,15 @@ def _final_validate(config: ConfigType) -> ConfigType:
                 f"segment {config[CONF_SEGMENT]} of board {config[CONF_BOARD]} is used by '{other.get(CONF_NAME)}' too",
                 [CONF_SEGMENT],
             )
+        # one strip: the chip, its pixels and order every light says; the other settings (limits, white, standalone) any
+        # one light of the receiver may say, the others leave out (two that say it must agree)
         for key in (CONF_CHIP, CONF_NUM_LEDS, CONF_COLOR_ORDER, CONF_AUTO_WHITE, CONF_COLD_WHITE_SHARE, CONF_MAX_FPS,
                     CONF_LED_CURRENT, CONF_CURRENT_LIMIT, CONF_VIRTUAL_OFFSET, CONF_VIRTUAL_LENGTH, CONF_STANDALONE):
-            if other.get(key) != config.get(key):
+            both = key in (CONF_CHIP, CONF_NUM_LEDS, CONF_COLOR_ORDER) or (key in other and key in config)
+            if both and other.get(key) != config.get(key):
                 raise cv.Invalid(
                     f"{key} differs from '{other.get(CONF_NAME)}' on the same receiver: it is one strip's setting, "
-                    "give every light of the receiver the same",
+                    "say it on one light of the receiver, or the same on each",
                     [key],
                 )
     for i, eff in enumerate(config.get(CONF_EFFECTS, [])):
@@ -302,32 +306,42 @@ def _final_validate(config: ConfigType) -> ConfigType:
 FINAL_VALIDATE_SCHEMA = _final_validate
 
 
-def _receiver_config(config: ConfigType) -> list:
-    """(id, value) of CONFIG 129-139 for this strip"""
+def _receiver_config(config: ConfigType, siblings: list) -> list:
+    """(id, value) of CONFIG 129-139 for this strip. The options of a receiver's lights are one set: the first light
+    that says a setting gives it, else its default."""
+
+    def pick(key, default):
+        for c in [config] + siblings:
+            if key in c:
+                return c[key]
+        return default
+
     chip = config[CONF_CHIP]
     text, order = config[CONF_COLOR_ORDER]
-    white = AUTO_WHITE[config[CONF_AUTO_WHITE]]
-    if config.get(CONF_COLD_WHITE_SHARE) is not None:
-        white |= int(round(config[CONF_COLD_WHITE_SHARE] * 255)) << 8
-    standalone = config[CONF_STANDALONE]
+    white = AUTO_WHITE[pick(CONF_AUTO_WHITE, "accurate")]
+    share = pick(CONF_COLD_WHITE_SHARE, None)
+    if share is not None:
+        white |= int(round(share * 255)) << 8
+    standalone = pick(CONF_STANDALONE, {})
     policy = (
-        (PXP_POWER_ON if standalone[CONF_POWER_ON] else 0)
-        | (PXP_ON_LOSS if standalone[CONF_ON_SIGNAL_LOSS] else 0)
-        | (PXP_STREAM_WINS if standalone[CONF_STREAM_WINS] else 0)
+        (PXP_POWER_ON if standalone.get(CONF_POWER_ON) else 0)
+        | (PXP_ON_LOSS if standalone.get(CONF_ON_SIGNAL_LOSS) else 0)
+        | (PXP_STREAM_WINS if standalone.get(CONF_STREAM_WINS) else 0)
     )
-    limit = config[CONF_CURRENT_LIMIT]
+    timeout = standalone.get(CONF_SIGNAL_LOSS_TIMEOUT)
+    limit = pick(CONF_CURRENT_LIMIT, 0)
     return [
         (CFG_CHIP, CHIPS[chip][3]),
         (CFG_ORDER, order),
         (CFG_PIXELS, config[CONF_NUM_LEDS]),
-        (CFG_FPS, config[CONF_MAX_FPS]),
-        (CFG_MA_CH, int(round(config[CONF_LED_CURRENT] * 10000))),   # 0.1 mA
+        (CFG_FPS, pick(CONF_MAX_FPS, 0)),
+        (CFG_MA_CH, int(round(pick(CONF_LED_CURRENT, 0.020) * 10000))),   # 0.1 mA
         (CFG_LIMIT_MA, 0 if limit == 0 else int(round(limit * 1000))),
         (CFG_WHITE, white),
-        (CFG_VOFFSET, config[CONF_VIRTUAL_OFFSET]),
-        (CFG_VLENGTH, config[CONF_VIRTUAL_LENGTH]),
+        (CFG_VOFFSET, pick(CONF_VIRTUAL_OFFSET, 0)),
+        (CFG_VLENGTH, pick(CONF_VIRTUAL_LENGTH, 0)),
         (CFG_POLICY, policy),
-        (CFG_LOSS_TIMEOUT, int(round(standalone[CONF_SIGNAL_LOSS_TIMEOUT].total_milliseconds / 100))),
+        (CFG_LOSS_TIMEOUT, 30 if timeout is None else int(round(timeout.total_milliseconds / 100))),
     ]
 
 
@@ -339,9 +353,18 @@ def _flags(config: ConfigType) -> int:
     )
 
 
+def _entity_conf(config: ConfigType, label: str, suffix: str) -> dict:
+    """An entity of the light: on the light's device (device_id) it is just `label` (Home Assistant puts the device's
+    name in front), else the light's name and the label"""
+    base = config.get(CONF_NAME) or ""
+    conf = {CONF_ID: f"{config[CONF_ID]}_{suffix}", CONF_NAME: label if CONF_DEVICE_ID in config or not base else f"{base} {label}"}
+    if CONF_DEVICE_ID in config:
+        conf[CONF_DEVICE_ID] = config[CONF_DEVICE_ID]
+    return conf
+
+
 async def _entity_number(var, config, which: int, label: str, icon: str, default: int):
-    name = f"{config[CONF_NAME]} {label}"
-    conf = {CONF_ID: f"{config[CONF_ID]}_{label.lower().replace(' ', '_')}", CONF_NAME: name}
+    conf = _entity_conf(config, label, label.lower().replace(" ", "_"))
     ent = await number.new_number(
         number.number_schema(PixelNumber, icon=icon, entity_category=ENTITY_CATEGORY_CONFIG)(conf),
         min_value=0,
@@ -362,7 +385,12 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_segment(config[CONF_SEGMENT]))
     cg.add(var.set_range(config[CONF_SEGMENT_START], config[CONF_SEGMENT_LENGTH]))
     cg.add(var.set_flags(_flags(config)))
-    for cfg_id, value in _receiver_config(config):
+    siblings = [
+        c for c in _pixel_lights(CORE.config)
+        if c[CONF_ID] != config[CONF_ID]
+        and (str(c[CONF_DIG2ANALOG_ULTRA_ID]), c[CONF_BOARD]) == (str(config[CONF_DIG2ANALOG_ULTRA_ID]), config[CONF_BOARD])
+    ]
+    for cfg_id, value in _receiver_config(config, siblings):
         cg.add(var.set_receiver_config(cfg_id, cg.RawExpression(value) if isinstance(value, str) else value))
     cat = catalogue.load()
     cg.add(var.set_solid_id(cat.solid_id))
@@ -384,7 +412,7 @@ async def to_code(config: ConfigType) -> None:
     if config[CONF_CONTROLS]:
         await _entity_number(var, config, 0, "Speed", "mdi:speedometer", config[CONF_SPEED])
         await _entity_number(var, config, 1, "Intensity", "mdi:gauge", config[CONF_INTENSITY])
-        conf = {CONF_ID: f"{config[CONF_ID]}_palette", CONF_NAME: f"{config[CONF_NAME]} Palette"}
+        conf = _entity_conf(config, "Palette", "palette")
         ent = await select.new_select(
             select.select_schema(PixelPalette, icon="mdi:palette", entity_category=ENTITY_CATEGORY_CONFIG)(conf),
             options=cat.palette_options(),
@@ -397,7 +425,7 @@ async def to_code(config: ConfigType) -> None:
         await _entity_number(var, config, 3, "Custom 2", "mdi:tune", config[CONF_CUSTOM2])
     hub_conf = next(h for h in CORE.config.get("dig2analog_ultra", []) if h[CONF_ID] == config[CONF_DIG2ANALOG_ULTRA_ID])
     if config[CONF_STATUS] and hub_conf.get(CONF_TELEMETRY):
-        conf = {CONF_ID: f"{config[CONF_ID]}_status", CONF_NAME: f"{config[CONF_NAME]} Local effect status"}
+        conf = _entity_conf(config, "Local effect status", "status")
         ts = await text_sensor.new_text_sensor(
             text_sensor.text_sensor_schema(icon="mdi:led-strip-variant", entity_category=ENTITY_CATEGORY_DIAGNOSTIC)(conf)
         )

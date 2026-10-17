@@ -858,10 +858,11 @@ class Scheduler {
   /// it empties.
   static_assert(ULTRA_CFG_COUNT <= 32, "Board::cfg_have holds a bit per CONFIG id");
   /// the refresh list: CONFIG pages, then per light DEF, OPT, SET, EFFECT, SCENE, SCENE_EFFECT and its STEPs
-  /// ... then, at the end of the list (so the order of everything before is the one the sender library has), each
-  /// light's PIXEL_FX and the hardware-specific CONFIG pages (nothing there for a board without them)
-  static constexpr uint16_t REFRESH_MAIN = CONFIG_PAGES + ULTRA_LIGHTS * (6 + ULTRA_MAX_STEPS);
-  static constexpr uint16_t REFRESH_ITEMS = REFRESH_MAIN + ULTRA_LIGHTS + HW_PAGES;
+  /// ... each light's PIXEL_FX after its STEPs (the sender library's order too: rank 7), and the hardware-specific
+  /// CONFIG pages at the end (nothing there for a board without them: the order of everything else is unchanged)
+  static constexpr uint16_t REFRESH_PER_LIGHT = 7 + ULTRA_MAX_STEPS;
+  static constexpr uint16_t REFRESH_MAIN = CONFIG_PAGES + ULTRA_LIGHTS * REFRESH_PER_LIGHT;
+  static constexpr uint16_t REFRESH_ITEMS = REFRESH_MAIN + HW_PAGES;
   static_assert(REFRESH_ITEMS <= 255, "Board::rr holds a refresh position");
   /// The hardware-specific CONFIG ids (129-139, ULTRA_CFG_PX_*) of a board that has them, in HW_PAGES slots
   struct HwConfig {
@@ -1111,7 +1112,7 @@ class Scheduler {
   /// 3 complete rounds after the board's init, a resync or a change of its lights, then in every 4th round only
   /// (rounds 0, 1, 2, 6, 10, ...); the used lights' items in every round. A round ends where the list starts again.
   bool take_refresh_(Board &b, uint8_t *s, size_t slot, int64_t now_us) {
-    const uint16_t per_light = 6 + ULTRA_MAX_STEPS;
+    const uint16_t per_light = REFRESH_PER_LIGHT;
     const uint16_t total = REFRESH_ITEMS;
     for (uint16_t tries = 0; tries < total; tries++) {
       const uint16_t pos = b.rr;
@@ -1120,12 +1121,8 @@ class Scheduler {
       if (b.rr == 0)
         b.rot = b.rot < 6 ? static_cast<uint8_t>(b.rot + 1) : 3;   // a round done: 0..6, then 3, 4, 5, 6, 3, ...
       const Item *it = nullptr;
-      if (pos >= REFRESH_MAIN) {   // the tail: PIXEL_FX per light, then the hardware-specific CONFIG pages
-        const uint16_t k = pos - REFRESH_MAIN;
-        if (k < ULTRA_LIGHTS)
-          it = b.light[k] ? b.light[k]->pixfx.get() : nullptr;
-        else
-          it = b.hw ? &b.hw->page[k - ULTRA_LIGHTS] : nullptr;
+      if (pos >= REFRESH_MAIN) {   // the tail: the hardware-specific CONFIG pages
+        it = b.hw ? &b.hw->page[pos - REFRESH_MAIN] : nullptr;
       } else if (pos < CONFIG_PAGES) {
         it = &b.config[pos];
       } else {
@@ -1144,6 +1141,7 @@ class Scheduler {
              : k == 3 ? &li.effect
              : k == 4 ? &li.scene
              : k == 5 ? &li.scene_fx
+             : k == REFRESH_PER_LIGHT - 1 ? li.pixfx.get()
                       : (k - 6u < li.steps.size() ? &li.steps[k - 6] : nullptr);
       }
       if (it == nullptr || !it->valid)

@@ -300,7 +300,7 @@ class Scheduler {
     return board < this->boards_.size() && id < ULTRA_CFG_COUNT &&
            (this->boards_[board].cfg_have & (1u << id)) != 0;
   }
-  /// A hardware-specific setting (CONFIG ids 129-139: the Ultra-Digital receiver's local pixel effects, ULTRA_CFG_PX_*).
+  /// A hardware-specific setting (CONFIG ids 129-140: the Ultra-Digital receiver's local pixel effects, ULTRA_CFG_PX_*).
   /// Like set_config(): sent with flush_config(), identical values are not re-sent, repeated by the refresh.
   void set_hw_config(uint16_t board, uint8_t id, uint16_t value) {
     if (board >= this->boards_.size() || id < ULTRA_CFG_PX_FIRST || id >= ULTRA_CFG_PX_FIRST + ULTRA_CFG_PX_COUNT)
@@ -833,7 +833,7 @@ class Scheduler {
 
  protected:
   static constexpr uint8_t CONFIG_PAGES = 3;
-  static constexpr uint8_t HW_PAGES = (ULTRA_CFG_PX_COUNT + 8) / 9;   // CONFIG 129-139 (ULTRA_CFG_PX_*): 2 slots
+  static constexpr uint8_t HW_PAGES = (ULTRA_CFG_PX_COUNT + 8) / 9;   // CONFIG 129-140 (ULTRA_CFG_PX_*): 2 slots
   static_assert(1 + CONFIG_PAGES * 9 >= ULTRA_CFG_COUNT, "every official CONFIG id in a CONFIG slot");
 
   struct Item {
@@ -872,7 +872,7 @@ class Scheduler {
   static constexpr uint16_t REFRESH_MAIN = CONFIG_PAGES + ULTRA_LIGHTS * REFRESH_PER_LIGHT;
   static constexpr uint16_t REFRESH_ITEMS = REFRESH_MAIN + HW_PAGES;
   static_assert(REFRESH_ITEMS <= 255, "Board::rr holds a refresh position");
-  /// The hardware-specific CONFIG ids (129-139, ULTRA_CFG_PX_*) of a board that has them, in HW_PAGES slots
+  /// The hardware-specific CONFIG ids (129-140, ULTRA_CFG_PX_*) of a board that has them, in HW_PAGES slots
   struct HwConfig {
     Item page[HW_PAGES];
     uint16_t cfg[ULTRA_CFG_PX_COUNT]{};
@@ -884,7 +884,7 @@ class Scheduler {
     std::vector<Cmd> queue;
     std::unique_ptr<LightItems> light[ULTRA_LIGHTS];
     uint16_t cfg[ULTRA_CFG_COUNT]{};
-    std::unique_ptr<HwConfig> hw;   // CONFIG 129-139 (only a board that has them: an Ultra-Digital receiver)
+    std::unique_ptr<HwConfig> hw;   // CONFIG 129-140 (only a board that has them: an Ultra-Digital receiver)
     uint8_t rr{0};    // the refresh list's next position (REFRESH_ITEMS of them)
     uint8_t rot{0};   // complete refresh rounds since its init / a resync / a change of its lights: 0..6, then 3..6
     uint32_t cfg_have{0};   // the CONFIG ids set (bit per id)

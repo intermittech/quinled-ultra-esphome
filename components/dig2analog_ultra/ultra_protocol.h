@@ -693,8 +693,9 @@ enum {
     ULTRA_CFG_PX_SMOOTH = 141,         /* pixel smoothing (ULTRA_PXS_*): how the receiver takes its colour to the strip's 8 bits. The 16-bit paths do the
                                           gamma, the brightness and the auto-white at 16 bits and round at the end; a dither adds an ordered, stateless
                                           threshold (host frame index and pixel index) first, so receivers on one grid make the same bytes and the average
-                                          over 256 frames is the 16-bit value. 0 AUTO (the default: 16 bits, dithered at 50 frames a second or more, rounded
-                                          below), 1 ROUND, 2 DITHER, 3 OFF (the 8-bit path of 0.2.8) */
+                                          over 256 frames is the 16-bit value. 0 AUTO (the default: 16 bits; at 50 frames a second or more it dithers the channels at
+                                          wire level 4 and up and rounds the dimmer ones, below 50 frames it rounds: ULTRA_PXS_AUTO_FPS and ULTRA_PXS_AUTO_MIN_LEVEL,
+                                          both bench items), 1 ROUND, 2 DITHER (all levels), 3 OFF (the 8-bit path of 0.6.12) */
     ULTRA_CFG_PX_FIRST = 129,
     ULTRA_CFG_PX_COUNT = 13,           /* ids 129 .. 141 */
 };
@@ -844,8 +845,9 @@ enum {
 #define ULTRA_PXS_OFF           3u
 #define ULTRA_PXS_AUTO_FPS      50u    /* AUTO dithers from this frame rate (the frame grid's, or the measured one without a grid) */
 #ifndef ULTRA_PXS_AUTO_MIN_LEVEL
-#define ULTRA_PXS_AUTO_MIN_LEVEL 0u    /* ... and only a channel whose wire level is at least this (AUTO rounds the dimmer ones: a dither at the bottom flips a pixel between
-                                          levels 1 and 0 at the frame rate, a visible shimmer at low rates); 0 = every channel (the packer's code for it is then left out).
+#define ULTRA_PXS_AUTO_MIN_LEVEL 4u    /* ... and only a channel whose wire level is at least this (AUTO rounds the dimmer ones: a dither at the bottom flips a pixel between
+                                          levels 1 and 0 at the frame rate, a visible shimmer at low rates; at level 4 one step is at most 25 % of the light); 0 = every
+                                          channel (the packer's code for the level is then left out). Bench item, like the frame rate above
                                           ROUND / DITHER ignore it */
 #endif
 #define ULTRA_PXLM_AUTO         0u     /* CONFIG 140 values */

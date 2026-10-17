@@ -98,7 +98,8 @@ CFG_VOFFSET, CFG_VLENGTH, CFG_POLICY, CFG_LOSS_TIMEOUT = 136, 137, 138, 139
 # (in a strip's data path, the hub's pixels pass), chain = the last board of a normal Ultra line
 LINE_MODES = {"auto": 0, "stream": 1, "chain": 2}
 # CONFIG 141, the pixel smoothing (ULTRA_PXS_*): how the receiver takes its colour to the strip's 8 bits. auto (the default) = 16 bit gamma /
-# brightness / auto-white, dithered at 50 frames a second or more and rounded below; round; dither; off = the 8-bit path of protocol 0.2.8
+# brightness / auto-white; at 50 frames a second or more it dithers the channels at wire level 4 and up (rounds the dimmer ones and everything below 50
+# frames; both numbers are bench items); round; dither (all levels); off = the 8-bit path of 0.6.12
 CFG_SMOOTH = 141
 PIXEL_SMOOTHING = {"auto": 0, "round": 1, "dither": 2, "off": 3}
 
@@ -201,7 +202,8 @@ CONFIG_SCHEMA = cv.All(
             # the white of RGBW and RGBCCT strips from the colour: off, accurate (taken out of R G B), bright
             cv.Optional(CONF_AUTO_WHITE): cv.one_of(*[k for k in AUTO_WHITE if k != "default"], lower=True),
             cv.Optional(CONF_COLD_WHITE_SHARE): cv.percentage,   # WS2805: the share of the cold white (default even)
-            # smooth dimming (CONFIG 141): auto (default), round, dither or off (the 8-bit path); a receiver of an older firmware ignores it
+            # smooth dimming (CONFIG 141): auto (default: 16 bit, dithered from 50 fps and wire level 4, bench items), round, dither or off (the 8-bit path);
+            # a receiver of an older firmware ignores it
             cv.Optional(CONF_PIXEL_SMOOTHING): _smoothing,
             cv.Optional(CONF_MAX_FPS): cv.int_range(min=0, max=1000),   # 0 = as many as the line allows
             # the strip's LED current per channel at full (for the current limit), and the limit: 0 = the link's

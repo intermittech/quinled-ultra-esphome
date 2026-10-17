@@ -68,7 +68,9 @@ class PixelFxEffect final : public light::LightEffect {
 
 /// A light on one segment of an Ultra-Digital receiver's strip (the QuinLED Diff-Power system's digital receiver): the
 /// receiver makes the pixels itself (PIXEL_FX), ESPHome says what: the effect (the catalogue), its colours, speed,
-/// intensity and palette, brightness and the transition. Exclusive with a streaming light on the same strip.
+/// intensity and palette, brightness and the transition. On a digital port exclusive with a streaming light on the same
+/// strip; on a normal Ultra line (chain mode: the receiver is the line's last board, protocol 0.2.9) its PIXEL_FX and CONFIG
+/// are slots of that line like any board's, nothing is streamed and nothing is handed back.
 class PixelLight final : public light::LightOutput,
                          public Component,
                          public PixelSource,
@@ -89,6 +91,12 @@ class PixelLight final : public light::LightOutput,
   void set_strip_frame_us(uint32_t us) { this->strip_frame_us_ = us; }
   /// the receiver's settings (CONFIG 129-139: one set for the strip, every light of the board must agree)
   void set_receiver_config(uint8_t id, uint16_t value) { this->cfg_.push_back({id, value}); }
+  /// CONFIG 140, the line mode (ULTRA_PXLM_*) the YAML says, and the mode the line needs (STREAM on a digital port, CHAIN on
+  /// a normal Ultra line). With telemetry the hub sends it once the receiver's IDENTITY shows ULTRA_HWCAP_CHAIN.
+  void set_line_mode(uint8_t mode, uint8_t expected) {
+    this->line_mode_ = mode;
+    this->line_expected_ = expected;
+  }
   void set_solid_id(uint8_t id) { this->solid_ = id; }
   void set_palette_ids(const std::vector<uint8_t> &ids) { this->palette_ids_ = ids; }
   void set_defaults(uint8_t speed, uint8_t intensity, uint8_t palette_index, uint8_t custom1, uint8_t custom2) {
@@ -113,6 +121,8 @@ class PixelLight final : public light::LightOutput,
   void add_effect(PixelFxEffect *effect) { this->effects_.push_back(effect); }
 #ifdef USE_TEXT_SENSOR
   void set_status_sensor(text_sensor::TextSensor *s) { this->status_ = s; }
+  /// the receiver's line (once per receiver, on a normal Ultra line)
+  void set_line_sensor(text_sensor::TextSensor *s) { this->line_ = s; }
 #endif
 
   // Component
@@ -176,7 +186,10 @@ class PixelLight final : public light::LightOutput,
   void release_();                               // the hub's pixels pass (PIXEL_FX effect 0)
   void queue_fx_(const PixelFxTracker::Out &o);  // a PIXEL_FX to the receiver (and the hub's digital port)
   void pixel_page_();                            // page 0x81 news
+  void send_line_mode_();                        // CONFIG 140 to the receiver
+  void line_identity_();                         // the receiver's IDENTITY is known (or it is not heard): CONFIG 140
   std::string status_text_() const;
+  std::string line_text_() const;
   uint8_t shown_effect_();                       // the effect to send: the chosen one, Solid when the receiver lacks it
   uint16_t palette_id_() const {
     return this->palette_index_ < this->palette_ids_.size() ? this->palette_ids_[this->palette_index_]
@@ -200,6 +213,11 @@ class PixelLight final : public light::LightOutput,
   uint32_t standby_after_ms_{0};
   uint32_t store_after_ms_{0};
   uint32_t strip_frame_us_{0};
+  uint8_t line_mode_{ULTRA_PXLM_AUTO}, line_expected_{ULTRA_PXLM_STREAM};
+  bool line_sent_{false};              // CONFIG 140 is with the hub
+  bool line_waiting_{false};           // ... held back until IDENTITY says whether the receiver has ULTRA_HWCAP_CHAIN
+  uint32_t line_wait_ms_{0};           // ... since
+  std::string line_last_, line_issue_logged_;
 
   PixelFxTracker track_;               // what the segment was told, the phase anchor, lit
   bool dirty_{false};                  // something to send in the next loop
@@ -212,6 +230,7 @@ class PixelLight final : public light::LightOutput,
   std::string status_last_, missing_logged_;
 #ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *status_{nullptr};
+  text_sensor::TextSensor *line_{nullptr};
 #endif
 
   static std::vector<PixelLight *> registry_;

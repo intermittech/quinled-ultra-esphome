@@ -23,6 +23,9 @@ std::vector<PixelLight *> PixelLight::registry_;
 static constexpr int64_t REANCHOR_US = 20LL * 86400 * 1000000;
 /// a change of speed, colours, ... ramps over this long on the receiver
 static constexpr uint32_t PARAM_RAMP_MS = 250;
+/// CONFIG 140 waits this long for the receiver's IDENTITY (its ULTRA_HWCAP_CHAIN); a receiver not heard by then gets it
+/// unchecked (it is behind a board that does not pass answers on, or off): a receiver without the id skips it
+static constexpr uint32_t LINE_WAIT_MS = 60000;
 
 PixelLight *PixelLight::find(light::LightOutput *output) {
   for (auto *l : registry_) {
@@ -112,6 +115,17 @@ void PixelLight::setup_state(light::LightState *state) {
 void PixelLight::setup() {
   for (const Cfg &c : this->cfg_)
     this->hub_->set_pixel_config(this->board_, c.id, c.value);
+  // CONFIG 140, the line mode: the hub asks the receiver what it can first (IDENTITY: ULTRA_HWCAP_CHAIN) when it can hear it
+  bool ask = false;
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  ask = this->hub_->has_telemetry() && this->board_ < this->hub_->telemetry().receivers();
+#endif
+  if (ask) {
+    this->line_waiting_ = true;
+    this->line_wait_ms_ = millis();
+  } else {
+    this->send_line_mode_();
+  }
   this->hub_->pixel_config_flush();
   this->hub_->add_pixel_light(this);
   for (light::LightState *other : this->others_)
@@ -121,7 +135,8 @@ void PixelLight::setup() {
     this->page_hooked_ = true;
     this->hub_->add_on_receiver_callback(this->board_, [this](uint32_t updates) {
       constexpr uint32_t PX = (1u << dig2analog_ultra::TP_PX_STATE) | (1u << dig2analog_ultra::TP_PX_EFFECTS) |
-                              (1u << dig2analog_ultra::TP_PX_PALETTES) | (1u << dig2analog_ultra::TP_FEATURES) |
+                              (1u << dig2analog_ultra::TP_PX_PALETTES) | (1u << dig2analog_ultra::TP_PX_LINE) |
+                              (1u << dig2analog_ultra::TP_IDENTITY) | (1u << dig2analog_ultra::TP_FEATURES) |
                               dig2analog_ultra::TU_AVAILABILITY;
       if (updates & PX)
         this->pixel_page_();
@@ -137,6 +152,9 @@ void PixelLight::dump_config() {
                 static_cast<unsigned>(this->effects_.size()));
   for (const Cfg &c : this->cfg_)
     ESP_LOGCONFIG(TAG, "  CONFIG %u = %u", c.id, c.value);
+  ESP_LOGCONFIG(TAG, "  CONFIG %u = %u (line mode: %s, the line needs %s)", ULTRA_CFG_PX_LINE_MODE, this->line_mode_,
+                this->line_mode_ == ULTRA_PXLM_AUTO ? "auto" : dig2analog_ultra::pixel_mode_name(this->line_mode_),
+                dig2analog_ultra::pixel_mode_name(this->line_expected_));
   for (light::LightState *o : this->others_)
     ESP_LOGCONFIG(TAG, "  exclusive with '%s'", o->get_name().c_str());
 }
@@ -227,6 +245,13 @@ void PixelLight::loop() {
       this->dirty_ = true;
     }
   }
+  if (this->line_waiting_ && millis() - this->line_wait_ms_ >= LINE_WAIT_MS) {
+    // not heard in a minute: it may be behind a board that does not pass answers on; send it unchecked
+    ESP_LOGI(TAG, "'%s': the receiver on board %u was not heard: CONFIG 140 (the line mode) sent without its capabilities",
+             this->state_->get_name().c_str(), this->board_);
+    this->send_line_mode_();
+    this->hub_->pixel_config_flush();
+  }
   if (this->dirty_)
     this->send_();
   if (this->track_.reanchor_due(this->hub_->start_time_us(this->board_))) {
@@ -311,6 +336,47 @@ void PixelLight::set_color3(const uint8_t *rgb) {
 }
 
 // ------------------------------------------------------------------------------------------------- page 0x81
+// CONFIG 140 with the hub (it repeats it with the other CONFIG ids, a receiver that restarts or is replaced gets it again)
+void PixelLight::send_line_mode_() {
+  this->line_waiting_ = false;
+  this->line_sent_ = true;
+  this->hub_->set_pixel_config(this->board_, ULTRA_CFG_PX_LINE_MODE, this->line_mode_);
+}
+
+// The receiver's IDENTITY is known: CONFIG 140 only if it has the mode (an older receiver is always a stream one: nothing to say)
+void PixelLight::line_identity_() {
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  if (!this->line_waiting_)
+    return;
+  const dig2analog_ultra::ReceiverData &d = this->hub_->telemetry().data(this->board_);
+  if (!d.have_identity)
+    return;
+  if (d.hw_caps & ULTRA_HWCAP_CHAIN) {
+    this->send_line_mode_();
+    this->hub_->pixel_config_flush();
+    return;
+  }
+  this->line_waiting_ = false;
+  this->line_sent_ = true;   // (never: this receiver has no CONFIG 140)
+  if (this->line_expected_ == ULTRA_PXLM_CHAIN) {
+    ESP_LOGW(TAG, "'%s': the receiver on board %u has no chain mode (ULTRA_HWCAP_CHAIN): it cannot run on a normal Ultra "
+             "line, update its firmware; CONFIG 140 is not sent", this->state_->get_name().c_str(), this->board_);
+  }
+#endif
+}
+
+std::string PixelLight::line_text_() const {
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  if (!this->hub_->has_telemetry() || this->board_ >= this->hub_->telemetry().receivers())
+    return "No telemetry";
+  const dig2analog_ultra::ReceiverData &d = this->hub_->telemetry().data(this->board_);
+  return dig2analog_ultra::pixel_line_status(d.have_identity, d.hw_caps, this->hub_->telemetry().pixel(this->board_),
+                                             this->line_expected_);
+#else
+  return "No telemetry";
+#endif
+}
+
 std::string PixelLight::status_text_() const {
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   if (!this->hub_->has_telemetry() || this->board_ >= this->hub_->telemetry().receivers())
@@ -323,7 +389,11 @@ std::string PixelLight::status_text_() const {
     return "No local effects (firmware too old)";
   if (!ps.have_state)
     return "Waiting for the receiver";
-  const char *mode = ps.mode == ULTRA_PXM_LOCAL ? "Local" : ps.mode == ULTRA_PXM_STANDALONE ? "Standalone" : "Stream";
+  // (on a normal Ultra line nothing is streamed: no effect running means the strip is dark)
+  const char *mode = ps.mode == ULTRA_PXM_LOCAL ? "Local"
+                     : ps.mode == ULTRA_PXM_STANDALONE ? "Standalone"
+                     : this->line_expected_ == ULTRA_PXLM_CHAIN ? "Off"
+                                                                : "Stream";
   std::string t = mode;
   const uint8_t id = this->segment_ < ULTRA_PX_SEGMENTS ? ps.running[this->segment_] : 0;
   if (ps.mode != ULTRA_PXM_STREAM && id != 0) {
@@ -360,6 +430,7 @@ std::string PixelLight::status_text_() const {
 
 void PixelLight::pixel_page_() {
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  this->line_identity_();
   const dig2analog_ultra::ReceiverData &d = this->hub_->telemetry().data(this->board_);
   const PixelState &ps = this->hub_->telemetry().pixel(this->board_);
   if (d.have_identity && !(d.hw_caps & ULTRA_HWCAP_PIXEL_FX) && !this->warned_cap_) {
@@ -385,12 +456,33 @@ void PixelLight::pixel_page_() {
     if (!ps.has_effect(this->effect_) && !this->track_.released())
       this->request_send_();   // (shown_effect_: Solid)
   }
+  // the receiver's line (a normal Ultra line only: the hub asks for it there): its counters at verbose level, what is wrong
+  // with it once in the log
+  if (ps.line.have) {
+    ESP_LOGV(TAG, "'%s': board %u line: config %u, mode %u, flags 0x%02X, %u slots, %u Ultra frames, %u others, %u long, "
+             "%u windows, %u answered, %u missed, %u markers", this->state_->get_name().c_str(), this->board_, ps.line.config,
+             ps.line.mode, ps.line.flags, ps.line.slots, ps.line.frames, ps.line.non_ultra, ps.line.long_frames,
+             ps.line.windows, ps.line.answers, ps.line.missed, ps.line.markers);
+  }
+  const std::string issues = dig2analog_ultra::pixel_line_issues(ps.line, this->line_expected_);
+  if (issues != this->line_issue_logged_) {
+    this->line_issue_logged_ = issues;
+    if (!issues.empty())
+      ESP_LOGW(TAG, "'%s': board %u: %s", this->state_->get_name().c_str(), this->board_, issues.c_str());
+  }
 #ifdef USE_TEXT_SENSOR
   if (this->status_ != nullptr) {
     const std::string t = this->status_text_();
     if (t != this->status_last_) {
       this->status_last_ = t;
       this->status_->publish_state(t);
+    }
+  }
+  if (this->line_ != nullptr) {
+    const std::string t = this->line_text_();
+    if (t != this->line_last_) {
+      this->line_last_ = t;
+      this->line_->publish_state(t);
     }
   }
 #endif

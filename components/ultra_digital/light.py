@@ -3,6 +3,10 @@
 The effect list is the protocol's catalogue (generated at compile time from pixel_fx_catalogue.json); Speed,
 Intensity and Palette are entities of the light; c2, c3 and the extra values go through the ultra_digital.effect_params
 action. ESPHome's transition length goes to the receiver, which ramps brightness and colours itself.
+
+The receiver is on one of two kinds of line: a digital port (digital: on the data line; the receiver sits in the strip's
+data path, mode stream) or a normal Ultra line as its last board (chain mode, protocol 0.2.9). `mode:` says which
+(CONFIG 140); auto lets the line decide.
 """
 
 import logging
@@ -76,6 +80,7 @@ CONF_POWER_ON = "power_on"
 CONF_ON_SIGNAL_LOSS = "on_signal_loss"
 CONF_STREAM_WINS = "stream_wins"
 CONF_SIGNAL_LOSS_TIMEOUT = "signal_loss_timeout"
+CONF_MODE = "mode"
 CONF_STORE_AFTER = "store_after"
 CONF_STANDBY_AFTER = "standby_after"
 CONF_EXCLUSIVE_WITH = "exclusive_with"
@@ -88,6 +93,9 @@ CONF_CATALOGUE_EFFECTS = "catalogue_effects"
 # CONFIG ids of the receiver's settings (ultra_protocol.h ULTRA_CFG_PX_*)
 CFG_CHIP, CFG_ORDER, CFG_PIXELS, CFG_FPS, CFG_MA_CH, CFG_LIMIT_MA, CFG_WHITE = 129, 130, 131, 132, 133, 134, 135
 CFG_VOFFSET, CFG_VLENGTH, CFG_POLICY, CFG_LOSS_TIMEOUT = 136, 137, 138, 139
+# CONFIG 140, the line mode (ULTRA_PXLM_*): auto = the receiver decides once per power-up, stream = a digital port's receiver
+# (in a strip's data path, the hub's pixels pass), chain = the last board of a normal Ultra line
+LINE_MODES = {"auto": 0, "stream": 1, "chain": 2}
 # the auto-white modes (ULTRA_PXW_*)
 AUTO_WHITE = {"default": 0, "off": 1, "accurate": 2, "bright": 3}
 # ULTRA_PXF_* (PIXEL_FX FLAGS)
@@ -191,6 +199,10 @@ CONFIG_SCHEMA = cv.All(
             # an effect continuing over several strips: this strip starts at virtual_offset of a virtual strip
             cv.Optional(CONF_VIRTUAL_OFFSET): cv.int_range(min=0, max=65535),
             cv.Optional(CONF_VIRTUAL_LENGTH): cv.int_range(min=0, max=65535),
+            # where the receiver sits (CONFIG 140; one setting for the receiver, any one of its lights may say it, the others
+            # leave it out or agree): chain = the last board of a normal Ultra line (no digital: on the data line), stream =
+            # in a pixel strip's data path (digital: on the data line), auto (the default) = the line decides
+            cv.Optional(CONF_MODE): cv.one_of(*LINE_MODES, lower=True),
             # standalone: what the receiver does without the controller (stored with the light's state)
             cv.Optional(CONF_STANDALONE): cv.Schema(
                 {
@@ -227,7 +239,8 @@ CONFIG_SCHEMA = cv.All(
             # the entities: Speed, Intensity and Palette of the light (controls: false leaves them out), Custom 1 / 2
             cv.Optional(CONF_CONTROLS, default=True): cv.boolean,
             cv.Optional(CONF_CUSTOM_CONTROLS, default=False): cv.boolean,
-            # what the receiver reports (page 0x81, with the line's telemetry): mode, effect, frame rate, load
+            # what the receiver reports (page 0x81, with the line's telemetry): mode, effect, frame rate, load; on a normal
+            # Ultra line (chain mode) also its line (Line status, once per receiver)
             cv.Optional(CONF_STATUS, default=True): cv.boolean,
             cv.Optional(CONF_CATALOGUE_EFFECTS, default=True): cv.boolean,
         }
@@ -245,12 +258,7 @@ def _final_validate(config: ConfigType) -> ConfigType:
     hub = next((h for h in full.get("dig2analog_ultra", []) or [] if h[CONF_ID] == config[CONF_DIG2ANALOG_ULTRA_ID]), None)
     if hub is None:
         raise cv.Invalid("the data line (dig2analog_ultra) is missing", [CONF_DIG2ANALOG_ULTRA_ID])
-    if "digital" not in hub:
-        raise cv.Invalid(
-            f"'{hub[CONF_ID]}' is not a digital port: a QuinLED Diff-Power Ultra-Digital receiver sits in a pixel "
-            "strip's data path and needs its frames behind markers; give the data line digital: (and num_boards: 1)",
-            [CONF_DIG2ANALOG_ULTRA_ID],
-        )
+    digital = "digital" in hub
     if config[CONF_BOARD] >= hub[CONF_NUM_BOARDS]:
         raise cv.Invalid(
             f"board {config[CONF_BOARD]} out of range, '{hub[CONF_ID]}' has num_boards: {hub[CONF_NUM_BOARDS]} "
@@ -258,6 +266,41 @@ def _final_validate(config: ConfigType) -> ConfigType:
             [CONF_BOARD],
         )
     mine = (str(config[CONF_DIG2ANALOG_ULTRA_ID]), config[CONF_BOARD])
+    mode = _receiver_mode(config, [c for c in _pixel_lights(full) if c[CONF_ID] != config[CONF_ID]
+                                   and (str(c[CONF_DIG2ANALOG_ULTRA_ID]), c[CONF_BOARD]) == mine])
+    if digital and mode == "chain":
+        raise cv.Invalid(
+            f"mode: chain is for a normal Ultra line: '{hub[CONF_ID]}' is a digital port (digital:), where the receiver "
+            "sits in a pixel strip's data path (mode: stream, or auto)",
+            [CONF_MODE],
+        )
+    if not digital and mode == "stream":
+        raise cv.Invalid(
+            f"mode: stream needs a digital port: '{hub[CONF_ID]}' is a normal Ultra line. A receiver in a pixel strip's "
+            "data path needs its frames behind markers (give the data line digital: and num_boards: 1); on a normal "
+            "Ultra line the receiver is its last board (mode: chain, or auto)",
+            [CONF_MODE],
+        )
+    if not digital:
+        # a chain end: nothing is forwarded (protocol 0.2.9, phase 1), so the receiver is the last board of its line, and
+        # the only Ultra-Digital receiver on it
+        last = hub[CONF_NUM_BOARDS] - 1
+        if config[CONF_BOARD] != last:
+            others = [c for c in _pixel_lights(full) if str(c[CONF_DIG2ANALOG_ULTRA_ID]) == str(hub[CONF_ID])
+                      and c[CONF_BOARD] != config[CONF_BOARD]]
+            raise cv.Invalid(
+                f"board {config[CONF_BOARD]} of '{hub[CONF_ID]}' (num_boards: {hub[CONF_NUM_BOARDS]}): an Ultra-Digital "
+                f"receiver on a normal Ultra line is its last board, board: {last} (it forwards nothing, so a board behind "
+                "it would not be reached)"
+                + (", and there is only one on a line" if others else ""),
+                [CONF_BOARD],
+            )
+        if config.get(CONF_EXCLUSIVE_WITH):
+            raise cv.Invalid(
+                "exclusive_with is for a digital port's streaming light: a receiver on a normal Ultra line shows only its "
+                "own effects, there is no pixel stream to share the strip with",
+                [CONF_EXCLUSIVE_WITH],
+            )
     for other in full.get("light", []) or []:
         if other.get("platform") == "dig2analog_ultra" and (
             str(other.get(CONF_DIG2ANALOG_ULTRA_ID)), other.get(CONF_BOARD)
@@ -281,7 +324,8 @@ def _final_validate(config: ConfigType) -> ConfigType:
         # one strip: the chip, its pixels and order every light says; the other settings (limits, white, standalone) any
         # one light of the receiver may say, the others leave out (two that say it must agree)
         for key in (CONF_CHIP, CONF_NUM_LEDS, CONF_COLOR_ORDER, CONF_AUTO_WHITE, CONF_COLD_WHITE_SHARE, CONF_MAX_FPS,
-                    CONF_LED_CURRENT, CONF_CURRENT_LIMIT, CONF_VIRTUAL_OFFSET, CONF_VIRTUAL_LENGTH, CONF_STANDALONE):
+                    CONF_LED_CURRENT, CONF_CURRENT_LIMIT, CONF_VIRTUAL_OFFSET, CONF_VIRTUAL_LENGTH, CONF_STANDALONE,
+                    CONF_MODE):
             both = key in (CONF_CHIP, CONF_NUM_LEDS, CONF_COLOR_ORDER) or (key in other and key in config)
             if both and other.get(key) != config.get(key):
                 raise cv.Invalid(
@@ -297,6 +341,13 @@ def _final_validate(config: ConfigType) -> ConfigType:
                 f"({PIXEL_FX_EFFECT}) and ESPHome's own",
                 [CONF_EFFECTS, i],
             )
+    standalone = config.get(CONF_STANDALONE) or {}
+    if not digital and standalone.get(CONF_STREAM_WINS):
+        raise cv.Invalid(
+            "stream_wins: a pixel stream taking the strip back has no meaning on a normal Ultra line (the receiver shows only "
+            "its own effects there)",
+            [CONF_STANDALONE, CONF_STREAM_WINS],
+        )
     for i, ex in enumerate(config.get(CONF_EXCLUSIVE_WITH, [])):
         if str(ex) == str(config[CONF_ID]):
             raise cv.Invalid("a light cannot be exclusive with itself", [CONF_EXCLUSIVE_WITH, i])
@@ -306,9 +357,19 @@ def _final_validate(config: ConfigType) -> ConfigType:
 FINAL_VALIDATE_SCHEMA = _final_validate
 
 
+def _receiver_mode(config: ConfigType, siblings: list) -> str:
+    """The receiver's line mode (CONFIG 140): the first light of the receiver that says it, else auto. (The lights of one
+    receiver that say it agree: _final_validate.)"""
+    for c in [config] + siblings:
+        if CONF_MODE in c:
+            return c[CONF_MODE]
+    return "auto"
+
+
 def _receiver_config(config: ConfigType, siblings: list) -> list:
-    """(id, value) of CONFIG 129-139 for this strip. The options of a receiver's lights are one set: the first light
-    that says a setting gives it, else its default."""
+    """(id, value) of CONFIG 129-139 for this strip (140, the line mode, goes on its own: it waits for the receiver's
+    capabilities). The options of a receiver's lights are one set: the first light that says a setting gives it, else its
+    default."""
 
     def pick(key, default):
         for c in [config] + siblings:
@@ -397,6 +458,11 @@ async def to_code(config: ConfigType) -> None:
     ]
     for cfg_id, value in _receiver_config(config, siblings):
         cg.add(var.set_receiver_config(cfg_id, cg.RawExpression(value) if isinstance(value, str) else value))
+    hub_conf = next(h for h in CORE.config.get("dig2analog_ultra", []) if h[CONF_ID] == config[CONF_DIG2ANALOG_ULTRA_ID])
+    digital = "digital" in hub_conf
+    # CONFIG 140 as the YAML says it (auto too: a board forced earlier goes back to deciding itself), and the mode the line
+    # needs: stream on a digital port, chain on a normal Ultra line
+    cg.add(var.set_line_mode(LINE_MODES[_receiver_mode(config, siblings)], LINE_MODES["stream" if digital else "chain"]))
     cat = catalogue.load()
     cg.add(var.set_solid_id(cat.solid_id))
     cg.add(var.set_palette_ids(cat.palette_ids()))
@@ -428,7 +494,6 @@ async def to_code(config: ConfigType) -> None:
     if config[CONF_CUSTOM_CONTROLS]:
         await _entity_number(var, config, 2, "Custom 1", "mdi:tune", config[CONF_CUSTOM1])
         await _entity_number(var, config, 3, "Custom 2", "mdi:tune", config[CONF_CUSTOM2])
-    hub_conf = next(h for h in CORE.config.get("dig2analog_ultra", []) if h[CONF_ID] == config[CONF_DIG2ANALOG_ULTRA_ID])
     if config[CONF_STATUS] and hub_conf.get(CONF_TELEMETRY):
         conf = _entity_conf(config, "Local effect status", "status")
         ts = await text_sensor.new_text_sensor(
@@ -436,3 +501,11 @@ async def to_code(config: ConfigType) -> None:
         )
         CORE.component_ids.add(conf[CONF_ID])
         cg.add(var.set_status_sensor(ts))
+        # the receiver's line (chain mode): once per receiver, on the light with its lowest segment
+        if not digital and all(config[CONF_SEGMENT] < c[CONF_SEGMENT] for c in siblings):
+            conf = _entity_conf(config, "Line status", "line")
+            ts = await text_sensor.new_text_sensor(
+                text_sensor.text_sensor_schema(icon="mdi:lan-connect", entity_category=ENTITY_CATEGORY_DIAGNOSTIC)(conf)
+            )
+            CORE.component_ids.add(conf[CONF_ID])
+            cg.add(var.set_line_sensor(ts))

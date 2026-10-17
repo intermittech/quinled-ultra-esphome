@@ -1,9 +1,11 @@
 # QuinLED Diff-Power sender with a QuinLED Diff-Power Ultra-Digital receiver on port 1: a pixel strip whose effects the
 # receiver makes itself (local pixel effects: Aurora, Rainbow, Candle, ... no pixel stream, no Wi-Fi load per pixel).
 # The light has the protocol's effect list, and Speed, Intensity and Palette as entities of its device; colour 2 and 3
-# through the ultra_digital.effect_params action. Port 2 streams pixels (an ESPHome addressable light on the same kind of
-# strip) and is exclusive with a local light only where both share a strip (see exclusive_with, wiki: Ultra-Digital
-# effects). ESP32 classic, ESP-IDF. Set the pins to your sender's wiring.
+# through the ultra_digital.effect_params action. The same strip also has an ESPHome addressable light (ultra_digital_stream:
+# its pixels go through the receiver, between the line's marker frames); the two are exclusive (exclusive_with, wiki:
+# Ultra-Digital effects): the stream stops while a local effect runs and starts again when it is switched off.
+# The line is a DIGITAL PORT (digital:): the receiver sits in the strip's data path, its frames go behind markers in latch
+# gaps the strip never sees, one receiver per port. ESP32 classic, ESP-IDF. Set the pins to your sender's wiring.
 
 substitutions:
   name: sender-1
@@ -37,7 +39,7 @@ esp32:
 external_components:
   # @main until the first release; then pin one (@v0.x.y, wiki: Installation)
   - source: github://intermittech/quinled-ultra-esphome@main
-    components: [dig2analog_ultra, diffpower, ultra_digital]
+    components: [dig2analog_ultra, diffpower, ultra_digital, ultra_digital_stream]
     # Developing the component itself? Use the local copy instead:
     # source:
     #   type: local
@@ -75,7 +77,8 @@ dig2analog_ultra:
     pin: ${port1_data}
     num_boards: 1          # one Ultra-Digital receiver per port
     rmt_symbols: 128
-    refresh_interval: 500ms   # a header at least once a second: the receiver's effect clock (the default 200 ms is fine)
+    digital:               # the receiver is in the strip's data path (markers, latch gaps, polls that leave the line)
+      reset_time: 300us    # the strip chip's latch (WS2812B 280 us and more; SK6812 80 us)
     port: port1
     telemetry:
       uart_id: rs485_1
@@ -96,7 +99,31 @@ light:
     num_leds: 300
     color_order: GRB
     default_transition_length: 1s
+    exclusive_with: garden_stream   # (the stream light below: one of the two shows the strip)
     # what the receiver does without the controller: show the light's last effect again after a power cut
     store_after: 30s
     standalone:
       power_on: true
+  # the same strip as an ESPHome addressable light: its pixels go through the receiver (no RMT channel of its own)
+  - platform: ultra_digital_stream
+    id: garden_stream
+    name: Garden strip (stream)
+    device_id: garden_strip
+    dig2analog_ultra_id: line1
+    num_leds: 300
+    chipset: ws2812
+    channel_colors: GRB
+    default_transition_length: 1s
+    effects:
+      - addressable_rainbow:
+      - pulse:
+
+button:
+  # after the receiver stopped answering (the hub polled it 3 times, 60 s later 3 more, and keeps the strip free of markers
+  # since: the Garden strip's receiver is not there, or its cable): poll it again
+  - platform: template
+    name: Retry receiver
+    entity_category: config
+    on_press:
+      - dig2analog_ultra.retry_receiver:
+          id: line1

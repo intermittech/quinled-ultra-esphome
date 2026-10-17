@@ -247,6 +247,29 @@ static void test_tracker() {
   CHECK(!t.store(1200 + 99000, 0, &so), "never without a delay");
   t.touched(5000);
   CHECK(t.store(5000 + 30000, 30000, &so), "a touch (a light change) starts the timer again");
+  // the same slot with only a new START is what the receiver takes as a seamless renewal: the 20-day renewal sends exactly
+  // that, a user's choice of the effect (again) must differ (the slot has no seed: a nonce in colour 3's blue)
+  {
+    PixelFxTracker r;
+    PixelFxTracker::Out a, b, c, d;
+    PixelLightState q = sample();
+    q.transition_ms = 0;
+    CHECK(r.update(q, true, 800, T0, 100, &a), "restart: the first send");
+    CHECK(r.update(q, true, 800, T0 + 1000000, 200, &b) && b.anchor_us == T0 + 1000000 && pixel_fx_same(a.fx, b.fx),
+          "an automatic renewal: the same slot with a new START");
+    CHECK(r.update(q, true, 800, T0 + 2000000, 300, &c, true) && c.anchor_us == T0 + 2000000 && !pixel_fx_same(b.fx, c.fx) &&
+              c.fx.c[2][2] == (b.fx.c[2][2] ^ 1) && c.fx.effect == b.fx.effect && c.fx.speed == b.fx.speed,
+          "the user chose the effect again: a new START and a slot that differs (a nonce), nothing visible changed");
+    CHECK(r.update(q, true, 800, T0 + 3000000, 400, &d, true) && !pixel_fx_same(c.fx, d.fx), "and again: it differs again");
+    q.speed = 77;
+    PixelFxTracker::Out e;
+    CHECK(r.update(q, false, 800, T0 + 3500000, 450, &e) && e.anchor_us == T0 + 3000000 && e.fx.c[2][2] == d.fx.c[2][2],
+          "a parameter change after it keeps the START and the nonce");
+    q.effect = 9;
+    PixelFxTracker::Out f;
+    CHECK(r.update(q, true, 800, T0 + 4000000, 500, &f, true) && f.fx.effect == 9 && f.fx.c[2][2] == e.fx.c[2][2],
+          "a different effect needs no nonce");
+  }
   // 20 days: a new anchor
   CHECK(!t.reanchor_due(T0 + 19LL * 86400 * 1000000) && t.reanchor_due(T0 + 61000 + PixelFxTracker::REANCHOR_US),
         "the anchor is renewed after 20 days");

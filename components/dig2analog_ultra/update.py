@@ -159,6 +159,11 @@ def _final_validate(config):
             "your own source.",
             config.get("name", hub),
         )
+    for h in full.get("dig2analog_ultra", []) or []:
+        if h[CONF_ID] == hub and "digital" in h:
+            raise cv.Invalid(
+                f"dig2analog_ultra '{hub}' is a digital port: firmware updates over its data line are not supported yet"
+            )
     same = [
         u
         for u in full.get("update", []) or []

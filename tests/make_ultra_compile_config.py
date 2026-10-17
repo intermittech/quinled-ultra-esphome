@@ -6,7 +6,8 @@ and the downlight notification pattern; tests/build/ultra/ultra-telemetry.yaml: 
 telemetry (the UART, the direction pin, every receiver sensor and text); tests/build/ultra/ultra-p4-telemetry.yaml (4
 RMT lines with telemetry on a P4), ultra-p4-parlio.yaml (16 PARLIO lanes, 4 shared UARTs),
 ultra-p4-parlio-ports.yaml (the same, each lane on a Diff-Power port), ultra-p4-parlio-lights.yaml (8 lanes at 10
-MHz, no telemetry) and ultra-digital.yaml (local pixel effects without telemetry: four segments, a streaming light, WS2805). The examples themselves:
+MHz, no telemetry) and ultra-digital.yaml (two digital ports without telemetry: four local-effect segments and a stream light on one,
+a WS2805 strip on the other). The examples themselves:
 tests/local_examples.py.
 
 Usage: .venv/Scripts/python tests/make_ultra_compile_config.py
@@ -565,9 +566,9 @@ def telemetry_config(example: str) -> str:
 
 
 DIGITAL_CONFIG = """\
-# tests/build/ultra/ultra-digital.yaml: local pixel effects without telemetry (the page 0x81 code compiled out): a line of
-# two receivers, one with four segments, one WS2805 with the custom sliders, a streaming light on the first strip
-# (exclusive), the action, a stored power-on effect
+# tests/build/ultra/ultra-digital.yaml: digital ports without telemetry (the page 0x81 code compiled out): a line with one
+# receiver and four segments, an ESPHome addressable light on the same strip (ultra_digital_stream, exclusive), the
+# actions, a stored power-on effect; a second line with a WS2805 strip and the custom sliders
 esphome:
   name: d2a-ultra-digital
 esp32:
@@ -578,7 +579,7 @@ external_components:
   - source:
       type: local
       path: ../../../components
-    components: [dig2analog_ultra, ultra_digital]
+    components: [dig2analog_ultra, ultra_digital, ultra_digital_stream]
 logger:
 api:
   encryption:
@@ -590,21 +591,31 @@ wifi:
   password: !secret wifi_password
 
 dig2analog_ultra:
-  id: ultra
-  pin: GPIO16
-  num_boards: 2
-  refresh_interval: 500ms
+  - id: ultra
+    pin: GPIO16
+    num_boards: 1
+    refresh_interval: 500ms
+    digital:
+      reset_time: 300us
+  - id: ultra_bar
+    pin: GPIO17
+    num_boards: 1
+    digital:
 
 light:
-  - platform: esp32_rmt_led_strip
+  - platform: ultra_digital_stream
     id: streamer
     name: Streamer
-    pin: GPIO18
-    num_leds: 60
+    dig2analog_ultra_id: ultra
+    num_leds: 120
     chipset: ws2812
-    rgb_order: GRB
+    channel_colors: GRB
+    effects:
+      - pulse:
+      - addressable_rainbow:
   - platform: ultra_digital
     id: seg0
+    dig2analog_ultra_id: ultra
     name: Roof
     board: 0
     segment: 0
@@ -618,6 +629,7 @@ light:
       on_signal_loss: true
   - platform: ultra_digital
     id: seg1
+    dig2analog_ultra_id: ultra
     name: Roof back
     board: 0
     segment: 1
@@ -631,6 +643,7 @@ light:
     status: false
   - platform: ultra_digital
     id: seg2
+    dig2analog_ultra_id: ultra
     name: Roof edge
     board: 0
     segment: 2
@@ -647,7 +660,8 @@ light:
   - platform: ultra_digital
     id: bar
     name: Bar
-    board: 1
+    dig2analog_ultra_id: ultra_bar
+    board: 0
     chip: ws2805
     num_leds: 90
     color_order: RGBWC
@@ -673,6 +687,11 @@ button:
           custom1: 10
           custom2: 20
           palette: Ocean
+  - platform: template
+    name: Retry receiver
+    on_press:
+      - dig2analog_ultra.retry_receiver:
+          id: ultra
 """
 
 

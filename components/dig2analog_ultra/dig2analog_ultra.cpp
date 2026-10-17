@@ -71,6 +71,20 @@ static size_t IRAM_ATTR HOT encoder_callback(const void *data, size_t size, size
                         done);
 }
 
+#ifdef USE_DIG2ANALOG_ULTRA_DIGITAL
+// A digital port's encoder: lead LOW, marker, the bits, tail LOW (ultra_dport.h), the symbol table set per transmission
+static size_t IRAM_ATTR HOT dp_encoder_callback(const void *data, size_t size, size_t symbols_written,
+                                                size_t symbols_free, rmt_symbol_word_t *symbols, bool *done,
+                                                void *arg) {
+  auto *e = static_cast<DpEncoder *>(arg);
+  int finished = 0;
+  const size_t n = ultra_dp_rmt_encode(&e->tab, static_cast<const uint8_t *>(data), size, symbols_written,
+                                       reinterpret_cast<uint32_t *>(symbols), symbols_free, &finished);
+  *done = finished != 0;
+  return n;
+}
+#endif
+
 int64_t UltraHub::now_us_() { return esp_timer_get_time(); }
 
 void UltraHub::set_board_config(int board, uint8_t id, uint16_t value) {
@@ -356,6 +370,18 @@ void UltraHub::resync(bool power_on) {
 #endif
   this->preamble_full_ = !(power_on && this->synced_once_);
   this->preamble_ = this->preamble_full_ ? preamble_frames(this->num_boards_) : power_on_preamble_frames(this->num_boards_);
+#ifdef USE_DIG2ANALOG_ULTRA_DIGITAL
+  if (this->digital_) {
+    this->preamble_ = 0;   // (the marker is the "for you"; nothing to lock)
+    this->preamble_full_ = true;
+    if (power_on) {   // the receiver just booted with its supply: no marker for ULTRA_DP_POWERUP_MS from then
+      ultra_dp_powered(&this->dp_, this->now_us_() - static_cast<int64_t>(this->power_on_delay_ms_) * 1000);
+    }
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+    this->poller_.locked(millis());
+#endif
+  }
+#endif
   int64_t lead_us = static_cast<int64_t>(this->preamble_) * (this->frame_us_ + 200);
   if (this->switch_frame_ < ULTRA_SWITCH_WS_FRAMES)
     lead_us += static_cast<int64_t>(ULTRA_SWITCH_WS_FRAMES - this->switch_frame_) * (this->switch_frame_us_ + 200);
@@ -980,6 +1006,12 @@ void UltraHub::rw_publish_() {
 void UltraHub::switch_boards_to_ultra(uint8_t boot_protocol) {
   if (!this->started_ || this->is_failed())
     return;
+#ifdef USE_DIG2ANALOG_ULTRA_DIGITAL
+  if (this->digital_) {
+    ESP_LOGW(TAG, "GPIO%u: a digital port has no boards in WS mode to switch", this->pin_);
+    return;
+  }
+#endif
   const uint8_t p = boot_protocol == 3 ? 3 : 0;
   ESP_LOGI(TAG, "Switching boards to Ultra: WS config frames, then the start-up preamble (boot protocol %s)",
            p == 3 ? "ultra" : "auto");
@@ -1344,6 +1376,10 @@ void UltraHub::setup() {
       static_cast<uint32_t>((static_cast<uint64_t>(ultra_switch_frame_bytes(this->num_boards_)) * 8 * worst) / 1000) +
       this->reset_ns_ / 1000;
   this->preamble_ = preamble_frames(this->num_boards_);
+#ifdef USE_DIG2ANALOG_ULTRA_DIGITAL
+  if (this->digital_ && !this->digital_setup_())
+    return;
+#endif
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
   this->arm_ping_burst_();
 #endif
@@ -1367,6 +1403,21 @@ bool UltraHub::setup_rmt_() {
     return false;
   }
   this->sched_.set_bit_timing(this->bit0_high_ns_, this->bit0_low_ns_, this->bit1_high_ns_, this->bit1_low_ns_);
+#ifdef USE_DIG2ANALOG_ULTRA_DIGITAL
+  this->rmt_res_ = res;
+  if (this->digital_) {   // the strip chip's bit words (the pixel frames), as the RMT's
+    const uint32_t p0h = ns_to_ticks(this->px_t0h_, res), p0l = ns_to_ticks(this->px_t0l_, res);
+    const uint32_t p1h = ns_to_ticks(this->px_t1h_, res), p1l = ns_to_ticks(this->px_t1l_, res);
+    if (this->px_bytes_ != 0 && (p0h == 0 || p0l == 0 || p1h == 0 || p1l == 0 || p0h > RMT_DURATION_MAX ||
+                                 p0l > RMT_DURATION_MAX || p1h > RMT_DURATION_MAX || p1l > RMT_DURATION_MAX)) {
+      ESP_LOGE(TAG, "The strip's timing does not fit an RMT symbol at %" PRIu32 " Hz", res);
+      this->mark_failed();
+      return false;
+    }
+    this->px_word0_ = make_symbol(p0h, 1, p0l, 0).val;
+    this->px_word1_ = make_symbol(p1h, 1, p1l, 0).val;
+  }
+#endif
   this->enc_.symbols.bit0 = make_symbol(t0h, 1, t0l, 0);
   this->enc_.symbols.bit1 = make_symbol(t1h, 1, t1l, 0);
   this->enc_.symbols.reset = make_symbol(rst0, 0, rst1, 0);
@@ -1393,6 +1444,12 @@ bool UltraHub::setup_rmt_() {
   memset(&enc, 0, sizeof(enc));
   enc.callback = encoder_callback;
   enc.arg = &this->enc_;
+#ifdef USE_DIG2ANALOG_ULTRA_DIGITAL
+  if (this->digital_) {
+    enc.callback = dp_encoder_callback;
+    enc.arg = &this->dp_enc_;
+  }
+#endif
   enc.min_chunk_size = 1;
   if (rmt_new_simple_encoder(&enc, &this->encoder_) != ESP_OK) {
     ESP_LOGE(TAG, "RMT encoder creation failed");
@@ -1404,6 +1461,7 @@ bool UltraHub::setup_rmt_() {
   this->rw_reset_symbol_ = this->reset_symbol_;
   if (this->rw_uart_ != nullptr && this->rw_dir_pin_ != nullptr) {
     // an RW frame ends with a 2 us low, then the RMT's interrupt lets go of the line: the window is its reset
+    // (a digital port: the tail LOW of the poll's transmission, ultra_dp_next)
     const uint32_t us1 = ns_to_ticks(1000, res);
     this->rw_reset_symbol_ = make_symbol(us1, 0, us1, 0);
     rmt_tx_event_callbacks_t cbs;
@@ -1859,6 +1917,12 @@ void UltraHub::loop() {
 #else
   const bool ping_pending = false;
 #endif
+#ifdef USE_DIG2ANALOG_ULTRA_DIGITAL
+  if (this->digital_) {
+    this->loop_digital_();
+    return;
+  }
+#endif
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   // A response window: the receivers answer, nothing goes out until it ends; its bytes are read a little later
   // (the UART hands over its last bytes after a few byte times of silence).
@@ -2071,6 +2135,306 @@ esp_err_t UltraHub::lane_post_() {
 }
 #endif
 
+#ifdef USE_DIG2ANALOG_ULTRA_DIGITAL
+// ------------------------------------------------------------------------------------------------ a digital port
+// The planner (ultra_dport.h, shared with the sender library, tested against the receiver's own delay line there)
+// decides when a transmission may start and what LOW goes before and after it; this sends it: pixel frames from the
+// stream light, Ultra frames (commands, refreshes, polls) behind a marker, the window of a poll. One RMT channel and
+// one encoder whose symbol table (lead LOW, marker, the bits, tail LOW) is set before each transmission, while the line
+// is free.
+
+// The stream light hands over a frame: copied (the light may draw the next while this one waits for the line or is
+// on the wire); one waits at most, the newest.
+// setup(): the planner, the pixel buffers, the back-off a restart keeps. false: failed (logged, marked).
+bool UltraHub::digital_setup_() {
+  this->preamble_ = 0;
+  ultra_dp_init(&this->dp_, this->dp_reset_us_);
+  ultra_dp_powered(&this->dp_, this->now_us_());   // (the receiver may have booted with the ESP32: no marker yet)
+  if (this->px_bytes_ != 0) {
+    RAMAllocator<uint8_t> px_alloc(RAMAllocator<uint8_t>::ALLOC_INTERNAL);
+    this->px_pending_ = px_alloc.allocate(this->px_bytes_);
+    this->px_tx_ = px_alloc.allocate(this->px_bytes_);
+    if (this->px_pending_ == nullptr || this->px_tx_ == nullptr) {
+      ESP_LOGE(TAG, "Cannot allocate the pixel buffers (2 x %u B)", static_cast<unsigned>(this->px_bytes_));
+      this->mark_failed();
+      return false;
+    }
+  }
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  if (this->rw_uart_ != nullptr) {
+    this->poller_.locked(millis());
+    this->dp_pref_ = global_preferences->make_preference<uint8_t>(this->tel_key_ ^ 0x44504F31u);
+    uint8_t flag = 0;
+    if (this->dp_pref_.load(&flag) && flag == 1) {
+      this->dp_.bo_phase = ULTRA_DP_BO_GAVE_UP;
+      this->dp_stored_ = true;
+      ESP_LOGW(TAG, "GPIO%u: the receiver stopped answering before the last restart: no markers on the strip "
+               "until it is retried (dig2analog_ultra.retry_receiver)", this->pin_);
+    }
+  }
+#endif
+  return true;
+}
+
+void UltraHub::digital_pixels(const uint8_t *data) {
+  if (!this->digital_ || this->px_pending_ == nullptr || this->px_bytes_ == 0)
+    return;
+  std::memcpy(this->px_pending_, data, this->px_bytes_);
+  this->px_ready_ = true;
+  this->px_have_ = true;
+  this->wake_();
+}
+
+// A PIXEL_FX of a segment was queued: a local effect (the receiver makes the pixels, the hub sends none and a header at
+// least once a second), or effect 0: the stream again once the receiver has finished its frame (a hand-back).
+void UltraHub::digital_note_fx(uint8_t segment, uint8_t effect, int64_t start_us, uint32_t local_frame_us) {
+  if (!this->digital_ || segment >= 8)
+    return;
+  const uint8_t bit = static_cast<uint8_t>(1u << segment);
+  const bool was = this->fx_active_ != 0;
+  if (effect != 0)
+    this->fx_active_ = static_cast<uint8_t>(this->fx_active_ | bit);
+  else
+    this->fx_active_ = static_cast<uint8_t>(this->fx_active_ & ~bit);
+  const bool now = this->fx_active_ != 0;
+  if (now) {
+    ultra_dp_local(&this->dp_, 1);
+  } else if (was) {
+    ultra_dp_handback(&this->dp_, start_us, local_frame_us);   // (clears the local flag, holds the pixels back)
+    this->px_ready_ = this->px_have_;   // the stream's newest picture goes out again first (the light only draws on a change)
+  }
+  this->wake_();
+}
+
+void UltraHub::digital_retry() {
+  if (!this->digital_)
+    return;
+  ultra_dp_retry(&this->dp_);
+  this->digital_save_();
+  ESP_LOGI(TAG, "GPIO%u: the receiver is polled again", this->pin_);
+  this->wake_();
+}
+
+// The back-off's end state is kept across restarts: a receiver that stopped answering is not tried again after every
+// reboot (each try is a glitch on the strip), only after the user's retry. The first two phases are not: they are
+// short and restart with a fresh count.
+void UltraHub::digital_save_() {
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  const bool gave_up = this->dp_.bo_phase == ULTRA_DP_BO_GAVE_UP;
+  if (gave_up == this->dp_stored_)
+    return;
+  this->dp_stored_ = gave_up;
+  const uint8_t flag = gave_up ? 1 : 0;
+  this->dp_pref_.save(&flag);
+#endif
+}
+
+void UltraHub::digital_window_end_(int64_t now) {
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  const uint32_t answers = this->poller_.stats().answers;
+  this->finish_window_(false);
+  const bool answered = this->poller_.stats().answers != answers;
+  const uint8_t was = this->dp_.bo_phase;
+  ultra_dp_poll_result(&this->dp_, now, answered);
+  if (this->dp_.bo_phase != was) {
+    if (this->dp_.bo_phase == ULTRA_DP_BO_GAVE_UP) {
+      ESP_LOGW(TAG, "GPIO%u: the receiver does not answer: no more markers on the strip until it is retried "
+               "(dig2analog_ultra.retry_receiver, or its Retry button)", this->pin_);
+    } else if (this->dp_.bo_phase == ULTRA_DP_BO_WAIT) {
+      ESP_LOGW(TAG, "GPIO%u: the receiver does not answer: %u more tries in %u s", this->pin_,
+               static_cast<unsigned>(ULTRA_DP_TRIES), static_cast<unsigned>(ULTRA_DP_RETRY_S));
+    }
+    this->digital_save_();
+  }
+#endif
+}
+
+void UltraHub::loop_digital_() {
+  const int64_t now = now_us_();
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  if (this->rw_open_) {
+    // the window ends at W_D after the frame's last bit: from the RMT's interrupt (the line was let go of) when the
+    // hub has it, else from the frame's TIME. The first frame after it retakes the line.
+    int64_t released = this->rw_released_us_;   // (written by the RMT's interrupt: 64 bits, read until it is stable)
+    if (released != this->rw_released_us_)
+      released = this->rw_released_us_;
+    if (released != 0) {
+      const int64_t end = released - 2 + static_cast<int64_t>(ultra_dp_window_us(this->poller_.rate()));
+      if (end > this->rw_end_us_) {
+        this->rw_end_us_ = end;
+        this->dp_.free_us = std::max(this->dp_.free_us, end);
+      }
+    }
+    if (now < this->rw_end_us_)
+      return;
+    this->digital_window_end_(now);
+  }
+#endif
+  const bool blocked = ultra_dp_blocked(&this->dp_, now);
+  const bool quiet = now < this->dp_.quiet_until_us;   // (no marker for a while after the power-up)
+  const bool refresh_due = !this->has_sent_ || millis() - this->last_frame_ms_ >= this->refresh_interval_ms_;
+  const bool cmds = !blocked && !quiet && (this->tx_prepared_ || this->sched_.pending());
+  unsigned want = 0;
+  if (cmds || (refresh_due && !blocked && !quiet))
+    want |= ULTRA_DP_W_CMD;
+  bool poll = false;
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  if (!blocked && !quiet && !this->tx_prepared_ && this->rw_due_(false)) {
+    poll = true;
+    want |= ULTRA_DP_W_POLL;
+  }
+#endif
+  const bool pixels = this->px_ready_ && !this->dp_.local;
+  if (pixels)
+    want |= ULTRA_DP_W_PIXELS;
+  if (cmds || poll || pixels)
+    this->last_busy_ms_ = millis();
+  if (this->high_freq_active_ && !cmds && !poll && !pixels && millis() - this->last_busy_ms_ > BUSY_HOLD_MS) {
+    this->high_freq_.stop();
+    this->high_freq_active_ = false;
+  }
+  if (want == 0 || !this->line_free_())
+    return;
+  ultra_dp_tx_t tx;
+  if (!ultra_dp_next(&this->dp_, now, want, &tx))
+    return;
+  this->transmit_digital_(tx, now);
+}
+
+void UltraHub::transmit_digital_(const ultra_dp_tx_t &tx, int64_t now) {
+  const uint32_t res = this->rmt_res_;
+  ultra_dp_rmt_t &tab = this->dp_enc_.tab;
+  std::memset(&tab, 0, sizeof(tab));
+  tab.lead = ultra_dp_rmt_low(tx.lead_low_us, res);
+  tab.tail = ultra_dp_rmt_low(tx.tail_low_us, res);
+  const uint8_t *data;
+  size_t size;
+  uint32_t wire_us;
+  int64_t time_us = 0;
+  const bool poll = tx.kind == ULTRA_DP_POLL;
+  if (tx.kind == ULTRA_DP_PIXELS) {
+    // the frame being sent is a copy: the light draws on (the newest waits in px_pending_)
+    std::memcpy(this->px_tx_, this->px_pending_, this->px_bytes_);
+    this->px_ready_ = false;
+    tab.bit0 = this->px_word0_;
+    tab.bit1 = this->px_word1_;
+    data = this->px_tx_;
+    size = this->px_bytes_;
+    uint32_t ones = 0;
+    for (size_t i = 0; i < size; i++)
+      ones += static_cast<uint32_t>(__builtin_popcount(data[i]));
+    const uint64_t ns = static_cast<uint64_t>(ones) * (this->px_t1h_ + this->px_t1l_) +
+                        static_cast<uint64_t>(size * 8 - ones) * (this->px_t0h_ + this->px_t0l_);
+    wire_us = tx.lead_low_us + static_cast<uint32_t>((ns + 500) / 1000) + tx.tail_low_us;
+  } else {
+    tab.marker = ultra_dp_rmt_marker(res);
+    tab.bit0 = this->enc_.symbols.bit0.val;
+    tab.bit1 = this->enc_.symbols.bit1.val;
+    // the frame's first bit follows the marker and its gap: its TIME (and the commands' start offsets) from there
+    const int64_t frame_start = now + tx.lead_low_us + ULTRA_DP_MARKER_US + ULTRA_DP_GAP_HUB_US;
+    if (!this->tx_prepared_) {
+      this->tx_normal_ = true;
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+      this->tx_rw_ = false;
+      uint16_t polls = 0;
+      if (poll)
+        polls = this->poller_.build(millis(), this->rw_slots_.data(), &this->rw_window_us_);
+      if (poll && polls == 0)
+        return;   // (nothing to ask after all)
+      if (poll) {
+        time_us = this->sched_.build_rw_frame(frame_start, this->tx_buf_, this->rw_slots_.data(), polls);
+        this->tx_rw_ = true;
+      } else
+#endif
+      {
+        time_us = this->sched_.build_frame(frame_start, this->tx_buf_);
+      }
+      this->tx_bytes_ = this->sched_.frame_bytes();
+      this->tx_prepared_ = true;
+    } else {
+      time_us = this->sched_.retime_frame(frame_start, this->tx_buf_);   // (a frame the RMT refused: sent again)
+    }
+    data = this->tx_buf_;
+    size = this->tx_bytes_;
+    wire_us = tx.lead_low_us + ULTRA_DP_MARKER_US + ULTRA_DP_GAP_HUB_US +
+              static_cast<uint32_t>((this->sched_.wire_ns(this->tx_buf_, this->tx_bytes_) + 500) / 1000) +
+              tx.tail_low_us;
+  }
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  if (this->rw_dir_pin_ != nullptr && !this->rw_driving_) {
+    this->rw_dir_pin_->digital_write(true);   // the hub drives the line again (the window is over); its LOW lead follows
+    this->rw_driving_ = true;
+  }
+  if (poll) {
+    // the UART is this line's until the window is read: the receiver on before the frame's last bit
+    this->rw_turn_ = true;
+    this->rw_waiting_ = false;
+    if (this->rw_rx_enable_pin_ != nullptr)
+      this->rw_rx_enable_pin_->digital_write(true);
+    this->rw_uart_rate_();
+    uint8_t junk[64];
+    size_t n;
+    while ((n = this->rw_uart_->available()) > 0 && this->rw_uart_->read_array(junk, std::min(n, sizeof(junk))))
+      ;   // the window's bytes start here
+    this->rw_release_ = this->rw_dir_pin_ != nullptr;
+    this->rw_released_us_ = 0;
+  }
+#endif
+  rmt_transmit_config_t cfg;
+  std::memset(&cfg, 0, sizeof(cfg));
+  const esp_err_t err = rmt_transmit(this->channel_, this->encoder_, data, size, &cfg);
+  if (err != ESP_OK) {
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+    this->rw_release_ = false;
+    if (poll) {
+      this->tx_prepared_ = false;   // (a poll is not worth keeping: asked again)
+      this->tx_rw_ = false;
+      this->rw_drop_turn_();
+    }
+#endif
+    if (!this->status_has_warning())
+      ESP_LOGW(TAG, "RMT transmit failed: %s", esp_err_to_name(err));
+    this->status_set_warning();
+    return;
+  }
+  const uint8_t rate =
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+      this->poller_.rate();
+#else
+      ULTRA_RW_RATE_1M;
+#endif
+  ultra_dp_started(&this->dp_, &tx, now, wire_us, time_us, rate);
+  if (tx.kind == ULTRA_DP_PIXELS) {
+    this->px_frames_++;
+    this->status_clear_warning();
+    return;
+  }
+#ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
+  if (poll) {
+    // nothing goes out until the window ends (W_D after the frame's last bit); the line is let go of by the RMT's
+    // interrupt, the receiver answers, the UART is read when the window is over (digital_window_end_)
+    this->rw_open_ = true;
+    this->rw_t0_us_ = time_us;
+    this->rw_end_us_ = this->dp_.free_us;
+    this->rw_read_us_ = this->rw_end_us_;
+    if (this->rw_dir_pin_ != nullptr)
+      this->rw_driving_ = false;
+    this->tx_rw_ = false;
+    this->loop_fast_();
+  }
+#endif
+  this->tx_prepared_ = false;
+#ifdef USE_DIFFPOWER
+  if (this->sched_.take_power_off_sent() && this->port_ != nullptr)
+    this->port_->notice_sent();   // (its next copy 50 ms from now)
+#endif
+  this->status_clear_warning();
+  this->last_frame_ms_ = millis();
+  this->has_sent_ = true;
+  this->frames_++;
+}
+#endif  // USE_DIG2ANALOG_ULTRA_DIGITAL
+
 void UltraHub::dump_config() {
   const uint32_t period0 = this->bit0_high_ns_ + this->bit0_low_ns_;
   const uint32_t period1 = this->bit1_high_ns_ + this->bit1_low_ns_;
@@ -2132,6 +2496,15 @@ void UltraHub::dump_config() {
                   this->rw_rx_enable_pin_ != nullptr ? ", receiver enable pin (its UART may be shared)" : "");
     if (this->comm_on_)
       ESP_LOGCONFIG(TAG, "  Commissioning: %s", this->comm_.status().c_str());
+  }
+#endif
+#ifdef USE_DIG2ANALOG_ULTRA_DIGITAL
+  if (this->digital_) {
+    ESP_LOGCONFIG(TAG,
+                  "  Digital port: one Ultra-Digital receiver in the strip's data path, frames behind markers, no "
+                  "preamble; strip reset %" PRIu32 " us, pixel frames %" PRIu32 " B (bit0 %" PRIu32 "/%" PRIu32
+                  " ns, bit1 %" PRIu32 "/%" PRIu32 " ns)",
+                  this->dp_reset_us_, this->px_bytes_, this->px_t0h_, this->px_t0l_, this->px_t1h_, this->px_t1l_);
   }
 #endif
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE

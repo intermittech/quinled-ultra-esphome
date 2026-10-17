@@ -15,6 +15,7 @@ every millisecond, in 16 bit, in step with every other board on the line.
 | `dig2analog_ultra_strip` | ESPHome's addressable effects (rainbow, scan, twinkle, ...) across Ultra lights, one light per pixel |
 | `diffpower` | QuinLED Diff-Power sender ports: 55 V only while a light on the port needs it (standby at 4.5 V, board detection, pre-wake, the dark window), for any ESPHome light |
 | `ultra_digital` | A light per segment of a QuinLED Diff-Power Ultra-Digital receiver's pixel strip, whose effects the receiver makes itself (the catalogue's effect list, Speed / Intensity / Palette, transitions on the receiver; exclusive with a streaming light) |
+| `ultra_digital_stream` | An ESPHome addressable light on the strip behind a receiver: its pixel frames go through the digital port's hub (`dig2analog_ultra` with `digital:`), between the line's marker frames, and stop while the receiver shows a local effect |
 | `dig2analog_ultra_parlio` | Up to 16 data lines from the ESP32-P4's PARLIO TX unit (one DMA stream) instead of the RMT's 4 |
 
 ## Install
@@ -85,6 +86,7 @@ See the **[wiki](https://github.com/intermittech/quinled-ultra-esphome/wiki)**:
 | [Diff-Power ports](https://github.com/intermittech/quinled-ultra-esphome/wiki/Diff-Power-Ports) | `diffpower`: a Diff-Power sender's ports in standby, waking; [power modes](https://github.com/intermittech/quinled-ultra-esphome/wiki/Power-Modes), pre-wake |
 | [Diff-Power telemetry](https://github.com/intermittech/quinled-ultra-esphome/wiki/Diff-Power-Telemetry) | QuinLED Diff-Power Ultra receivers reporting back: entities, dashboards, the lifetime ledger |
 | [Ultra-Digital effects](https://github.com/intermittech/quinled-ultra-esphome/wiki/Ultra-Digital-Effects) | `ultra_digital`: local pixel effects on the Ultra-Digital receiver |
+| [Ultra-Digital port](https://github.com/intermittech/quinled-ultra-esphome/wiki/Ultra-Digital-Port) | `digital:` on the line: the receiver in a pixel strip's data path, frames behind markers, the stream light, polls and the back-off |
 | [Installation](https://github.com/intermittech/quinled-ultra-esphome/wiki/Installation) | Adding the components, pinning a version |
 | [Bench plan](https://github.com/intermittech/quinled-ultra-esphome/wiki/Bench-Plan) | What still needs checking on hardware |
 | [Development](https://github.com/intermittech/quinled-ultra-esphome/wiki/Development) | Tests and layout |

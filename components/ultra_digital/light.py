@@ -9,7 +9,7 @@ import logging
 
 import esphome.codegen as cg
 from esphome.components import light, number, select, text_sensor
-from esphome.components.dig2analog_ultra import CONF_DIG2ANALOG_ULTRA_ID, CONF_NUM_BOARDS, CONF_REFRESH_INTERVAL, UltraHub
+from esphome.components.dig2analog_ultra import CONF_DIG2ANALOG_ULTRA_ID, CONF_NUM_BOARDS, UltraHub
 from esphome.components.dig2analog_ultra.receiver_schema import CONF_TELEMETRY
 from esphome.components.light.effects import register_rgb_effect
 from esphome.components.light.types import LightEffect
@@ -245,17 +245,17 @@ def _final_validate(config: ConfigType) -> ConfigType:
     hub = next((h for h in full.get("dig2analog_ultra", []) or [] if h[CONF_ID] == config[CONF_DIG2ANALOG_ULTRA_ID]), None)
     if hub is None:
         raise cv.Invalid("the data line (dig2analog_ultra) is missing", [CONF_DIG2ANALOG_ULTRA_ID])
+    if "digital" not in hub:
+        raise cv.Invalid(
+            f"'{hub[CONF_ID]}' is not a digital port: a QuinLED Diff-Power Ultra-Digital receiver sits in a pixel "
+            "strip's data path and needs its frames behind markers; give the data line digital: (and num_boards: 1)",
+            [CONF_DIG2ANALOG_ULTRA_ID],
+        )
     if config[CONF_BOARD] >= hub[CONF_NUM_BOARDS]:
         raise cv.Invalid(
             f"board {config[CONF_BOARD]} out of range, '{hub[CONF_ID]}' has num_boards: {hub[CONF_NUM_BOARDS]} "
             "(boards are 0-based)",
             [CONF_BOARD],
-        )
-    # the receiver's phase comes from the headers: the line sends one at least every second (the refresh)
-    if hub[CONF_REFRESH_INTERVAL].total_milliseconds > 1000:
-        raise cv.Invalid(
-            f"refresh_interval of '{hub[CONF_ID]}' is {hub[CONF_REFRESH_INTERVAL].total_milliseconds} ms: a line with "
-            "local pixel effects sends a header at least once a second (the receivers' effect clocks), set 1 s or less"
         )
     mine = (str(config[CONF_DIG2ANALOG_ULTRA_ID]), config[CONF_BOARD])
     for other in full.get("light", []) or []:
@@ -386,6 +386,10 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_segment(config[CONF_SEGMENT]))
     cg.add(var.set_range(config[CONF_SEGMENT_START], config[CONF_SEGMENT_LENGTH]))
     cg.add(var.set_flags(_flags(config)))
+    # the strip's frame on the wire: a hand-back to the stream waits for the receiver to finish its frame
+    bytes_per_led = CHIPS[config[CONF_CHIP]][1]
+    bit_ns = 2500 if config[CONF_CHIP] == "ws2811_400k" else 1250
+    cg.add(var.set_strip_frame_us(config[CONF_NUM_LEDS] * bytes_per_led * 8 * bit_ns // 1000))
     siblings = [
         c for c in _pixel_lights(CORE.config)
         if c[CONF_ID] != config[CONF_ID]

@@ -76,7 +76,7 @@ jobs:
       - name: PARLIO test (16 lanes, the shared-UART coordinator, negative controls, the render's cost)
         working-directory: quinled-ultra-esphome
         run: python tests/run_ultra_parlio_test.py
-      - name: Ultra-Digital test (PIXEL_FX, the pixel CONFIG, page 0x81, the light's own code, the catalogue copy)
+      - name: Ultra-Digital test (PIXEL_FX, the pixel CONFIG, page 0x81, the light's own code, the catalogue copy, the digital port's wire and the receiver's delay line)
         working-directory: quinled-ultra-esphome
         run: python tests/run_ultra_digital_test.py
       - name: Schema tests

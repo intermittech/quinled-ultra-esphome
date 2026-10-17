@@ -28,7 +28,7 @@ PIECES = ["PixelLight *PixelLight::find(", "void PixelLight::transition_requeste
           "void PixelFxEffect::start(", "void PixelFxEffect::stop(", "void PixelLight::effect_started(",
           "void PixelLight::effect_stopped(", "void PixelLight::setup() {", "void PixelLight::on_light_remote_values_update(",
           "void ExclusiveWatcher::on_light_remote_values_update(", "void PixelLight::other_changed_(",
-          "void PixelLight::release_(", "void PixelLight::write_state(", "uint8_t PixelLight::shown_effect_(",
+          "void PixelLight::queue_fx_(", "void PixelLight::release_(", "void PixelLight::write_state(", "uint8_t PixelLight::shown_effect_(",
           "void PixelLight::loop(", "void PixelLight::send_(", "void PixelLight::set_param(",
           "uint8_t PixelLight::get_param(", "void PixelLight::set_palette_index(", "void PixelLight::set_color2(",
           "void PixelLight::set_color3(", "void PixelLight::pixel_page_("]
@@ -62,6 +62,47 @@ def light_test() -> int:
     return run.returncode
 
 
+# the digital port's methods, cut unchanged from components/dig2analog_ultra/dig2analog_ultra.cpp for
+# tests/ultra_digital_transport_test.cpp
+TRANSPORT_ENCODER = ["static size_t IRAM_ATTR HOT dp_encoder_callback("]
+TRANSPORT_METHODS = ["bool UltraHub::digital_setup_(", "void UltraHub::digital_pixels(", "void UltraHub::digital_note_fx(",
+                     "void UltraHub::digital_retry(", "void UltraHub::digital_save_(", "void UltraHub::digital_window_end_(",
+                     "void UltraHub::loop_digital_(", "void UltraHub::transmit_digital_("]
+
+
+def planner_copy() -> bool:
+    """components/dig2analog_ultra/ultra_dport.h is the sender library's, byte for byte (the planner is tested there,
+    against the receiver's own delay line)"""
+    mine = ROOT / "components" / "dig2analog_ultra" / "ultra_dport.h"
+    theirs = PROTOCOL / "sender" / "src" / "ultra_dport.h"
+    if not theirs.exists():
+        if os.environ.get("ULTRA_REQUIRE_DEPS") == "1":
+            print(f"FAIL: the protocol repository is missing ({theirs}; ULTRA_REQUIRE_DEPS=1)")
+            return False
+        print(f"quinled-ultra-protocol not found ({theirs}): the planner copy check skipped")
+        return True
+    # the working tree's file (the sender library's CI tag is the same file once released)
+    same = mine.read_bytes().replace(b"\r\n", b"\n") == theirs.read_bytes().replace(b"\r\n", b"\n")
+    print(f"{'ok  ' if same else 'FAIL'} ultra_dport.h is the sender library's copy")
+    return same
+
+
+def transport_test() -> int:
+    out = BUILD / "transport"
+    out.mkdir(parents=True, exist_ok=True)
+    text = (ROOT / "components" / "dig2analog_ultra" / "dig2analog_ultra.cpp").read_text(encoding="utf-8")
+    (out / "dp_encoder.inc").write_text("\n\n".join(definition(text, s) for s in TRANSPORT_ENCODER) + "\n", encoding="utf-8")
+    (out / "dp_methods.inc").write_text("\n\n".join(definition(text, s) for s in TRANSPORT_METHODS) + "\n", encoding="utf-8")
+    exe = out / ("ultra_digital_transport_test.exe" if sys.platform == "win32" else "ultra_digital_transport_test")
+    subprocess.run(ZIG + ["c++", "-std=c++17", "-O1", "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-unused-function",
+                          "-Wno-nullability-completeness", "-fsanitize=undefined", "-fno-sanitize-recover=all",
+                          str(HERE / "ultra_digital_transport_test.cpp"), "-o", str(exe)], check=True)
+    run = subprocess.run([str(exe)], capture_output=True, text=True)
+    sys.stdout.write(run.stdout)
+    sys.stderr.write(run.stderr)
+    return run.returncode
+
+
 def main() -> int:
     BUILD.mkdir(exist_ok=True)
     exe = BUILD / ("ultra_digital_test.exe" if sys.platform == "win32" else "ultra_digital_test")
@@ -73,6 +114,10 @@ def main() -> int:
     sys.stderr.write(run.stderr)
     bad = run.returncode != 0
     bad |= light_test() != 0
+    bad |= not planner_copy()
+    bad |= transport_test() != 0
+    # what the hub put on the wire, on the receiver's own delay line (the firmware's model; skipped without the firmware)
+    bad |= subprocess.run([sys.executable, str(HERE / "run_ultra_dline_replay_test.py")]).returncode != 0
 
     # 1. the chips: the YAML's table against the header's
     sys.path.insert(0, str(ROOT / "components"))

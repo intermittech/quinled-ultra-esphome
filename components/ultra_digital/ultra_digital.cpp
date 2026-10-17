@@ -82,6 +82,7 @@ void PixelLight::effect_started(PixelFxEffect *effect) {
   this->chosen_ = effect;
   this->effect_ = effect->id();
   this->effect_changed_ = true;
+  this->restart_ = true;   // (the user chose it: a Sunrise running already starts over; the 20-day renewal doesn't)
   this->request_send_();
 }
 
@@ -165,10 +166,19 @@ void PixelLight::other_changed_(light::LightState *other) {
     this->state_->make_call().set_state(false).set_transition_length(0).perform();
 }
 
+// A PIXEL_FX to the receiver; on a digital port the hub learns of it too (a local effect: no pixels from it; effect
+// 0: the stream again once the receiver has finished its frame)
+void PixelLight::queue_fx_(const PixelFxTracker::Out &o) {
+  this->hub_->scheduler().light_pixel_fx(this->board_, this->segment_, o.fx, o.anchor_us);
+#ifdef USE_DIG2ANALOG_ULTRA_DIGITAL
+  this->hub_->digital_note_fx(this->segment_, o.fx.effect, o.anchor_us, this->strip_frame_us_);
+#endif
+  this->hub_->wake_();
+}
+
 void PixelLight::release_() {
   const PixelFxTracker::Out o = this->track_.release(this->hub_->start_time_us(this->board_));
-  this->hub_->scheduler().light_pixel_fx(this->board_, this->segment_, o.fx, o.anchor_us);
-  this->hub_->wake_();
+  this->queue_fx_(o);
   this->dirty_ = false;
 }
 
@@ -226,8 +236,7 @@ void PixelLight::loop() {
   }
   PixelFxTracker::Out o;
   if (!this->dirty_ && this->track_.store(millis(), this->store_after_ms_, &o)) {
-    this->hub_->scheduler().light_pixel_fx(this->board_, this->segment_, o.fx, o.anchor_us);
-    this->hub_->wake_();
+    this->queue_fx_(o);
     ESP_LOGD(TAG, "'%s': stored on the receiver as its power-on effect", this->state_->get_name().c_str());
   }
 }
@@ -247,13 +256,13 @@ void PixelLight::send_() {
   s.transition_ms = static_cast<uint16_t>(std::min<uint32_t>(this->transition_ms_, 0xFFFF));
   PixelFxTracker::Out o;
   const bool send = this->track_.update(s, this->effect_changed_, this->state_->get_default_transition_length(),
-                                        this->hub_->start_time_us(this->board_), millis(), &o);
+                                        this->hub_->start_time_us(this->board_), millis(), &o, this->restart_);
   this->effect_changed_ = false;
+  this->restart_ = false;
   this->transition_ms_ = 0;
   if (!send)
     return;   // the receiver is there already
-  this->hub_->scheduler().light_pixel_fx(this->board_, this->segment_, o.fx, o.anchor_us);
-  this->hub_->wake_();
+  this->queue_fx_(o);
 }
 
 // ----------------------------------------------------------------------------------------------------- parameters

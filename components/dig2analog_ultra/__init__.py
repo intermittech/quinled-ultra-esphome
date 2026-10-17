@@ -33,6 +33,7 @@ from esphome.types import ConfigType
 
 from .parlio_timing import layout as parlio_layout
 from .receiver_schema import (
+    CONF_DIRECTION_PIN,
     CONF_TELEMETRY,
     TELEMETRY_SCHEMA,
     telemetry_defaults,
@@ -61,6 +62,7 @@ UltraHub = dig2analog_ultra_ns.class_("UltraHub", cg.Component)
 SwitchBoardsToUltraAction = dig2analog_ultra_ns.class_("SwitchBoardsToUltraAction", automation.Action)
 CalibrateCurrentAction = dig2analog_ultra_ns.class_("CalibrateCurrentAction", automation.Action)
 CancelCalibrationAction = dig2analog_ultra_ns.class_("CancelCalibrationAction", automation.Action)
+RetryReceiverAction = dig2analog_ultra_ns.class_("RetryReceiverAction", automation.Action)
 CommissionAction = dig2analog_ultra_ns.class_("CommissionAction", automation.Action)
 ShowVersionAction = dig2analog_ultra_ns.class_("ShowVersionAction", automation.Action)
 # (dig2analog_ultra_parlio's bus, by name: that component imports this one)
@@ -106,6 +108,7 @@ CONF_ONLY_WHEN_OFF = "only_when_off"
 CONF_BOARDS = "boards"
 CONF_LEVEL = "level"
 CONF_PARLIO_ID = "parlio_id"
+CONF_DIGITAL = "digital"
 CONF_LANE = "lane"
 
 # light platform keys that take a channel, and their roles (ULTRA_ROLE_*)
@@ -263,6 +266,31 @@ def _validate_reset(value):
     return value
 
 
+def _validate_digital(value):
+    """digital: (or true) -> the options; reset_time: the strip's reset (the latch), the pixel frames' tail and what a
+    hand-back from a local effect waits for."""
+    if value is None or value is True:
+        value = {}
+    if value is False:
+        raise cv.Invalid("digital: leave it out for a line of dig2analog boards")
+    return DIGITAL_SCHEMA(value)
+
+
+def _validate_digital_reset(value):
+    value = cv.positive_time_period_nanoseconds(value)
+    us = value.total_nanoseconds / 1000
+    if us < 50 or us > 800:
+        raise cv.Invalid("reset_time: 50us to 800us (the strip chip's latch time; WS2812B 280us+, SK6812 80us)")
+    return value
+
+
+DIGITAL_SCHEMA = cv.Schema(
+    {
+        cv.Optional(CONF_RESET_TIME, default="300us"): _validate_digital_reset,
+    }
+)
+
+
 def _validate_start_delay(value):
     """auto (default): the hub works out how far ahead commands start; or a fixed time up to 1 s."""
     if isinstance(value, str) and value.strip().lower() == "auto":
@@ -357,6 +385,24 @@ def _validate_transmitter(config):
     return config
 
 
+def _validate_digital_line(config):
+    """A digital port: one receiver, an RMT line, and with telemetry the direction pin (the hub lets go of the line)."""
+    if CONF_DIGITAL not in config:
+        return config
+    if config[CONF_NUM_BOARDS] != 1:
+        raise cv.Invalid("digital: a digital port has one receiver (num_boards: 1)", [CONF_NUM_BOARDS])
+    if CONF_PARLIO_ID in config:
+        raise cv.Invalid("digital: needs an RMT line (pin), not a PARLIO lane", [CONF_DIGITAL])
+    tel = config.get(CONF_TELEMETRY)
+    if tel is not None and CONF_DIRECTION_PIN not in tel:
+        raise cv.Invalid(
+            "digital with telemetry: give the telemetry a direction_pin (the hub lets go of the data line for the "
+            "receiver's answer)",
+            [CONF_TELEMETRY],
+        )
+    return config
+
+
 CONFIG_SCHEMA = cv.All(
     telemetry_defaults,   # the receivers' entities, named for their devices (before they are validated)
     esp32.only_on_variant(
@@ -371,6 +417,11 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_PARLIO_ID): cv.use_id(UltraParlioBus),
             cv.Optional(CONF_LANE): cv.int_range(min=0, max=15),
             cv.Required(CONF_NUM_BOARDS): cv.int_range(min=1, max=64),
+            # A DIGITAL PORT (protocol 0.2.8): one QuinLED Diff-Power Ultra-Digital receiver (num_boards: 1) in the data
+            # path of a pixel strip. The hub sends its frames behind markers in latch gaps (the strip never sees them),
+            # the pixel stream of an ultra_digital_stream light between them, and polls leave the line to the
+            # receiver's answer. No preamble, no firmware update over this line.
+            cv.Optional(CONF_DIGITAL): _validate_digital,
             # '0' 250 ns, '1' 700 ns: centred on the boards' 472 ns decision, so the pulse-width change of every
             # board's forwarding may add up in either direction over 50 boards (wiki: Ultra line options, Long chains)
             cv.Optional(CONF_BIT0_HIGH, default="250ns"): cv.positive_time_period_nanoseconds,
@@ -450,6 +501,7 @@ CONFIG_SCHEMA = cv.All(
         }
     ).extend(cv.COMPONENT_SCHEMA),
     _validate_transmitter,
+    _validate_digital_line,
 )
 
 
@@ -623,6 +675,11 @@ def _final_validate(configs):
             )
         used = {}
         count = {}
+        if CONF_DIGITAL in conf and _lights_of(full, conf[CONF_ID]):
+            raise cv.Invalid(
+                f"'{conf[CONF_ID]}' is a digital port: it has pixel lights (ultra_digital, ultra_digital_stream), not "
+                "dig2analog_ultra lights"
+            )
         for light in _lights_of(full, conf[CONF_ID]):
             board = light["board"]
             if board >= conf[CONF_NUM_BOARDS]:
@@ -766,6 +823,9 @@ async def to_code(config: ConfigType) -> None:
         cg.add(var.set_use_dma(config[CONF_USE_DMA]))
     cg.add(var.set_timing(*timing))
     cg.add(var.set_refresh_interval(config[CONF_REFRESH_INTERVAL].total_milliseconds))
+    if CONF_DIGITAL in config:
+        cg.add_define("USE_DIG2ANALOG_ULTRA_DIGITAL")
+        cg.add(var.set_digital(int(config[CONF_DIGITAL][CONF_RESET_TIME].total_nanoseconds // 1000)))
     if config[CONF_START_DELAY] != "auto":
         cg.add(var.set_start_delay(config[CONF_START_DELAY].total_milliseconds))
     cg.add(var.set_repeats(config[CONF_REPEATS]))
@@ -866,6 +926,20 @@ async def calibrate_current_to_code(config, action_id, template_arg, args):
     await cg.register_parented(var, config[CONF_ID])
     cg.add(var.set_boards(config.get(CONF_BOARDS, [])))
     cg.add(var.set_level(config[CONF_LEVEL]))
+    return var
+
+
+# A digital port's receiver stopped answering (the hub tried 3 polls, 60 s later 3 more, and keeps the strip free of
+# markers since): poll it again.
+@automation.register_action(
+    "dig2analog_ultra.retry_receiver",
+    RetryReceiverAction,
+    automation.maybe_simple_id({cv.GenerateID(): cv.use_id(UltraHub)}),
+    synchronous=True,
+)
+async def retry_receiver_to_code(config, action_id, template_arg, args):
+    var = cg.new_Pvariable(action_id, template_arg)
+    await cg.register_parented(var, config[CONF_ID])
     return var
 
 

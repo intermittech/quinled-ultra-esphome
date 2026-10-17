@@ -85,6 +85,8 @@ class PixelLight final : public light::LightOutput,
     this->state_in_.seg_len = length;
   }
   void set_flags(uint8_t flags) { this->state_in_.flags = flags; }
+  /// the strip's frame on the wire (us): what a hand-back to the stream waits for (the receiver finishes its frame first)
+  void set_strip_frame_us(uint32_t us) { this->strip_frame_us_ = us; }
   /// the receiver's settings (CONFIG 129-139: one set for the strip, every light of the board must agree)
   void set_receiver_config(uint8_t id, uint16_t value) { this->cfg_.push_back({id, value}); }
   void set_solid_id(uint8_t id) { this->solid_ = id; }
@@ -172,6 +174,7 @@ class PixelLight final : public light::LightOutput,
   }
   void send_();
   void release_();                               // the hub's pixels pass (PIXEL_FX effect 0)
+  void queue_fx_(const PixelFxTracker::Out &o);  // a PIXEL_FX to the receiver (and the hub's digital port)
   void pixel_page_();                            // page 0x81 news
   std::string status_text_() const;
   uint8_t shown_effect_();                       // the effect to send: the chosen one, Solid when the receiver lacks it
@@ -196,10 +199,12 @@ class PixelLight final : public light::LightOutput,
   PixelLightState state_in_;           // c2, c3, speed, ... (the parts the light's state doesn't carry)
   uint32_t standby_after_ms_{0};
   uint32_t store_after_ms_{0};
+  uint32_t strip_frame_us_{0};
 
   PixelFxTracker track_;               // what the segment was told, the phase anchor, lit
   bool dirty_{false};                  // something to send in the next loop
   bool effect_changed_{false};         // a new effect: a new phase anchor, the crossfade
+  bool restart_{false};                // the user chose the effect (again): time-driven effects start over
   bool warned_missing_{false}, warned_cap_{false};
   uint32_t transition_ms_{0};          // the length asked for since the last send
   bool first_loop_{true};

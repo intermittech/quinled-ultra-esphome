@@ -32,7 +32,7 @@ external_components:
   - source:
       type: local
       path: {components}
-    components: [dig2analog_ultra, dig2analog_ultra_strip, diffpower, dig2analog_ultra_parlio, ultra_digital]
+    components: [dig2analog_ultra, dig2analog_ultra_strip, diffpower, dig2analog_ultra_parlio, ultra_digital, ultra_digital_stream]
 """
 
 PSU = """\
@@ -54,6 +54,15 @@ dig2analog_ultra:
   id: u
   pin: GPIO16
   num_boards: 2
+"""
+
+# a digital port: one Ultra-Digital receiver in a pixel strip's data path
+ULTRA_DP = """\
+dig2analog_ultra:
+  id: u
+  pin: GPIO16
+  num_boards: 1
+  digital:
 """
 
 ULTRA_RGBWW = """\
@@ -335,6 +344,16 @@ UD_STREAM = """\
     num_leds: 30
     chipset: ws2812
     rgb_order: GRB
+"""
+
+
+UDS = """\
+  - platform: ultra_digital_stream
+    id: streamer
+    name: stream
+    dig2analog_ultra_id: u
+    num_leds: 30
+    chipset: ws2812
 """
 
 
@@ -1482,70 +1501,101 @@ CASES = [
      parlio(telemetry=False) + PARLIO_RMT_LINES + "  - id: m3\n    pin: GPIO39\n    num_boards: 1\n    rmt_symbols: 48\n"
      "  - id: m4\n    pin: GPIO40\n    num_boards: 1\n    rmt_symbols: 48\n", False, "need 5 x 48", P4),
     # ---- ultra_digital
-    ("ultra_digital minimal", ULTRA + UD, True, None),
-    ("ultra_digital sk6812_rgbw WRGB", ULTRA + "light:\n" + ud_light(chip="sk6812_rgbw", extra="    color_order: WRGB\n"), True, None),
-    ("ultra_digital ws2814 default RGBW", ULTRA + "light:\n" + ud_light(chip="ws2814"), True, None),
+    ("ultra_digital minimal", ULTRA_DP + UD, True, None),
+    ("ultra_digital sk6812_rgbw WRGB", ULTRA_DP + "light:\n" + ud_light(chip="sk6812_rgbw", extra="    color_order: WRGB\n"), True, None),
+    ("ultra_digital ws2814 default RGBW", ULTRA_DP + "light:\n" + ud_light(chip="ws2814"), True, None),
     ("ultra_digital ws2805 five channels",
-     ULTRA + "light:\n" + ud_light(chip="ws2805", extra="    color_order: RGBCW\n    cold_white_share: 40%\n"), True, None),
-    ("ultra_digital ws2812b color_order with a W", ULTRA + "light:\n" + ud_light(extra="    color_order: RGBW\n"), False, "3 letters"),
-    ("ultra_digital ws2814 color_order RGB", ULTRA + "light:\n" + ud_light(chip="ws2814", extra="    color_order: RGB\n"), False, "4 letters"),
-    ("ultra_digital color_order twice the same channel", ULTRA + "light:\n" + ud_light(extra="    color_order: GGB\n"), False, "each of RGB once"),
-    ("ultra_digital cold_white_share on a plain chip", ULTRA + "light:\n" + ud_light(extra="    cold_white_share: 40%\n"), False, "WS2805"),
-    ("ultra_digital unknown chip", ULTRA + "light:\n" + ud_light(chip="apa102"), False, "apa102"),
-    ("ultra_digital segment beyond the strip", ULTRA + "light:\n" + ud_light(extra="    segment_start: 70\n"), False, "beyond num_leds"),
+     ULTRA_DP + "light:\n" + ud_light(chip="ws2805", extra="    color_order: RGBCW\n    cold_white_share: 40%\n"), True, None),
+    ("ultra_digital ws2812b color_order with a W", ULTRA_DP + "light:\n" + ud_light(extra="    color_order: RGBW\n"), False, "3 letters"),
+    ("ultra_digital ws2814 color_order RGB", ULTRA_DP + "light:\n" + ud_light(chip="ws2814", extra="    color_order: RGB\n"), False, "4 letters"),
+    ("ultra_digital color_order twice the same channel", ULTRA_DP + "light:\n" + ud_light(extra="    color_order: GGB\n"), False, "each of RGB once"),
+    ("ultra_digital cold_white_share on a plain chip", ULTRA_DP + "light:\n" + ud_light(extra="    cold_white_share: 40%\n"), False, "WS2805"),
+    ("ultra_digital unknown chip", ULTRA_DP + "light:\n" + ud_light(chip="apa102"), False, "apa102"),
+    ("ultra_digital segment beyond the strip", ULTRA_DP + "light:\n" + ud_light(extra="    segment_start: 70\n"), False, "beyond num_leds"),
     ("ultra_digital segment range beyond the strip",
-     ULTRA + "light:\n" + ud_light(extra="    segment_start: 40\n    segment_length: 40\n"), False, "beyond num_leds"),
-    ("ultra_digital board out of range", ULTRA + "light:\n" + ud_light(board=2), False, "boards are 0-based"),
+     ULTRA_DP + "light:\n" + ud_light(extra="    segment_start: 40\n    segment_length: 40\n"), False, "beyond num_leds"),
+    ("ultra_digital board out of range", ULTRA_DP + "light:\n" + ud_light(board=1), False, "boards are 0-based"),
     ("ultra_digital 4 segments of one receiver",
-     ULTRA + "light:\n" + "".join(
+     ULTRA_DP + "light:\n" + "".join(
          ud_light(name=f"s{k}", segment=k, extra=f"    segment_start: {k * 15}\n    segment_length: 15\n") for k in range(4)),
      True, None),
-    ("ultra_digital the same segment twice", ULTRA + "light:\n" + ud_light(name="a") + ud_light(name="b"), False, "is used by"),
+    ("ultra_digital the same segment twice", ULTRA_DP + "light:\n" + ud_light(name="a") + ud_light(name="b"), False, "is used by"),
     ("ultra_digital segments disagreeing on the chip",
-     ULTRA + "light:\n" + ud_light(name="a") + ud_light(name="b", segment=1, chip="sk6812"), False, "differs"),
+     ULTRA_DP + "light:\n" + ud_light(name="a") + ud_light(name="b", segment=1, chip="sk6812"), False, "differs"),
     ("ultra_digital receiver settings on one light of the receiver",
-     ULTRA + "light:\n" + ud_light(name="a", extra="    max_fps: 60\n") + ud_light(name="b", segment=1), True, None),
+     ULTRA_DP + "light:\n" + ud_light(name="a", extra="    max_fps: 60\n") + ud_light(name="b", segment=1), True, None),
     ("ultra_digital receiver settings agreeing",
-     ULTRA + "light:\n" + ud_light(name="a", extra="    max_fps: 60\n") + ud_light(name="b", segment=1, extra="    max_fps: 60\n"),
+     ULTRA_DP + "light:\n" + ud_light(name="a", extra="    max_fps: 60\n") + ud_light(name="b", segment=1, extra="    max_fps: 60\n"),
      True, None),
     ("ultra_digital receiver settings disagreeing",
-     ULTRA + "light:\n" + ud_light(name="a", extra="    max_fps: 60\n") + ud_light(name="b", segment=1, extra="    max_fps: 30\n"),
+     ULTRA_DP + "light:\n" + ud_light(name="a", extra="    max_fps: 60\n") + ud_light(name="b", segment=1, extra="    max_fps: 30\n"),
      False, "say it on one light"),
-    ("ultra_digital segment 4", ULTRA + "light:\n" + ud_light(segment=4), False, "segment"),
-    ("ultra_digital refresh_interval over a second", ULTRA + "  refresh_interval: 2s\n" + UD, False, "at least once a second"),
-    ("ultra_digital on a board of a dig2analog_ultra light",
-     ULTRA + "light:\n" + ULTRA_MONO.format(name="m", board=0, channel=1) + ud_light(name="u"), False, "dig2analog_ultra light"),
-    ("ultra_digital next to a dig2analog_ultra light on another board",
-     ULTRA + "light:\n" + ULTRA_MONO.format(name="m", board=1, channel=1) + ud_light(), True, None),
+    ("ultra_digital segment 4", ULTRA_DP + "light:\n" + ud_light(segment=4), False, "segment"),
+    ("ultra_digital refresh_interval over a second is fine (the beacon)", ULTRA_DP + "  refresh_interval: 5s\n" + UD, True, None),
+    ("ultra_digital next to a dig2analog_ultra light",
+     ULTRA_DP + "light:\n" + ULTRA_MONO.format(name="m", board=0, channel=1) + ud_light(name="u"), False, "is a digital port"),
     ("ultra_digital exclusive with a streaming light",
-     ULTRA + "light:\n" + UD_STREAM + ud_light(extra="    exclusive_with: streamer\n"), True, None),
-    ("ultra_digital exclusive with itself", ULTRA + "light:\n" + ud_light(extra="    id: me\n    exclusive_with: me\n"), False, "itself"),
+     ULTRA_DP + "light:\n" + UD_STREAM + ud_light(extra="    exclusive_with: streamer\n"), True, None),
+    ("ultra_digital exclusive with an ultra_digital_stream light",
+     ULTRA_DP + "light:\n" + UDS + ud_light(extra="    exclusive_with: streamer\n"), True, None),
+    ("ultra_digital exclusive with itself", ULTRA_DP + "light:\n" + ud_light(extra="    id: me\n    exclusive_with: me\n"), False, "itself"),
     ("ultra_digital exclusive with something that is no light",
-     ULTRA + "light:\n" + ud_light(extra="    exclusive_with: u\n"), False, "exclusive_with"),
-    ("ultra_digital a custom effect id", ULTRA + "light:\n" + ud_light(extra=ud_effects(("Mine", 130))), True, None),
-    ("ultra_digital an effect name twice", ULTRA + "light:\n" + ud_light(extra=ud_effects(("Solid", 130))), False, "twice"),
-    ("ultra_digital only the listed effects", ULTRA + "light:\n" + ud_light(extra=ud_effects(("Mine", 130), only=True)), True, None),
-    ("ultra_digital fx 0", ULTRA + "light:\n" + ud_light(extra=ud_effects(("x", 0))), False, "fx"),
+     ULTRA_DP + "light:\n" + ud_light(extra="    exclusive_with: u\n"), False, "exclusive_with"),
+    ("ultra_digital a custom effect id", ULTRA_DP + "light:\n" + ud_light(extra=ud_effects(("Mine", 130))), True, None),
+    ("ultra_digital an effect name twice", ULTRA_DP + "light:\n" + ud_light(extra=ud_effects(("Solid", 130))), False, "twice"),
+    ("ultra_digital only the listed effects", ULTRA_DP + "light:\n" + ud_light(extra=ud_effects(("Mine", 130), only=True)), True, None),
+    ("ultra_digital fx 0", ULTRA_DP + "light:\n" + ud_light(extra=ud_effects(("x", 0))), False, "fx"),
     ("ultra_digital a dig2analog_ultra effect",
-     ULTRA + "light:\n" + ud_light(extra="    effects:\n      - ultra_pulse:\n"), False, "ultra_pulse"),
-    ("ultra_digital an ESPHome effect", ULTRA + "light:\n" + ud_light(extra="    effects:\n      - random:\n"), True, None),
-    ("ultra_digital the palette by name", ULTRA + "light:\n" + ud_light(extra="    palette: ocean\n"), True, None),
-    ("ultra_digital an unknown palette", ULTRA + "light:\n" + ud_light(extra="    palette: nope\n"), False, "unknown palette"),
+     ULTRA_DP + "light:\n" + ud_light(extra="    effects:\n      - ultra_pulse:\n"), False, "ultra_pulse"),
+    ("ultra_digital an ESPHome effect", ULTRA_DP + "light:\n" + ud_light(extra="    effects:\n      - random:\n"), True, None),
+    ("ultra_digital the palette by name", ULTRA_DP + "light:\n" + ud_light(extra="    palette: ocean\n"), True, None),
+    ("ultra_digital an unknown palette", ULTRA_DP + "light:\n" + ud_light(extra="    palette: nope\n"), False, "unknown palette"),
     ("ultra_digital colours as hex and lists",
-     ULTRA + "light:\n" + ud_light(extra="    color_2: 0xFF8000\n    color_3: [0, 64, 255]\n"), True, None),
-    ("ultra_digital a bad colour", ULTRA + "light:\n" + ud_light(extra="    color_2: [1, 2]\n"), False, "red, green, blue"),
+     ULTRA_DP + "light:\n" + ud_light(extra="    color_2: 0xFF8000\n    color_3: [0, 64, 255]\n"), True, None),
+    ("ultra_digital a bad colour", ULTRA_DP + "light:\n" + ud_light(extra="    color_2: [1, 2]\n"), False, "red, green, blue"),
     ("ultra_digital current and limits",
-     ULTRA + "light:\n" + ud_light(extra="    led_current: 18mA\n    current_limit: 2A\n    max_fps: 60\n"), True, None),
+     ULTRA_DP + "light:\n" + ud_light(extra="    led_current: 18mA\n    current_limit: 2A\n    max_fps: 60\n"), True, None),
     ("ultra_digital standalone and store",
-     ULTRA + "light:\n" + ud_light(
+     ULTRA_DP + "light:\n" + ud_light(
          extra="    store_after: 30s\n    standalone:\n      power_on: true\n      on_signal_loss: true\n      signal_loss_timeout: 5s\n"),
      True, None),
-    ("ultra_digital store_after under 5 s", ULTRA + "light:\n" + ud_light(extra="    store_after: 1s\n"), False, "5"),
-    ("ultra_digital too many pixels", ULTRA + "light:\n" + ud_light(leds=3000), False, "2500"),
+    ("ultra_digital store_after under 5 s", ULTRA_DP + "light:\n" + ud_light(extra="    store_after: 1s\n"), False, "5"),
+    ("ultra_digital too many pixels", ULTRA_DP + "light:\n" + ud_light(leds=3000), False, "2500"),
     ("ultra_digital the action",
-     ULTRA + "light:\n" + ud_light(extra="    id: strip\n") + UD_ACTION.format(
+     ULTRA_DP + "light:\n" + ud_light(extra="    id: strip\n") + UD_ACTION.format(
          id="strip", fields="          color_2: 0xFF0000\n          speed: 200\n          palette: Ocean\n"), True, None),
-    ("ultra_digital the action on something that is no light", ULTRA + UD + UD_ACTION.format(id="u", fields=""), False, "u"),
+    ("ultra_digital the action on something that is no light", ULTRA_DP + UD + UD_ACTION.format(id="u", fields=""), False, "u"),
+    ("ultra_digital without digital: on the line", ULTRA + UD, False, "is not a digital port"),
+    # ---- the digital port itself
+    ("digital port minimal", ULTRA_DP, True, None),
+    ("digital port with a reset time", ULTRA_DP.replace("  digital:\n", "  digital:\n    reset_time: 80us\n"), True, None),
+    ("digital port reset time too short", ULTRA_DP.replace("  digital:\n", "  digital:\n    reset_time: 10us\n"), False, "50us"),
+    ("digital port with two boards", ULTRA_DP.replace("num_boards: 1", "num_boards: 2"), False, "one receiver"),
+    ("digital port with telemetry needs the direction pin",
+     ULTRA_DP + TELEMETRY + RX_LIST + RX_UART, False, "direction_pin"),
+    ("digital port with telemetry",
+     ULTRA_DP + TELEMETRY + RX_LIST.replace("      - device_id: r2\n", "") + "    direction_pin: GPIO4\n" + RX_UART, True, None),
+    ("digital port with a firmware update entity",
+     ULTRA_DP + UPD_NET + UPD, False, "digital port"),
+    ("digital port with a dig2analog_ultra light",
+     ULTRA_DP + "light:\n" + ULTRA_MONO.format(name="m", board=0, channel=1), False, "digital port"),
+    ("digital port: the retry action",
+     ULTRA_DP + "button:\n  - platform: template\n    name: R\n    on_press:\n      - dig2analog_ultra.retry_receiver:\n          id: u\n",
+     True, None),
+    # ---- ultra_digital_stream
+    ("stream light minimal", ULTRA_DP + "light:\n" + UDS, True, None),
+    ("stream light sk6812 rgbw", ULTRA_DP + "light:\n" + UDS.replace("chipset: ws2812", "chipset: sk6812\n    channel_colors: GRBW"), True, None),
+    ("stream light custom timing",
+     ULTRA_DP + "light:\n" + UDS.replace("    chipset: ws2812\n", "    bit0_high: 350ns\n    bit0_low: 900ns\n    bit1_high: 700ns\n"
+                                          "    bit1_low: 550ns\n    reset_time: 80us\n"), True, None),
+    ("stream light with a chipset and timing", ULTRA_DP + "light:\n" + UDS + "    bit0_high: 350ns\n    bit0_low: 900ns\n"
+     "    bit1_high: 700ns\n    bit1_low: 550ns\n", False, "chipset"),
+    ("stream light without a chipset or timing", ULTRA_DP + "light:\n" + UDS.replace("    chipset: ws2812\n", ""), False, "chipset"),
+    ("stream light on a line that is no digital port", ULTRA + "light:\n" + UDS, False, "not a digital port"),
+    ("stream light twice on a port", ULTRA_DP + "light:\n" + UDS + UDS.replace("id: streamer", "id: s2").replace("name: stream", "name: s2"),
+     False, "one strip"),
+    ("stream light too many pixels", ULTRA_DP + "light:\n" + UDS.replace("num_leds: 30", "num_leds: 3000"), False, "2500"),
+    ("stream light with effects", ULTRA_DP + "light:\n" + UDS + "    effects:\n      - pulse:\n      - addressable_rainbow:\n", True, None),
 ]
 
 

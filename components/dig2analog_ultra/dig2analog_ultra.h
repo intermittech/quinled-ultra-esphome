@@ -47,6 +47,10 @@
 #include "ultra_parlio.h"
 #endif
 
+#ifdef USE_DIG2ANALOG_ULTRA_DIGITAL
+#include "ultra_dport.h"
+#endif
+
 namespace esphome::dig2analog_ultra {
 
 class UltraLight;
@@ -62,6 +66,13 @@ class PixelSource {
   virtual uint32_t pixel_standby_after() const = 0;
   virtual light::LightState *pixel_state() const = 0;
 };
+
+#ifdef USE_DIG2ANALOG_ULTRA_DIGITAL
+/// A digital port's encoder argument: the symbol table of the transmission (lead LOW, marker, bits, tail LOW)
+struct DpEncoder {
+  ultra_dp_rmt_t tab;
+};
+#endif
 
 using EncoderParams = FrameSymbols<rmt_symbol_word_t>;
 /// The encoder's argument: the bit symbols, and the underrun watch (diagnostics, only when watching).
@@ -357,6 +368,48 @@ class UltraHub final : public Component {
     if (std::find(this->pixel_boards_.begin(), this->pixel_boards_.end(), board) == this->pixel_boards_.end())
       this->pixel_boards_.push_back(board);
   }
+
+#ifdef USE_DIG2ANALOG_ULTRA_DIGITAL
+  // A DIGITAL PORT (protocol 0.2.8, ultra_dport.h): one QuinLED Diff-Power Ultra-Digital receiver (num_boards 1) in the
+  // data path of a pixel strip. Its Ultra frames go out behind a marker in a latch gap (the strip never sees them), the
+  // pixel stream of a light (ultra_digital_stream) goes between them, the polls leave the line to the receiver's answer,
+  // and a receiver running a local effect (PIXEL_FX) gets no pixels and a header at least once a second. No preamble,
+  // no chain lock, no firmware update over this line (the receiver's own bootloader path is the Ultra line's).
+  /// codegen: the line is a digital port; reset_us: the strip's reset (the latch: the hub's pixel frames' tail, and what
+  /// a hand-back from a local effect waits for)
+  void set_digital(uint32_t reset_us) {
+    this->digital_ = true;
+    this->dp_reset_us_ = reset_us;
+  }
+  bool is_digital() const { return this->digital_; }
+  /// codegen of a stream light (ultra_digital_stream): the pixel frame's size and the strip chip's timing. Several
+  /// lights on the strip's one output are not possible: the last one wins (the schema allows one).
+  void set_digital_stream(uint32_t bytes, uint32_t bit0_high_ns, uint32_t bit0_low_ns, uint32_t bit1_high_ns,
+                          uint32_t bit1_low_ns, uint32_t reset_us) {
+    this->px_bytes_ = bytes;
+    this->px_t0h_ = bit0_high_ns;
+    this->px_t0l_ = bit0_low_ns;
+    this->px_t1h_ = bit1_high_ns;
+    this->px_t1l_ = bit1_low_ns;
+    if (reset_us > this->dp_reset_us_)
+      this->dp_reset_us_ = reset_us;
+  }
+  /// A pixel frame is ready (copied; the newest wins while one waits for the line). Not while a local effect runs.
+  void digital_pixels(const uint8_t *data);
+  /// The receiver's local effect on a segment changed (PIXEL_FX queued with `effect`; 0: the stream again, at
+  /// start_us on the host clock; local_frame_us: the receiver's frame on the strip, which it finishes first)
+  void digital_note_fx(uint8_t segment, uint8_t effect, int64_t start_us, uint32_t local_frame_us);
+  /// the user intervened (a button, the action dig2analog_ultra.retry_receiver): the back-off starts over
+  void digital_retry();
+  /// the receiver stopped answering: 0 fine, 1 retrying (first series), 2 waiting for the second, 3 gave up
+  uint8_t digital_backoff() const { return this->dp_.bo_phase; }
+  /// ... no marker frame goes out in this state (commands wait for the retry)
+  bool digital_blocked() const { return ultra_dp_blocked(&this->dp_, now_us_()); }
+  bool digital_local() const { return this->dp_.local != 0; }
+  uint32_t digital_polls() const { return this->dp_.polls; }
+  uint32_t digital_answered() const { return this->dp_.answered; }
+  uint32_t digital_pixel_frames() const { return this->px_frames_; }
+#endif
 
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   // Diff-Power receiver telemetry (the return channel, ultra_telemetry.h; wiki: Diff-Power telemetry).
@@ -691,6 +744,31 @@ class UltraHub final : public Component {
 #endif
 
   bool setup_rmt_();
+#ifdef USE_DIG2ANALOG_ULTRA_DIGITAL
+  // the digital port: the planner (ultra_dport.h) decides when a transmission may start, these send it
+  void loop_digital_();
+  void transmit_digital_(const ultra_dp_tx_t &tx, int64_t now);
+  void digital_window_end_(int64_t now);
+  void digital_save_();
+  bool digital_setup_();
+  bool digital_{false};
+  ultra_dp_t dp_{};
+  uint32_t dp_reset_us_{300};
+  /// the encoder's symbol table: set before a transmission, while the line is free (the encoder reads it in its
+  /// interrupt, until the transmission is out)
+  DpEncoder dp_enc_{};
+  uint32_t rmt_res_{0};
+  uint32_t px_t0h_{400}, px_t0l_{850}, px_t1h_{800}, px_t1l_{450};   // the strip chip's bit timing (ns)
+  uint32_t px_word0_{0}, px_word1_{0};                               // ... as RMT words
+  uint32_t px_bytes_{0};
+  uint8_t *px_pending_{nullptr}, *px_tx_{nullptr};   // the newest frame, and the one being sent
+  bool px_ready_{false};
+  bool px_have_{false};                              // the stream light handed over a frame at least once
+  uint32_t px_frames_{0};
+  uint8_t fx_active_{0};                             // per segment: a local effect (the stream passes without)
+  ESPPreferenceObject dp_pref_;
+  bool dp_stored_{false};                            // the "gave up" flag is on flash
+#endif
   uint8_t *tx_buf_{nullptr};
   bool tx_prepared_{false};      // tx_buf_ holds a frame the RMT refused: sent again first
   bool tx_normal_{true};         // it is a normal / DARK frame (retime_frame gives it a new TIME)
@@ -756,6 +834,19 @@ template<typename... Ts> class CalibrateCurrentAction final : public Action<Ts..
   std::vector<uint16_t> boards_;
   uint8_t duty_pct_{0};
 };
+
+#ifdef USE_DIG2ANALOG_ULTRA_DIGITAL
+/// dig2analog_ultra.retry_receiver: a digital port polls its receiver again after it stopped answering
+template<typename... Ts> class RetryReceiverAction final : public Action<Ts...>, public Parented<UltraHub> {
+ public:
+  void play(const Ts &...x) override { this->parent_->digital_retry(); }
+};
+#else
+template<typename... Ts> class RetryReceiverAction final : public Action<Ts...>, public Parented<UltraHub> {
+ public:
+  void play(const Ts &...x) override {}
+};
+#endif
 
 template<typename... Ts> class ShowVersionAction final : public Action<Ts...>, public Parented<UltraHub> {
  public:

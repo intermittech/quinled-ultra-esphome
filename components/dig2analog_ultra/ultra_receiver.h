@@ -172,6 +172,8 @@ class UltraTelemetryPort final : public Component {
   Paced paced_[VALUE_COUNT]{};
   MeanPaced power_mean_;
   bool standby_was_{false};
+  uint32_t setup_sig_{0};   // the Setup info's signature at its last build (ultra_telemetry.h)
+  bool setup_sig_set_{false};
   sensor::Sensor *health_[HEALTH_COUNT]{};
   bool has_health_{false}, health_seen_{false};
   uint32_t health_ms_{0}, answers_was_{0}, missing_was_{0};

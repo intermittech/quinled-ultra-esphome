@@ -1735,38 +1735,70 @@ inline float light_power_estimate(const ReceiverData &d, uint8_t mask) {
 /// Ultra-Digital receiver, id 3, drives pixels; an unknown board) has none to lay out.
 inline uint8_t setup_channels(uint8_t hw_id) { return hw_id == UPD_HW_ID_DP_ULTRA_RX ? 5 : 0; }   // (ReceiverData: 5)
 
-/// One receiver's record of the line's Setup info: "<position>:<UID16>:<hardware id>:<channels>:<used>" (position
-/// 1-based, UID16 four hex digits, used = the channels that draw current, e.g. "125", "-" none, "?" not known: no
-/// calibration test yet, so which outputs have a load isn't known), or "<position>:?" for a position nothing has
-/// answered at. The used channels are the last calibration test's (normal or abnormal, not "no load"), so the text
-/// changes only with a test, never with the lights (Home Assistant records every change).
-inline std::string telemetry_setup_record(uint16_t position, const ReceiverData &d, bool answering, bool have_uid,
-                                          uint16_t uid16) {
-  std::string s = std::to_string(position);
-  if (!have_uid && !answering && !d.have_board)
-    return s + ":?";
-  char b[8];
-  snprintf(b, sizeof(b), ":%04X:", static_cast<unsigned>(uid16));
-  s += have_uid ? b : ":????:";
-  const uint8_t hw = d.have_board ? d.hw_id : d.have_status ? d.hw : 0;
-  s += std::to_string(hw) + ":" + std::to_string(setup_channels(hw)) + ":";
-  const uint8_t n = setup_channels(hw);
+/// What one receiver's record of the Setup info says: the single source of both the text and its signature.
+struct SetupFields {
+  bool heard{false};     // false: "<position>:?" (nothing has answered at this position)
+  bool have_uid{false};
+  uint16_t uid16{0};
+  uint8_t hw{0};
+  uint8_t channels{0};
+  uint8_t used{0};       // bit n = CH n+1 draws current in the last calibration test
+  bool used_known{false};
+  bool operator==(const SetupFields &o) const {
+    return heard == o.heard && have_uid == o.have_uid && uid16 == o.uid16 && hw == o.hw && channels == o.channels &&
+           used == o.used && used_known == o.used_known;
+  }
+};
+
+/// The fields of a receiver's record. The used channels are the last calibration test's (normal or abnormal, not "no
+/// load"), so they change only with a test, never with the lights (Home Assistant records every change).
+inline SetupFields telemetry_setup_fields(const ReceiverData &d, bool answering, bool have_uid, uint16_t uid16) {
+  SetupFields f;
+  f.heard = have_uid || answering || d.have_board;
+  if (!f.heard)
+    return f;
+  f.have_uid = have_uid;
+  f.uid16 = have_uid ? uid16 : 0;
+  f.hw = d.have_board ? d.hw_id : d.have_status ? d.hw : 0;
+  f.channels = setup_channels(f.hw);
   const bool tested = d.have_health && ((d.he_flags & ULTRA_HE_F_TESTED) || d.ch_class[0] != ULTRA_HE_UNTESTED);
-  std::string used;
-  if (n == 0) {
-    used = d.have_board ? "-" : "?";
+  if (f.channels == 0) {
+    f.used_known = d.have_board;   // (no lights to lay out: "-"; before its IDENTITY: "?")
   } else if (tested) {
-    for (uint8_t i = 0; i < n; i++) {
+    f.used_known = true;
+    for (uint8_t i = 0; i < f.channels; i++) {
       const uint8_t c = d.ch_class[i] & 0x0F;
       if (c == ULTRA_HE_NORMAL || c == ULTRA_HE_ABNORMAL)
-        used += static_cast<char>('1' + i);
+        f.used |= static_cast<uint8_t>(1u << i);
     }
-    if (used.empty())
-      used = "-";
-  } else {
-    used = "?";
   }
-  return s + used;
+  return f;
+}
+
+/// One receiver's record: "<position>:<UID16>:<hardware id>:<channels>:<used>" (position 1-based, UID16 four hex
+/// digits, used = the channels that draw current, e.g. "125", "-" none, "?" not known: no calibration test yet, so
+/// which outputs have a load isn't known), or "<position>:?" for a position nothing has answered at.
+inline std::string telemetry_setup_record(uint16_t position, const SetupFields &f) {
+  std::string s = std::to_string(position);
+  if (!f.heard)
+    return s + ":?";
+  char b[8];
+  snprintf(b, sizeof(b), ":%04X:", static_cast<unsigned>(f.uid16));
+  s += f.have_uid ? b : ":????:";
+  s += std::to_string(f.hw) + ":" + std::to_string(f.channels) + ":";
+  if (!f.used_known)
+    return s + "?";
+  if (f.used == 0)
+    return s + "-";
+  for (uint8_t i = 0; i < 5; i++) {
+    if (f.used & (1u << i))
+      s += static_cast<char>('1' + i);
+  }
+  return s;
+}
+inline std::string telemetry_setup_record(uint16_t position, const ReceiverData &d, bool answering, bool have_uid,
+                                          uint16_t uid16) {
+  return telemetry_setup_record(position, telemetry_setup_fields(d, answering, have_uid, uid16));
 }
 
 /// The Setup info text, the receivers in cable order: "S1 1:9C02:2:5:12 2:A41F:2:5:3 3:?". "S1" is the format's
@@ -1776,13 +1808,13 @@ template <typename Poller>
 inline std::string telemetry_setup_info(const Poller &p) {
   size_t last = 0;   // 1 + the last position that has been heard
   for (uint16_t i = 0; i < p.receivers(); i++) {
-    if (p.has_uid(i) || p.answering(i) || p.data(i).have_board)
+    if (telemetry_setup_fields(p.data(i), p.answering(i), p.has_uid(i), p.uid16(i)).heard)
       last = i + 1;
   }
   std::string s = "S1";
   for (size_t i = 0; i < last; i++) {
-    const std::string r = telemetry_setup_record(static_cast<uint16_t>(i + 1), p.data(i), p.answering(i), p.has_uid(i),
-                                                 p.uid16(i));
+    const std::string r = telemetry_setup_record(
+        static_cast<uint16_t>(i + 1), telemetry_setup_fields(p.data(i), p.answering(i), p.has_uid(i), p.uid16(i)));
     if (s.size() + 1 + r.size() > TEXT_STATE_MAX - 5) {
       s += " +" + std::to_string(last - i);
       break;
@@ -1790,6 +1822,21 @@ inline std::string telemetry_setup_info(const Poller &p) {
     s += " " + r;
   }
   return s;
+}
+
+/// A hash of exactly what telemetry_setup_info() reads (the fields above; no allocation, a few integer operations per
+/// receiver): the port builds the text only when this changes, not on every window.
+template <typename Poller>
+inline uint32_t telemetry_setup_sig(const Poller &p) {
+  uint32_t h = 2166136261u;
+  auto mix = [&h](uint32_t v) { h = (h ^ v) * 16777619u; };
+  for (uint16_t i = 0; i < p.receivers(); i++) {
+    const SetupFields f = telemetry_setup_fields(p.data(i), p.answering(i), p.has_uid(i), p.uid16(i));
+    mix(static_cast<uint32_t>(f.heard) | static_cast<uint32_t>(f.have_uid) << 1 | static_cast<uint32_t>(f.used_known) << 2 |
+        static_cast<uint32_t>(f.used) << 3 | static_cast<uint32_t>(f.hw) << 8 | static_cast<uint32_t>(f.channels) << 16);
+    mix(f.uid16);
+  }
+  return h;
 }
 
 // --------------------------------------------------------------------------------------- the receivers' reply rate

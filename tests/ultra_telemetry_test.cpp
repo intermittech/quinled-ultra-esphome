@@ -18,6 +18,7 @@
 #include <cstring>
 #include <chrono>
 #include <cstdio>
+#include <map>
 #include <random>
 #include <set>
 #include <string>
@@ -3085,6 +3086,46 @@ static void test_setup_info() {
   snprintf(want, sizeof(want), "S1 1:%04X:2:5:12345 2:%04X:2:5:1345 3:%04X:2:5:12345", c.rx[0].uid16(), c.rx[1].uid16(),
            c.rx[2].uid16());
   CHECK(line == want, "three heard, the two silent ones left out: '%s' (wanted '%s')", line.c_str(), want);
+  // the signature the port gates the build with: a different text always has a different signature (random receivers: the
+  // hardware, the identity, the tests, answering or not); the same text may have two (a trailing position nothing heard)
+  struct Fake {
+    std::vector<ReceiverData> d;
+    std::vector<bool> ans, uid;
+    std::vector<uint16_t> u16;
+    uint16_t receivers() const { return static_cast<uint16_t>(d.size()); }
+    const ReceiverData &data(uint16_t i) const { return d[i]; }
+    bool answering(uint16_t i) const { return ans[i]; }
+    bool has_uid(uint16_t i) const { return uid[i]; }
+    uint16_t uid16(uint16_t i) const { return u16[i]; }
+  };
+  std::map<uint32_t, std::string> by_sig;
+  int clashes = 0;
+  for (int k = 0; k < 60000; k++) {
+    Fake f;
+    const int n = 1 + static_cast<int>(rng() % 3);
+    for (int i = 0; i < n; i++) {
+      ReceiverData r;
+      r.have_board = rng() % 3 != 0;
+      r.hw_id = static_cast<uint8_t>(1 + rng() % 4);
+      r.have_status = rng() % 2;
+      r.hw = static_cast<uint8_t>(1 + rng() % 4);
+      r.have_health = rng() % 4 != 0;
+      r.he_flags = rng() % 2 ? ULTRA_HE_F_TESTED : 0;
+      for (int c = 0; c < 5; c++)
+        r.ch_class[c] = static_cast<uint8_t>((rng() % 4) | (rng() % 2 ? ULTRA_HE_R_BELOW : 0));
+      f.d.push_back(r);
+      f.ans.push_back(rng() % 2);
+      f.uid.push_back(rng() % 4 != 0);
+      f.u16.push_back(static_cast<uint16_t>(rng() % 3));   // (few values: many equal texts)
+    }
+    const std::string t = telemetry_setup_info(f);
+    const uint32_t g = telemetry_setup_sig(f);
+    auto a = by_sig.emplace(g, t);
+    if (!a.second && a.first->second != t)
+      clashes++;
+  }
+  CHECK(clashes == 0 && by_sig.size() > 1000, "signature vs text: %d signatures for two texts (%zu signatures)", clashes,
+        by_sig.size());
   // a long chain: the text never passes 255 characters and ends with +N
   Chain big(40);
   for (auto &r : big.rx)

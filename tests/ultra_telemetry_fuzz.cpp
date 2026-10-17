@@ -244,6 +244,7 @@ int main(int argc, char **argv) {
       CHECK(p.reach_now(now) <= n, "reach beyond the chain");
       // ---- everything the entities would show, on every receiver
       const int cut_at = p.cut_at(now);
+      note_text(telemetry_setup_info(p), "telemetry_setup_info");
       for (uint16_t i = 0; i < n; i++) {
         const ReceiverData &d = p.data(i);
         CHECK(d.have_identity == (d.have_board && d.have_features), "rx %u: have_identity inconsistent", i);

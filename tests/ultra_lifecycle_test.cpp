@@ -2103,7 +2103,7 @@ struct UltraTelemetryPort {   // as ultra_receiver.h
   enum Value : uint8_t {
     POWER = 0, CURRENT, LOAD, CABLE_LOSS, CABLE_LOSS_PCT, PEAK_LOAD, LIVE_POWER, ENERGY, VALUE_COUNT,
   };
-  enum Text : uint8_t { RECEIVERS = 0, STATUS, STATUS_DETAIL, TEXT_COUNT };
+  enum Text : uint8_t { RECEIVERS = 0, STATUS, STATUS_DETAIL, SETUP_INFO, TEXT_COUNT };
   enum Health : uint8_t { H_WINDOWS = 0, H_MISSING, H_BROKEN, H_CONTENTION, H_RESTARTS, H_LATE, H_RATE, HEALTH_COUNT };
   static constexpr uint32_t HEALTH_MS = 60000;
   void update_();
@@ -2120,6 +2120,8 @@ struct UltraTelemetryPort {   // as ultra_receiver.h
   Paced paced_[VALUE_COUNT]{};
   MeanPaced power_mean_;
   bool standby_was_{false};
+  uint32_t setup_sig_{0};
+  bool setup_sig_set_{false};
 };
 struct UltraLightTelemetry {   // as ultra_receiver.h
   void update_(uint32_t updates);

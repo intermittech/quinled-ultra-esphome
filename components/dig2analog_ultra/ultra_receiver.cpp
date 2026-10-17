@@ -331,8 +331,14 @@ void UltraTelemetryPort::update_() {
                       : waking  ? std::string("The port just woke: waiting for its receivers' first answers.")
                                 : port_status_detail(m));
   // the receivers in cable order for the setup generator (changes with a receiver found, replaced or tested)
-  if (this->texts_[SETUP_INFO] != nullptr)
-    text(SETUP_INFO, telemetry_setup_info(p));
+  if (this->texts_[SETUP_INFO] != nullptr) {
+    const uint32_t sig = telemetry_setup_sig(p);   // (integer work per window; the text only when it changed)
+    if (!this->setup_sig_set_ || sig != this->setup_sig_) {
+      this->setup_sig_ = sig;
+      this->setup_sig_set_ = true;
+      text(SETUP_INFO, telemetry_setup_info(p));
+    }
+  }
   this->publish_health_();
 }
 

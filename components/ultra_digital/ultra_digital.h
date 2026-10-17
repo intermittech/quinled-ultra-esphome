@@ -89,7 +89,7 @@ class PixelLight final : public light::LightOutput,
   void set_flags(uint8_t flags) { this->state_in_.flags = flags; }
   /// the strip's frame on the wire (us): what a hand-back to the stream waits for (the receiver finishes its frame first)
   void set_strip_frame_us(uint32_t us) { this->strip_frame_us_ = us; }
-  /// the receiver's settings (CONFIG 129-139: one set for the strip, every light of the board must agree)
+  /// the receiver's settings (CONFIG 129-139 and 141: one set for the strip, every light of the board must agree)
   void set_receiver_config(uint8_t id, uint16_t value) { this->cfg_.push_back({id, value}); }
   /// CONFIG 140, the line mode (ULTRA_PXLM_*) the YAML says, and the mode the line needs (STREAM on a digital port, CHAIN on
   /// a normal Ultra line). With telemetry the hub sends it once the receiver's IDENTITY shows ULTRA_HWCAP_CHAIN.

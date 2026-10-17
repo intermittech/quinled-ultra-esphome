@@ -1,6 +1,6 @@
 #pragma once
 
-// The hub's side of the QuinLED Diff-Power Ultra-Digital receiver's local pixel effects (PIXEL_FX, CONFIG 129-140,
+// The hub's side of the QuinLED Diff-Power Ultra-Digital receiver's local pixel effects (PIXEL_FX, CONFIG 129-141,
 // page 0x81; ultra_protocol.h ULTRA_PX_* / ULTRA_PXG_* / ULTRA_PXL_*). Pure logic, no ESPHome or ESP-IDF dependency
 // (host-tested: tests/ultra_digital_test.cpp): what page 0x81 says (PixelState, its part 3 the line: PixelLineState and
 // what it means for the line the receiver is on), the chips and colour orders, and how the light's state becomes a

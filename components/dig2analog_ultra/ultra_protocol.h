@@ -272,7 +272,7 @@ enum {
 #define ULTRA_HWCAP_PIXEL         0x00000040u  /* a pixel delay line on a digital port (the Ultra-Digital
                                                   receiver): polled behind a marker (ULTRA_DP_* above), one per port */
 #define ULTRA_HWCAP_PIXEL_FX      0x00000080u  /* runs local pixel effects (the Ultra-Digital receiver): PIXEL_FX,
-                                                  CONFIG 129-140, page 0x81 (ULTRA_PX_* below) */
+                                                  CONFIG 129-141, page 0x81 (ULTRA_PX_* below) */
 #define ULTRA_HWCAP_CHAIN         0x00000100u  /* runs on a normal Ultra line, behind a marker-less chain of boards
                                                   (the Ultra-Digital receiver's chain mode: CONFIG 140, page 0x81 part 3,
                                                   ULTRA_PXL_* below); the capability sets 0x01CD without RELAY: this
@@ -690,8 +690,13 @@ enum {
                                           power-up from what it sees), 1 STREAM (a pixel line: the hub's pixels pass, polls
                                           behind markers), 2 CHAIN (a normal Ultra line: plain Ultra frames, the board takes
                                           the first slot it sees; it only ever shows its own effects) */
+    ULTRA_CFG_PX_SMOOTH = 141,         /* pixel smoothing (ULTRA_PXS_*): how the receiver takes its colour to the strip's 8 bits. The 16-bit paths do the
+                                          gamma, the brightness and the auto-white at 16 bits and round at the end; a dither adds an ordered, stateless
+                                          threshold (host frame index and pixel index) first, so receivers on one grid make the same bytes and the average
+                                          over 256 frames is the 16-bit value. 0 AUTO (the default: 16 bits, dithered at 50 frames a second or more, rounded
+                                          below), 1 ROUND, 2 DITHER, 3 OFF (the 8-bit path of 0.2.8) */
     ULTRA_CFG_PX_FIRST = 129,
-    ULTRA_CFG_PX_COUNT = 12,           /* ids 129 .. 140 */
+    ULTRA_CFG_PX_COUNT = 13,           /* ids 129 .. 141 */
 };
 
 /* ----------------------------------------------------------------------------------- local pixel effects (hardware 3) */
@@ -743,7 +748,7 @@ enum {
 #define ULTRA_PX_FX_STREAM    0u       /* EFFECT 0 */
 #define ULTRA_PX_PAL_COLORS   0xFEu    /* PALETTE: c1 -> c2 -> c3 -> c1 */
 #define ULTRA_PX_PAL_DEFAULT  0xFFu    /* PALETTE: the effect's own */
-/* FLAGS. STORE: this segment's fields (not START and SEQ) and CONFIG 129-140 become the power-on / standalone effect
+/* FLAGS. STORE: this segment's fields (not START and SEQ) and CONFIG 129-141 become the power-on / standalone effect
  * (CONFIG 138); with EFFECT 0 the stored effect is cleared. The record is written only in stream mode or while the strip
  * is dark, never as a visible pause. LOCK: a plain pixel stream from the controller doesn't take the strip back
  * (otherwise, with ULTRA_PXP_STREAM_WINS, it does). RESTART: this slot is not a renewal of the running effect: the
@@ -808,7 +813,7 @@ enum {
 #define ULTRA_PXG_LOAD         19u     /* u8: the CPU load of the last second, 0.5 % steps (0-200) */
 #define ULTRA_PXG_LIMIT        20u     /* u8: the current limiter's brightness scale now, 255 = none */
 #define ULTRA_PXG_LATE         21u     /* u8: frames that started after their grid time (saturating) */
-#define ULTRA_PXG_CONFIG_CRC   22u     /* u16: ultra_px_config_crc over CONFIG 129-140 as the receiver has them */
+#define ULTRA_PXG_CONFIG_CRC   22u     /* u16: ultra_px_config_crc over CONFIG 129-141 as the receiver has them */
 /* part 1: bit (id & 7) of byte id >> 3 (ids 0-191) = the effect id is in the firmware's catalogue; part 2 the same for
  * the palettes */
 #define ULTRA_PXG_PART_STATE    0u
@@ -833,6 +838,11 @@ enum {
  * frame and is never shown (the strip keeps its effect or stays dark); the board counts it (ULTRA_PXL_F_NONULTRA) and shows it
  * on its status LED. Marker frames (a digital-port hub) are still understood, so a
  * hub on a digital port can reach a CHAIN board to set CONFIG 140 back. */
+#define ULTRA_PXS_AUTO          0u     /* CONFIG 141 values (pixel smoothing) */
+#define ULTRA_PXS_ROUND         1u
+#define ULTRA_PXS_DITHER        2u
+#define ULTRA_PXS_OFF           3u
+#define ULTRA_PXS_AUTO_FPS      50u    /* AUTO dithers from this frame rate (the frame grid's, or the measured one without a grid) */
 #define ULTRA_PXLM_AUTO         0u     /* CONFIG 140 values */
 #define ULTRA_PXLM_STREAM       1u
 #define ULTRA_PXLM_CHAIN        2u
@@ -1288,7 +1298,7 @@ static inline int ultra_pixel_fx_parse(const uint8_t *s, ultra_pixel_fx_t *f)
     return (int)light;
 }
 
-/* page 0x81's CONFIG CRC: ultra_crc16 over (id, value u16) of ids 129 .. 140 in order; values[k] = id 129 + k */
+/* page 0x81's CONFIG CRC: ultra_crc16 over (id, value u16) of ids 129 .. 141 in order; values[k] = id 129 + k */
 static inline uint16_t ultra_px_config_crc(const uint16_t *values)
 {
     uint8_t b[ULTRA_CFG_PX_COUNT * 3u];

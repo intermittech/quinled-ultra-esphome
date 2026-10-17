@@ -69,6 +69,7 @@ CONF_REVERSE = "reverse"
 CONF_MIRROR = "mirror"
 CONF_LOCK = "lock"
 CONF_AUTO_WHITE = "auto_white"
+CONF_PIXEL_SMOOTHING = "pixel_smoothing"
 CONF_COLD_WHITE_SHARE = "cold_white_share"
 CONF_MAX_FPS = "max_fps"
 CONF_LED_CURRENT = "led_current"
@@ -96,6 +97,10 @@ CFG_VOFFSET, CFG_VLENGTH, CFG_POLICY, CFG_LOSS_TIMEOUT = 136, 137, 138, 139
 # CONFIG 140, the line mode (ULTRA_PXLM_*): auto = the receiver decides once per power-up, stream = a digital port's receiver
 # (in a strip's data path, the hub's pixels pass), chain = the last board of a normal Ultra line
 LINE_MODES = {"auto": 0, "stream": 1, "chain": 2}
+# CONFIG 141, the pixel smoothing (ULTRA_PXS_*): how the receiver takes its colour to the strip's 8 bits. auto (the default) = 16 bit gamma /
+# brightness / auto-white, dithered at 50 frames a second or more and rounded below; round; dither; off = the 8-bit path of protocol 0.2.8
+CFG_SMOOTH = 141
+PIXEL_SMOOTHING = {"auto": 0, "round": 1, "dither": 2, "off": 3}
 # the auto-white modes (ULTRA_PXW_*)
 AUTO_WHITE = {"default": 0, "off": 1, "accurate": 2, "bright": 3}
 # ULTRA_PXF_* (PIXEL_FX FLAGS)
@@ -190,6 +195,8 @@ CONFIG_SCHEMA = cv.All(
             # the white of RGBW and RGBCCT strips from the colour: off, accurate (taken out of R G B), bright
             cv.Optional(CONF_AUTO_WHITE): cv.one_of(*[k for k in AUTO_WHITE if k != "default"], lower=True),
             cv.Optional(CONF_COLD_WHITE_SHARE): cv.percentage,   # WS2805: the share of the cold white (default even)
+            # smooth dimming (CONFIG 141): auto (default), round, dither or off (the 8-bit path); a receiver of an older firmware ignores it
+            cv.Optional(CONF_PIXEL_SMOOTHING): cv.one_of(*PIXEL_SMOOTHING, lower=True),
             cv.Optional(CONF_MAX_FPS): cv.int_range(min=0, max=1000),   # 0 = as many as the line allows
             # the strip's LED current per channel at full (for the current limit), and the limit: 0 = the link's
             cv.Optional(CONF_LED_CURRENT): cv.All(cv.current, cv.Range(min=0.001, max=0.1)),
@@ -323,7 +330,7 @@ def _final_validate(config: ConfigType) -> ConfigType:
             )
         # one strip: the chip, its pixels and order every light says; the other settings (limits, white, standalone) any
         # one light of the receiver may say, the others leave out (two that say it must agree)
-        for key in (CONF_CHIP, CONF_NUM_LEDS, CONF_COLOR_ORDER, CONF_AUTO_WHITE, CONF_COLD_WHITE_SHARE, CONF_MAX_FPS,
+        for key in (CONF_CHIP, CONF_NUM_LEDS, CONF_COLOR_ORDER, CONF_AUTO_WHITE, CONF_COLD_WHITE_SHARE, CONF_PIXEL_SMOOTHING, CONF_MAX_FPS,
                     CONF_LED_CURRENT, CONF_CURRENT_LIMIT, CONF_VIRTUAL_OFFSET, CONF_VIRTUAL_LENGTH, CONF_STANDALONE,
                     CONF_MODE):
             both = key in (CONF_CHIP, CONF_NUM_LEDS, CONF_COLOR_ORDER) or (key in other and key in config)
@@ -367,7 +374,7 @@ def _receiver_mode(config: ConfigType, siblings: list) -> str:
 
 
 def _receiver_config(config: ConfigType, siblings: list) -> list:
-    """(id, value) of CONFIG 129-139 for this strip (140, the line mode, goes on its own: it waits for the receiver's
+    """(id, value) of CONFIG 129-139 and 141 for this strip (140, the line mode, goes on its own: it waits for the receiver's
     capabilities). The options of a receiver's lights are one set: the first light that says a setting gives it, else its
     default."""
 
@@ -403,6 +410,7 @@ def _receiver_config(config: ConfigType, siblings: list) -> list:
         (CFG_VLENGTH, pick(CONF_VIRTUAL_LENGTH, 0)),
         (CFG_POLICY, policy),
         (CFG_LOSS_TIMEOUT, 30 if timeout is None else int(round(timeout.total_milliseconds / 100))),
+        (CFG_SMOOTH, PIXEL_SMOOTHING[pick(CONF_PIXEL_SMOOTHING, "auto")]),
     ]
 
 

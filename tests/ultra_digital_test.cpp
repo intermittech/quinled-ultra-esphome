@@ -3,7 +3,7 @@
 //  - components/dig2analog_ultra/ultra_pixel_fx.h: the chips and colour orders, the PIXEL_FX a light's state becomes,
 //    page 0x81's decoding, and the tracker that decides when something new is due (a new effect = a new phase anchor, a
 //    change of its parameters keeps it, the hand-back to the stream, the 20 day anchor, the STORE copy, lit);
-//  - ultra_core.h's Scheduler: PIXEL_FX slots (the START stamp, copies, replacement, the refresh, a replay), CONFIG 129-140
+//  - ultra_core.h's Scheduler: PIXEL_FX slots (the START stamp, copies, replacement, the refresh, a replay), CONFIG 129-141
 //    in their own slots, a board without them unchanged; a normal Ultra line whose last board is the receiver (its slot,
 //    the boards in front untouched);
 //  - ultra_telemetry.h: page 0x81 read from a modelled Ultra-Digital receiver (HWCAP PIXEL_FX only; the maps once; UNSUPPORTED
@@ -140,14 +140,14 @@ static void test_slot() {
     CHECK(hex(hs, ULTRA_SLOT_BYTES) == "0b204d09fffffa240102fe0a0b0c0d0e0f101112c802bc000c012c1e050660d2",
           "the firmware's self-test vector: %s", hex(hs, ULTRA_SLOT_BYTES).c_str());
     const uint16_t zeros[ULTRA_CFG_PX_COUNT] = {};
-    CHECK(ultra_px_config_crc(zeros) == 0xf810, "ultra_px_config_crc of twelve zeros (%04x; an independent CRC-16/CCITT-FALSE)",
+    CHECK(ultra_px_config_crc(zeros) == 0x308b, "ultra_px_config_crc of thirteen zeros (%04x; an independent CRC-16/CCITT-FALSE)",
           ultra_px_config_crc(zeros));
-    // CONFIG 129-140 as the protocol's vectors set them (slot_config_pixel + slot_config_pixel_line_mode): the CRC the
+    // CONFIG 129-141 as the protocol's vectors set them (slot_config_pixel + slot_config_pixel_line_mode): the CRC the
     // answer_pixel_state vector carries
     const uint16_t chain_cfg[ULTRA_CFG_PX_COUNT] = {ULTRA_PXC_SK6812_RGBW, ULTRA_PX_ORDER(ULTRA_PXCH_G, ULTRA_PXCH_R, ULTRA_PXCH_B, ULTRA_PXCH_W, 0),
                                                     300, 60, 200, 0, ULTRA_PXW_ACCURATE, 0, 0,
                                                     ULTRA_PXP_POWER_ON | ULTRA_PXP_ON_LOSS, 30, ULTRA_PXLM_CHAIN};
-    CHECK(ultra_px_config_crc(chain_cfg) == 0xba35, "the vectors' twelve values: CRC 0xBA35 (%04x)", ultra_px_config_crc(chain_cfg));
+    CHECK(ultra_px_config_crc(chain_cfg) == 0xba55, "the vectors' thirteen values: CRC 0xBA55 (%04x)", ultra_px_config_crc(chain_cfg));
     CHECK(ultra_px_config_crc(chain_cfg) != ultra_px_config_crc(zeros), "(not all zeros)");
     const uint8_t lm_ids[3] = {ULTRA_CFG_PX_POLICY, ULTRA_CFG_PX_LOSS_TIMEOUT, ULTRA_CFG_PX_LINE_MODE};
     const uint16_t lm_vals[3] = {ULTRA_PXP_POWER_ON | ULTRA_PXP_ON_LOSS, 30, ULTRA_PXLM_CHAIN};
@@ -246,7 +246,7 @@ static void test_line() {
   uint16_t cfg[ULTRA_CFG_PX_COUNT] = {ULTRA_PXC_SK6812_RGBW, ULTRA_PX_ORDER(ULTRA_PXCH_G, ULTRA_PXCH_R, ULTRA_PXCH_B, ULTRA_PXCH_W, 0),
                                       300, 60, 200, 0, ULTRA_PXW_ACCURATE, 0, 0, 3, 30, ULTRA_PXLM_CHAIN};
   CHECK(ps.have_state && ps.mode == ULTRA_PXM_LOCAL && ps.running[0] == 7 && ps.fps10 == 600 && ps.config_crc == ultra_px_config_crc(cfg),
-        "answer_pixel_state: the state, and the CONFIG CRC is the one over our twelve values (%04x)", ps.config_crc);
+        "answer_pixel_state: the state, and the CONFIG CRC is the one over our thirteen values (%04x)", ps.config_crc);
   decode_pixel_page(ps, ULTRA_PXG_PART_LINE, ln.data() + ULTRA_RSP_DATA);
   const PixelLineState &l = ps.line;
   CHECK(l.have && l.config == ULTRA_PXLM_CHAIN && l.mode == ULTRA_PXLM_CHAIN && l.flags == (ULTRA_PXL_F_LOCKED | ULTRA_PXL_F_LIT) &&
@@ -593,9 +593,9 @@ static void test_config() {
     }
     seqs[i % 2] = sl[2];
   }
-  CHECK(ids.size() == ULTRA_CFG_PX_COUNT && *ids.begin() == 129 && *ids.rbegin() == 140, "all of 129-140 on the wire (%u)",
+  CHECK(ids.size() == ULTRA_CFG_PX_COUNT && *ids.begin() == 129 && *ids.rbegin() == 141, "all of 129-141 on the wire (%u)",
         static_cast<unsigned>(ids.size()));
-  CHECK(ids.count(140) == 1 && ULTRA_CFG_PX_COUNT == 12u, "CONFIG 140 (the line mode) is one of them, twelve in all");
+  CHECK(ids.count(140) == 1 && ids.count(141) == 1 && ULTRA_CFG_PX_COUNT == 13u, "CONFIG 140 (the line mode) and 141 (the smoothing) are among them, thirteen in all");
   // the same values again: nothing queued; one changed: its slot only
   for (int i = 0; i < 12; i++)
     s.build_frame(2000000 + 3000 * i, f.data());

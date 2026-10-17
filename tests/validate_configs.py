@@ -1605,6 +1605,12 @@ CASES = [
     ("chain: two receivers on one line",
      ULTRA_CH + "light:\n" + ud_light(name="a", board=1, extra="    mode: chain\n") + ud_light(name="b", board=2, extra="    mode: chain\n"),
      False, "only one on a line"),
+    ("smoothing: dither", ULTRA_DP + "light:\n" + ud_light(extra="    pixel_smoothing: dither\n"), True, None),
+    ("smoothing: off", ULTRA_DP + "light:\n" + ud_light(extra="    pixel_smoothing: off\n"), True, None),
+    ("smoothing: not a mode", ULTRA_DP + "light:\n" + ud_light(extra="    pixel_smoothing: fast\n"), False, "pixel_smoothing"),
+    ("smoothing: two lights of a receiver disagree",
+     ULTRA_DP + "light:\n" + ud_light(name="a", extra="    pixel_smoothing: round\n") +
+     ud_light(name="b", segment=1, extra="    pixel_smoothing: dither\n"), False, "differs from"),
     ("chain: board out of range", ULTRA_CH + "light:\n" + ud_light(board=3), False, "boards are 0-based"),
     ("chain: next to a dig2analog_ultra light on its own board",
      ULTRA_CH + "light:\n" + ULTRA_MONO.format(name="m", board=2, channel=1) + ud_light(board=2), False, "is a dig2analog_ultra light's"),

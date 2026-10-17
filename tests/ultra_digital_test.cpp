@@ -224,7 +224,7 @@ static void test_page() {
 
 // The protocol's test vector answers (test-vectors/vectors.json answer_pixel_state, answer_pixel_line): tests/run_ultra_digital_test.py
 // compares these two strings with the repository's. An Ultra-Digital receiver, last board (index 2) of a normal Ultra line.
-static const char *const ANSWER_PIXEL_STATE = "a5812069567800011a1408040366010700000021000000025818ff00ba351100";
+static const char *const ANSWER_PIXEL_STATE = "a5812069567800011a1408040366010700000021000000025818ff00ba557da6";
 static const char *const ANSWER_PIXEL_LINE = "a5812068567802021103a11200020000020001ff000100034000000000003d51";
 
 static std::vector<uint8_t> unhex(const char *h) {

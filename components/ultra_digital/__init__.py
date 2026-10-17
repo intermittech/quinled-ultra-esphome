@@ -1,6 +1,6 @@
 """ultra_digital: the QuinLED Diff-Power Ultra-Digital receiver's local pixel effects (light platform: light.py).
 
-The receiver makes the strip's pixels itself (the PIXEL_FX command of the QuinLED Ultra protocol 0.2.8): Home Assistant
+The receiver makes the strip's pixels itself (the PIXEL_FX command of the QuinLED Ultra protocol 0.2.9): Home Assistant
 users get WLED-like effects, speed, intensity and palettes without a pixel stream. The effect list is the protocol's
 catalogue (pixel_fx_catalogue.json). This file: the actions and what the platform shares (chips, the catalogue).
 """

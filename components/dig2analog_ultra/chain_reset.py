@@ -4,9 +4,9 @@ The receiver classifies a frame (its slot and its header) while the next one may
 tick with the frame capture. Behind other boards the gap it sees is 320 us longer for each of them (each removes its slot from the front
 of the frame); alone on its line it sees the hub's reset and nothing more. The firmware frees its capture 126 .. 189 us after a frame's
 last edge while a light effect runs (a 40-pixel Rainbow: it takes a frame that starts 150 us after the last one ended,
-test/test_ud_chain_budget.py in the firmware repository). A heavy effect (Pacifica on 300 or 1,080 pixels renders about 27 k cycles
-between two looks at the line) holds the capture longer and drops frames at some phases of the 50 us tick when the reset is 300 us; at
-500 us it does not (ud-fx-verify, round 2, N1). A receiver that is the first board therefore gets at least CHAIN_FIRST_RESET_NS between
+test/test_ud_chain_budget.py in the firmware repository). A heavy effect (Pacifica, the costliest: it renders in 4-pixel steps, 2 at 400 kHz, up to the 600-pixel cap, 500 RGBW or 400
+five-channel) holds the capture longer between two looks at the line and can drop frames at some phases of the 50 us tick when the reset
+is 300 us; at 500 us it does not (test/test_ud_chain_budget.py in the firmware repository). A receiver that is the first board therefore gets at least CHAIN_FIRST_RESET_NS between
 the frames whatever reset_time says: for a burst of queued commands that is about 12 % fewer frames a second.
 
 The floor is applied to the hub's validated reset_time (final validation), so an RMT line and a PARLIO lane (whose bus layout reads the

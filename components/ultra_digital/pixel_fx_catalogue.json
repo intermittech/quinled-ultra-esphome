@@ -1,5 +1,5 @@
 {
- "catalogue_version": 1,
+ "catalogue_version": 2,
  "note": "ids are never reused; 1-127 official, 128-255 custom. palette 254 = colour 1 -> 2 -> 3, 255 = the effect's own default. colors = how many of c1..c3 the effect uses, color_slots = their labels by position (null: that slot is unused); speed / intensity / palette: true when used; the labels say what they do; custom1 / custom2: null or a label. A retired id would stay with retired: true.",
  "palette_special": {
   "colors": 254,
@@ -1097,6 +1097,216 @@
    },
    "state_bytes_per_pixel": 0,
    "origin": "own"
+  },
+  {
+   "id": 27,
+   "name": "Ripples",
+   "summary": "Raindrops on a pond: soft rings spread out and fade.",
+   "colors": 1,
+   "color_slots": [
+    null,
+    "Background",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Ripple size",
+   "palette": true,
+   "custom1": "Rain (how many of the drops fall; 0: none)",
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 24,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 200,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own"
+  },
+  {
+   "id": 28,
+   "name": "Wipe",
+   "summary": "One colour wipes over the other along the strip, then back.",
+   "colors": 2,
+   "color_slots": [
+    "Colour 1",
+    "Colour 2",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Hold (0: none, 255: three sweeps long)",
+   "palette": true,
+   "custom1": "Colours (0-127: Colour 1 and 2 alternate, 128-255: a new palette colour each wipe)",
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 64,
+    "palette": 23,
+    "c1": [
+     255,
+     0,
+     0
+    ],
+    "c2": [
+     0,
+     150,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own"
+  },
+  {
+   "id": 29,
+   "name": "Stripes",
+   "summary": "Hard stripes of colour 1 and colour 2 move along the strip (candy cane).",
+   "colors": 2,
+   "color_slots": [
+    "Colour 1",
+    "Colour 2",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed (0: still)",
+   "intensity": true,
+   "intensity_label": "Stripe size (higher: finer)",
+   "palette": false,
+   "custom1": "Share of Colour 1 (128: half)",
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 190,
+    "palette": 255,
+    "c1": [
+     255,
+     0,
+     0
+    ],
+    "c2": [
+     255,
+     255,
+     255
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 128,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own"
+  },
+  {
+   "id": 30,
+   "name": "Bulbs",
+   "summary": "A string of coloured bulbs; the colours hop along it.",
+   "colors": 1,
+   "color_slots": [
+    null,
+    "Unlit",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Shift speed (0: still)",
+   "intensity": true,
+   "intensity_label": "Spacing (higher: closer bulbs)",
+   "palette": true,
+   "custom1": "Bulb size (share of the spacing, 128: half)",
+   "custom2": "Colour step (64: a quarter of the palette)",
+   "defaults": {
+    "speed": 40,
+    "intensity": 200,
+    "palette": 3,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 128,
+    "custom2": 64
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own"
+  },
+  {
+   "id": 31,
+   "name": "Lava Lamp",
+   "summary": "Big soft blobs of palette colour drift and merge.",
+   "colors": 1,
+   "color_slots": [
+    null,
+    "Background",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Blob size",
+   "palette": true,
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 200,
+    "palette": 16,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own"
   }
  ],
  "palettes": [
@@ -1219,6 +1429,72 @@
    "name": "Sunrise",
    "origin": "own, made for this firmware (GPL-3.0-or-later) (Sunrise / Sunset: a warm sky from dark to day)",
    "cyclic": false
+  },
+  {
+   "id": 20,
+   "name": "Candlelight",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (candle flame, amber to warm white)",
+   "cyclic": false
+  },
+  {
+   "id": 21,
+   "name": "Warm White",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (2200 K - 3200 K whites; on RGBW strips the white LED does the work)",
+   "cyclic": true
+  },
+  {
+   "id": 22,
+   "name": "Daylight",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (2700 K - 6500 K whites)",
+   "cyclic": true
+  },
+  {
+   "id": 23,
+   "name": "Christmas",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (red, green, warm white, gold)",
+   "cyclic": true
+  },
+  {
+   "id": 24,
+   "name": "Winter",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (ice blue and white)",
+   "cyclic": true
+  },
+  {
+   "id": 25,
+   "name": "Halloween",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (orange, purple, green)",
+   "cyclic": true
+  },
+  {
+   "id": 26,
+   "name": "Autumn",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (leaves: rust, orange, gold)",
+   "cyclic": true
+  },
+  {
+   "id": 27,
+   "name": "Pastel",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (soft pink, peach, lemon, mint, sky, lilac)",
+   "cyclic": true
+  },
+  {
+   "id": 28,
+   "name": "Embers",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (glowing coals)",
+   "cyclic": false
+  },
+  {
+   "id": 29,
+   "name": "Rose",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (deep rose to blush)",
+   "cyclic": true
+  },
+  {
+   "id": 30,
+   "name": "Moonlight",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (night blue to silver)",
+   "cyclic": true
   }
  ]
 }

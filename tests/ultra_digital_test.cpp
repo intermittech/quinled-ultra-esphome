@@ -710,6 +710,7 @@ struct UdModel {
   uint32_t caps{ULTRA_HWCAP_RETURN | ULTRA_HWCAP_PIXEL | ULTRA_HWCAP_PIXEL_FX};
   bool unsupported_fx{false};
   bool unsupported_line{false};
+  uint32_t line_polls{0};   // every POLL of page 0x81 part 3, answered or UNSUPPORTED
   uint8_t line_mode{ULTRA_PXLM_CHAIN}, line_flags{ULTRA_PXL_F_LOCKED};
   uint32_t asked[4]{};      // page 0x81 parts
   uint32_t other_asked{0};
@@ -723,6 +724,7 @@ struct UdModel {
     uint8_t d[24]{};
     uint8_t out = page;
     if (page == ULTRA_PAGE_HW_FX) {
+      this->line_polls += arg[0] == ULTRA_PXG_PART_LINE;
       if (this->unsupported_fx || arg[0] > 3 || (arg[0] == 3 && (this->unsupported_line || !(this->caps & ULTRA_HWCAP_CHAIN)))) {
         out = ULTRA_PAGE_UNSUPPORTED;
       } else {
@@ -882,7 +884,7 @@ static void test_poller_line() {
     p.init(1, ULTRA_RW_RATE_1M, TelemetryIntervals{});
     p.locked(now);
     run(p, m, now, 20000);
-    CHECK(m.asked[3] == 0 && m.asked[0] >= 3 && !p.pixel(0).line.have, "a digital port: part 3 is never asked (%u)", m.asked[3]);
+    CHECK(m.line_polls == 0 && m.asked[0] >= 3 && !p.pixel(0).line.have, "a digital port: part 3 is never asked (%u)", m.line_polls);
   }
   // an older receiver (no ULTRA_HWCAP_CHAIN): never asked either
   {
@@ -893,7 +895,7 @@ static void test_poller_line() {
     p.set_line_pages(true);
     p.locked(now);
     run(p, m, now, 20000);
-    CHECK(m.asked[3] == 0 && m.asked[0] >= 3, "no HWCAP_CHAIN: part 3 is not asked (%u)", m.asked[3]);
+    CHECK(m.line_polls == 0 && m.asked[0] >= 3, "no HWCAP_CHAIN: part 3 is not asked (%u)", m.line_polls);
   }
   // UNSUPPORTED on part 3: not asked again, the rest goes on
   {
@@ -906,7 +908,8 @@ static void test_poller_line() {
     p.set_line_pages(true);
     p.locked(now);
     run(p, m, now, 60000);
-    CHECK(m.asked[3] == 0 && m.asked[0] >= 10 && !p.pixel(0).line.have, "UNSUPPORTED part 3: nothing decoded, the state still read (%u)", m.asked[0]);
+    CHECK(m.line_polls == 1 && m.asked[0] >= 10 && !p.pixel(0).line.have,
+          "UNSUPPORTED part 3: asked once (%u), nothing decoded, the state still read (%u)", m.line_polls, m.asked[0]);
   }
   // twelve pages' bits fit the masks: UNSUPPORTED on the last page doesn't lose the others (bit 16 and up)
   CHECK(TP_COUNT == 17 && TP_PX_LINE == 16, "17 poll pages (TP_PX_LINE is bit 16 of the masks)");

@@ -128,7 +128,7 @@ class UltraTelemetryPort final : public Component {
   enum Value : uint8_t {
     POWER = 0, CURRENT, LOAD, CABLE_LOSS, CABLE_LOSS_PCT, PEAK_LOAD, LIVE_POWER, ENERGY, VALUE_COUNT,
   };
-  enum Text : uint8_t { RECEIVERS = 0, STATUS, STATUS_DETAIL, TEXT_COUNT };
+  enum Text : uint8_t { RECEIVERS = 0, STATUS, STATUS_DETAIL, SETUP_INFO, TEXT_COUNT };
   /// the line's telemetry health (diagnostic, disabled by default; once a minute): poll windows, missing answers (%
   /// of those asked for in that minute), broken answers (bad CRC), answers with contention, receiver restarts, late
   /// releases of the line, the reply rate (kbit/s)

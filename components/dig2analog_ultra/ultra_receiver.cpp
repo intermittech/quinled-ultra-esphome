@@ -330,6 +330,9 @@ void UltraTelemetryPort::update_() {
                       : standby ? std::string("The port is in standby (4.5 V).")
                       : waking  ? std::string("The port just woke: waiting for its receivers' first answers.")
                                 : port_status_detail(m));
+  // the receivers in cable order for the setup generator (changes with a receiver found, replaced or tested)
+  if (this->texts_[SETUP_INFO] != nullptr)
+    text(SETUP_INFO, telemetry_setup_info(p));
   this->publish_health_();
 }
 

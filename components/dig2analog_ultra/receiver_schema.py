@@ -244,6 +244,10 @@ PORT_ENTITIES = {
     # "OK", "91 % load", "No answer", a receiver's problem, "Peaks 104 %", "2 limiting"; and the plain line under it
     "port_status": ("text", 1, "status", _text("mdi:list-status", diagnostic=False)),
     "port_status_detail": ("text", 2, "status detail", _text("mdi:text-box-outline", diagnostic=False)),
+    # the receivers in cable order for the setup generator: "S1 1:9C02:2:5:12 2:A41F:2:5:? 3:?", each position:UID16:
+    # hardware id:channels:used (the channels with a load in the last calibration test; "?" untested; "-" none);
+    # at most 255 characters, then "+N" (wiki: Setup-Info)
+    "port_setup_info": ("text", 3, "setup info", _text("mdi:clipboard-list-outline")),
     # the line's buttons: its current calibration (the whole line goes dark ~1.1 s per board), its boards blink their
     # firmware version (disabled until enabled in Home Assistant)
     "port_calibrate_current": (
@@ -506,6 +510,7 @@ RAM_PER_LIGHT = 900
 RAM_PER_ESTIMATE = 200
 RAM_PER_LINE = 1000
 RAM_PER_ENTITY = 60   # (a line's health sensors: round 12, from the full - basic difference per receiver entity)
+RAM_PER_SETUP_INFO = 400   # a line's Setup info: its text sensor and up to 255 characters of state
 RAM_PER_COMMISSION = 900   # a line's commissioning: 5 entities, its record (148 B), its texts, its state
 RAM_LEDGER_ENTRY, RAM_LEDGER_POSITION = 80, 40
 RAM_WARN_CLASSIC = 60 * 1024   # a classic ESP32: ~100-150 KB free with Wi-Fi and the API
@@ -528,6 +533,7 @@ def ram_estimate(full):
         level = str(tel.get(CONF_DIAGNOSTICS, "full")).lower()
         parts["receivers"] += RAM_PER_RECEIVER.get(level, RAM_PER_RECEIVER["full"]) * len(recs)
         parts["lines"] += RAM_PER_ENTITY * len(PORT_HEALTH & set(tel))
+        parts["lines"] += RAM_PER_SETUP_INFO
         if tel.get(CONF_COMMISSIONING, True):
             parts["lines"] += RAM_PER_COMMISSION
         counters += len(recs) + 1

@@ -1730,6 +1730,68 @@ inline float light_power_estimate(const ReceiverData &d, uint8_t mask) {
   return all == 0 ? 0.0f : total * static_cast<float>(mine) / static_cast<float>(all);
 }
 
+// ------------------------------------------------------------------------------------------------------- setup info
+/// The outputs of a Diff-Power Ultra-Analog receiver (hardware id 2): the lights' channels; any other hardware (the
+/// Ultra-Digital receiver, id 3, drives pixels; an unknown board) has none to lay out.
+inline uint8_t setup_channels(uint8_t hw_id) { return hw_id == UPD_HW_ID_DP_ULTRA_RX ? 5 : 0; }   // (ReceiverData: 5)
+
+/// One receiver's record of the line's Setup info: "<position>:<UID16>:<hardware id>:<channels>:<used>" (position
+/// 1-based, UID16 four hex digits, used = the channels that draw current, e.g. "125", "-" none, "?" not known: no
+/// calibration test yet, so which outputs have a load isn't known), or "<position>:?" for a position nothing has
+/// answered at. The used channels are the last calibration test's (normal or abnormal, not "no load"), so the text
+/// changes only with a test, never with the lights (Home Assistant records every change).
+inline std::string telemetry_setup_record(uint16_t position, const ReceiverData &d, bool answering, bool have_uid,
+                                          uint16_t uid16) {
+  std::string s = std::to_string(position);
+  if (!have_uid && !answering && !d.have_board)
+    return s + ":?";
+  char b[8];
+  snprintf(b, sizeof(b), ":%04X:", static_cast<unsigned>(uid16));
+  s += have_uid ? b : ":????:";
+  const uint8_t hw = d.have_board ? d.hw_id : d.have_status ? d.hw : 0;
+  s += std::to_string(hw) + ":" + std::to_string(setup_channels(hw)) + ":";
+  const uint8_t n = setup_channels(hw);
+  const bool tested = d.have_health && ((d.he_flags & ULTRA_HE_F_TESTED) || d.ch_class[0] != ULTRA_HE_UNTESTED);
+  std::string used;
+  if (n == 0) {
+    used = d.have_board ? "-" : "?";
+  } else if (tested) {
+    for (uint8_t i = 0; i < n; i++) {
+      const uint8_t c = d.ch_class[i] & 0x0F;
+      if (c == ULTRA_HE_NORMAL || c == ULTRA_HE_ABNORMAL)
+        used += static_cast<char>('1' + i);
+    }
+    if (used.empty())
+      used = "-";
+  } else {
+    used = "?";
+  }
+  return s + used;
+}
+
+/// The Setup info text, the receivers in cable order: "S1 1:9C02:2:5:12 2:A41F:2:5:3 3:?". "S1" is the format's
+/// version. Trailing positions nothing has ever answered at are left out (a controller made for more receivers than
+/// are connected). Within Home Assistant's 255 characters: if the records don't fit, the rest is "+N" (N receivers).
+template <typename Poller>
+inline std::string telemetry_setup_info(const Poller &p) {
+  size_t last = 0;   // 1 + the last position that has been heard
+  for (uint16_t i = 0; i < p.receivers(); i++) {
+    if (p.has_uid(i) || p.answering(i) || p.data(i).have_board)
+      last = i + 1;
+  }
+  std::string s = "S1";
+  for (size_t i = 0; i < last; i++) {
+    const std::string r = telemetry_setup_record(static_cast<uint16_t>(i + 1), p.data(i), p.answering(i), p.has_uid(i),
+                                                 p.uid16(i));
+    if (s.size() + 1 + r.size() > TEXT_STATE_MAX - 5) {
+      s += " +" + std::to_string(last - i);
+      break;
+    }
+    s += " " + r;
+  }
+  return s;
+}
+
 // --------------------------------------------------------------------------------------- the receivers' reply rate
 /// The rate a line's receivers answer at (ULTRA_RW_RATE_*), stepped down on a cable that breaks their answers: one
 /// rate slower (1 M -> 500 k -> 250 k) once BAD of its last 32 counted windows had a broken answer (a SYNC byte whose

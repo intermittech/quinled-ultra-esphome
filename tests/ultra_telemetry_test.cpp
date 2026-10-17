@@ -3039,6 +3039,65 @@ static void test_reply_rate() {
         "configured 500 k: never faster (%u); pinned at 1 M: never moved", t.rate());
 }
 
+/// The Setup info: one record per receiver in cable order (position:UID16:hardware:channels:used), "?" where nothing
+/// answered, trailing never-heard positions left out, "+N" instead of what doesn't fit in 255 characters.
+static void test_setup_info() {
+  // the records themselves
+  ReceiverData d;
+  d.have_board = true;
+  d.hw_id = UPD_HW_ID_DP_ULTRA_RX;
+  d.have_health = true;
+  d.he_flags = ULTRA_HE_F_TESTED;
+  for (int i = 0; i < 5; i++)
+    d.ch_class[i] = ULTRA_HE_NO_LOAD;
+  d.ch_class[0] = ULTRA_HE_NORMAL;
+  d.ch_class[3] = ULTRA_HE_ABNORMAL | ULTRA_HE_R_BELOW;
+  CHECK(telemetry_setup_record(1, d, true, true, 0x9C02) == "1:9C02:2:5:14", "tested, CH1 and CH4: '%s'",
+        telemetry_setup_record(1, d, true, true, 0x9C02).c_str());
+  d.ch_class[0] = d.ch_class[3] = ULTRA_HE_NO_LOAD;
+  CHECK(telemetry_setup_record(12, d, false, true, 0x00A1) == "12:00A1:2:5:-", "tested, no load, not answering now: '%s'",
+        telemetry_setup_record(12, d, false, true, 0x00A1).c_str());
+  d.he_flags = 0;
+  for (int i = 0; i < 5; i++)
+    d.ch_class[i] = ULTRA_HE_UNTESTED;
+  CHECK(telemetry_setup_record(2, d, true, true, 0xBEEF) == "2:BEEF:2:5:?", "never tested: '%s'",
+        telemetry_setup_record(2, d, true, true, 0xBEEF).c_str());
+  d.hw_id = UPD_HW_ID_DP_ULTRA_DIGITAL;
+  CHECK(telemetry_setup_record(3, d, true, true, 0x1234) == "3:1234:3:0:-", "digital receiver: '%s'",
+        telemetry_setup_record(3, d, true, true, 0x1234).c_str());
+  ReceiverData none;
+  CHECK(telemetry_setup_record(4, none, false, false, 0) == "4:?", "nothing heard: '%s'",
+        telemetry_setup_record(4, none, false, false, 0).c_str());
+  // the text, from a modelled chain: receiver 4 never takes part (an older board, and the one behind it can't be heard),
+  // receiver 2 has one channel unused
+  Chain c(5);
+  c.rx[3].has_channel = false;
+  c.rx[1].ch2_class = ULTRA_HE_NO_LOAD;
+  for (auto &r : c.rx)
+    r.he_flags = ULTRA_HE_F_TESTED;
+  TelemetryPoller p = started(c, 5);
+  c.run(p, 3000);
+  const std::string line0 = telemetry_setup_info(p);
+  CHECK(line0.find("S1 ") == 0 && line0.size() <= 255, "starts S1: '%s'", line0.c_str());
+  c.run(p, 12000);
+  const std::string line = telemetry_setup_info(p);
+  char want[96];
+  snprintf(want, sizeof(want), "S1 1:%04X:2:5:12345 2:%04X:2:5:1345 3:%04X:2:5:12345", c.rx[0].uid16(), c.rx[1].uid16(),
+           c.rx[2].uid16());
+  CHECK(line == want, "three heard, the two silent ones left out: '%s' (wanted '%s')", line.c_str(), want);
+  // a long chain: the text never passes 255 characters and ends with +N
+  Chain big(40);
+  for (auto &r : big.rx)
+    r.he_flags = ULTRA_HE_F_TESTED;
+  TelemetryPoller q = started(big, 40);
+  big.run(q, 60000);
+  const std::string many = telemetry_setup_info(q);
+  CHECK(many.size() <= 255 && many.compare(0, 3, "S1 ") == 0, "40 receivers: %zu characters ('%s')", many.size(),
+        many.c_str());
+  const size_t plus = many.rfind(" +");
+  CHECK(plus != std::string::npos && std::stoi(many.substr(plus + 2)) > 0, "the rest as +N: '%s'", many.c_str());
+}
+
 int main() {
   std::printf("ultra telemetry test (the return channel's hub side)\n");
   test_power_off_cap();
@@ -3078,6 +3137,7 @@ int main() {
   test_status();
   test_port();
   test_025();
+  test_setup_info();
   std::printf("%s (%d failures)\n", failures ? "FAILED" : "ALL ULTRA TELEMETRY TESTS PASSED", failures);
   return failures ? 1 : 0;
 }

@@ -382,6 +382,7 @@ async def to_code(config: ConfigType) -> None:
     hub = await cg.get_variable(config[CONF_DIG2ANALOG_ULTRA_ID])
     cg.add(var.set_hub(hub))
     cg.add(var.set_board(config[CONF_BOARD]))
+    cg.add(hub.set_pixel_board(config[CONF_BOARD]))   # (before the hub's setup: no light indices are cleared on it)
     cg.add(var.set_segment(config[CONF_SEGMENT]))
     cg.add(var.set_range(config[CONF_SEGMENT_START], config[CONF_SEGMENT_LENGTH]))
     cg.add(var.set_flags(_flags(config)))

@@ -345,10 +345,10 @@ class UltraHub final : public Component {
   void add_light(UltraLight *light) { this->lights_.push_back(light); }
   /// A pixel light of an Ultra-Digital receiver (ultra_digital): counted as a lit light for the power and the lit-time
   void add_pixel_light(PixelSource *light) { this->pixel_lights_.push_back(light); }
-  /// A setting of an Ultra-Digital receiver (CONFIG 129-139, ULTRA_CFG_PX_*; the receiver keeps it): sent now and with
-  /// every refresh
-  void set_pixel_config(uint16_t board, uint8_t id, uint16_t value) {
-    this->sched_.set_hw_config(board, id, value);
+  /// A setting of an Ultra-Digital receiver (CONFIG 129-139, ULTRA_CFG_PX_*; the receiver keeps it): several, then
+  /// pixel_config_flush(): sent at once (one SEQ per CONFIG slot) and with every refresh
+  void set_pixel_config(uint16_t board, uint8_t id, uint16_t value) { this->sched_.set_hw_config(board, id, value); }
+  void pixel_config_flush() {
     this->sched_.flush_config();
     this->wake_();
   }

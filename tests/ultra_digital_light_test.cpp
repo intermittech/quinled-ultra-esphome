@@ -70,8 +70,9 @@ struct FakeHub {
   Scheduler &scheduler() { return this->sched; }
   void wake_() { this->wakes++; }
   int64_t start_time_us(uint16_t) const { return now_ms * 1000LL + 40000; }   // the lead: 40 ms
-  void set_pixel_board(uint16_t b) { this->pixel_boards.push_back(b); }
   void set_pixel_config(uint16_t, uint8_t id, uint16_t v) { this->configs.push_back({id, v}); }
+  uint32_t flushes{0};
+  void pixel_config_flush() { this->flushes++; }
   template<typename T> void add_pixel_light(T *l) { this->pixel_light = l; }
   bool has_telemetry() const { return this->telemetry_on; }
   const FakeTelemetry &telemetry() const { return this->tel; }
@@ -324,9 +325,9 @@ static void test_boot_and_effects() {
   now_ms = 100000;
   Rig r;
   r.l.setup();
-  CHECK(r.hub.pixel_boards.size() == 1 && r.hub.configs.size() == 1 && r.hub.configs[0].first == ULTRA_CFG_PX_PIXELS &&
-            r.hub.callbacks.size() == 1,
-        "setup: the board is a pixel board, its CONFIG is sent, the page hook is in");
+  CHECK(r.hub.configs.size() == 1 && r.hub.configs[0].first == ULTRA_CFG_PX_PIXELS &&
+            r.hub.flushes == 1 && r.hub.callbacks.size() == 1,
+        "setup: its CONFIG is sent (once, flushed), the page hook is in");
   r.state.set_remote(true, 0.5f);
   r.run();
   CHECK(r.wire.fx.size() == 1, "boot: one PIXEL_FX (%zu)", r.wire.fx.size());

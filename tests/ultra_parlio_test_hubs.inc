@@ -150,6 +150,11 @@ struct TestLight {
   uint32_t get_standby_after() const { return 1000; }
   bool is_lit(uint32_t) const { return this->lit; }
   void *get_state() const { return nullptr; }
+  // as an Ultra-Digital receiver's pixel light (the hub's pixel_lights_)
+  uint32_t pixel_standby_after() const { return 1000; }
+  bool pixel_lit(uint32_t) const { return this->lit; }
+  void *pixel_state() const { return nullptr; }
+  uint16_t pixel_board() const { return 0; }
 };
 
 struct DiffPowerPort {
@@ -346,6 +351,7 @@ struct UltraHub {
   int64_t notice_end_us_{0};
   uint8_t rw_dir_gpio_{0}, rw_dir_idle_{0};
   std::vector<TestLight *> lights_;
+  std::vector<TestLight *> pixel_lights_;
   bool cal_power_hold_{false}, upd_power_hold_{false};
   enum PowerCycle : uint8_t { CYCLE_NONE = 0, CYCLE_WAIT_OFF, CYCLE_OFF, CYCLE_DONE, CYCLE_FAILED };
   PowerCycle cycle_{CYCLE_NONE};

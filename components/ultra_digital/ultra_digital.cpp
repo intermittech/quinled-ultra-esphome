@@ -109,9 +109,9 @@ void PixelLight::setup_state(light::LightState *state) {
 }
 
 void PixelLight::setup() {
-  this->hub_->set_pixel_board(this->board_);
   for (const Cfg &c : this->cfg_)
     this->hub_->set_pixel_config(this->board_, c.id, c.value);
+  this->hub_->pixel_config_flush();
   this->hub_->add_pixel_light(this);
   for (light::LightState *other : this->others_)
     other->add_remote_values_listener(new ExclusiveWatcher(this, other));   // NOLINT (lives as long as the program)

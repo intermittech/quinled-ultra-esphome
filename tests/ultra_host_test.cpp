@@ -108,6 +108,13 @@ static const char *slot_undefined(const uint8_t *s) {
     }
     return false;
   };
+  if (type == ULTRA_PIXEL_FX) {   // (0.2.8: an Ultra-Digital receiver's segment; every other board ignores it)
+    if (light >= ULTRA_PX_SEGMENTS)
+      return "PIXEL_FX segment";
+    if (fl != 0)
+      return "slot flags";
+    return (s[ULTRA_PX_FLAGS] & 0xC0) ? "PIXEL_FX reserved flags" : nullptr;
+  }
   if (type >= ULTRA_TYPES || type == ULTRA_POLL)
     return "type";
   const bool board = type == ULTRA_CONFIG || type == ULTRA_IDENTIFY;
@@ -140,7 +147,8 @@ static const char *slot_undefined(const uint8_t *s) {
     case ULTRA_CONFIG:
       for (int i = 0; i < 9; i++) {
         const uint8_t id = p[3 * i];
-        if (id >= ULTRA_CFG_COUNT || (id == ULTRA_CFG_NONE && ultra_get16(p + 3 * i + 1) != 0))
+        const bool pixel = id >= ULTRA_CFG_PX_FIRST && id < ULTRA_CFG_PX_FIRST + ULTRA_CFG_PX_COUNT;   // (0.2.8)
+        if ((id >= ULTRA_CFG_COUNT && !pixel) || (id == ULTRA_CFG_NONE && ultra_get16(p + 3 * i + 1) != 0))
           return "CONFIG id";
       }
       return nullptr;
@@ -206,7 +214,30 @@ static void test_defined_values() {
     }
     for (auto &x : par)
       x = r8();
-    switch (rng() % 14) {
+    switch (rng() % 16) {
+      case 14: {   // PIXEL_FX with every field random (segments 4-6 and a board out of range are refused)
+        ultra_pixel_fx_t fx;
+        fx.effect = r8();
+        fx.speed = r8();
+        fx.intensity = r8();
+        fx.palette = r8();
+        for (int i = 0; i < 9; i++)
+          fx.c[i / 3][i % 3] = r8();
+        fx.brightness = r8();
+        fx.flags = r8();   // (bits 6-7 are reserved: the builder sends 0)
+        fx.custom1 = r8();
+        fx.custom2 = r8();
+        fx.start_ms = 0;
+        fx.transition_ms = r16();
+        fx.seg_start = r16();
+        fx.seg_len = r16();
+        s.light_pixel_fx(b, l, fx, now + static_cast<int64_t>(rng() % 40000000));
+        break;
+      }
+      case 15:     // the pixel CONFIG ids (and the ones around them, which are refused)
+        s.set_hw_config(b, static_cast<uint8_t>(120 + rng() % 30), r16());
+        s.flush_config();
+        break;
       case 0:
         s.light_def(b, l, roles, r16(), r8(), mn, mx);
         break;

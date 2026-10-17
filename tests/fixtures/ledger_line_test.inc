@@ -9,6 +9,9 @@ struct Light {
     if (fading && static_cast<int32_t>(off_ms - now) <= 0) fading = false;
     return on || fading;
   }
+  // as an Ultra-Digital receiver's pixel light (the current hub's pixel_lights_)
+  uint16_t pixel_board() const { return board; }
+  bool pixel_lit(uint32_t now) { return is_lit(now); }
 };
 struct Keeper : CoreKeeper {
   uint64_t ticks = 0;
@@ -29,6 +32,7 @@ struct UltraHub {
   Keeper keeper_;
   TelemetryPoller poller_;
   std::vector<Light *> lights_;
+  std::vector<Light *> pixel_lights_;
   bool ready = false, line_on_ = false;
   Port *port_ = nullptr;
   std::vector<uint8_t> lit_rx_;

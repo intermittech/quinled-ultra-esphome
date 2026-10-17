@@ -173,4 +173,106 @@ inline bool pixel_fx_same(const ultra_pixel_fx_t &a, const ultra_pixel_fx_t &b) 
   return std::memcmp(sx, sy, ULTRA_SLOT_BYTES) == 0;
 }
 
+// ----------------------------------------------------------------------------------------------------- the sender
+/// What a pixel light has told its segment, and when something new is due (pure; the light feeds it ESPHome's state,
+/// tests/ultra_digital_test.cpp feeds it a script). One PIXEL_FX is the whole truth about the segment: the effect with
+/// its parameters, the colours, the brightness (0 = off) and the transition. START is the effect's time zero: a new
+/// effect takes a new one, a change of its parameters, colours or brightness keeps it (the effect carries on in phase on
+/// every receiver), and after REANCHOR_US it gets a fresh one (START is an int32 of ms: 24.8 days).
+class PixelFxTracker {
+ public:
+  static constexpr int64_t REANCHOR_US = 20LL * 86400 * 1000000;
+
+  struct Out {
+    ultra_pixel_fx_t fx;
+    int64_t anchor_us;   // START, host time
+  };
+
+  /// The state wanted now. effect_changed: a new effect (or the first send, or a new anchor asked for): START now
+  /// (start_us: where a command queued now starts), the crossfade over default_transition_ms when the wanted transition
+  /// is 0. false: nothing to tell the receiver (it is there already); else out is the PIXEL_FX to send
+  bool update(const PixelLightState &want, bool effect_changed, uint32_t default_transition_ms, int64_t start_us,
+              uint32_t now_ms, Out *out) {
+    if (this->released_) {
+      if (!want.on)
+        return false;   // handed back to the stream and still off: nothing to say
+      this->released_ = false;
+      effect_changed = true;
+    }
+    PixelLightState s = want;
+    if (effect_changed && this->sent_ && s.transition_ms == 0)
+      s.transition_ms = static_cast<uint16_t>(std::min<uint32_t>(default_transition_ms, 0xFFFF));   // the crossfade
+    const ultra_pixel_fx_t f = pixel_fx_of(s);
+    if (this->sent_ && !effect_changed && pixel_fx_same(f, this->last_))
+      return false;
+    if (effect_changed || !this->sent_)
+      this->anchor_us_ = start_us;
+    this->last_ = f;
+    this->sent_ = true;
+    // lit: on, or still fading out on the receiver (the power supply, a Diff-Power port's wake)
+    if (this->on_ && !want.on) {
+      this->off_until_ms_ = static_cast<uint32_t>((start_us + 999) / 1000) + f.transition_ms;
+      this->fading_out_ = true;
+    } else if (want.on) {
+      this->fading_out_ = false;
+    }
+    this->on_ = want.on;
+    this->changed_ms_ = now_ms;
+    this->store_due_ = true;
+    out->fx = f;
+    out->anchor_us = this->anchor_us_;
+    return true;
+  }
+
+  /// The strip goes back to the hub's stream: PIXEL_FX effect 0 (to send); the state starts over
+  Out release(int64_t start_us) {
+    Out o;
+    std::memset(&o.fx, 0, sizeof o.fx);
+    o.fx.effect = ULTRA_PX_FX_STREAM;
+    o.anchor_us = start_us;
+    this->released_ = true;
+    this->sent_ = false;
+    this->on_ = false;
+    this->fading_out_ = false;
+    this->store_due_ = false;
+    return o;
+  }
+
+  bool released() const { return this->released_; }
+  bool sent() const { return this->sent_; }
+  /// the receiver shows a local effect that this light started (so there is something to hand back)
+  bool local() const { return this->sent_ && !this->released_; }
+  bool lit(uint32_t now_ms) {
+    if (this->fading_out_ && static_cast<int32_t>(this->off_until_ms_ - now_ms) <= 0)
+      this->fading_out_ = false;
+    return this->on_ || this->fading_out_;
+  }
+  /// the anchor is old: ask for a fresh one (update(..., effect_changed = true) with a crossfade)
+  bool reanchor_due(int64_t start_us) const { return this->local() && start_us - this->anchor_us_ > REANCHOR_US; }
+  /// `store_after_ms` after the last change: the PIXEL_FX to send once more with STORE (the receiver's power-on effect)
+  bool store(uint32_t now_ms, uint32_t store_after_ms, Out *out) {
+    if (!this->store_due_ || store_after_ms == 0 || !this->local() || now_ms - this->changed_ms_ < store_after_ms)
+      return false;
+    this->store_due_ = false;
+    out->fx = this->last_;
+    out->fx.flags = static_cast<uint8_t>(out->fx.flags | ULTRA_PXF_STORE);
+    out->fx.transition_ms = 0;
+    out->anchor_us = this->anchor_us_;
+    return true;
+  }
+  /// a change of the light that isn't a send of its own (the colours c2, c3; the light's state): the store timer restarts
+  void touched(uint32_t now_ms) {
+    this->changed_ms_ = now_ms;
+    this->store_due_ = this->sent_ && !this->released_;
+  }
+  const ultra_pixel_fx_t &last() const { return this->last_; }
+  int64_t anchor_us() const { return this->anchor_us_; }
+
+ protected:
+  ultra_pixel_fx_t last_{};
+  int64_t anchor_us_{0};
+  uint32_t off_until_ms_{0}, changed_ms_{0};
+  bool sent_{false}, released_{false}, on_{false}, fading_out_{false}, store_due_{false};
+};
+
 }  // namespace esphome::dig2analog_ultra

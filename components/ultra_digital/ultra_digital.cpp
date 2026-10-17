@@ -149,17 +149,14 @@ void PixelLight::on_light_remote_values_update() {
         o->make_call().set_state(false).set_transition_length(0).perform();
     }
   }
-  this->last_change_ms_ = millis();
-  this->store_pending_ = this->store_after_ms_ != 0;
+  this->track_.touched(millis());
 }
 
 void ExclusiveWatcher::on_light_remote_values_update() { this->owner_->other_changed_(this->other_); }
 
 void PixelLight::other_changed_(light::LightState *other) {
-  if (!other->remote_values.is_on() || this->released_)
-    return;
-  if (!this->sent_)
-    return;   // (the receiver isn't in local mode: nothing to hand back)
+  if (!other->remote_values.is_on() || !this->track_.local())
+    return;   // (nothing of ours on the receiver: nothing to hand back)
   // the stream light switched on: the strip is handed back to it (the hub's pixels pass), ours goes off
   ESP_LOGD(TAG, "'%s' switched on: '%s' releases the strip to the stream", other->get_name().c_str(),
            this->state_->get_name().c_str());
@@ -169,16 +166,10 @@ void PixelLight::other_changed_(light::LightState *other) {
 }
 
 void PixelLight::release_() {
-  ultra_pixel_fx_t f;
-  std::memset(&f, 0, sizeof f);
-  f.effect = ULTRA_PX_FX_STREAM;
-  this->hub_->scheduler().light_pixel_fx(this->board_, this->segment_, f, this->hub_->start_time_us(this->board_));
+  const PixelFxTracker::Out o = this->track_.release(this->hub_->start_time_us(this->board_));
+  this->hub_->scheduler().light_pixel_fx(this->board_, this->segment_, o.fx, o.anchor_us);
   this->hub_->wake_();
-  this->released_ = true;
-  this->sent_ = false;
   this->dirty_ = false;
-  this->on_ = false;
-  this->fading_out_ = false;
 }
 
 // Instant changes (calls without a transition, the end of one) arrive here; the transition sends from loop()
@@ -226,21 +217,16 @@ void PixelLight::loop() {
       this->dirty_ = true;
     }
   }
-  const uint32_t now = millis();
   if (this->dirty_)
     this->send_();
-  if (this->sent_ && !this->released_ && this->hub_->start_time_us(this->board_) - this->anchor_us_ > REANCHOR_US) {
+  if (this->track_.reanchor_due(this->hub_->start_time_us(this->board_))) {
     this->effect_changed_ = true;   // the anchor is old: a new one (one crossfade, once in 20 days)
     this->transition_ms_ = 1000;
     this->send_();
   }
-  if (this->store_pending_ && this->sent_ && !this->released_ && !this->dirty_ &&
-      now - this->last_change_ms_ >= this->store_after_ms_) {
-    this->store_pending_ = false;
-    ultra_pixel_fx_t f = this->last_;
-    f.flags = static_cast<uint8_t>(f.flags | ULTRA_PXF_STORE);
-    f.transition_ms = 0;
-    this->hub_->scheduler().light_pixel_fx(this->board_, this->segment_, f, this->anchor_us_);
+  PixelFxTracker::Out o;
+  if (!this->dirty_ && this->track_.store(millis(), this->store_after_ms_, &o)) {
+    this->hub_->scheduler().light_pixel_fx(this->board_, this->segment_, o.fx, o.anchor_us);
     this->hub_->wake_();
     ESP_LOGD(TAG, "'%s': stored on the receiver as its power-on effect", this->state_->get_name().c_str());
   }
@@ -249,15 +235,8 @@ void PixelLight::loop() {
 void PixelLight::send_() {
   this->dirty_ = false;
   const light::LightColorValues &v = this->state_->remote_values;
-  const bool on = v.is_on();
-  if (this->released_) {
-    if (!on)
-      return;   // handed back to the stream and still off: nothing to say
-    this->released_ = false;
-    this->effect_changed_ = true;
-  }
   PixelLightState s = this->state_in_;
-  s.on = on;
+  s.on = v.is_on();
   s.brightness = v.get_brightness();
   const float cb = v.get_color_brightness();
   s.red = v.get_red() * cb;
@@ -265,32 +244,16 @@ void PixelLight::send_() {
   s.blue = v.get_blue() * cb;
   s.effect = this->shown_effect_();
   s.palette = static_cast<uint8_t>(this->palette_id_());
-  uint32_t transition = this->transition_ms_;
-  if (this->effect_changed_ && this->sent_ && transition == 0)
-    transition = std::min<uint32_t>(this->state_->get_default_transition_length(), 0xFFFF);   // the effect crossfade
-  s.transition_ms = static_cast<uint16_t>(transition);
-  ultra_pixel_fx_t f = pixel_fx_of(s);
-  if (this->sent_ && !this->effect_changed_ && pixel_fx_same(f, this->last_)) {
-    this->transition_ms_ = 0;
-    return;   // the receiver is there already
-  }
-  const int64_t start_us = this->hub_->start_time_us(this->board_);
-  if (this->effect_changed_ || !this->sent_)
-    this->anchor_us_ = start_us;
-  this->hub_->scheduler().light_pixel_fx(this->board_, this->segment_, f, this->anchor_us_);
-  this->hub_->wake_();
-  this->last_ = f;
-  this->sent_ = true;
+  s.transition_ms = static_cast<uint16_t>(std::min<uint32_t>(this->transition_ms_, 0xFFFF));
+  PixelFxTracker::Out o;
+  const bool send = this->track_.update(s, this->effect_changed_, this->state_->get_default_transition_length(),
+                                        this->hub_->start_time_us(this->board_), millis(), &o);
   this->effect_changed_ = false;
   this->transition_ms_ = 0;
-  // lit: on, or still fading out on the receiver (the power supply, a Diff-Power port's wake)
-  if (this->on_ && !on) {
-    this->off_until_ms_ = static_cast<uint32_t>((start_us + 999) / 1000) + f.transition_ms;
-    this->fading_out_ = true;
-  } else if (on) {
-    this->fading_out_ = false;
-  }
-  this->on_ = on;
+  if (!send)
+    return;   // the receiver is there already
+  this->hub_->scheduler().light_pixel_fx(this->board_, this->segment_, o.fx, o.anchor_us);
+  this->hub_->wake_();
 }
 
 // ----------------------------------------------------------------------------------------------------- parameters
@@ -303,8 +266,7 @@ void PixelLight::set_param(uint8_t which, uint8_t value) {
     default: return;
   }
   this->transition_ms_ = std::max<uint32_t>(this->transition_ms_, PARAM_RAMP_MS);
-  this->last_change_ms_ = millis();
-  this->store_pending_ = this->store_after_ms_ != 0;
+  this->track_.touched(millis());
   this->request_send_();
 }
 
@@ -323,8 +285,7 @@ void PixelLight::set_palette_index(size_t index) {
     return;
   this->palette_index_ = index;
   this->transition_ms_ = std::max<uint32_t>(this->transition_ms_, PARAM_RAMP_MS);
-  this->last_change_ms_ = millis();
-  this->store_pending_ = this->store_after_ms_ != 0;
+  this->track_.touched(millis());
   this->request_send_();
 }
 
@@ -412,7 +373,7 @@ void PixelLight::pixel_page_() {
       ESP_LOGW(TAG, "'%s': not in the receiver's firmware (catalogue %u): %s", this->state_->get_name().c_str(),
                ps.catalogue, missing.c_str());
     }
-    if (!ps.has_effect(this->effect_) && !this->released_)
+    if (!ps.has_effect(this->effect_) && !this->track_.released())
       this->request_send_();   // (shown_effect_: Solid)
   }
 #ifdef USE_TEXT_SENSOR

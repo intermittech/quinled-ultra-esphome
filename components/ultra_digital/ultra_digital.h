@@ -28,6 +28,7 @@
 
 namespace esphome::ultra_digital {
 
+using dig2analog_ultra::PixelFxTracker;
 using dig2analog_ultra::PixelLightState;
 using dig2analog_ultra::PixelSource;
 using dig2analog_ultra::UltraHub;
@@ -128,11 +129,7 @@ class PixelLight final : public light::LightOutput,
 
   // PixelSource (the hub)
   uint16_t pixel_board() const override { return this->board_; }
-  bool pixel_lit(uint32_t now_ms) override {
-    if (this->fading_out_ && static_cast<int32_t>(this->off_until_ms_ - now_ms) <= 0)
-      this->fading_out_ = false;
-    return this->on_ || this->fading_out_;
-  }
+  bool pixel_lit(uint32_t now_ms) override { return this->track_.lit(now_ms); }
   uint32_t pixel_standby_after() const override { return this->standby_after_ms_; }
   light::LightState *pixel_state() const override { return this->state_; }
 
@@ -198,19 +195,11 @@ class PixelLight final : public light::LightOutput,
   uint32_t standby_after_ms_{0};
   uint32_t store_after_ms_{0};
 
+  PixelFxTracker track_;               // what the segment was told, the phase anchor, lit
   bool dirty_{false};                  // something to send in the next loop
   bool effect_changed_{false};         // a new effect: a new phase anchor, the crossfade
-  bool released_{false};               // handed back to the stream: nothing to send until switched on again
-  bool sent_{false};
   bool warned_missing_{false}, warned_cap_{false};
   uint32_t transition_ms_{0};          // the length asked for since the last send
-  int64_t anchor_us_{0};               // the effect's time zero (a change of its parameters keeps it)
-  ultra_pixel_fx_t last_{};
-  bool on_{false};
-  bool fading_out_{false};
-  uint32_t off_until_ms_{0};
-  uint32_t last_change_ms_{0};
-  bool store_pending_{false};
   bool first_loop_{true};
   bool page_hooked_{false};
   std::string status_last_, missing_logged_;

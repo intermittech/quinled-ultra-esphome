@@ -843,6 +843,11 @@ enum {
 #define ULTRA_PXS_DITHER        2u
 #define ULTRA_PXS_OFF           3u
 #define ULTRA_PXS_AUTO_FPS      50u    /* AUTO dithers from this frame rate (the frame grid's, or the measured one without a grid) */
+#ifndef ULTRA_PXS_AUTO_MIN_LEVEL
+#define ULTRA_PXS_AUTO_MIN_LEVEL 0u    /* ... and only a channel whose wire level is at least this (AUTO rounds the dimmer ones: a dither at the bottom flips a pixel between
+                                          levels 1 and 0 at the frame rate, a visible shimmer at low rates); 0 = every channel (the packer's code for it is then left out).
+                                          ROUND / DITHER ignore it */
+#endif
 #define ULTRA_PXLM_AUTO         0u     /* CONFIG 140 values */
 #define ULTRA_PXLM_STREAM       1u
 #define ULTRA_PXLM_CHAIN        2u

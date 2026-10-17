@@ -1044,6 +1044,10 @@ bool UltraHub::any_lit_(uint32_t now) const {
     if (l->is_lit(now))
       return true;
   }
+  for (auto *l : this->pixel_lights_) {
+    if (l->pixel_lit(now))
+      return true;
+  }
   return false;
 }
 
@@ -1176,6 +1180,8 @@ void UltraHub::service_power_() {
   bool lit = this->cal_power_hold_;
   for (auto *l : this->lights_)
     lit |= l->is_lit(now);
+  for (auto *l : this->pixel_lights_)
+    lit |= l->pixel_lit(now);
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   lit |= this->comm_.hold_power();   // (a commissioning: the supply on while it runs)
 #endif
@@ -1241,8 +1247,11 @@ void UltraHub::setup() {
   }
 #endif
   // light indices without a light in the YAML: cleared on the boards (an earlier configuration may have used them)
-  for (uint16_t b = 0; b < this->num_boards_; b++)
+  for (uint16_t b = 0; b < this->num_boards_; b++) {
+    if (std::find(this->pixel_boards_.begin(), this->pixel_boards_.end(), b) != this->pixel_boards_.end())
+      continue;   // an Ultra-Digital receiver: no light indices (its segments are PIXEL_FX, not lights)
     this->sched_.clear_unused_lights(b, b < this->light_counts_.size() ? this->light_counts_[b] : 0);
+  }
   for (uint8_t n : this->light_counts_)
     this->max_lights_ = std::max(this->max_lights_, n);
   this->light_counts_.clear();
@@ -1547,6 +1556,10 @@ void UltraHub::ledger_line_() {
       if (l->get_board() < this->lit_rx_.size() && l->is_lit(now))
         this->lit_rx_[l->get_board()] |= 1;
     }
+    for (auto *l : this->pixel_lights_) {
+      if (l->pixel_board() < this->lit_rx_.size() && l->pixel_lit(now))
+        this->lit_rx_[l->pixel_board()] |= 1;
+    }
   }
   for (uint16_t i = 0; i < this->lit_rx_.size(); i++) {
     const uint8_t lit = this->lit_rx_[i];
@@ -1597,6 +1610,8 @@ void UltraHub::attach_port_() {
   this->port_attached_ = true;
   for (auto *l : this->lights_)
     this->port_->add_load(l->get_standby_after(), [l](uint32_t now) { return l->is_lit(now); }, l->get_state());
+  for (auto *l : this->pixel_lights_)
+    this->port_->add_load(l->pixel_standby_after(), [l](uint32_t now) { return l->pixel_lit(now); }, l->pixel_state());
   this->port_->add_load(1, [this](uint32_t now) {
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
     if (this->standby_hold_(now) || this->comm_.hold_power())

@@ -736,6 +736,7 @@ struct PowerSupplyRequester {
 struct UltraLight {
   bool lit{false};
   bool is_lit(uint32_t) const { return this->lit; }
+  bool pixel_lit(uint32_t) const { return this->lit; }   // (as an Ultra-Digital receiver's pixel light)
 };
 
 /// The hub around service_power_() and power_cycle() (build/lifecycle/hub_power.inc).
@@ -755,6 +756,7 @@ struct UltraHub {
   uint32_t power_on_ms_{0}, power_on_delay_ms_{100};
   bool cal_power_hold_{false}, upd_power_hold_{false};
   std::vector<UltraLight *> lights_;
+  std::vector<UltraLight *> pixel_lights_;   // the Ultra-Digital receivers' lights
   PowerCycle cycle_{CYCLE_NONE};
   uint32_t cycle_ms_{0};
   uint8_t pin_{16};
@@ -3558,6 +3560,9 @@ struct Light {
   bool is_lit(uint32_t) const { return this->lit; }
   uint32_t get_standby_after() const { return this->hold; }
   LightState *get_state() { return &this->state; }
+  uint32_t pixel_standby_after() const { return this->hold; }   // (as an Ultra-Digital receiver's pixel light)
+  bool pixel_lit(uint32_t) const { return this->lit; }
+  LightState *pixel_state() { return &this->state; }
 };
 namespace diffpower {
 struct DiffPowerPort {   // what the hub uses of it
@@ -3609,6 +3614,7 @@ struct UltraHub {
   void status_set_warning() {}
   void status_clear_warning() {}
   std::vector<Light *> lights_;
+  std::vector<Light *> pixel_lights_;
   diffpower::DiffPowerPort *port_{nullptr};
   bool port_attached_{false}, cal_power_hold_{false}, upd_power_hold_{false};
   uint32_t notices_{0};
@@ -4030,6 +4036,8 @@ struct Light {
   bool on;
   uint16_t get_board() const { return this->board; }
   bool is_lit(uint32_t) const { return this->on; }
+  uint16_t pixel_board() const { return this->board; }   // (as an Ultra-Digital receiver's pixel light)
+  bool pixel_lit(uint32_t) const { return this->on; }
 };
 struct Keeper {   // what the hub tells the ledger
   bool lit_due(uint32_t) const { return true; }   // the differential ledger suite tests the real cadence
@@ -4056,6 +4064,7 @@ struct UltraHub {
     uint16_t receivers() const { return 3; }
   } poller_;
   std::vector<Light *> lights_;
+  std::vector<Light *> pixel_lights_;
   bool ready{false};
   bool boards_powered_() const { return this->ready; }
   bool line_on_{false};

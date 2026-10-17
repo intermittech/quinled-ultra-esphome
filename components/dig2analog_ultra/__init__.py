@@ -656,7 +656,7 @@ def _final_validate(configs):
                     )
     # ultra_* effects only run on dig2analog_ultra lights
     for light in full.get("light", []) or []:
-        if light.get("platform") == "dig2analog_ultra":
+        if light.get("platform") in ("dig2analog_ultra", "ultra_digital"):
             continue
         for eff in light.get("effects", []) or []:
             key = next(iter(eff))

@@ -300,12 +300,60 @@ class Scheduler {
     return board < this->boards_.size() && id < ULTRA_CFG_COUNT &&
            (this->boards_[board].cfg_have & (1u << id)) != 0;
   }
-  /// Queue the changed settings (all of them in 3 CONFIG slots of up to 9 values).
+  /// A hardware-specific setting (CONFIG ids 129-139: the Ultra-Digital receiver's local pixel effects, ULTRA_CFG_PX_*).
+  /// Like set_config(): sent with flush_config(), identical values are not re-sent, repeated by the refresh.
+  void set_hw_config(uint16_t board, uint8_t id, uint16_t value) {
+    if (board >= this->boards_.size() || id < ULTRA_CFG_PX_FIRST || id >= ULTRA_CFG_PX_FIRST + ULTRA_CFG_PX_COUNT)
+      return;
+    Board &b = this->boards_[board];
+    const uint8_t k = id - ULTRA_CFG_PX_FIRST;
+    if (!b.hw) {
+      b.hw.reset(new HwConfig());
+      restart_rotation_(b);   // (its list has more items now)
+    }
+    if ((b.hw->have & (1u << k)) && b.hw->cfg[k] == value)
+      return;
+    b.hw->cfg[k] = value;
+    b.hw->have |= static_cast<uint16_t>(1u << k);
+    b.cfg_dirty = true;
+  }
+  uint16_t get_hw_config(uint16_t board, uint8_t id) const {
+    return board < this->boards_.size() && this->boards_[board].hw && id >= ULTRA_CFG_PX_FIRST &&
+                   id < ULTRA_CFG_PX_FIRST + ULTRA_CFG_PX_COUNT
+               ? this->boards_[board].hw->cfg[id - ULTRA_CFG_PX_FIRST]
+               : 0;
+  }
+  bool has_hw_config(uint16_t board, uint8_t id) const {
+    return board < this->boards_.size() && this->boards_[board].hw && id >= ULTRA_CFG_PX_FIRST &&
+           id < ULTRA_CFG_PX_FIRST + ULTRA_CFG_PX_COUNT &&
+           (this->boards_[board].hw->have & (1u << (id - ULTRA_CFG_PX_FIRST))) != 0;
+  }
+  /// Queue the changed settings (all of them in 3 CONFIG slots of up to 9 values, then the hardware-specific ones in
+  /// HW_PAGES).
   void flush_config() {
     for (auto &b : this->boards_) {
       if (!b.cfg_dirty)
         continue;
       b.cfg_dirty = false;
+      for (uint8_t page = 0; b.hw && page < HW_PAGES; page++) {
+        uint8_t ids[9];
+        uint16_t vals[9];
+        uint32_t n = 0;
+        for (uint8_t k = page * 9; k < ULTRA_CFG_PX_COUNT && k < (page + 1) * 9; k++) {
+          if (b.hw->have & (1u << k)) {
+            ids[n] = static_cast<uint8_t>(ULTRA_CFG_PX_FIRST + k);
+            vals[n++] = b.hw->cfg[k];
+          }
+        }
+        Item &it = b.hw->page[page];
+        it.valid = n != 0;
+        if (!it.valid)
+          continue;
+        const uint8_t seq = this->next_seq_(b, ULTRA_LIGHT_BOARD, ULTRA_CONFIG);
+        ultra_slot_config(it.slot, seq, ids, vals, n);
+        it.start_us = NO_START;
+        this->queue_(b, key_(ULTRA_LIGHT_BOARD, ULTRA_CONFIG, static_cast<uint8_t>(CONFIG_PAGES + page)));
+      }
       for (uint8_t page = 0; page < CONFIG_PAGES; page++) {
         uint8_t ids[9];
         uint16_t vals[9];
@@ -419,6 +467,30 @@ class Scheduler {
     it.valid = true;
     it.start_us = NO_START;
     this->queue_(b, key_(light, ULTRA_SCENE_EFFECT, 0));
+  }
+
+  /// A local pixel effect of an Ultra-Digital receiver's segment (PIXEL_FX; light = the segment, 0 .. 3), starting at
+  /// start_us: the effect's time zero on the host clock (the receivers' phase anchor; a change of its parameters keeps
+  /// it, a new effect takes a new one). fx.effect 0 hands the strip back to the hub's stream. Sent with repeats like
+  /// SET and part of the refresh (the receiver applies a SEQ once).
+  void light_pixel_fx(uint16_t board, uint8_t segment, const ultra_pixel_fx_t &fx, int64_t start_us) {
+    if (!this->valid_(board, segment) || segment >= ULTRA_PX_SEGMENTS)
+      return;
+    Board &b = this->boards_[board];
+    LightItems &li = li_(b, segment);
+    if (!li.pixfx)
+      li.pixfx.reset(new Item());
+    Item &it = *li.pixfx;
+    ultra_slot_pixel_fx(it.slot, segment, this->next_seq_(b, segment, ULTRA_PIXEL_FX), &fx);
+    it.valid = true;
+    it.start_us = start_us;
+    it.stream = false;
+    this->queue_(b, key_(segment, ULTRA_PIXEL_FX, 0));
+  }
+  /// The segment's last PIXEL_FX is queued or sent (the light keeps its own copy of what it asked for)
+  bool pixel_fx_valid(uint16_t board, uint8_t segment) const {
+    return this->valid_(board, segment) && this->boards_[board].light[segment] &&
+           this->boards_[board].light[segment]->pixfx && this->boards_[board].light[segment]->pixfx->valid;
   }
 
   /// Effect (FX_NONE stops it) at start_us; strobe steps are sent along (count in params[0]). While the light's
@@ -611,6 +683,10 @@ class Scheduler {
         if (b.config[p].valid)
           this->queue_(b, key_(ULTRA_LIGHT_BOARD, ULTRA_CONFIG, p));
       }
+      for (uint8_t p = 0; b.hw && p < HW_PAGES; p++) {
+        if (b.hw->page[p].valid)
+          this->queue_(b, key_(ULTRA_LIGHT_BOARD, ULTRA_CONFIG, static_cast<uint8_t>(CONFIG_PAGES + p)));
+      }
       for (uint8_t l = 0; l < ULTRA_LIGHTS; l++) {
         if (!b.light[l])
           continue;
@@ -629,6 +705,8 @@ class Scheduler {
           this->queue_(b, key_(l, ULTRA_SCENE, 0));
         if (li.scene_fx.valid)
           this->queue_(b, key_(l, ULTRA_SCENE_EFFECT, 0));
+        if (li.pixfx && li.pixfx->valid)
+          this->queue_(b, key_(l, ULTRA_PIXEL_FX, 0));   // (its START is kept: the effect continues in phase)
         for (size_t i = 0; i < li.steps.size(); i++)
           this->queue_(b, key_(l, ULTRA_STEP, static_cast<uint8_t>(i)));
       }
@@ -685,7 +763,7 @@ class Scheduler {
     for (const auto &b : this->boards_) {
       for (const auto &l : b.light) {
         if (l)
-          n += sizeof(LightItems) + (l->steps.capacity() + l->held_steps.capacity()) * sizeof(Item);
+          n += sizeof(LightItems) + (l->steps.capacity() + l->held_steps.capacity() + (l->pixfx ? 1 : 0)) * sizeof(Item);
       }
     }
     this->queue_bytes_peak_ = this->queue_bytes_;
@@ -748,6 +826,7 @@ class Scheduler {
 
  protected:
   static constexpr uint8_t CONFIG_PAGES = 3;
+  static constexpr uint8_t HW_PAGES = (ULTRA_CFG_PX_COUNT + 8) / 9;   // CONFIG 129-139 (ULTRA_CFG_PX_*): 2 slots
   static_assert(1 + CONFIG_PAGES * 9 >= ULTRA_CFG_COUNT, "every official CONFIG id in a CONFIG slot");
 
   struct Item {
@@ -767,6 +846,7 @@ class Scheduler {
   };
   struct LightItems {
     Item def, opt, set, effect, scene, scene_fx;
+    std::unique_ptr<Item> pixfx;   // an Ultra-Digital receiver's segment (light = segment): its local pixel effect
     std::vector<Item> steps;
     bool held{false};  // a strip shows on the light: held_effect waits for release_effect()
     Item held_effect;
@@ -778,19 +858,29 @@ class Scheduler {
   /// it empties.
   static_assert(ULTRA_CFG_COUNT <= 32, "Board::cfg_have holds a bit per CONFIG id");
   /// the refresh list: CONFIG pages, then per light DEF, OPT, SET, EFFECT, SCENE, SCENE_EFFECT and its STEPs
-  static constexpr uint16_t REFRESH_ITEMS = CONFIG_PAGES + ULTRA_LIGHTS * (6 + ULTRA_MAX_STEPS);
+  /// ... then, at the end of the list (so the order of everything before is the one the sender library has), each
+  /// light's PIXEL_FX and the hardware-specific CONFIG pages (nothing there for a board without them)
+  static constexpr uint16_t REFRESH_MAIN = CONFIG_PAGES + ULTRA_LIGHTS * (6 + ULTRA_MAX_STEPS);
+  static constexpr uint16_t REFRESH_ITEMS = REFRESH_MAIN + ULTRA_LIGHTS + HW_PAGES;
   static_assert(REFRESH_ITEMS <= 255, "Board::rr holds a refresh position");
+  /// The hardware-specific CONFIG ids (129-139, ULTRA_CFG_PX_*) of a board that has them, in HW_PAGES slots
+  struct HwConfig {
+    Item page[HW_PAGES];
+    uint16_t cfg[ULTRA_CFG_PX_COUNT]{};
+    uint16_t have{0};   // the ids set (bit per id - 129)
+  };
   struct Board {   // (the slots first: no padding)
     Item config[CONFIG_PAGES];
     Item identify;  // the last IDENTIFY (identify, version, dark, release, calibrate)
     std::vector<Cmd> queue;
     std::unique_ptr<LightItems> light[ULTRA_LIGHTS];
     uint16_t cfg[ULTRA_CFG_COUNT]{};
+    std::unique_ptr<HwConfig> hw;   // CONFIG 129-139 (only a board that has them: an Ultra-Digital receiver)
     uint8_t rr{0};    // the refresh list's next position (REFRESH_ITEMS of them)
     uint8_t rot{0};   // complete refresh rounds since its init / a resync / a change of its lights: 0..6, then 3..6
     uint32_t cfg_have{0};   // the CONFIG ids set (bit per id)
     bool cfg_dirty{false};
-    uint8_t seq[ULTRA_LIGHTS + 1][ULTRA_TYPES]{};
+    uint8_t seq[ULTRA_LIGHTS + 1][ULTRA_PIXEL_FX + 1]{};   // (ULTRA_PIXEL_FX is the last type; ULTRA_TYPES stays below it)
     uint8_t urgent_run{0};   // queued commands sent in a row (build_frame: every 16th slot a refresh)
     uint8_t first_unused{ULTRA_LIGHTS};   // light indices from here on are not in the YAML
     uint8_t unsent{0};                    // queued commands of which no copy went out yet
@@ -865,8 +955,11 @@ class Scheduler {
   /// out is always the latest command of its key.
   static Item queued_item_(const Board &b, uint16_t key) {
     const uint8_t light = key >> 12, type = (key >> 8) & 15, sub = key & 255;
-    if (type == ULTRA_CONFIG)
+    if (type == ULTRA_CONFIG) {
+      if (sub >= CONFIG_PAGES)
+        return b.hw && sub - CONFIG_PAGES < HW_PAGES ? b.hw->page[sub - CONFIG_PAGES] : Item{};
       return b.config[sub];
+    }
     if (type == ULTRA_IDENTIFY)
       return b.identify;
     if (!b.light[light])
@@ -885,6 +978,8 @@ class Scheduler {
         return li.scene;
       case ULTRA_SCENE_EFFECT:
         return li.scene_fx;
+      case ULTRA_PIXEL_FX:
+        return li.pixfx ? *li.pixfx : Item{};
       default:  // STEP (a new effect drops the old steps from the queue; an empty slot is never valid)
         return sub < li.steps.size() ? li.steps[sub] : Item{};
     }
@@ -942,7 +1037,7 @@ class Scheduler {
       ultra_put24(s + ULTRA_PAYLOAD + 22, duration);
       ms = ms < -32768 ? -32768 : ms > 32767 ? 32767 : ms;
       ultra_put16(s + ULTRA_PAYLOAD + 25, static_cast<uint16_t>(static_cast<int16_t>(ms)));
-    } else if (s[0] == ULTRA_EFFECT) {
+    } else if (s[0] == ULTRA_EFFECT || s[0] == ULTRA_PIXEL_FX) {   // (START is at slot byte 4 in both)
       ms = ms < INT32_MIN ? INT32_MIN : ms > INT32_MAX ? INT32_MAX : ms;
       ultra_put32(s + ULTRA_PAYLOAD + 1, static_cast<uint32_t>(static_cast<int32_t>(ms)));
     }
@@ -1025,7 +1120,13 @@ class Scheduler {
       if (b.rr == 0)
         b.rot = b.rot < 6 ? static_cast<uint8_t>(b.rot + 1) : 3;   // a round done: 0..6, then 3, 4, 5, 6, 3, ...
       const Item *it = nullptr;
-      if (pos < CONFIG_PAGES) {
+      if (pos >= REFRESH_MAIN) {   // the tail: PIXEL_FX per light, then the hardware-specific CONFIG pages
+        const uint16_t k = pos - REFRESH_MAIN;
+        if (k < ULTRA_LIGHTS)
+          it = b.light[k] ? b.light[k]->pixfx.get() : nullptr;
+        else
+          it = b.hw ? &b.hw->page[k - ULTRA_LIGHTS] : nullptr;
+      } else if (pos < CONFIG_PAGES) {
         it = &b.config[pos];
       } else {
         const uint16_t l = (pos - CONFIG_PAGES) / per_light, k = (pos - CONFIG_PAGES) % per_light;

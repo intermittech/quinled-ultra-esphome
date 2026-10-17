@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "fw_version.h"
+#include "ultra_pixel_fx.h"
 #include "ultra_protocol.h"
 #include "ultra_text.h"
 
@@ -57,13 +58,18 @@ enum TelemetryPage : uint8_t {
   TP_FAULTS,        // 0.2.5: DIAG part 1, the fault memory and the calibration trend
   TP_SYNC,          // 0.2.6: LIFE_SYNC, only when the ledger asks (TelemetryPoller::request_sync)
   TP_CALIBRATION,   // the current model, how the last calibration test ended (feature CALIBRATION); after a run too
+  TP_PX_STATE,      // 0.2.8: page 0x81 part 0, an Ultra-Digital receiver's local effects (HWCAP PIXEL_FX): mode, running
+  TP_PX_EFFECTS,    // ... part 1: the effects the firmware has (once after it starts)
+  TP_PX_PALETTES,   // ... part 2: its palettes
   TP_COUNT,
 };
+static constexpr bool tp_is_pixel(uint8_t tp) { return tp >= TP_PX_STATE; }
 static constexpr uint8_t TP_PAGE_ID[TP_COUNT] = {ULTRA_PAGE_IDENTITY, ULTRA_PAGE_IDENTITY, ULTRA_PAGE_POWER,
                                                  ULTRA_PAGE_STATUS,   ULTRA_PAGE_OUTPUTS,  ULTRA_PAGE_SUPPLY,
                                                  ULTRA_PAGE_ENERGY,   ULTRA_PAGE_HEALTH,   ULTRA_PAGE_LIFETIME,
                                                  ULTRA_PAGE_DIAG,     ULTRA_PAGE_DIAG,     ULTRA_PAGE_LIFE_SYNC,
-                                                 ULTRA_PAGE_CALIBRATION};
+                                                 ULTRA_PAGE_CALIBRATION, ULTRA_PAGE_HW_FX,    ULTRA_PAGE_HW_FX,
+                                                 ULTRA_PAGE_HW_FX};
 /// the IDENTITY feature a page needs (0: every receiver, or tried)
 static constexpr uint32_t TP_FEATURE[TP_COUNT] = {0,
                                                   0,
@@ -77,10 +83,16 @@ static constexpr uint32_t TP_FEATURE[TP_COUNT] = {0,
                                                   ULTRA_FEAT_DIAG,
                                                   ULTRA_FEAT_DIAG,
                                                   ULTRA_FEAT_LIFE_SYNC,
-                                                  ULTRA_FEAT_CALIBRATION};
+                                                  ULTRA_FEAT_CALIBRATION,
+                                                  0,
+                                                  0,
+                                                  0};
 /// the POLL's argument byte 0 (IDENTITY, DIAG: its part)
 static constexpr uint8_t TP_PART[TP_COUNT] = {ULTRA_ID_PART_BOARD, ULTRA_ID_PART_FEATURES, 0, 0, 0, 0, 0, 0, 0, 0,
-                                              1, 0, 0};
+                                              1, 0, 0, ULTRA_PXG_PART_STATE, ULTRA_PXG_PART_EFFECTS,
+                                              ULTRA_PXG_PART_PALETTES};
+/// the maps of page 0x81 (parts 1, 2) don't change while the firmware runs: read again after this long
+static constexpr uint32_t PX_MAP_INTERVAL_MS = 12u * 3600000u;
 /// the features of a 0.2.5 receiver (its ENERGY bytes 15-18 and HEALTH's hot flag are set; before: 0)
 static constexpr uint32_t FEATURES_025 = ULTRA_FEAT_LIFETIME | ULTRA_FEAT_DIAG | ULTRA_FEAT_RETRY | ULTRA_FEAT_LOSS_SCENE;
 
@@ -1037,6 +1049,11 @@ class TelemetryPoller {
   }
 
   const ReceiverData &data(uint16_t i) const { return this->rx_[i].d; }
+  /// What receiver i's page 0x81 said (an Ultra-Digital receiver's local effects; nothing known: have_* false)
+  const PixelState &pixel(uint16_t i) const {
+    static const PixelState none{};
+    return i < this->px_.size() ? this->px_[i] : none;
+  }
   bool answering(uint16_t i) const { return this->rx_[i].answering; }
   uint8_t misses(uint16_t i) const { return this->rx_[i].misses; }
   /// POLLs that asked receiver i for an answer, and the ones that got none (missed polls)
@@ -1129,6 +1146,11 @@ class TelemetryPoller {
       case TP_FAULTS:
       case TP_CALIBRATION:   // (and right after the hub's calibration run: read_now)
         return this->iv_.diag_ms;
+      case TP_PX_STATE:
+        return this->iv_.power_ms;
+      case TP_PX_EFFECTS:
+      case TP_PX_PALETTES:
+        return PX_MAP_INTERVAL_MS;
       default:
         return 0;
     }
@@ -1146,6 +1168,8 @@ class TelemetryPoller {
       return false;
     if (tp == TP_OUTPUTS && !r.outputs)
       return false;
+    if (tp_is_pixel(tp))   // page 0x81: only the receivers that run local pixel effects
+      return (r.d.hw_caps & ULTRA_HWCAP_PIXEL_FX) != 0;
     if (tp == TP_SYNC && !r.sync_due)
       return false;
     return TP_FEATURE[tp] == 0 || (r.d.features & TP_FEATURE[tp]) != 0;
@@ -1192,6 +1216,8 @@ class TelemetryPoller {
   void restarted_(Receiver &r, uint32_t now_ms, bool new_board) {
     if (new_board) {
       r.d = ReceiverData{};
+      if (&r - this->rx_.data() < static_cast<std::ptrdiff_t>(this->px_.size()))
+        this->px_[static_cast<size_t>(&r - this->rx_.data())] = PixelState{};
       r.unsupported = 0;
       r.updated |= (1u << TP_COUNT) - 1;   // every value unknown again
       r.sync_due = false;   // (the ledger asks again for the board that's there)
@@ -1272,7 +1298,13 @@ class TelemetryPoller {
     const uint32_t old_up = d.uptime_s, old_ms = r.status_ms;
     const bool had_status = d.have_status;
     const uint8_t old_state = d.power_state;
-    decode_receiver_page(d, TP_PAGE_ID[tp], data, TP_PART[tp]);
+    if (tp_is_pixel(tp)) {
+      if (this->px_.size() != this->rx_.size())
+        this->px_.resize(this->rx_.size());   // (on the first one: only a line with such a receiver pays for it)
+      decode_pixel_page(this->px_[static_cast<size_t>(&r - this->rx_.data())], TP_PART[tp], data);
+    } else {
+      decode_receiver_page(d, TP_PAGE_ID[tp], data, TP_PART[tp]);
+    }
     r.updated |= 1u << tp;
     r.fresh |= static_cast<uint16_t>(1u << tp);
     switch (tp) {
@@ -1326,6 +1358,7 @@ class TelemetryPoller {
   }
 
   std::vector<Receiver> rx_;
+  std::vector<PixelState> px_;   // page 0x81 per receiver, sized with the first such answer
   std::vector<Asked> win_;
   TelemetryIntervals iv_{};
   uint8_t rate_{ULTRA_RW_RATE_1M};

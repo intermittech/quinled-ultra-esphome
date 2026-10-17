@@ -32,7 +32,7 @@ external_components:
   - source:
       type: local
       path: {components}
-    components: [dig2analog_ultra, dig2analog_ultra_strip, diffpower, dig2analog_ultra_parlio]
+    components: [dig2analog_ultra, dig2analog_ultra_strip, diffpower, dig2analog_ultra_parlio, ultra_digital]
 """
 
 PSU = """\

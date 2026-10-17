@@ -5,6 +5,7 @@
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
+#include "esphome/components/light/light_state.h"
 
 #include "ultra_core.h"
 #include "ultra_settings.h"
@@ -19,6 +20,7 @@
 #include <driver/rmt_encoder.h>
 #include <driver/rmt_tx.h>
 
+#include <algorithm>
 #include <vector>
 
 #ifdef USE_DIG2ANALOG_ULTRA_UPDATE
@@ -48,6 +50,19 @@
 namespace esphome::dig2analog_ultra {
 
 class UltraLight;
+
+/// A light of an Ultra-Digital receiver (ultra_digital, local pixel effects) on a board of this line: what the hub
+/// needs of it for the power (a Diff-Power port, the supply), the receivers' lit-time and the resync.
+class PixelSource {
+ public:
+  virtual uint16_t pixel_board() const = 0;
+  /// on, or still fading out on the receiver (power supply request)
+  virtual bool pixel_lit(uint32_t now_ms) = 0;
+  /// its own turn-off period on a Diff-Power port (0: the port's)
+  virtual uint32_t pixel_standby_after() const = 0;
+  virtual light::LightState *pixel_state() const = 0;
+};
+
 using EncoderParams = FrameSymbols<rmt_symbol_word_t>;
 /// The encoder's argument: the bit symbols, and the underrun watch (diagnostics, only when watching).
 struct EncoderArg {
@@ -328,6 +343,20 @@ class UltraHub final : public Component {
   void wake_();
   void loop_fast_();
   void add_light(UltraLight *light) { this->lights_.push_back(light); }
+  /// A pixel light of an Ultra-Digital receiver (ultra_digital): counted as a lit light for the power and the lit-time
+  void add_pixel_light(PixelSource *light) { this->pixel_lights_.push_back(light); }
+  /// A setting of an Ultra-Digital receiver (CONFIG 129-139, ULTRA_CFG_PX_*; the receiver keeps it): sent now and with
+  /// every refresh
+  void set_pixel_config(uint16_t board, uint8_t id, uint16_t value) {
+    this->sched_.set_hw_config(board, id, value);
+    this->sched_.flush_config();
+    this->wake_();
+  }
+  /// A board that is an Ultra-Digital receiver: it has no light indices to clear (clear_unused_lights)
+  void set_pixel_board(uint16_t board) {
+    if (std::find(this->pixel_boards_.begin(), this->pixel_boards_.end(), board) == this->pixel_boards_.end())
+      this->pixel_boards_.push_back(board);
+  }
 
 #ifdef USE_DIG2ANALOG_ULTRA_TELEMETRY
   // Diff-Power receiver telemetry (the return channel, ultra_telemetry.h; wiki: Diff-Power telemetry).
@@ -648,6 +677,8 @@ class UltraHub final : public Component {
 
   uint32_t power_on_delay_ms_{0};
   std::vector<UltraLight *> lights_;
+  std::vector<PixelSource *> pixel_lights_;   // the Ultra-Digital receivers' lights (ultra_digital)
+  std::vector<uint16_t> pixel_boards_;        // ... and their boards
   bool power_waiting_{false};
   uint32_t power_on_ms_{0};
 #ifdef USE_POWER_SUPPLY

@@ -1,0 +1,2861 @@
+#pragma once
+
+// The return channel, host side (protocol 0.3, wiki: Return Channel): which receivers answer in the next response
+// window and with which page, the RW frame's POLL slots, the answers out of the bytes the hub's UART received, and
+// what they say. No ESP-IDF / ESPHome dependencies: tests/ultra_telemetry_test.cpp runs it on a PC against a modelled
+// chain, tests/ultra_telemetry_contract_test.cpp against the Diff-Power Ultra Receiver Analog-Medium firmware's receive / answer
+// path. UltraHub sends the frames and reads the UART.
+//
+// The rules it keeps (wiki: Return Channel, "The hub"):
+//  - the receivers are the first boards of the line (a board without a return channel relays nothing, so receivers
+//    behind one can't be heard); up to 16 answer in one window (INDEX is a nibble), unique rising indices, relay only
+//    (index 0xFF) for receivers in front of an answering one that don't answer this time; one R and one rate;
+//  - no RW frame before ULTRA_RW_LOCK_MS of headers after the chain's preamble, at most one per MIN_SPACING_MS;
+//  - answers: discard to a SYNC, 32 bytes with a valid CRC; route by INDEX, match SEQ and the page (or BUSY /
+//    UNSUPPORTED), UID16 against the board at that position (a new one: its data is dropped, IDENTITY read again);
+//  - a missing answer is normal: the page is asked again in a later window (new SEQ, bounded back-off). A receiver
+//    that doesn't take part silences every one behind it for that window: only the first missing answer counts. A
+//    receiver that keeps missing (CUT_MISSES windows) cuts off the ones behind it: they aren't polled until it answers
+//    (it is asked at least every CUT_BACKOFF_MS meanwhile: a re-plugged receiver is seen within ~2 s);
+//  - a restart (its uptime fell): nothing is polled past it for 1 s, IDENTITY again, no acknowledge across it;
+//  - POWER: read the counts (and SUPPLY's dip count), show them, acknowledge exactly those in the next POWER poll.
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+#include <string>
+#include <vector>
+
+#include "fw_version.h"
+#include "ultra_pixel_fx.h"
+#include "ultra_descriptor.h"
+#include "ultra_pixel_calibration.h"
+#include "ultra_protocol.h"
+#include "ultra_text.h"
+#include "ultra_line_rate.h"
+
+namespace esphome::ultra_line {
+
+// LIFE_SYNC (protocol 0.3, ULTRA_LS_*): the hub gives a board its ledger back (ultra_ledger.h). The receiver's steps
+// per merge (the header's text): a counter ahead by more is ignored, so the hub sends at most this much (powered:
+// 0.1 h; lit: what powered got + 1; counts: powered_s / 10 + 64; Wh: descriptor domain 0's input bound over
+// the powered step + 1 h, rounded up by ultra_lifetime_energy_allowance).
+static constexpr uint32_t LS_STEP_POWERED = 7200, LS_STEP_EVENTS = 64, LS_STEP_EVENTS_PER_01H = 36;
+
+/// The pages the hub reads; when several are equally overdue, the earlier one goes first.
+enum TelemetryPage : uint8_t {
+  TP_IDENTITY = 0,  // IDENTITY part 0, the board: at the start, after a restart or a new board (UID16)
+  TP_FEATURES,      // IDENTITY part 1, the firmware's features (): right after part 0
+  TP_POWER,         // board limit, trips and latches (feature POWER_EVENTS)
+  TP_STATUS,
+  TP_OUTPUTS,       // optional: why the outputs differ from the lights (UNSUPPORTED: not asked again)
+  TP_SUPPLY,        // supply dips (feature SUPPLY_DIPS)
+  TP_ENERGY,        // feature ENERGY
+  TP_HEALTH,        // channel health (feature HEALTH)
+  TP_LIFETIME,      // the odometer (feature LIFETIME)
+  TP_DIAG,          // DIAG part 0, the running board (feature DIAG)
+  TP_FAULTS,        // DIAG part 1, the fault memory and the calibration trend
+  TP_SYNC,          // LIFE_SYNC, only when the ledger asks (TelemetryPoller::request_sync)
+  TP_CALIBRATION,   // the current model, how the last calibration test ended (feature CALIBRATION); after a run too
+  TP_PX_STATE,      // page 0x11 part 0, a Diff-Power Ultra Receiver Digital-Medium's local effects (HWCAP PIXEL_FX): mode, running
+  TP_PX_EFFECTS,    // ... part 1: the effects the firmware has (once after it starts)
+  TP_PX_PALETTES,   // ... part 2: its palettes
+  TP_LINK_STATS,    // LINK_STATS part 0: ingress widths, lock state and snapshot epoch
+  TP_UD_META,       // digital calibration metadata/progress (part 1)
+  TP_UD_QUALITY,    // ... coherent quality (part 2)
+  TP_TARGET,
+  TP_DESCRIPTOR,
+  TP_LINK_CONTEXT,
+  TP_FW_UPDATE,
+  TP_COUNT,
+};
+static constexpr bool tp_is_pixel(uint8_t tp) { return tp >= TP_PX_STATE && tp <= TP_PX_PALETTES; }
+static constexpr uint8_t TP_PAGE_ID[TP_COUNT] = {ULTRA_PAGE_IDENTITY, ULTRA_PAGE_IDENTITY, ULTRA_PAGE_POWER,
+                                                 ULTRA_PAGE_STATUS,   ULTRA_PAGE_OUTPUTS,  ULTRA_PAGE_SUPPLY,
+                                                 ULTRA_PAGE_ENERGY,   ULTRA_PAGE_HEALTH,   ULTRA_PAGE_LIFETIME,
+                                                 ULTRA_PAGE_DIAG,     ULTRA_PAGE_DIAG,     ULTRA_PAGE_LIFE_SYNC,
+                                                 ULTRA_PAGE_CALIBRATION, ULTRA_PAGE_PIXEL_FX,    ULTRA_PAGE_PIXEL_FX,
+                                                 ULTRA_PAGE_PIXEL_FX,       ULTRA_PAGE_LINK_STATS, ULTRA_PAGE_CALIBRATION, ULTRA_PAGE_CALIBRATION, ULTRA_PAGE_IDENTITY, ULTRA_PAGE_DESCRIPTOR, ULTRA_PAGE_LINK_STATS, ULTRA_PAGE_FW_UPDATE};
+/// the IDENTITY feature a page needs (0: every receiver, or tried)
+static constexpr uint32_t TP_FEATURE[TP_COUNT] = {0,
+                                                  0,
+                                                  ULTRA_FEAT_POWER_EVENTS,
+                                                  0,
+                                                  0,
+                                                  ULTRA_FEAT_SUPPLY_DIPS,
+                                                  ULTRA_FEAT_ENERGY,
+                                                  ULTRA_FEAT_HEALTH,
+                                                  ULTRA_FEAT_LIFETIME,
+                                                  ULTRA_FEAT_DIAG,
+                                                  ULTRA_FEAT_DIAG,
+                                                  ULTRA_FEAT_LIFE_SYNC,
+                                                  ULTRA_FEAT_CALIBRATION,
+                                                  0,
+                                                  0,
+                                                  0,
+                                                  0,
+                                                  ULTRA_FEAT_PIXEL_CALIBRATION,
+                                                  ULTRA_FEAT_PIXEL_CALIBRATION, 0, 0, 0, ULTRA_FEAT_FW_UPDATE};
+/// the POLL's argument byte 0 (IDENTITY, DIAG: its part)
+static constexpr uint8_t TP_PART[TP_COUNT] = {ULTRA_ID_PART_BOARD, ULTRA_ID_PART_FEATURES, 0, 0, 0, 0, 0, 0, 0, 0,
+                                              1, 0, 0, ULTRA_PXG_PART_STATE, ULTRA_PXG_PART_EFFECTS,
+                                              ULTRA_PXG_PART_PALETTES, 0, 1, 2, ULTRA_ID_PART_TARGET, 0, 0, 0};
+/// the maps of page 0x11 (parts 1, 2) don't change while the firmware runs: read again after this long
+static constexpr uint32_t PX_MAP_INTERVAL_MS = 12u * 3600000u;
+
+
+/// take_updates() bits beyond the pages
+static constexpr uint32_t TU_AVAILABILITY = 1u << 30;  // it started or stopped answering
+static constexpr uint32_t TU_RESTART = 1u << 29;       // it restarted (or is a different board now)
+static constexpr uint32_t TU_HUB = 1u << 28;           // the hub's own state of it changed (its calibration run)
+
+/// A supply dip is a problem (Status "Supply dips", the port's Problem) below this % of its reference (YAML
+/// dip_warning); the receivers log every dip below 90 %: one down to here is fine (Supply note)
+static constexpr uint8_t DIP_WARN_PCT = 80;
+
+/// CALIBRATION page DATA (the receiver firmware's layout; the protocol header names byte 1, ULTRA_CA_MODEL): the
+/// stored test's levels (0: none), the model | how the last test ended, the stored tests' count, the age of the last
+/// complete test (s, u24, this power-up; 0xFFFFFF: none), the dark current, CH1-CH5 at 100 %, the connected load (the
+/// channels together at 100 %, from the model; 0: not known), the limit in effect, its source | need
+static constexpr uint8_t CA_LEVELS = 0, CA_AGE = 4, CA_IDLE = 7, CA_CHANNELS = 9, CA_CONNECTED = 19;
+static constexpr uint32_t CA_AGE_NONE = 0xFFFFFF;
+
+// Hub-only diagnostic. Unknown, interrupted or stale samples discard both debounce histories.
+struct OutputVoltageLow {
+  static constexpr uint32_t BOOT_MS = 5000, LOW_MS = 3000;
+  uint32_t sample_ms{0}, low_ms{0};
+  uint8_t low{0}, good{0};
+  bool sampled{false}, known{false}, fault{false};
+  void reset() { *this = OutputVoltageLow{}; }
+  void sample(uint32_t now, uint16_t vb) {
+    if (vb == 0xFFFF) { this->reset(); return; }
+    this->sampled = true;
+    this->sample_ms = now;
+    if (vb < 400) {
+      this->good = 0;
+      if (!this->low) this->low_ms = now;
+      if (this->low < 3) this->low++;
+      if (this->low >= 3 && now - this->low_ms >= LOW_MS) {
+        this->known = this->fault = true;
+      }
+    } else {
+      this->low = 0;
+      if (this->good < 3) this->good++;
+      if (this->good >= 3) { this->known = true; this->fault = false; }
+    }
+  }
+  bool problem() const { return this->known && this->fault; }
+};
+
+/// What one receiver said, page by page (big-endian fields decoded; `have_*`: the page was read since the board
+/// answers / since it changed). Hub diagnostic state precedes the wire data.
+struct ReceiverData {
+  bool have_update{false};
+  uint8_t update_answer[32]{};
+  uint8_t update_seq{0}, update_index{0}, update_flags{0};
+  uint32_t update_firmware{0}, update_length{0}, update_body_crc{0}, update_descriptor_crc{0};
+  uint32_t update_ms{0};   // when FW_UPDATE was last read (a port job's fresh evidence: port_job_driver.h)
+  OutputVoltageLow output_voltage_low;
+  LineCounters line_counters;
+  uint32_t line_snapshot_ms{0};
+  uint16_t line_snapshot_epoch{0};
+  uint8_t line_ingress{255}, line_snapshot_flags{0};
+  bool line_context_due{false};
+  // ENERGY
+  double energy_wh{0};     // the board's lifetime energy, exact (TOTAL_WH + the mWh of this power-up's last Wh); the
+                           // Energy sensor shows its position's (ultra_ledger.h: never down)
+  uint32_t boot_mwh{0}, total_wh{0}, power_mw{0}, saved_age_s{0xFFFFFF};
+  uint16_t vb_10mv{0xFFFF};  //  the LED output supply; 0xFFFF = not measured
+  uint16_t peak_ma{0};       //  the input current's highest ~100 ms average since the ENERGY answer before
+  uint16_t supply_z_mohm{0};  // the supply / cable impedance; 0: not known yet
+  bool have_energy{false};
+  // OUTPUTS
+  bool have_outputs{false};
+  uint8_t defined{0}, scene{0}, why{0};
+  uint16_t level[5]{}, ch_ma[5]{};
+  // SUPPLY
+  bool have_supply{false};
+  uint8_t deep_pct{0};
+  uint8_t logged{0};
+  uint8_t dip_pct{0};
+  uint16_t dips{0}, ref_mv{0}, now_mv{0}, deep_mv{0};
+  uint16_t dip_mv{0};
+  uint16_t dip_ms{0}, dip_ma{0};
+  uint32_t deep_age_s{0xFFFFFF};
+  uint32_t dip_age_s{0xFFFFFF};  // the newest logged dip
+  uint32_t dip_read_up_s{0};     // the board's uptime (its last STATUS) when SUPPLY was read: the dip began ~age before
+  // the load before a dip: the current of the last STATUS before STATUS first flagged a dip (why = SUPPLY), and the
+  // uptime of the flagging STATUS (dip_is_cable_drop: a cable drop needs a load step; 0xFFFF = no reading before it)
+  uint16_t dip_pre_ma{0xFFFF};
+  uint32_t dip_flag_up_s{0};
+  // IDENTITY
+  uint32_t fw_word{0};  // major << 24 | minor << 16 | patch << 8 | pre-release (0 = unknown)
+  uint32_t features{0};  // part 1's word 0: the ULTRA_FEAT_* bits ( 192 bits; the later words: none used yet)
+  uint32_t feature_words[6]{};
+  uint32_t hw_caps{0};
+  uint16_t max_pixels[3]{};   // the descriptor's pixel output 0: the most pixels at 3 / 4 / 5 bytes (0 = none)
+  uint32_t pixel_cal_wait_ms{0};  // its calibration's host deadline (ultra_descriptor_calibration_ms; 0 = none)
+  uint8_t wire{0}, target[16]{}, geometry[3]{}, entry_10ms{0}, record_format{0}, descriptor_format{0};
+  uint16_t descriptor_length{0}, descriptor_crc{0};
+  bool have_target{false}, have_descriptor{false};
+  std::vector<uint8_t> descriptor_bytes;
+  uint16_t descriptor_received{0};
+  uint8_t descriptor_part{0};   // RX_CAP_*
+  bool have_board{false}, have_features{false};   // part 0, part 1 read
+  bool have_identity{false};                      // both: the board and its features known
+  uint32_t identity_ms{0};   // when have_identity last became true (this start of the board; port_inventory.h)
+  uint8_t uid[12]{};
+  uint8_t bl_version{0}, hw_id{0}, hw_rev{0};
+  // STATUS
+  bool have_status{false};
+  uint8_t hw{0};   // the hardware id ( the whole byte; the revision is IDENTITY's)
+  uint8_t reset_cause{0}, power_state{0};
+  uint8_t measured{0}, pwm_preset{0};
+  uint8_t modes{0};
+  uint16_t mcu_temp{ULTRA_ST_NA}, board_temp{ULTRA_ST_NA};  // int16 0.1 C as u16; ULTRA_ST_NA = none
+  uint16_t vbus_10mv{0xFFFF}, vdda_mv{0}, current_ma{0};
+  // the bus readings of a board without the SUPPLY page (its dips have no depth): the highest since it started, and
+  // the lowest while STATUS says "a supply dip" (0xFFFF: none in this dip); supply_dip_warning() compares them
+  uint16_t vbus_hi_10mv{0}, vbus_dip_low_10mv{0xFFFF};
+  uint16_t config_crc{0};
+  uint32_t fw_version{0};  // major << 16 | minor << 8 | patch (0 = a development build)
+  uint32_t uptime_s{0};
+  // LIFETIME : the odometer, kept across power cuts
+  uint32_t lt_powered{0}, lt_lit{0};   // 0.1 h
+  uint32_t lt_power_ups{0}, lt_dips{0};
+  uint32_t lt_records{0};
+  uint16_t lt_overload_trips{0}, lt_short_trips{0}, lt_updates{0};
+  bool have_lifetime{false};
+  uint8_t lt_temp_peak{0}, lt_current_peak{0}, lt_watchdog{0};   // 0.5 C, 0.1 A
+  // LIFE_SYNC : the last sync's answer (its LIFETIME bytes and Wh go to the fields above)
+  uint16_t ls_records16{0};
+  bool have_sync{false};
+  uint8_t ls_result{0}, ls_applied{0};
+  // HEALTH
+  bool have_health{false};
+  uint8_t he_flags{0};
+  uint8_t ch_class[5]{};
+  int8_t test_dev[5]{ULTRA_HE_NA, ULTRA_HE_NA, ULTRA_HE_NA, ULTRA_HE_NA, ULTRA_HE_NA};
+  int8_t model_dev[5]{ULTRA_HE_NA, ULTRA_HE_NA, ULTRA_HE_NA, ULTRA_HE_NA, ULTRA_HE_NA};
+  int32_t dark_ma{0};  // decoded signed 2 mA wire units, including the full i16 range
+  int16_t temp_peak{static_cast<int16_t>(ULTRA_ST_NA)};
+  uint32_t temp_age_s{0xFFFFFF};
+  // POWER
+  bool have_power{false};
+  uint8_t pw_now{0}, pw_latched{0};
+  uint8_t limit_source{0}, trip_cause{0};
+  uint8_t retry_s{0};
+  uint16_t limit_events{0}, overload_trips{0}, short_trips{0};
+  uint16_t limit_ma{0xFFFF};
+  uint16_t event_ma{0}, trip_ma{0}, factor{65535};
+  uint32_t limit_age_s{0xFFFFFF}, trip_age_s{0xFFFFFF};
+  // DIAG part 1 : the fault memory (across power cuts) and the calibration trend
+  bool have_faults{false};
+  uint8_t fm_trip{0};        // 1 short / 2 overload (bits 0-1) | its current, 0.5 A (bits 2-7); 0 = none
+  uint8_t fm_dip_pct{0}, fm_dip_10ms{0}, fm_dip_a10{0};
+  uint8_t fm_rst{0}, fm_rst_up_h{0};   // 1 watchdog / 2 exception (bits 0-1) | mcause (bits 2-7); 0 = none
+  int8_t trend[5]{ULTRA_HE_NA, ULTRA_HE_NA, ULTRA_HE_NA, ULTRA_HE_NA, ULTRA_HE_NA};
+  uint8_t trend_tests{0};
+  uint16_t fm_trip_lit_h{0};
+  uint16_t trend_lit_h{0xFFFF};
+  // DIAG part 0 : the running board
+  bool have_diag{false};
+  uint8_t dg_reset{0}, bc_cause{0xFF};   // this start's reset cause; the run before's exception (0xFF: none kept)
+  uint8_t flash_errs{0}, flash_pending{0}, save_wait{0}, input_load{0xFF}, input_load_peak{0xFF};
+  uint16_t bc_pc{0};
+  uint16_t cpu_pm{0}, cpu_peak_pm{0};    // 0.1 %
+  uint16_t ovr_captures{0}, ovr_frame_ends{0}, ovr_late_ms{0};
+  uint32_t bc_uptime_s{0};
+  // CALIBRATION: the age of the last complete test (this power-up), the connected load, the stored test's levels, the
+  // model in use (0 none, 1 learned, 2 calibrated) and how the last test ended (ULTRA_CA_END_*: until its power-up)
+  uint32_t cal_age_s{CA_AGE_NONE};
+  uint16_t cal_connected_ma{0};
+  int32_t cal_idle_ma{0};   // mA: signed input offset + board idle, decoded from 2 mA wire units
+  uint16_t cal_channel_ma[5]{};   // incremental input mA at full PWM (CALIBRATION, not OUTPUTS' present currents)
+  bool have_calibration{false};
+  uint8_t cal_levels{0}, cal_model{0}, cal_end{0};
+};
+
+
+/// STATUS 8 bits 4-7: why the light isn't as the host set it now (ULTRA_ST_WHY_*; 0: as set, unknown)
+inline uint8_t receiver_why(const ReceiverData &d) {
+  return d.have_status ? static_cast<uint8_t>((d.power_state >> ULTRA_ST_WHY_SHIFT) & 0x0F) : 0;
+}
+
+/// One page's DATA (24 bytes) into d (pure; the page byte as answered; part: the POLL's argument, DIAG's part).
+inline void decode_receiver_page(ReceiverData &d, uint8_t page, const uint8_t *p, uint8_t part = 0) {
+  switch (page) {
+    case ULTRA_PAGE_IDENTITY:   // ( two parts, the POLL's argument)
+      if (part == ULTRA_ID_PART_FEATURES) {
+        for (uint8_t i = 0; i < 6; i++) d.feature_words[i] = ultra_get32(p + 4 * i);
+        d.features = d.feature_words[0];   // (word 0)
+        d.have_features = true;
+      } else if (part == ULTRA_ID_PART_TARGET) {
+        std::memcpy(d.target, p, 16);
+        std::memcpy(d.geometry, p + 16, 3);
+        d.record_format = p[19]; d.descriptor_format = p[20]; d.entry_10ms = p[21];
+        d.have_target = p[22] == 0 && p[23] == 0 && d.entry_10ms >= 5;
+      } else {
+        std::memcpy(d.uid, p + ULTRA_ID_UID, 12);
+        d.fw_word = ultra_get32(p + ULTRA_ID_FW_VERSION);
+        d.bl_version = p[ULTRA_ID_BL_VERSION];
+        d.hw_id = p[ULTRA_ID_BOARD];
+        d.hw_rev = p[ULTRA_ID_REVISION];
+        d.wire = p[ULTRA_ID_WIRE];
+        d.descriptor_length = static_cast<uint16_t>(ultra_get16(p + ULTRA_ID_DESC_LEN));
+        d.descriptor_crc = static_cast<uint16_t>(ultra_get16(p + ULTRA_ID_DESC_CRC));
+        d.have_board = d.wire == ULTRA_VERSION && d.descriptor_length >= 11 && d.descriptor_length <= ULTRA_DESC_MAX_BYTES;
+        d.have_descriptor = false; d.hw_caps = 0; std::fill_n(d.max_pixels, 3, 0); d.pixel_cal_wait_ms = 0;
+        d.descriptor_bytes.clear(); d.descriptor_received = 0; d.descriptor_part = 0;
+      }
+      d.have_identity = d.have_board && d.have_features && d.have_target && d.have_descriptor;
+      break;
+    case ULTRA_PAGE_FW_UPDATE:
+      d.have_update = p[0] == 1 && p[2] <= 96 && !p[3] && ultra_get32(p+20) == 0;
+      d.update_flags = p[1]; d.update_firmware = ultra_get32(p+4);
+      d.update_length = ultra_get32(p+8); d.update_body_crc = ultra_get32(p+12);
+      d.update_descriptor_crc = ultra_get32(p+16);
+      break;
+    case ULTRA_PAGE_STATUS: {
+      // (before this STATUS: was a dip flagged, and the current then; a load step needs a reading from before the dip)
+      const bool flagged_before = receiver_why(d) == ULTRA_ST_WHY_SUPPLY;
+      const uint16_t before_ma =
+          d.have_status && (d.measured & ULTRA_ST_M_CURRENT) && d.current_ma != 0xFFFF ? d.current_ma : 0xFFFF;
+      d.fw_version = ultra_get24(p + ULTRA_ST_FW_VERSION);
+      d.hw = p[ULTRA_ST_BOARD];
+      d.uptime_s = ultra_get24(p + ULTRA_ST_UPTIME);
+      d.reset_cause = p[ULTRA_ST_RESET];
+      d.power_state = p[ULTRA_ST_STATE];
+      d.mcu_temp = static_cast<uint16_t>(ultra_get16(p + ULTRA_ST_MCU_TEMP));
+      d.board_temp = static_cast<uint16_t>(ultra_get16(p + ULTRA_ST_TEMP_BOARD));
+      d.vbus_10mv = static_cast<uint16_t>(ultra_get16(p + ULTRA_ST_VBUS));
+      d.vdda_mv = static_cast<uint16_t>(ultra_get16(p + ULTRA_ST_VDDA));
+      d.current_ma = static_cast<uint16_t>(ultra_get16(p + ULTRA_ST_CURRENT));
+      d.measured = p[ULTRA_ST_MEASURED];
+      d.pwm_preset = p[ULTRA_ST_PWM_PRESET];
+      d.config_crc = static_cast<uint16_t>(ultra_get16(p + ULTRA_ST_CONFIG_CRC));
+      d.modes = p[ULTRA_ST_MODES];
+      d.have_status = true;
+      {
+        const bool volts = (d.measured & ULTRA_ST_M_VBUS) && d.vbus_10mv != 0xFFFF;
+        if (volts && d.vbus_10mv > d.vbus_hi_10mv)
+          d.vbus_hi_10mv = d.vbus_10mv;
+        if (receiver_why(d) != ULTRA_ST_WHY_SUPPLY)
+          d.vbus_dip_low_10mv = 0xFFFF;   // (this dip is over)
+        else if (volts && d.vbus_10mv < d.vbus_dip_low_10mv)
+          d.vbus_dip_low_10mv = d.vbus_10mv;
+      }
+      if (receiver_why(d) == ULTRA_ST_WHY_SUPPLY && !flagged_before) {   // a dip since the last STATUS
+        d.dip_pre_ma = before_ma;
+        d.dip_flag_up_s = d.uptime_s;
+      }
+      break;
+    }
+    case ULTRA_PAGE_OUTPUTS:
+      for (int i = 0; i < 5; i++) {
+        d.level[i] = static_cast<uint16_t>(ultra_get16(p + ULTRA_OU_LEVEL + 2 * i));
+        d.ch_ma[i] = static_cast<uint16_t>(ultra_get16(p + ULTRA_OU_CURRENT + 2 * i));
+      }
+      d.defined = p[ULTRA_OU_DEFINED];
+      d.scene = p[ULTRA_OU_SCENE];
+      d.why = p[ULTRA_OU_WHY];
+      d.have_outputs = true;
+      break;
+    case ULTRA_PAGE_POWER:
+      d.pw_now = p[ULTRA_PW_NOW];
+      d.pw_latched = p[ULTRA_PW_LATCHED];
+      d.limit_events = static_cast<uint16_t>(ultra_get16(p + ULTRA_PW_LIMIT_EVENTS));
+      d.overload_trips = static_cast<uint16_t>(ultra_get16(p + ULTRA_PW_OVL_TRIPS));
+      d.short_trips = static_cast<uint16_t>(ultra_get16(p + ULTRA_PW_SHORT_TRIPS));
+      d.limit_age_s = ultra_get24(p + ULTRA_PW_LIMIT_AGE);
+      d.trip_age_s = ultra_get24(p + ULTRA_PW_TRIP_AGE);
+      d.limit_ma = static_cast<uint16_t>(ultra_get16(p + ULTRA_PW_LIMIT_MA));
+      d.limit_source = p[ULTRA_PW_SRC_CAUSE] >> 4;
+      d.trip_cause = p[ULTRA_PW_SRC_CAUSE] & 0x0F;
+      d.event_ma = static_cast<uint16_t>(ultra_get16(p + ULTRA_PW_EVENT_MA));
+      d.trip_ma = static_cast<uint16_t>(ultra_get16(p + ULTRA_PW_TRIP_MA));
+      d.factor = static_cast<uint16_t>(ultra_get16(p + ULTRA_PW_FACTOR));
+      d.retry_s = p[ULTRA_PW_RETRY_S];
+      d.have_power = true;
+      break;
+    case ULTRA_PAGE_SUPPLY:
+      d.dips = static_cast<uint16_t>(ultra_get16(p + ULTRA_SU_DIPS));
+      d.ref_mv = static_cast<uint16_t>(ultra_get16(p + ULTRA_SU_REF_10MV) * 10u);
+      d.now_mv = static_cast<uint16_t>(ultra_get16(p + ULTRA_SU_NOW_10MV) * 10u);
+      d.deep_mv = static_cast<uint16_t>(ultra_get16(p + ULTRA_SU_DEEP_10MV) * 10u);
+      d.deep_pct = p[ULTRA_SU_DEEP_PCT];
+      d.deep_age_s = ultra_get24(p + ULTRA_SU_DEEP_AGE);
+      d.logged = p[ULTRA_SU_LOGGED];
+      d.dip_age_s = ultra_get24(p + ULTRA_SU_EV_AGE);
+      d.dip_mv = static_cast<uint16_t>(ultra_get16(p + ULTRA_SU_EV_10MV) * 10u);
+      d.dip_pct = p[ULTRA_SU_EV_PCT];
+      d.dip_ms = static_cast<uint16_t>(ultra_get16(p + ULTRA_SU_EV_MS));
+      d.dip_ma = static_cast<uint16_t>(ultra_get16(p + ULTRA_SU_EV_MA));
+      d.dip_read_up_s = d.uptime_s;
+      d.have_supply = true;
+      break;
+    case ULTRA_PAGE_HEALTH:
+      d.he_flags = p[ULTRA_HE_FLAGS];
+      for (int i = 0; i < 5; i++) {
+        d.ch_class[i] = p[ULTRA_HE_CLASS + i];
+        d.test_dev[i] = static_cast<int8_t>(p[ULTRA_HE_TEST_DEV + i]);
+        d.model_dev[i] = static_cast<int8_t>(p[ULTRA_HE_MODEL_DEV + i]);
+      }
+      d.dark_ma = static_cast<int16_t>(ultra_get16(p + ULTRA_HE_DARK_2MA)) * 2;
+      d.temp_peak = static_cast<int16_t>(ultra_get16(p + ULTRA_HE_TEMP_PEAK));
+      d.temp_age_s = ultra_get24(p + ULTRA_HE_TEMP_AGE);
+      d.have_health = true;
+      break;
+    case ULTRA_PAGE_ENERGY:
+      d.boot_mwh = ultra_get32(p + ULTRA_EN_BOOT_MWH);
+      d.total_wh = ultra_get32(p + ULTRA_EN_TOTAL_WH);
+      d.energy_wh = d.total_wh + (ultra_get32(p + ULTRA_EN_BOOT_MWH) % 1000u) / 1000.0;
+      d.power_mw = ultra_get32(p + ULTRA_EN_POWER_MW);
+      d.saved_age_s = ultra_get24(p + ULTRA_EN_SAVED_AGE);
+      d.vb_10mv = static_cast<uint16_t>(ultra_get16(p + ULTRA_EN_VB));
+      d.peak_ma = static_cast<uint16_t>(ultra_get16(p + ULTRA_EN_PEAK_MA));
+      d.supply_z_mohm = static_cast<uint16_t>(ultra_get16(p + ULTRA_EN_SUPPLY_Z));
+      d.have_energy = true;
+      break;
+    case ULTRA_PAGE_LIFETIME:
+      d.lt_powered = ultra_get24(p + ULTRA_LT_POWERED);
+      d.lt_lit = ultra_get24(p + ULTRA_LT_LIT);
+      d.lt_power_ups = ultra_get24(p + ULTRA_LT_POWER_UPS);
+      d.lt_overload_trips = static_cast<uint16_t>(ultra_get16(p + ULTRA_LT_OVERLOAD_TRIPS));
+      d.lt_short_trips = static_cast<uint16_t>(ultra_get16(p + ULTRA_LT_SHORT_TRIPS));
+      d.lt_dips = ultra_get24(p + ULTRA_LT_DIPS);
+      d.lt_temp_peak = p[ULTRA_LT_TEMP_PEAK];
+      d.lt_current_peak = p[ULTRA_LT_CURRENT_PEAK];
+      d.lt_watchdog = p[ULTRA_LT_WATCHDOG];
+      d.lt_updates = static_cast<uint16_t>(ultra_get16(p + ULTRA_LT_UPDATES));
+      d.lt_records = ultra_get24(p + ULTRA_LT_RECORDS);
+      d.have_lifetime = true;
+      break;
+    case ULTRA_PAGE_DIAG:
+      if (part == 0) {
+        d.dg_reset = p[ULTRA_DG_RESET];
+        d.bc_cause = p[ULTRA_DG_BC_CAUSE];
+        d.bc_pc = static_cast<uint16_t>(ultra_get16(p + ULTRA_DG_BC_PC));
+        d.bc_uptime_s = ultra_get24(p + ULTRA_DG_BC_UPTIME);
+        d.cpu_pm = static_cast<uint16_t>(ultra_get16(p + ULTRA_DG_CPU));
+        d.cpu_peak_pm = static_cast<uint16_t>(ultra_get16(p + ULTRA_DG_CPU_PEAK));
+        d.ovr_captures = static_cast<uint16_t>(ultra_get16(p + ULTRA_DG_OVR_CAPTURES));
+        d.ovr_frame_ends = static_cast<uint16_t>(ultra_get16(p + ULTRA_DG_OVR_FRAME_ENDS));
+        d.ovr_late_ms = static_cast<uint16_t>(ultra_get16(p + ULTRA_DG_OVR_LATE_MS));
+        d.flash_errs = p[ULTRA_DG_FLASH_ERRS];
+        d.flash_pending = p[ULTRA_DG_FLASH_PENDING];
+        d.save_wait = p[ULTRA_DG_SAVE_WAIT];
+        d.input_load = p[ULTRA_DG_INPUT_LOAD];
+        d.input_load_peak = p[ULTRA_DG_INPUT_LOAD_PEAK];
+        d.have_diag = true;
+      } else {
+        d.fm_trip = p[ULTRA_DG_TRIP];
+        d.fm_trip_lit_h = static_cast<uint16_t>(ultra_get16(p + ULTRA_DG_TRIP_LIT_H));
+        d.fm_dip_pct = p[ULTRA_DG_DIP_PCT];
+        d.fm_dip_10ms = p[ULTRA_DG_DIP_10MS];
+        d.fm_dip_a10 = p[ULTRA_DG_DIP_CURRENT];
+        d.fm_rst = p[ULTRA_DG_RST];
+        d.fm_rst_up_h = p[ULTRA_DG_RST_UP_H];
+        for (int i = 0; i < 5; i++)
+          d.trend[i] = static_cast<int8_t>(p[ULTRA_DG_TREND + i]);
+        d.trend_lit_h = static_cast<uint16_t>(ultra_get16(p + ULTRA_DG_TREND_LIT_H));
+        d.trend_tests = p[ULTRA_DG_TREND_TESTS];
+        d.have_faults = true;
+      }
+      break;
+    case ULTRA_PAGE_LIFE_SYNC:   //  LIFETIME 0-15 and the Wh after the merge, its result
+      d.lt_powered = ultra_get24(p + ULTRA_LT_POWERED);
+      d.lt_lit = ultra_get24(p + ULTRA_LT_LIT);
+      d.lt_power_ups = ultra_get24(p + ULTRA_LT_POWER_UPS);
+      d.lt_overload_trips = static_cast<uint16_t>(ultra_get16(p + ULTRA_LT_OVERLOAD_TRIPS));
+      d.lt_short_trips = static_cast<uint16_t>(ultra_get16(p + ULTRA_LT_SHORT_TRIPS));
+      d.lt_dips = ultra_get24(p + ULTRA_LT_DIPS);
+      d.total_wh = ultra_get32(p + ULTRA_LS_A_TOTAL_WH);
+      d.ls_result = p[ULTRA_LS_A_RESULT];
+      d.ls_applied = p[ULTRA_LS_A_APPLIED];
+      d.ls_records16 = static_cast<uint16_t>(ultra_get16(p + ULTRA_LS_A_RECORDS));
+      d.have_sync = true;
+      break;
+    case ULTRA_PAGE_CALIBRATION:
+      d.cal_levels = p[CA_LEVELS];
+      d.cal_model = p[ULTRA_CA_MODEL] & 0x0F;
+      d.cal_end = p[ULTRA_CA_MODEL] >> 4;
+      d.cal_age_s = ultra_get24(p + CA_AGE);
+      d.cal_idle_ma = static_cast<int32_t>(static_cast<int16_t>(ultra_get16(p + CA_IDLE))) * 2;
+      for (uint8_t i = 0; i < 5; i++)
+        d.cal_channel_ma[i] = static_cast<uint16_t>(ultra_get16(p + CA_CHANNELS + 2 * i));
+      d.cal_connected_ma = static_cast<uint16_t>(ultra_get16(p + CA_CONNECTED));
+      d.have_calibration = true;
+      break;
+    default:
+      break;
+  }
+}
+
+// ------------------------------------------------------------------------------------------- sensor values / texts
+/// The numeric values a receiver's sensors show; NAN = not known (the page not read, or the board doesn't measure it).
+enum TelemetryValue : uint8_t {
+  TV_SUPPLY_VOLTAGE,  // V
+  TV_INPUT_CURRENT,   // A
+  TV_INPUT_POWER,     // W
+  TV_MCU_TEMPERATURE, // C
+  TV_UPTIME,          // s
+  TV_ENERGY,          // Wh, the board's lifetime (total_increasing)
+  TV_LIMIT_EVENTS,
+  TV_OVERLOAD_TRIPS,
+  TV_SHORT_TRIPS,
+  TV_SUPPLY_DIPS,      // since its power-up (SUPPLY)
+  TV_LED_SUPPLY,       // V, at the LED output (ENERGY)
+  TV_CURRENT_PEAK,     // A, the highest ~100 ms average since the ENERGY read before
+  TV_SUPPLY_IMPEDANCE, // mOhm, the supply / cable (ENERGY)
+  TV_LIT_HOURS,        // h, lifetime (LIFETIME)
+  TV_POWER_UPS,        // lifetime (LIFETIME)
+  TV_TRIPS,            // short + overload: lifetime with LIFETIME, else since its power-up (POWER)
+  TV_DIPS,             // supply dips: lifetime with LIFETIME, else since its power-up (SUPPLY)
+  TV_COUNT,
+};
+
+inline float telemetry_value(const ReceiverData &d, TelemetryValue v) {
+  const bool volts = d.have_status && (d.measured & ULTRA_ST_M_VBUS) && d.vbus_10mv != 0xFFFF;
+  const bool amps = d.have_status && (d.measured & ULTRA_ST_M_CURRENT);
+  // the lifetime counts once the board has the page (else its since-power-up counts: one source per board)
+  const bool life = d.have_identity && (d.features & ULTRA_FEAT_LIFETIME);
+  switch (v) {
+    case TV_SUPPLY_VOLTAGE:
+      return volts ? d.vbus_10mv * 0.01f : NAN;
+    case TV_INPUT_CURRENT:
+      return amps ? d.current_ma * 0.001f : NAN;
+    case TV_INPUT_POWER:   // STATUS's voltage x current (read every few s), else ENERGY's (once a minute)
+      if (volts && amps)
+        return d.vbus_10mv * 0.01f * d.current_ma * 0.001f;
+      return d.have_energy ? d.power_mw * 0.001f : NAN;
+    case TV_MCU_TEMPERATURE:
+      return d.have_status && d.mcu_temp != ULTRA_ST_NA ? static_cast<int16_t>(d.mcu_temp) * 0.1f : NAN;
+    case TV_UPTIME:
+      return d.have_status ? static_cast<float>(d.uptime_s) : NAN;
+    case TV_ENERGY:
+      return d.have_energy ? static_cast<float>(d.energy_wh) : NAN;
+    case TV_LIMIT_EVENTS:
+      return d.have_power ? d.limit_events : NAN;
+    case TV_OVERLOAD_TRIPS:
+      return d.have_power ? d.overload_trips : NAN;
+    case TV_SHORT_TRIPS:
+      return d.have_power ? d.short_trips : NAN;
+    case TV_SUPPLY_DIPS:
+      return d.have_supply ? d.dips : NAN;
+    case TV_LED_SUPPLY:
+      return d.have_energy && d.vb_10mv != 0xFFFF ? d.vb_10mv * 0.01f : NAN;
+    case TV_CURRENT_PEAK:
+      return d.have_energy ? d.peak_ma * 0.001f : NAN;
+    case TV_SUPPLY_IMPEDANCE:
+      return d.have_energy && d.supply_z_mohm != 0 ? static_cast<float>(d.supply_z_mohm) : NAN;
+    case TV_LIT_HOURS:
+      return d.have_lifetime ? d.lt_lit * 0.1f : NAN;
+    case TV_POWER_UPS:
+      return d.have_lifetime ? static_cast<float>(d.lt_power_ups) : NAN;
+    case TV_TRIPS:
+      if (life)
+        return d.have_lifetime ? static_cast<float>(d.lt_short_trips + d.lt_overload_trips) : NAN;
+      return d.have_power ? static_cast<float>(d.short_trips + d.overload_trips) : NAN;
+    case TV_DIPS:
+      if (life)
+        return d.have_lifetime ? static_cast<float>(d.lt_dips) : NAN;
+      return d.have_supply ? d.dips : NAN;
+    default:
+      return NAN;
+  }
+}
+
+/// "35 s", "12 min", "3.5 h", "2 d"
+inline std::string telemetry_age(uint32_t s) {
+  char b[24];
+  if (s < 120)
+    snprintf(b, sizeof(b), "%u s", static_cast<unsigned>(s));
+  else if (s < 7200)
+    snprintf(b, sizeof(b), "%u min", static_cast<unsigned>(s / 60));
+  else if (s < 172800)
+    snprintf(b, sizeof(b), "%.1f h", s / 3600.0);
+  else
+    snprintf(b, sizeof(b), "%u d", static_cast<unsigned>(s / 86400));
+  return b;
+}
+
+inline std::string telemetry_amps(uint32_t ma) {
+  char b[16];
+  snprintf(b, sizeof(b), "%.2f A", ma / 1000.0);
+  return b;
+}
+
+/// The firmware version: IDENTITY's word ("0.6.8", "0.7.0-beta.2"), else STATUS's ("0.6.8"; 0 = a development build).
+inline std::string telemetry_firmware_text(const ReceiverData &d) {
+  if (d.have_identity && d.fw_word != 0)
+    return format_fw_version(d.fw_word);
+  if (!d.have_status)
+    return "";
+  if (d.fw_version == 0)
+    return "development build";
+  char b[16];
+  snprintf(b, sizeof(b), "%u.%u.%u", static_cast<unsigned>(d.fw_version >> 16),
+           static_cast<unsigned>((d.fw_version >> 8) & 0xFF), static_cast<unsigned>(d.fw_version & 0xFF));
+  return b;
+}
+
+/// The reset cause of this start ("power-on", "watchdog", ...).
+inline std::string telemetry_reset_text(uint8_t cause) {
+  static const char *const NAMES[6] = {"pin", "power-on", "software", "watchdog", "window watchdog", "low power"};
+  std::string s;
+  for (int i = 0; i < 6; i++) {
+    if (cause & (1u << i)) {
+      if (!s.empty())
+        s += ", ";
+      s += NAMES[i];
+    }
+  }
+  return s.empty() ? "unknown" : s;
+}
+
+/// A RISC-V exception (mcause): "exception 2 (illegal instruction)".
+inline std::string telemetry_exception(uint8_t mcause) {
+  static const char *const NAMES[8] = {"instruction misaligned", "instruction access fault", "illegal instruction",
+                                       "breakpoint",             "load misaligned",          "load access fault",
+                                       "store misaligned",       "store access fault"};
+  std::string s = "exception " + std::to_string(mcause);
+  if (mcause < 8)
+    s += std::string(" (") + NAMES[mcause] + ")";
+  return s;
+}
+
+/// Notes after the Status detail that are no problem:  the receiver's lifetime record held (its flash-wear
+/// allowance used up: it is written less often).
+inline std::string receiver_status_notes(const ReceiverData &d) {
+  if (d.have_diag && (d.flash_pending & ULTRA_DG_FP_EXHAUSTED))
+    return " Lifetime record held: the receiver saves less often to protect its flash.";
+  return "";
+}
+
+/// The Last reset text: this start's cause; with DIAG  what the run before left ("software; the run before:
+/// up 3.5 h, no exception"), else the last abnormal reset the board keeps across power cuts ("power-on; the last
+/// abnormal one: watchdog, 12 h up").
+inline std::string telemetry_last_reset(const ReceiverData &d) {
+  if (!d.have_status)
+    return "";
+  std::string s = telemetry_reset_text(d.reset_cause);
+  if (d.have_diag && d.bc_cause != 0xFF) {
+    s += "; the run before: up " + telemetry_age(d.bc_uptime_s);
+    if (d.bc_cause == 0) {
+      s += ", no exception";
+    } else {
+      char b[16];
+      snprintf(b, sizeof(b), " at 0x%04X", static_cast<unsigned>(d.bc_pc));
+      s += ", " + telemetry_exception(d.bc_cause) + b;
+    }
+  } else if (d.have_faults && (d.fm_rst & 3) != 0 &&
+             !(d.reset_cause & (ULTRA_ST_RST_WATCHDOG | ULTRA_ST_RST_WWDG))) {   // (this start's own: said above)
+    s += "; the last abnormal one: ";
+    s += (d.fm_rst & 3) == 2 ? telemetry_exception(static_cast<uint8_t>(d.fm_rst >> 2)) : std::string("watchdog");
+    s += ", " + std::to_string(d.fm_rst_up_h) + (d.fm_rst_up_h == 255 ? " h or more" : " h") + " up";
+  }
+  return s;
+}
+
+inline const char *telemetry_limit_source(uint8_t src) {
+  static const char *const SRC[4] = {"board rating", "user limit", "PWM preset", "fuse"};
+  return src < 4 ? SRC[src] : "limit";
+}
+
+/// Why the light is dim or off right now: "ok", or the reasons ("tripped: short circuit, retry in 8 s", "limiting to
+/// 4.00 A (user limit)", "soft start", "signal loss", "calibration / test jig", ...): OUTPUTS' bits and
+/// STATUS's reason.
+inline std::string telemetry_status_text(const ReceiverData &d) {
+  if (!d.have_status)
+    return "";
+  std::vector<std::string> why;
+  const uint8_t st = d.power_state, rw = receiver_why(d);
+  uint8_t ou = d.have_outputs ? d.why : 0;
+  static const uint8_t WHY_OU[12] = {0, ULTRA_OU_W_TRIPPED, ULTRA_OU_W_TRIPPED, ULTRA_OU_W_TRIPPED, ULTRA_OU_W_TEST,
+                                     ULTRA_OU_W_TEST, 0, 0, ULTRA_OU_W_SIGNAL_LOSS, ULTRA_OU_W_SOFT_START,
+                                     ULTRA_OU_W_DARK_HOLD, ULTRA_OU_W_PATTERN};
+  if (rw < 12)
+    ou |= WHY_OU[rw];
+  if ((st & ULTRA_ST_TRIPPED) || (ou & ULTRA_OU_W_TRIPPED)) {
+    std::string t = "tripped";
+    if (rw == ULTRA_ST_WHY_SHORT || (rw != ULTRA_ST_WHY_OVERLOAD && d.have_power && d.trip_cause == ULTRA_PW_CAUSE_SHORT))
+      t += ": short circuit";
+    else if (rw == ULTRA_ST_WHY_OVERLOAD || (d.have_power && d.trip_cause == ULTRA_PW_CAUSE_OVERLOAD))
+      t += ": overload";
+    if (rw == ULTRA_ST_WHY_RETRIES_OUT)
+      t += ", retries used up";
+    else if (d.have_power && d.retry_s != 0)
+      t += d.retry_s == 255 ? ", retry in 255 s or more" : ", retry in " + std::to_string(d.retry_s) + " s";
+    why.push_back(t);
+  }
+  if ((st & ULTRA_ST_LIMITING) || (ou & ULTRA_OU_W_LIMIT)) {
+    std::string t = "limiting";
+    if (d.have_power && d.limit_ma != 0xFFFF)
+      t += " to " + telemetry_amps(d.limit_ma) + " (" + telemetry_limit_source(d.limit_source) + ")";
+    why.push_back(t);
+  }
+  if ((st & ULTRA_ST_CH_LIMITING) || (ou & ULTRA_OU_W_CH_LIMIT))
+    why.push_back("channel limit");
+  if (ou & ULTRA_OU_W_SOFT_START)
+    why.push_back("soft start");
+  if (ou & ULTRA_OU_W_SIGNAL_LOSS)
+    why.push_back("signal loss");
+  if (ou & ULTRA_OU_W_TEST)
+    why.push_back("calibration / test jig");
+  if (ou & ULTRA_OU_W_PATTERN)
+    why.push_back("identify / acknowledge pattern");
+  if (ou & ULTRA_OU_W_DARK_HOLD)
+    why.push_back("held dark");
+  if (why.empty())
+    return "ok";
+  std::string s = why[0];
+  for (size_t i = 1; i < why.size(); i++)
+    s += ", " + why[i];
+  return s;
+}
+
+/// The power events since the board's power-up, newest details first: "no events", or e.g. "1 short circuit (35 s
+/// ago, 12.40 A), 3 limit events (last 2 min ago, 4.10 A), 1 supply dip (to 18.20 V, 76 %, 12 ms, 1.0 h ago)".
+inline std::string telemetry_power_events_text(const ReceiverData &d) {
+  if (!d.have_power && !d.have_supply)
+    return "";
+  std::vector<std::string> ev;
+  auto count = [](uint32_t n, const char *one, const char *many) {
+    return std::to_string(n) + " " + (n == 1 ? one : many);
+  };
+  if (d.have_power) {
+    const bool last_short = d.trip_cause == ULTRA_PW_CAUSE_SHORT, last_ovl = d.trip_cause == ULTRA_PW_CAUSE_OVERLOAD;
+    if (d.short_trips) {
+      std::string t = count(d.short_trips, "short circuit", "short circuits");
+      if (last_short && d.trip_age_s != 0xFFFFFF)
+        t += " (last " + telemetry_age(d.trip_age_s) + " ago, " + telemetry_amps(d.trip_ma) + ")";
+      ev.push_back(t);
+    }
+    if (d.overload_trips) {
+      std::string t = count(d.overload_trips, "overload trip", "overload trips");
+      if (last_ovl && d.trip_age_s != 0xFFFFFF)
+        t += " (last " + telemetry_age(d.trip_age_s) + " ago, " + telemetry_amps(d.trip_ma) + ")";
+      ev.push_back(t);
+    }
+    if (d.limit_events) {
+      std::string t = count(d.limit_events, "limit event", "limit events");
+      if (d.limit_age_s != 0xFFFFFF)
+        t += " (last " + telemetry_age(d.limit_age_s) + " ago, " + telemetry_amps(d.event_ma) + ")";
+      ev.push_back(t);
+    }
+  }
+  if (d.have_supply && d.dips) {
+    std::string t = count(d.dips, "supply dip", "supply dips");
+    if (d.logged != 0 && d.dip_age_s != 0xFFFFFF) {
+      char b[64];
+      snprintf(b, sizeof(b), " (last to %.2f V, %u %%, %u ms, ", d.dip_mv / 1000.0, static_cast<unsigned>(d.dip_pct),
+               static_cast<unsigned>(d.dip_ms));
+      t += b + telemetry_age(d.dip_age_s) + " ago)";
+    }
+    ev.push_back(t);
+  }
+  if (ev.empty())
+    return "no events";
+  std::string s = ev[0];
+  for (size_t i = 1; i < ev.size(); i++)
+    s += ", " + ev[i];
+  return s;
+}
+
+/// Channel health from the last calibration test and the running model: "not tested", "ok", or the findings, the
+/// channels grouped by finding ("CH1, CH2, CH4 abnormal (far below its test, or no load)"), then the calibration
+/// trend. Within Home Assistant's 255 characters: a trend that wouldn't fit is shortened to its test count, and
+/// text_state() cuts what is still too long.
+inline std::string telemetry_health_text(const ReceiverData &d) {
+  if (!d.have_health)
+    return "";
+  // the abnormal channels by reason: didn't rise, far above, far below (or no load), none given
+  static const char *const WHY[4] = {" (current didn't rise with the level)", " (far above its test)",
+                                     " (far below its test, or no load)", ""};
+  std::string groups[4];
+  for (int i = 0; i < 5; i++) {
+    const uint8_t c = d.ch_class[i];
+    if ((c & 0x0F) != ULTRA_HE_ABNORMAL)
+      continue;
+    const int g = (c & ULTRA_HE_R_NOT_RISING) ? 0 : (c & ULTRA_HE_R_ABOVE) ? 1 : (c & ULTRA_HE_R_BELOW) ? 2 : 3;
+    groups[g] += (groups[g].empty() ? "CH" : ", CH") + std::to_string(i + 1);
+  }
+  std::vector<std::string> f;
+  for (int g = 0; g < 4; g++) {
+    if (!groups[g].empty())
+      f.push_back(groups[g] + " abnormal" + WHY[g]);
+  }
+  if (d.he_flags & ULTRA_HE_F_DARK)
+    f.push_back("current with all outputs off");
+  if (d.he_flags & ULTRA_HE_F_DRIFT)
+    f.push_back("model far off the test");
+  if ((d.he_flags & ULTRA_HE_F_CAL_SUGGESTED))
+    f.push_back("calibration suggested");
+  std::string s;
+  if (f.empty()) {
+    s = (d.he_flags & ULTRA_HE_F_TESTED) || d.ch_class[0] != ULTRA_HE_UNTESTED ? "ok" : "not tested";
+  } else {
+    s = f[0];
+    for (size_t i = 1; i < f.size(); i++)
+      s += ", " + f[i];
+  }
+  // the calibration trend: the newest stored test at 100 % against the first ("CH1 -3, CH3 +1 %")
+  if (d.have_faults && d.trend_tests >= 2) {
+    std::string t;
+    for (int i = 0; i < 5; i++) {
+      if (d.trend[i] == ULTRA_HE_NA)
+        continue;
+      char b[24];
+      snprintf(b, sizeof(b), "%sCH%d %+d", t.empty() ? "" : ", ", i + 1, static_cast<int>(d.trend[i]));
+      t += b;
+    }
+    if (!t.empty()) {
+      std::string head = "; trend (" + std::to_string(d.trend_tests) + " tests";
+      if (d.trend_lit_h != 0xFFFF)
+        head += ", " + std::to_string(d.trend_lit_h) + " lit h";
+      head += ")";
+      const std::string full = head + ": " + t + " %";
+      s += s.size() + full.size() <= TEXT_STATE_MAX ? full : head;
+    }
+  }
+  return text_state(s);
+}
+
+// ---------------------------------------------------------------------------------------------------------- poller
+struct TelemetryIntervals {
+  uint32_t status_ms{3000};
+  uint32_t power_ms{5000};   // POWER and OUTPUTS
+  uint32_t energy_ms{60000};
+  uint32_t supply_ms{60000};
+  uint32_t health_ms{60000};
+  uint32_t lifetime_ms{300000};   // LIFETIME
+  uint32_t diag_ms{300000};       // DIAG's two parts (and after every restart: IDENTITY makes every page due)
+};
+
+/// A line's listeners per receiver (its entities): after a response window, the news of a receiver goes to its own
+/// listeners only, in the order they were added (not to every listener of the line to filter: 16 receivers' news a
+/// window on a line of 50 would be 1,600 calls).
+class ReceiverListeners {
+ public:
+  void add(uint16_t receiver, std::function<void(uint32_t)> &&listener) {
+    this->list_.push_back(std::move(listener));
+    this->owner_.push_back(receiver);
+    // into its place: after its receiver's own and the ones before it (each receiver's in the order added)
+    for (size_t i = this->list_.size() - 1; i > 0 && this->owner_[i - 1] > receiver; i--) {
+      this->list_[i].swap(this->list_[i - 1]);
+      std::swap(this->owner_[i], this->owner_[i - 1]);
+    }
+  }
+  /// receiver's news (TelemetryPoller::take_updates bits) to its listeners
+  void call(uint16_t receiver, uint32_t updates) const {
+    for (size_t i = std::lower_bound(this->owner_.begin(), this->owner_.end(), receiver) - this->owner_.begin();
+         i < this->owner_.size() && this->owner_[i] == receiver; i++)
+      this->list_[i](updates);
+  }
+  size_t size() const { return this->list_.size(); }
+
+ protected:
+  std::vector<std::function<void(uint32_t)>> list_;   // by receiver; in each, the order added
+  std::vector<uint16_t> owner_;                        // ... each one's receiver
+};
+
+class TelemetryPoller {
+ public:
+  static constexpr uint32_t MIN_SPACING_MS = 10;   // at most one RW frame per 10 ms (wiki: Return Channel)
+  static constexpr uint32_t RETRY_MS = 250;        // a page asked again after a silenced or BUSY answer
+  static constexpr uint32_t BACKOFF_MAX_MS = 10000;
+  static constexpr uint32_t CUT_BACKOFF_MS = 2000; // ... at most for one that cuts the chain (every one behind it
+                                                   // waits for it): a re-plugged receiver is seen within ~2 s
+  static constexpr uint8_t UNAVAILABLE_MISSES = 3; // windows in a row: its sensors show "unavailable"
+  static constexpr uint8_t CUT_MISSES = 3;         // ... and the receivers behind it aren't polled
+  static constexpr uint32_t ACK_DELAY_MS = 1000;   // the acknowledge goes with the POWER poll this long after a read
+  // ... and within this long of a STATUS that shows no restart: a restarted receiver answers again only after ~0.5 s
+  // (its clock rated), so an acknowledge never reaches a new boot whose counts happen to match
+  static constexpr uint32_t ACK_FRESH_MS = 100;
+  static constexpr uint32_t RESTART_HOLD_MS = ULTRA_RW_LOCK_MS;
+  // a page's time further ahead than any interval (24 h at most, and its backoff): from over half a millis() wrap
+  // ago (a receiver not heard for that long, a line in standby for weeks): overdue
+  static constexpr int32_t STALE_MS = 25 * 3600000;
+  static constexpr size_t MAX_RECEIVERS = 64;   // per line (the schema's limit)
+
+  /// receivers: the first boards of the line (1..64); rate ULTRA_RW_RATE_*
+  void init(uint16_t receivers, uint8_t rate, const TelemetryIntervals &iv, uint8_t seed = 0x5A) {
+    this->idle_ = false;
+    this->rx_.assign(receivers < MAX_RECEIVERS ? receivers : MAX_RECEIVERS, Receiver{});
+    this->rate_ = rate < ULTRA_RW_RATES ? rate : ULTRA_RW_RATE_1M;
+    this->iv_ = iv;
+    for (size_t i = 0; i < this->rx_.size(); i++)
+      this->rx_[i].seq = static_cast<uint8_t>(seed + 37 * i);
+  }
+  static bool digital_calibration(const ReceiverData &d) {
+    return d.have_identity && (d.hw_caps & RX_CAP_PIXEL) && (d.features & ULTRA_FEAT_PIXEL_CALIBRATION);
+  }
+  const PixelCalibration &pixel_calibration(uint16_t i) const {
+    static const PixelCalibration none{};
+    return i < this->uc_.size() ? this->uc_[i] : none;
+  }
+  void refresh_pixel_identity(uint16_t i, uint32_t now) {
+    if (i >= this->rx_.size()) return;
+    auto &r = this->rx_[i];
+    r.need_identity = true; r.need_features = false;
+    r.d.have_identity = r.d.have_features = false;
+    r.next[TP_IDENTITY] = now;
+    this->idle_ = false;
+    this->invalidate_pixel_calibration(i);
+  }
+  void calibration_quiet(int board, uint32_t now) {
+    this->quiet_board_ = board;
+    this->idle_ = false;
+    if (board >= 0) {
+      this->quiet_poll_ms_ = now;
+      this->quiet_polled_ = true;
+      if (static_cast<size_t>(board) < this->uc_.size()) this->uc_[board].progress_only();
+    } else {
+      for (auto &c : this->uc_) c.progress_only();
+      for (auto &r : this->rx_) r.next[TP_UD_META] = now;
+    }
+  }
+  void pixel_calibration_result(uint16_t i, uint8_t error) {
+    if (i < this->uc_.size()) this->uc_[i].hub_error = error;
+    this->touch(i, (1u << TP_UD_META) | (1u << TP_CALIBRATION));
+  }
+  void invalidate_pixel_calibration(uint16_t i) {
+    if (i < this->uc_.size()) this->uc_[i].invalidate();
+    if (i < this->rx_.size()) {
+      this->rx_[i].d.have_calibration = false;
+      this->rx_[i].next[TP_UD_META] = 0;
+      this->rx_[i].updated |= (1u << TP_UD_META) | (1u << TP_CALIBRATION);
+    }
+    this->idle_ = false;
+  }
+  uint16_t receivers() const { return static_cast<uint16_t>(this->rx_.size()); }
+  /// The line is a normal Ultra line (not a digital port): a Diff-Power-UR-Digital-M on it that can run in chain mode
+  /// (RX_CAP_CHAIN) is asked for page 0x11 part 3, the line. A chain board does not answer in a digital port's window.
+  void set_line_pages(bool on) { this->line_pages_ = on; }
+  void invalidate_update_inventory(uint32_t now_ms) {
+    for(auto &r:this->rx_) this->restarted_(r,now_ms,false);
+  }
+  void invalidate_line_stats() {
+    for (auto &r : this->rx_) {
+      r.d.line_counters = LineCounters{}; r.d.line_context_due = false;
+      r.next[TP_LINK_STATS] = 0;
+    }
+  }
+  /// the rate its POLLs ask the receivers to answer at (ReplyRate)
+  void set_rate(uint8_t rate) { this->rate_ = rate < ULTRA_RW_RATES ? rate : ULTRA_RW_RATE_1M; }
+  uint8_t rate() const { return this->rate_; }
+  /// STATUS's interval (the update rate, ms; at runtime: the controller's Telemetry update rate)
+  void set_status_interval(uint32_t ms) {
+    this->iv_.status_ms = ms;
+    this->idle_ = false;
+  }
+  /// the line's dip_warning: a supply dip is a problem below this % of its reference (receiver_status)
+  void set_dip_warning(uint8_t pct) { this->dip_warn_ = pct; }
+  uint8_t dip_warning() const { return this->dip_warn_; }
+  /// The longest window one RW frame can open (us, W): up to 16 answer.
+  uint32_t max_window_us() const {
+    const size_t n = this->rx_.size() < ULTRA_RW_MAX_SLOTS ? this->rx_.size() : ULTRA_RW_MAX_SLOTS;
+    return ultra_rw_window_us(static_cast<uint8_t>(n), this->rate_);
+  }
+
+  /// The chain took a preamble (it locks again): no RW frame before ULTRA_RW_LOCK_MS of headers after it.
+  void locked(uint32_t now_ms) {
+    this->idle_ = false;
+    this->locked_ = true;
+    this->lock_ms_ = now_ms;
+    this->lock_wait_ = true;
+  }
+  /// The commissioning (ultra_commission.h): forget which pages were read; with all: every page of every receiver
+  /// due now (read again in turns), else only marked
+  void mark_fresh(uint32_t now_ms, bool all) {
+    for (auto &r : this->rx_) {
+      r.fresh = 0;
+      if (!all)
+        continue;
+      for (uint8_t tp = TP_POWER; tp < TP_COUNT; tp++) {
+        if (tp != TP_SYNC && this->enabled_(r, tp))
+          r.next[tp] = now_ms;
+      }
+    }
+    this->idle_ = false;
+  }
+  /// receiver i's page tp read since mark_fresh()
+  bool fresh(uint16_t i, uint8_t tp) const { return i < this->rx_.size() && (this->rx_[i].fresh & (1u << tp)); }
+  /// every page receiver i has (LIFE_SYNC aside) read since mark_fresh()
+  bool all_fresh(uint16_t i) const {
+    if (i >= this->rx_.size())
+      return false;
+    const Receiver &r = this->rx_[i];
+    if (digital_calibration(r.d) && !this->pixel_calibration(i).coherent) return false;
+    for (uint8_t tp = TP_POWER; tp < TP_COUNT; tp++) {
+      if (tp != TP_SYNC && this->enabled_(r, tp) && !(r.fresh & (1u << tp)))
+        return false;
+    }
+    return r.d.have_identity;
+  }
+  /// The boards lost their supply (or the line stopped): every receiver unavailable; they restart.
+  /// Every receiver's sensors again (take_updates: TU_AVAILABILITY): their status changed with the line's power
+  void touch_all() {
+    for (auto &r : this->rx_)
+      r.updated |= TU_AVAILABILITY;
+  }
+  /// Receiver i's entities again after the next window (bits: TU_HUB, the hub's own state of it changed)
+  void touch(uint16_t i, uint32_t bits) {
+    if (i < this->rx_.size())
+      this->rx_[i].updated |= bits;
+  }
+  void unpowered() {
+    this->idle_ = false;
+    this->locked_ = false;
+    for (auto &r : this->rx_) {
+      this->unavailable_(r);
+      r.misses = 0;
+      r.ack_due = false;
+    }
+  }
+  /// The ledger's sync for receiver i (LIFE_SYNC, its 23 argument bytes): asked next (until it answers)
+  void request_sync(uint16_t i, const uint8_t *args, uint32_t now_ms) {
+    if (i >= this->rx_.size())
+      return;
+    Receiver &r = this->rx_[i];
+    this->idle_ = false;
+    std::memcpy(r.sync_args, args, sizeof(r.sync_args));
+    r.sync_due = true;
+    r.next[TP_SYNC] = now_ms - 60000;   // (before every other page)
+  }
+  bool sync_pending(uint16_t i) const { return i < this->rx_.size() && this->rx_[i].sync_due; }
+  /// A page of receiver i due now (the ledger's reads)
+  void read_now(uint16_t i, uint8_t tp, uint32_t now_ms) {
+    if (i < this->rx_.size() && tp < TP_COUNT) {
+      this->rx_[i].next[tp] = now_ms;
+      this->idle_ = false;
+    }
+  }
+
+  /// An RW frame should go out now: the chain is locked, the spacing allows one, and a receiver it can hear has a
+  /// page due. "Nothing due" is remembered for the rest of that millisecond (the loop asks many times in one while
+  /// it runs fast); every change of the poller's state forgets it.
+  bool due(uint32_t now_ms) const {
+    if (this->idle_ && now_ms == this->idle_ms_)
+      return false;
+    if (this->due_scan(now_ms))
+      return true;
+    this->idle_ = true;
+    this->idle_ms_ = now_ms;
+    return false;
+  }
+  /// due() without the memo (the scan itself; tests compare the two)
+  bool due_scan(uint32_t now_ms) const {
+    if (!this->locked_ || this->rx_.empty())
+      return false;
+    // the lock interval after a preamble (> in whole ms: at least ULTRA_RW_LOCK_MS whatever the phase of millis());
+    // the first frame after it forgets it (build()), so a lock half a millis() wrap old (24.8 days) can't stop the
+    // polls
+    if (this->lock_wait_ && static_cast<int32_t>(now_ms - this->lock_ms_) <= (int32_t) ULTRA_RW_LOCK_MS)
+      return false;
+    if (this->sent_any_ && now_ms - this->last_ms_ < MIN_SPACING_MS)
+      return false;
+    const size_t reach = this->reach_(now_ms);
+    if (this->quiet_board_ >= 0)
+      return static_cast<size_t>(this->quiet_board_) < reach &&
+             (!this->quiet_polled_ || now_ms - this->quiet_poll_ms_ >= 1000);
+    for (size_t i = 0; i < reach; i++) {
+      int32_t overdue;
+      if (this->pick_(this->rx_[i], now_ms, &overdue) < TP_COUNT && overdue >= 0)
+        return true;
+    }
+    return false;
+  }
+
+  /// The RW frame's POLL slots for boards 0..n-1 into slots (n x ULTRA_SLOT_BYTES; boards behind them take normal
+  /// slots); returns n (0: nothing to poll). window_us: W, the window after the frame's last bit.
+  // Before the first cold-port reply, only harmless STATUS probes: descriptor reads and LIFE_SYNC wait for boot.
+  uint16_t build(uint32_t now_ms, uint8_t *slots, uint32_t *window_us, bool startup_probe = false) {
+    this->idle_ = false;
+    // what is over is forgotten (compared to an old time half a millis() wrap later, it would look new again)
+    if (this->lock_wait_ && static_cast<int32_t>(now_ms - this->lock_ms_) > (int32_t) ULTRA_RW_LOCK_MS)
+      this->lock_wait_ = false;
+    for (auto &r : this->rx_) {
+      if (r.hold && static_cast<int32_t>(now_ms - r.hold_until) >= 0)
+        r.hold = false;
+    }
+    const size_t reach = this->reach_(now_ms);
+    this->win_.clear();
+    if (reach == 0)
+      return 0;
+    // who answers: every receiver it can hear (so a missing answer shows which one broke the chain), the 16 most
+    // overdue of a longer chain (on the stack: no heap per window)
+    uint16_t answer[ULTRA_RW_MAX_SLOTS];
+    size_t na = 0;
+    if (this->quiet_board_ >= 0) {
+      if (!this->due_scan(now_ms)) return 0;
+      answer[na++] = static_cast<uint16_t>(this->quiet_board_);
+      this->quiet_poll_ms_ = now_ms; this->quiet_polled_ = true;
+    } else if (reach <= ULTRA_RW_MAX_SLOTS) {
+      for (size_t i = 0; i < reach; i++)
+        answer[na++] = static_cast<uint16_t>(i);
+    } else {
+      int32_t over[MAX_RECEIVERS];
+      uint16_t by[MAX_RECEIVERS];
+      for (size_t i = 0; i < reach; i++) {
+        this->pick_(this->rx_[i], now_ms, &over[i]);
+        by[i] = static_cast<uint16_t>(i);
+      }
+      for (size_t i = 1; i < reach; i++) {   // insertion sort: most overdue first, chain order on ties
+        const uint16_t v = by[i];
+        size_t j = i;
+        for (; j > 0 && over[by[j - 1]] < over[v]; j--)
+          by[j] = by[j - 1];
+        by[j] = v;
+      }
+      bool chosen[MAX_RECEIVERS]{};
+      for (size_t i = 0; i < ULTRA_RW_MAX_SLOTS; i++)
+        chosen[by[i]] = true;
+      for (size_t i = 0; i < reach; i++) {
+        if (chosen[i])
+          answer[na++] = static_cast<uint16_t>(i);   // indices rise along the chain
+      }
+    }
+    const uint8_t slots_r = static_cast<uint8_t>(na);
+    const uint16_t last = answer[na - 1];
+    size_t k = 0;
+    for (uint16_t b = 0; b <= last; b++) {
+      Receiver &r = this->rx_[b];
+      uint8_t *s = slots + ULTRA_SLOT_BYTES * b;
+      r.seq++;
+      if (k < na && answer[k] == b) {
+        int32_t overdue;
+        uint8_t tp = this->quiet_board_ >= 0 ? static_cast<uint8_t>(TP_UD_META) : this->pick_(r, now_ms, &overdue);
+        if (startup_probe || tp >= TP_COUNT)
+          tp = TP_STATUS;
+        uint8_t arg[23]{TP_PART[tp]};
+        if (tp == TP_DESCRIPTOR) arg[0] = r.d.descriptor_part;
+        if ((tp == TP_CALIBRATION && digital_calibration(r.d)) || tp == TP_UD_META || tp == TP_UD_QUALITY) arg[1] = ULTRA_CAL_KIND_PIXEL;
+        uint32_t nargs = tp == TP_DESCRIPTOR ? 1 : ((arg[1] != 0) ? 2 : (TP_PART[tp] != 0 ? 1 : 0));
+        if (tp == TP_LINK_STATS || tp == TP_LINK_CONTEXT) {
+          arg[0] = r.d.line_ingress;
+          arg[1] = tp == TP_LINK_STATS ? 1 : 0;
+          arg[2] = tp == TP_LINK_CONTEXT ? 1 : 0;
+          nargs = 3;
+        }
+        if (tp == TP_SYNC) {   // the ledger's counters (its arguments as asked)
+          std::memcpy(arg, r.sync_args, sizeof(r.sync_args));
+          nargs = sizeof(r.sync_args);
+        }
+        if (tp == TP_POWER && r.ack_due && (!r.d.have_status || now_ms - r.status_ms > ACK_FRESH_MS))
+          tp = TP_STATUS;   // its STATUS first (a restart drops the acknowledge), the acknowledge in the next window
+        if (tp == TP_POWER && r.ack_due) {   // acknowledge exactly the counts as last read (the dips: SUPPLY's)
+          arg[0] = ULTRA_PW_ARG_ACK;
+          ultra_put16(arg + 1, r.d.limit_events);
+          ultra_put16(arg + 3, r.d.overload_trips);
+          ultra_put16(arg + 5, r.d.short_trips);
+          ultra_put16(arg + 7, r.d.have_supply ? r.d.dips : 0);
+          nargs = 9;
+          r.ack_sent = true;
+        }
+        ultra_slot_poll(s, r.seq, static_cast<uint8_t>(k), slots_r, TP_PAGE_ID[tp], this->rate_, arg, nargs);
+        this->win_.push_back(Asked{b, tp, static_cast<uint8_t>(k), r.seq, false});
+        r.polls++;
+        k++;
+      } else {
+        ultra_slot_poll(s, r.seq, ULTRA_POLL_RELAY_ONLY, slots_r, ULTRA_PAGE_STATUS, this->rate_, nullptr, 0);
+      }
+    }
+    *window_us = ultra_rw_window_us(slots_r, this->rate_);
+    this->last_ms_ = now_ms;
+    this->sent_any_ = true;
+    this->stats_.windows++;
+    return static_cast<uint16_t>(last + 1);
+  }
+
+  /// The window of the last build() is over: bytes = what the hub's UART received since the frame went out (junk,
+  /// breaks, lead bytes and the answers, in any amount). Matches the answers, decodes them, reschedules.
+  void finish(uint32_t now_ms, const uint8_t *bytes, size_t n) {
+    this->idle_ = false;
+    for (size_t i = 0; i + ULTRA_SLOT_BYTES <= n;) {
+      if (bytes[i] == ULTRA_RSP_SYNC && ultra_answer_check(bytes + i) == 0) {
+        // a 0xA5 inside an answer's DATA is not a start; junk that passed the CRC by chance (1 in 65,536) but
+        // matched no POLL skips nothing
+        i += this->answer_(now_ms, bytes + i) ? ULTRA_SLOT_BYTES : 1;
+      } else {
+        if (bytes[i] == ULTRA_RSP_SYNC)
+          this->stats_.bad_crc++;
+        i++;
+      }
+    }
+    bool silenced = false;   // a receiver in front of this one didn't answer: this one couldn't be heard
+    for (const Asked &a : this->win_) {
+      Receiver &r = this->rx_[a.rx];
+      if (a.answered)
+        continue;
+      r.missed++;
+      if (digital_calibration(r.d)) this->invalidate_pixel_calibration(a.rx);
+      if (silenced) {
+        r.next[a.tp] = now_ms + RETRY_MS;
+        continue;
+      }
+      silenced = true;
+      this->stats_.missing++;
+      if (r.misses < 255)
+        r.misses++;
+      // 250 ms doubling up to 10 s; 2 s for one with receivers behind it once it cuts them off. Gone (unavailable),
+      // every page of it waits as long: one poll per back-off, not a burst of its pages
+      const uint32_t cap = r.misses >= CUT_MISSES && a.rx + 1u < this->rx_.size() ? CUT_BACKOFF_MS : BACKOFF_MAX_MS;
+      const uint32_t back = r.misses >= 6 ? cap : RETRY_MS << (r.misses - 1);
+      const uint32_t at = now_ms + (back > cap ? cap : back);
+      r.next[a.tp] = at;
+      if (r.misses >= UNAVAILABLE_MISSES) {
+        this->unavailable_(r);
+        for (uint32_t &t : r.next) {
+          if (static_cast<int32_t>(t - at) < 0)
+            t = at;
+        }
+      }
+    }
+    // receivers behind a cut can't be heard: unavailable
+    if (this->cut_(now_ms)) {
+      for (size_t i = this->reach_(now_ms); i < this->rx_.size(); i++)
+        this->unavailable_(this->rx_[i]);
+    }
+    this->win_.clear();
+  }
+
+  /// Called even without windows: stale data and intentional power/calibration/update holds become unavailable.
+  /// ENERGY expires after twice its configured interval plus 1 s of scheduling slack (at least 5 s).
+  bool service_output_voltage_low(uint32_t now, bool suppressed) {
+    this->output_voltage_low_suppressed_ = suppressed;
+    bool changed = false;
+    for (auto &r : this->rx_) {
+      const bool known = r.d.output_voltage_low.known, fault = r.d.output_voltage_low.fault;
+      this->check_output_voltage_low_(r, now);
+      if (known != r.d.output_voltage_low.known || fault != r.d.output_voltage_low.fault) {
+        r.updated |= TU_HUB;
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  const ReceiverData &data(uint16_t i) const { return this->rx_[i].d; }
+  /// What receiver i's page 0x11 said (a Diff-Power-UR-Digital-M's local effects; nothing known: have_* false)
+  const PixelState &pixel(uint16_t i) const {
+    static const PixelState none{};
+    return i < this->px_.size() ? this->px_[i] : none;
+  }
+  bool answering(uint16_t i) const { return this->rx_[i].answering; }
+  uint8_t misses(uint16_t i) const { return this->rx_[i].misses; }
+  /// POLLs that asked receiver i for an answer, and the ones that got none (missed polls)
+  uint32_t polls(uint16_t i) const { return this->rx_[i].polls; }
+  uint32_t missed(uint16_t i) const { return this->rx_[i].missed; }
+  bool has_uid(uint16_t i) const { return this->rx_[i].have_uid; }
+  uint16_t uid16(uint16_t i) const { return this->rx_[i].uid16; }
+  /// Read OUTPUTS from receiver i too (several lights on it: their estimated power, why they're dim); off by default
+  void set_outputs(uint16_t i, bool on) {
+    if (i < this->rx_.size())
+      this->rx_[i].outputs = on;
+    this->idle_ = false;
+  }
+  /// The receiver that keeps missing and cuts off the ones behind it (-1: none).
+  int cut_at(uint32_t now_ms) const {
+    for (size_t i = 0; i < this->rx_.size(); i++) {
+      if (this->rx_[i].misses >= CUT_MISSES)
+        return static_cast<int>(i);
+    }
+    (void) now_ms;
+    return -1;
+  }
+  /// What changed since the last call: bits 1 << TP_* (pages read), TU_AVAILABILITY, TU_RESTART.
+  uint32_t take_updates(uint16_t i) {
+    const uint32_t u = this->rx_[i].updated;
+    this->rx_[i].updated = 0;
+    return u;
+  }
+  struct Stats {
+    uint32_t windows{0};     // RW frames
+    uint32_t answers{0};     // answers matched
+    uint32_t missing{0};     // first missing answers (the ones that count)
+    uint32_t bad_crc{0};     // SYNC bytes without a valid answer behind them (junk, broken answers)
+    uint32_t stale{0};       // valid answers that matched no POLL of the window (late, a wrong SEQ / page)
+    uint32_t contention{0};  // answers with RFLAGS CONTENTION
+    uint32_t restarts{0};    // receivers that restarted or were swapped
+  };
+  const Stats &stats() const { return this->stats_; }
+  /// For tests: the SEQ of a receiver's last POLL
+  uint8_t seq(uint16_t i) const { return this->rx_[i].seq; }
+
+ protected:
+  struct Receiver {   // (the fields in size order: no padding)
+    ReceiverData d;
+    uint32_t next[TP_COUNT]{};
+    uint32_t hold_until{0};    // restarted: not polled past before this (hold)
+    uint32_t answering_ms{0};  // first answer after unavailability or a restart
+    uint32_t status_ms{0};     // when its last STATUS was read (restart detection)
+    uint32_t polls{0}, missed{0};   // POLLs that asked it for an answer, and the ones without one
+    uint32_t updated{0};
+    uint32_t unsupported{0};   // bit 1 << TP_*: answered UNSUPPORTED (until the board restarts or changes)
+    uint32_t fresh{0};         // bit 1 << TP_*: read since mark_fresh() (the commissioning's waits)
+    uint16_t uid16{0};
+    bool have_uid{false};
+    bool answering{false};
+    bool reported{false};      // its "unavailable" went out (take_updates TU_AVAILABILITY)
+    uint8_t misses{0};
+    uint8_t seq{0};
+    bool need_identity{true};
+    bool need_features{false};   // IDENTITY part 1 due (after part 0)
+    bool hold{false};          // (build() forgets it once over: it can't come back half a millis() wrap later)
+    bool ack_due{false};       // POWER showed a latch: acknowledge with the next POWER poll
+    bool ack_sent{false};      // ... it went out with the last one
+    bool outputs{false};       // OUTPUTS is read too (a receiver with several lights: their power, why they're dim)
+    // LIFE_SYNC: asked by the ledger (its arguments), until it answers
+    bool sync_due{false};
+    uint8_t sync_args[23]{};
+  };
+  struct Asked {
+    uint16_t rx;
+    uint8_t tp, index, seq;
+    bool answered;
+  };
+
+  uint32_t interval_(uint8_t tp) const {
+    switch (tp) {
+      case TP_FW_UPDATE:
+      case TP_STATUS:
+        return this->iv_.status_ms;
+      case TP_POWER:
+      case TP_OUTPUTS:
+        return this->iv_.power_ms;
+      case TP_ENERGY:
+        return this->iv_.energy_ms;
+      case TP_SUPPLY:
+        return this->iv_.supply_ms;
+      case TP_HEALTH:
+        return this->iv_.health_ms;
+      case TP_LIFETIME:
+        return this->iv_.lifetime_ms;
+      case TP_DIAG:
+      case TP_FAULTS:
+      case TP_UD_META:
+      case TP_UD_QUALITY:
+      case TP_CALIBRATION:   // (and right after the hub's calibration run: read_now)
+        return this->iv_.diag_ms;
+      case TP_PX_STATE:
+      case TP_LINK_STATS:
+        return this->iv_.power_ms;
+      case TP_PX_EFFECTS:
+      case TP_PX_PALETTES:
+        return PX_MAP_INTERVAL_MS;
+      default:
+        return 0;
+    }
+  }
+  bool enabled_(const Receiver &r, uint8_t tp) const {
+    if (r.unsupported & (1u << tp))
+      return false;
+    if (tp == TP_IDENTITY)
+      return r.need_identity;
+    if (tp == TP_FEATURES)
+      return r.need_features;
+    if (tp == TP_TARGET) return r.d.have_board && r.d.have_features && !r.d.have_target;
+    if (tp == TP_DESCRIPTOR) return r.d.have_board && r.d.have_features && r.d.have_target && !r.d.have_descriptor;
+    if (tp == TP_STATUS) return true;
+    if (!r.d.have_identity)   // the optional pages once IDENTITY says which the board has
+      return false;
+    if (tp == TP_UD_META || tp == TP_UD_QUALITY || (tp == TP_CALIBRATION && digital_calibration(r.d))) {
+      if (!digital_calibration(r.d)) return false;
+      const size_t i = static_cast<size_t>(&r - this->rx_.data());
+      const uint8_t part = i < this->uc_.size() ? this->uc_[i].next : 1;
+      return TP_PART[tp] == part;
+    }
+    if (tp == TP_OUTPUTS && !r.outputs)
+      return false;
+    if (tp == TP_LINK_CONTEXT) return this->line_pages_ && r.d.line_context_due;
+    if (tp == TP_LINK_STATS) return this->line_pages_ && r.d.line_ingress != 255 && !r.d.line_context_due;
+    if (tp_is_pixel(tp))   // page 0x11: only the receivers that run local pixel effects
+      return (r.d.hw_caps & RX_CAP_PIXEL_FX) != 0;
+    if (tp == TP_SYNC && !r.sync_due)
+      return false;
+    return TP_FEATURE[tp] == 0 || (r.d.features & TP_FEATURE[tp]) != 0;
+  }
+  /// The page to ask a receiver for: the most overdue one it has (overdue < 0: none due yet, the soonest).
+  uint8_t pick_(const Receiver &r, uint32_t now_ms, int32_t *overdue) const {
+    uint8_t best = TP_COUNT;
+    int32_t most = INT32_MIN;
+    for (uint8_t tp = 0; tp < TP_COUNT; tp++) {
+      if (!this->enabled_(r, tp))
+        continue;
+      int32_t o = static_cast<int32_t>(now_ms - r.next[tp]);
+      if (o < -STALE_MS || ((tp == TP_FEATURES || tp == TP_TARGET || tp == TP_DESCRIPTOR || tp == TP_LINK_CONTEXT) && o >= 0))
+        o = INT32_MAX / 2;   // (more than any interval ahead: its time from over half a millis() wrap ago: overdue;
+                             // IDENTITY's part 1 right after part 0: the board's pages wait for its features)
+      if (o > most) {
+        most = o;
+        best = tp;
+      }
+    }
+    *overdue = most;
+    return best;
+  }
+  bool check_output_voltage_low_(Receiver &r, uint32_t now) {
+    const auto &d = r.d;
+    const uint8_t why = receiver_why(d);
+    const uint32_t status_age = std::max<uint32_t>(5000u, 3 * this->iv_.status_ms + 1000u);
+    const uint32_t energy_age = std::max<uint32_t>(5000u, 2 * this->iv_.energy_ms + 1000u);
+    const bool eligible = !this->output_voltage_low_suppressed_ && this->quiet_board_ < 0 && r.answering &&
+        now - r.answering_ms >= OutputVoltageLow::BOOT_MS &&
+        d.have_identity && (d.hw_caps & RX_CAP_PIXEL) && (d.hw_caps & RX_CAP_RETURN) &&
+        (d.features & ULTRA_FEAT_ENERGY) && this->enabled_(r, TP_ENERGY) &&
+        d.have_status && now - r.status_ms <= status_age &&
+        why != ULTRA_ST_WHY_TEST && why != ULTRA_ST_WHY_CALIBRATING;
+    if (!eligible || (d.output_voltage_low.sampled && now - d.output_voltage_low.sample_ms > energy_age))
+      r.d.output_voltage_low.reset();
+    return eligible;
+  }
+
+  bool cut_(uint32_t now_ms) const { return this->cut_at(now_ms) >= 0; }
+  /// it doesn't answer (or can't be heard): its sensors unavailable, once (also one that never answered)
+  void unavailable_(Receiver &r) {
+    const size_t i = static_cast<size_t>(&r - this->rx_.data());
+    if (i < this->uc_.size()) { this->uc_[i].invalidate(); r.d.have_calibration = false; }
+
+    if (r.answering || !r.reported)
+      r.updated |= TU_AVAILABILITY;
+    r.d.output_voltage_low.reset();
+    r.answering = false;
+    r.reported = true;
+  }
+  /// The receivers that can be heard now: up to and including one that keeps missing, or one that restarted less
+  /// than RESTART_HOLD_MS ago.
+  size_t reach_(uint32_t now_ms) const {
+    for (size_t i = 0; i < this->rx_.size(); i++) {
+      const Receiver &r = this->rx_[i];
+      if (r.misses >= CUT_MISSES || (r.hold && static_cast<int32_t>(now_ms - r.hold_until) < 0))
+        return i + 1;
+    }
+    return this->rx_.size();
+  }
+
+  /// A new board at a position, or a restart: what it said before is void (IDENTITY again, no acknowledge across it).
+  void restarted_(Receiver &r, uint32_t now_ms, bool new_board) {
+    const size_t uc_index = static_cast<size_t>(&r - this->rx_.data());
+    if (uc_index < this->uc_.size()) this->uc_[uc_index].invalidate();
+    r.d.have_calibration = false;
+    if (new_board) {
+      r.d = ReceiverData{};
+      if (&r - this->rx_.data() < static_cast<std::ptrdiff_t>(this->px_.size()))
+        this->px_[static_cast<size_t>(&r - this->rx_.data())] = PixelState{};
+      r.unsupported = 0;
+      r.updated |= (1u << TP_COUNT) - 1;   // every value unknown again
+      r.sync_due = false;   // (the ledger asks again for the board that's there)
+    }
+    r.d.output_voltage_low.reset();
+    r.d.vbus_hi_10mv = 0;   // (the supply may be another one after a power cycle: its highest reading is learned again)
+    r.d.vbus_dip_low_10mv = 0xFFFF;
+    r.d.dip_pre_ma = 0xFFFF;   // (the load before a dip: read again in this power-up)
+    r.answering_ms = now_ms;
+    r.d.have_board = r.d.have_features = r.d.have_target = r.d.have_descriptor = r.d.have_identity = false;
+    r.d.hw_caps = 0; std::fill_n(r.d.max_pixels, 3, 0); r.d.pixel_cal_wait_ms = 0; r.d.descriptor_bytes.clear();
+    r.d.line_counters = LineCounters{}; r.d.line_context_due = false; r.d.line_ingress = 255;
+    r.d.have_update = false;
+    r.need_identity = true;
+    r.need_features = false;
+    r.next[TP_IDENTITY] = now_ms;
+    r.ack_due = r.ack_sent = false;
+    r.hold = true;
+    r.hold_until = now_ms + RESTART_HOLD_MS;
+    r.updated |= TU_RESTART;
+    this->stats_.restarts++;
+  }
+
+  /// one answer of the window; false: it matched no POLL of it (stale, junk)
+  bool answer_(uint32_t now_ms, const uint8_t *a) {
+    const uint8_t index = a[2] >> 4, rflags = a[2] & 0x0F, seq = a[3], page = a[1];
+    Asked *q = nullptr;
+    for (auto &w : this->win_) {
+      if (w.index == index && !w.answered)
+        q = &w;
+    }
+    if (q == nullptr || q->seq != seq ||
+        (page != TP_PAGE_ID[q->tp] && page != ULTRA_PAGE_BUSY && page != ULTRA_PAGE_UNSUPPORTED)) {
+      this->stats_.stale++;
+      return false;
+    }
+    q->answered = true;
+    this->stats_.answers++;
+    Receiver &r = this->rx_[q->rx];
+    const uint16_t uid = static_cast<uint16_t>(ultra_get16(a + 4));
+    if (r.have_uid && uid != r.uid16)
+      this->restarted_(r, now_ms, true);
+    r.have_uid = true;
+    r.uid16 = uid;
+    if (r.misses >= UNAVAILABLE_MISSES) {   // back after it was gone (re-plugged?): every page due now, STATUS first
+      for (uint32_t &t : r.next)            // (a restart shows in its uptime; its pages' back-off is over)
+        t = now_ms;
+      r.next[TP_STATUS] = now_ms - 1;
+    }
+    r.misses = 0;
+    if (!r.answering) {
+      r.answering = true;
+      r.answering_ms = now_ms;
+      r.d.output_voltage_low.reset();
+      r.reported = false;
+      r.updated |= TU_AVAILABILITY;
+    }
+    if (rflags & ULTRA_RSP_CONTENTION)
+      this->stats_.contention++;
+    if ((rflags & ULTRA_RSP_EVENT) && !r.ack_due && this->enabled_(r, TP_POWER) &&
+        static_cast<int32_t>(r.next[TP_POWER] - now_ms) > 0)
+      r.next[TP_POWER] = now_ms;   // a power event: read it soon (one being acknowledged: known)
+    const uint8_t tp = q->tp;
+    if (tp == TP_POWER && r.ack_sent)
+      r.ack_due = r.ack_sent = false;   // the answer shows the state after the acknowledge
+    if (page == ULTRA_PAGE_BUSY) {
+      r.next[tp] = now_ms + RETRY_MS;
+      return true;
+    }
+    if (page == ULTRA_PAGE_UNSUPPORTED) {
+      if (digital_calibration(r.d) && (tp == TP_CALIBRATION || tp == TP_UD_META || tp == TP_UD_QUALITY))
+        this->invalidate_pixel_calibration(q->rx);
+      r.unsupported |= 1u << tp;
+      if (tp == TP_IDENTITY)
+        r.need_identity = false;
+      if (tp == TP_FEATURES)
+        r.need_features = false;
+      return true;
+    }
+    r.next[tp] = now_ms + this->interval_(tp);   // (decode_ may want it sooner)
+    if (tp == TP_FW_UPDATE) {
+      std::memcpy(r.d.update_answer, a, 32); r.d.update_seq = q->seq; r.d.update_index = q->index;
+    }
+    this->decode_(r, tp, a + ULTRA_RSP_DATA, now_ms);
+    return true;
+  }
+
+  void decode_(Receiver &r, uint8_t tp, const uint8_t *data, uint32_t now_ms) {
+    // IDENTITY with another full UID than the one read before (the UID16 the same: a CRC collision): another board,
+    // what was read of the one before is void
+    if (tp == TP_IDENTITY && r.d.have_board && std::memcmp(r.d.uid, data + ULTRA_ID_UID, 12) != 0)
+      this->restarted_(r, now_ms, true);
+    ReceiverData &d = r.d;
+    const uint32_t old_up = d.uptime_s, old_ms = r.status_ms;
+    const bool had_status = d.have_status, had_identity = d.have_identity;
+    const uint8_t old_state = d.power_state;
+    if (tp == TP_LINK_CONTEXT) {
+      auto &s = d.line_counters;
+      s.coherent = d.line_context_due && now_ms - d.line_snapshot_ms <= 2000 &&
+          data[ULTRA_LC_PORT] == d.line_ingress && data[ULTRA_LC_PROFILE] < 4 &&
+          data[ULTRA_LC_FLAGS] == d.line_snapshot_flags &&
+          ultra_get16(data + ULTRA_LC_EPOCH) == d.line_snapshot_epoch && !data[22] && !data[23];
+      s.sampled_ms = d.line_snapshot_ms; s.epoch = d.line_snapshot_epoch;
+      s.profile = data[ULTRA_LC_PROFILE]; s.flags = data[ULTRA_LC_FLAGS];
+      s.supported = data[ULTRA_LC_SUPPORTED];
+      s.valid = ultra_get16(data + ULTRA_LC_FRAMES); s.bad = ultra_get16(data + ULTRA_LC_CRC_ERRORS);
+      d.line_context_due = false;
+    } else if (tp == TP_LINK_STATS) {
+      d.line_snapshot_ms = now_ms; d.line_snapshot_epoch = ultra_get16(data + ULTRA_LS_EPOCH);
+      d.line_snapshot_flags = data[ULTRA_LS_FLAGS]; d.line_context_due = data[ULTRA_LS_PORT] == d.line_ingress;
+      d.line_counters.coherent = false; r.next[TP_LINK_CONTEXT] = now_ms;
+      if (this->px_.size() != this->rx_.size()) this->px_.resize(this->rx_.size());
+      decode_pixel_link(this->px_[static_cast<size_t>(&r - this->rx_.data())].line, data);
+    } else if (digital_calibration(d) && (tp == TP_CALIBRATION || tp == TP_UD_META || tp == TP_UD_QUALITY)) {
+      if (this->uc_.size() != this->rx_.size()) this->uc_.resize(this->rx_.size());
+      PixelCalibration &c = this->uc_[static_cast<size_t>(&r - this->rx_.data())];
+      const bool accepted = c.read(TP_PART[tp], data, this->quiet_board_ >= 0, d.max_pixels);
+      d.have_calibration = c.usable();
+      if (accepted) {
+        decode_receiver_page(d, ULTRA_PAGE_CALIBRATION, c.coefficients, 0);
+        d.have_calibration = c.usable();
+        r.updated |= 1u << TP_CALIBRATION;
+      }
+      const uint8_t next_tp = c.next == 0 ? static_cast<uint8_t>(TP_CALIBRATION) :
+                              c.next == 2 ? static_cast<uint8_t>(TP_UD_QUALITY) : static_cast<uint8_t>(TP_UD_META);
+      r.next[next_tp] = now_ms + ((c.stage == 0) ? (c.flags() & (ULTRA_UCF_PENDING | ULTRA_UCF_CLEAR_PENDING) ? 1000 : this->iv_.diag_ms) : 0);
+    } else if (tp_is_pixel(tp)) {
+      if (this->px_.size() != this->rx_.size())
+        this->px_.resize(this->rx_.size());   // (on the first one: only a line with such a receiver pays for it)
+      const size_t i = static_cast<size_t>(&r - this->rx_.data());
+      const uint16_t crc = this->px_[i].config_crc;
+      const bool had = this->px_[i].have_state;
+      decode_pixel_page(this->px_[i], TP_PART[tp], data);
+      if (tp == TP_PX_STATE && had && crc != this->px_[i].config_crc) this->invalidate_pixel_calibration(i);
+    } else {
+      if (tp == TP_DESCRIPTOR) {
+        if (d.descriptor_bytes.empty()) d.descriptor_bytes.resize(d.descriptor_length);
+        const size_t remaining = d.descriptor_length - d.descriptor_received;
+        const size_t take = std::min<size_t>(24, remaining);
+        bool padding = true;
+        for (size_t k = take; k < 24; k++) padding &= data[k] == 0;
+        if (padding && take) {
+          std::memcpy(d.descriptor_bytes.data() + d.descriptor_received, data, take);
+          d.descriptor_received += take;
+          if (d.descriptor_received == d.descriptor_length) {
+            ultra_descriptor_t desc{};
+            d.have_descriptor = ultra_descriptor_decode(&desc, d.descriptor_bytes.data(), d.descriptor_length) == 0 &&
+                desc.crc == d.descriptor_crc && desc.board == d.hw_id && desc.variant == d.target[6] &&
+                d.target[0] == d.hw_id && d.target[7] == d.hw_rev;
+            if (d.have_descriptor) {
+              ultra_desc_link_t link{}; ultra_desc_pixel_t px{};
+              for (uint8_t port = 0; port < 16; port++) if (!ultra_descriptor_link(&desc, port, &link)) {
+                if (link.flags & ULTRA_LINK_RETURN) d.hw_caps |= RX_CAP_RETURN;
+                if (link.phy == ULTRA_PHY_ADAPTIVE && (link.flags & ULTRA_LINK_RETURN) && d.line_ingress == 255)
+                  d.line_ingress = port;
+              }
+              if (desc.channels) d.hw_caps |= RX_CAP_CURRENT;
+              if (desc.outputs) d.hw_caps |= RX_CAP_PIXEL;
+              if (!ultra_descriptor_pixel(&desc, 0, &px)) {
+                if (px.flags & ULTRA_PIXEL_LOCAL) d.hw_caps |= RX_CAP_PIXEL_FX;
+                if (px.flags & ULTRA_PIXEL_CHAIN) d.hw_caps |= RX_CAP_CHAIN;
+                std::copy(px.max_pixels, px.max_pixels + 3, d.max_pixels);
+                d.pixel_cal_wait_ms = ultra_descriptor_calibration_ms(&desc, 1, 0);
+              }
+              d.have_identity = d.have_board && d.have_features && d.have_target;
+            } else {
+              d.descriptor_received = 0; d.descriptor_part = 0;
+            }
+          } else ++d.descriptor_part;
+        }
+      } else decode_receiver_page(d, TP_PAGE_ID[tp], data, TP_PART[tp]);
+    }
+    const size_t uc_i = static_cast<size_t>(&r - this->rx_.data());
+    if ((tp == TP_STATUS || tp == TP_ENERGY) && uc_i < this->uc_.size()) {
+      auto &c = this->uc_[uc_i];
+      const uint32_t mv = tp == TP_STATUS ? d.vbus_10mv : d.vb_10mv;
+      const uint16_t ref = c.get(tp == TP_STATUS ? ULTRA_UC_VBUS : ULTRA_UC_VLED);
+      if (c.have && ref && mv != 65535u && (mv * 100u < ref * 95u || mv * 100u > ref * 105u)) {
+        c.coherent = false;
+        c.meta[ULTRA_UC_FLAGS] |= ULTRA_UCF_STALE;
+        d.have_calibration = false;
+        r.updated |= 1u << TP_CALIBRATION;
+        r.next[TP_UD_META] = now_ms;
+      }
+    }
+    if (this->check_output_voltage_low_(r, now_ms) && tp == TP_ENERGY)
+      d.output_voltage_low.sample(now_ms, d.vb_10mv);
+    if (d.have_identity && !had_identity)
+      d.identity_ms = now_ms;
+    if (tp == TP_FW_UPDATE)
+      d.update_ms = now_ms;
+    r.updated |= 1u << tp;
+    r.fresh |= 1u << tp;
+    switch (tp) {
+      case TP_IDENTITY:   // part 0, the board: its features next (part 1)
+        r.need_identity = false;
+        r.need_features = true;
+        r.next[TP_FEATURES] = now_ms;
+        break;
+      case TP_TARGET:
+      case TP_DESCRIPTOR:
+      case TP_FEATURES:
+        r.need_features = false;
+        for (uint8_t p = TP_POWER; p < TP_COUNT; p++) {   // the pages it has: due now
+          if (p != TP_STATUS && this->enabled_(r, p))
+            r.next[p] = now_ms;
+        }
+        break;
+      case TP_STATUS: {
+        r.status_ms = now_ms;
+        if (had_status) {
+          // its uptime should have grown by the hub's time since (modulo 2^24): far behind = it restarted
+          const uint32_t elapsed = (now_ms - old_ms) / 1000;
+          const uint32_t expect = (old_up + elapsed) & 0xFFFFFF;
+          const uint32_t behind = (expect - d.uptime_s) & 0xFFFFFF;
+          if (behind > 5 + elapsed / 32 && behind < 0x800000)   // (+3 %: the boards' clocks)
+            this->restarted_(r, now_ms, false);
+        }
+        if (d.power_state != old_state) {   // the power state or  its reason changed: the details soon
+          if (this->enabled_(r, TP_POWER))
+            r.next[TP_POWER] = now_ms;
+          if (this->enabled_(r, TP_OUTPUTS))
+            r.next[TP_OUTPUTS] = now_ms;   // (why the outputs are dim: else up to power_ms old)
+        }
+        break;
+      }
+      case TP_SYNC:
+        r.sync_due = false;
+        break;
+      case TP_POWER:
+        if (d.pw_latched != 0) {
+          // shown now (the sensors), acknowledged with the next POWER poll: exactly these counts
+          r.ack_due = true;
+          r.next[TP_POWER] = now_ms + ACK_DELAY_MS;
+          if ((d.pw_latched & ULTRA_PW_EV_SUPPLY_DIP) && this->enabled_(r, TP_SUPPLY))
+            r.next[TP_SUPPLY] = now_ms;   // a dip: its count first
+        } else {
+          r.ack_due = false;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
+  std::vector<PixelCalibration> uc_;  // allocated only on digital calibration-capable lines
+  int quiet_board_{-1};
+  uint32_t quiet_poll_ms_{0};
+  bool quiet_polled_{false};
+  std::vector<Receiver> rx_;
+  std::vector<PixelState> px_;   // page 0x11 per receiver, sized with the first such answer
+  std::vector<Asked> win_;
+  TelemetryIntervals iv_{};
+  uint8_t rate_{ULTRA_RW_RATE_1M};
+  uint8_t dip_warn_{DIP_WARN_PCT};
+  bool locked_{false};
+  bool lock_wait_{false};   // the lock interval not waited out yet (build() forgets it after)
+  bool output_voltage_low_suppressed_{false};
+  bool line_pages_{false};  // page 0x11 part 3 is asked for (a normal Ultra line, not a digital port)
+  mutable bool idle_{false};   // due(): nothing due at idle_ms_ (every change forgets it)
+  uint32_t lock_ms_{0};
+  bool sent_any_{false};
+  uint32_t last_ms_{0};
+  mutable uint32_t idle_ms_{0};
+  Stats stats_{};
+};
+
+// --------------------------------------------------------------------------------------- status for Home Assistant
+/// A receiver's status, worst first: what its Status sensor shows. The ones up to RS_CAL_SUGGESTED turn its Problem on
+/// (the protocol's hub rule, wiki: Return Channel, "Home Assistant": STATUS's reasons short, overload, retries used up,
+/// too hot, a supply dip, signal loss; HEALTH's abnormal channel, dark current, calibration suggested, too hot).
+enum ReceiverStatus : uint8_t {
+  RS_NO_ANSWER = 0,
+  RS_TRIPPED,
+  RS_CHANNEL_FAULT,
+  RS_TOO_HOT,
+  RS_SIGNAL_LOSS,
+  RS_SUPPLY_DIPS,
+  RS_OUTPUT_VOLTAGE_LOW,
+  RS_CAL_SUGGESTED,
+  RS_LIMITING,
+  RS_CALIBRATING,
+  RS_SOFT_START,
+  RS_HELD_DARK,
+  RS_BLINKING,
+  RS_OK,
+  RS_STANDBY,   // its Diff-Power port isn't on (diffpower): not powered, not polled; never a problem, never the worst
+  RS_WAKING,    // its line's power just came back: not heard yet, not missed enough to count as gone (as Standby)
+  RS_PORT_OFF,  // its Diff-Power port's power mode is Off (as Standby: never powered until another mode is chosen)
+  RS_COUNT,
+};
+static constexpr uint32_t TRIP_RECENT_S = 600;       // a trip in the last 10 min still shows (a retrying short)
+static constexpr uint32_t DIPS_RECENT_S = 86400;     // supply dips in the last 24 h
+
+/// The lowest supply dip in the last 24 h (SUPPLY: the newest logged one, the deepest since its power-up): its % of
+/// its reference and its lowest reading (mV); false: none
+inline bool lowest_recent_dip(const ReceiverData &d, uint8_t *pct, uint16_t *mv) {
+  bool any = false;
+  if (d.have_supply && d.dips != 0 && d.logged != 0 && d.dip_age_s < DIPS_RECENT_S && d.dip_pct != 0) {
+    *pct = d.dip_pct;
+    *mv = d.dip_mv;
+    any = true;
+  }
+  if (d.have_supply && d.dips != 0 && d.deep_age_s < DIPS_RECENT_S && d.deep_pct != 0 && (!any || d.deep_pct < *pct)) {
+    *pct = d.deep_pct;
+    *mv = d.deep_mv;
+    any = true;
+  }
+  return any;
+}
+/// A board without the SUPPLY page (the lean Digital-M): its dips have no depth, only STATUS's reason "a supply dip in
+/// the last 30 s". That one is a note; it is a dip worth a warning only when the bus reading itself fell, during that
+/// dip, below warn_pct % of the board's highest bus reading (up to 20 % drop is fine).
+inline bool lean_supply_dip_deep(const ReceiverData &d, uint8_t warn_pct) {
+  return d.vbus_hi_10mv != 0 && d.vbus_dip_low_10mv != 0xFFFF &&
+         static_cast<uint32_t>(d.vbus_dip_low_10mv) * 100u < static_cast<uint32_t>(d.vbus_hi_10mv) * warn_pct;
+}
+inline bool lean_supply_board(const ReceiverData &d) {
+  return d.have_identity && !(d.features & ULTRA_FEAT_SUPPLY_DIPS);
+}
+/// A supply dip worth a warning: one below warn_pct % of its reference in the last 24 h; a board without the SUPPLY
+/// page: STATUS's reason (a dip in the last 30 s) with a bus reading below warn_pct % of its highest
+inline bool supply_dip_warning(const ReceiverData &d, uint8_t warn_pct) {
+  if (lean_supply_board(d))
+    return receiver_why(d) == ULTRA_ST_WHY_SUPPLY && lean_supply_dip_deep(d, warn_pct);
+  uint8_t pct;
+  uint16_t mv;
+  return lowest_recent_dip(d, &pct, &mv) && pct < warn_pct;
+}
+
+// ----------------------------------------------------------------------------------------------------- cable drop
+/// The Port v1.1 rules for a 36 V strip's receiver: its LED supply is 30 V or more; it
+/// needs RX36_MIN_BUS_V at the receiver, also at full load (so the full-load cable is up to 50 m on a
+/// 48 V supply, 100 m on 55 V); at most RX36_MAX_PER_PORT of them on one port. The numbers are the design's: not
+/// settings.
+static constexpr float RX36_LED_V = 30.0f, RX36_MIN_BUS_V = 40.0f;
+static constexpr uint8_t RX36_MAX_PER_PORT = 4;
+
+/// A 36 V receiver: its LED supply (ENERGY) is measured and RX36_LED_V or more (a 24 V strip's is under it)
+inline bool receiver_is_36v(const ReceiverData &d) {
+  return d.have_energy && d.vb_10mv != 0xFFFF && d.vb_10mv >= static_cast<uint16_t>(RX36_LED_V * 100.0f);
+}
+
+/// What the supply impedance Z (ENERGY: the supply's fall over the input current's rise across settled steps, so the
+/// cable and the supply from the sender to this receiver) says about this receiver at full load: its bus voltage
+/// then is the unloaded one (now + Z x its current now) less Z x its full-load current. The board's own current
+/// only: the receivers in front of it on the cable at full load too would drop it further.
+struct CableDrop {
+  bool z_known{false};     // Z measured: a settled current step has been seen
+  bool known{false};       // ... and its bus voltage, its current and a full-load current too
+  uint8_t basis{0};        // the full-load current: 0 its limit, 1 its learned model's load, 2 its calibrated one's
+  float full_a{NAN};       // the full-load input current (A)
+  float open_v{NAN};       // its bus voltage with nothing drawn
+  float full_v{NAN};       // ... at full load
+  float drop_pct{NAN};     // the share lost between the two
+};
+
+/// The full-load input current (mA): an analog board's connected load (its current model, the channels together at
+/// 100 %) within the board limit; a digital one's, or one without a model: the board limit; 0: not known. basis: as
+/// CableDrop's.
+inline uint32_t full_load_ma(const ReceiverData &d, uint8_t *basis = nullptr) {
+  const bool limit = d.have_power && d.limit_ma != 0xFFFF && d.limit_ma != 0;
+  const bool load = d.have_calibration && !(d.hw_caps & RX_CAP_PIXEL) && d.cal_connected_ma != 0 &&
+                    (d.cal_model == 1 || d.cal_model == 2);
+  if (basis != nullptr)
+    *basis = load ? d.cal_model : 0;
+  if (load)
+    return limit ? std::min<uint32_t>(d.cal_connected_ma, d.limit_ma) : d.cal_connected_ma;
+  return limit ? d.limit_ma : 0;
+}
+
+inline CableDrop cable_drop(const ReceiverData &d) {
+  CableDrop c;
+  c.z_known = d.have_energy && d.supply_z_mohm != 0;
+  const bool volts = d.have_status && (d.measured & ULTRA_ST_M_VBUS) && d.vbus_10mv != 0xFFFF;
+  const bool amps = d.have_status && (d.measured & ULTRA_ST_M_CURRENT);
+  const uint32_t full_ma = full_load_ma(d, &c.basis);
+  if (!c.z_known || !volts || !amps || full_ma == 0)
+    return c;
+  const float z = d.supply_z_mohm * 0.001f;   // ohm
+  c.full_a = full_ma * 0.001f;
+  // (never above its bus voltage now: a present current above the full-load one is a rounding of the limit)
+  const float now_a = d.current_ma * 0.001f, more_a = c.full_a > now_a ? c.full_a - now_a : 0.0f;
+  c.open_v = d.vbus_10mv * 0.01f + z * now_a;
+  c.full_v = std::fmax(0.0f, d.vbus_10mv * 0.01f - z * more_a);   // (a voltage can't go below 0: a wild Z reads as 100 %)
+  c.drop_pct = c.open_v > 0.0f ? (c.open_v - c.full_v) / c.open_v * 100.0f : NAN;
+  c.known = c.open_v > 0.0f;
+  return c;
+}
+
+/// A supply dip that the cable alone explains: a load step and a depth that Z x that step accounts for. The step: the
+/// dip's current at its lowest reading against the board current read by the last STATUS before STATUS first flagged
+/// the dip (the dip began no later than that flag), at least 100 mA up; the depth (below the dip's own reference) no
+/// more than Z x the step, within the rounding of the dip's share and the impedance (x 1.25 + 0.3 V). A dip at a
+/// steady load (a supply sag), a dip without a STATUS reading before it, a later dip of the same flagged episode, Z
+/// unknown or the dip's details missing: false (the supply-or-cable wording stays).
+inline bool dip_is_cable_drop(const ReceiverData &d, uint8_t pct, uint16_t mv, uint16_t ma) {
+  if (!d.have_energy || d.supply_z_mohm == 0 || pct == 0 || pct >= 100 || ma == 0 || d.dip_pre_ma == 0xFFFF)
+    return false;
+  const uint32_t began_up_s = d.dip_read_up_s > d.dip_age_s ? d.dip_read_up_s - d.dip_age_s : 0;
+  if (began_up_s > d.dip_flag_up_s + 1u || ma < d.dip_pre_ma + 100u)
+    return false;   // a dip after the flagging STATUS, or no load step before it
+  const uint32_t reference_mv = static_cast<uint32_t>(mv) * 100u / pct;   // the dip's own reference
+  const uint32_t depth_mv = reference_mv > mv ? reference_mv - mv : 0;
+  const uint32_t step_ma = static_cast<uint32_t>(ma) - d.dip_pre_ma;
+  const uint32_t expected_mv = static_cast<uint32_t>(d.supply_z_mohm) * step_ma / 1000u;   // mOhm x mA = uV
+  return depth_mv * 4u <= expected_mv * 5u + 1200u;   // (x 1.25 + 0.3 V)
+}
+/// the lowest recent dip (lowest_recent_dip's pct) is the newest logged one: its current and length are the dip's
+inline bool newest_dip_is_lowest(const ReceiverData &d, uint8_t lowest_pct) {
+  return d.have_supply && d.logged != 0 && d.dip_age_s < DIPS_RECENT_S && d.dip_pct == lowest_pct;
+}
+
+inline const char *receiver_status_name(ReceiverStatus s) {
+  static const char *const NAMES[RS_COUNT] = {"No answer",   "Tripped",     "Channel fault",
+                                              "Too hot",     "Signal loss", "Supply dips",
+                                              "Output voltage low", "Calibration suggested",      "Limiting",
+                                              "Calibrating", "Soft start",  "Held dark",
+                                              "Blinking",    "OK",          "Standby",
+                                              "Waking",      "Port off"};
+  return s < RS_COUNT ? NAMES[s] : "OK";
+}
+inline bool receiver_status_problem(ReceiverStatus s) { return s <= RS_CAL_SUGGESTED; }
+
+/// The channels of `mask` (bit n = CH n+1) that HEALTH classes abnormal.
+inline uint8_t abnormal_channels(const ReceiverData &d, uint8_t mask) {
+  uint8_t m = 0;
+  for (int i = 0; d.have_health && i < 5; i++) {
+    if ((mask & (1u << i)) && (d.ch_class[i] & 0x0F) == ULTRA_HE_ABNORMAL)
+      m |= static_cast<uint8_t>(1u << i);
+  }
+  return m;
+}
+
+/// "CH2", "CH2 and CH4", "CH1, CH2 and CH4"
+inline std::string channel_list(uint8_t mask) {
+  std::vector<std::string> ch;
+  for (int i = 0; i < 5; i++) {
+    if (mask & (1u << i))
+      ch.push_back("CH" + std::to_string(i + 1));
+  }
+  std::string s;
+  for (size_t i = 0; i < ch.size(); i++)
+    s += (i == 0 ? "" : i + 1 == ch.size() ? " and " : ", ") + ch[i];
+  return s;
+}
+
+/// light 0: the receiver's status. Else a light's on it (its channels, bit n = CH n+1): only what dims that light (no
+/// supply dips, temperature or calibration suggestion; a channel fault on its own channels, or the dark current).
+/// dip_warn: a supply dip is a problem below this % of its reference (the line's dip_warning)
+inline ReceiverStatus receiver_status(const ReceiverData &d, bool answering, uint8_t light = 0,
+                                      uint8_t dip_warn = DIP_WARN_PCT) {
+  if (!answering)
+    return RS_NO_ANSWER;
+  const uint8_t st = d.have_status ? d.power_state : 0, ou = d.have_outputs ? d.why : 0, why = receiver_why(d);
+  const uint8_t hf = d.have_health ? d.he_flags : 0;
+  if (why == ULTRA_ST_WHY_SHORT || why == ULTRA_ST_WHY_OVERLOAD || why == ULTRA_ST_WHY_RETRIES_OUT ||
+      (st & ULTRA_ST_TRIPPED) || (ou & ULTRA_OU_W_TRIPPED) ||
+      (d.have_power && d.trip_age_s < TRIP_RECENT_S && (d.short_trips || d.overload_trips)))
+    return RS_TRIPPED;
+  if ((hf & ULTRA_HE_F_DARK) || abnormal_channels(d, light != 0 ? light : 0x1F) != 0)
+    return RS_CHANNEL_FAULT;
+  // The receiver owns its thermal threshold and hysteresis.
+  const bool hot = why == ULTRA_ST_WHY_HOT ||
+                   (hf & ULTRA_HE_F_HOT) != 0;
+  if (hot && light == 0)
+    return RS_TOO_HOT;
+  if (why == ULTRA_ST_WHY_SIGNAL_LOSS || (ou & ULTRA_OU_W_SIGNAL_LOSS))
+    return RS_SIGNAL_LOSS;
+  if (light == 0) {
+    if (supply_dip_warning(d, dip_warn))   // (shallower dips: no problem, its Supply note says so)
+      return RS_SUPPLY_DIPS;
+    if (d.output_voltage_low.problem())
+      return RS_OUTPUT_VOLTAGE_LOW;
+    if ((hf & ULTRA_HE_F_CAL_SUGGESTED))
+      return RS_CAL_SUGGESTED;
+  }
+  if ((st & (ULTRA_ST_LIMITING | ULTRA_ST_CH_LIMITING)) || (ou & (ULTRA_OU_W_LIMIT | ULTRA_OU_W_CH_LIMIT)))
+    return RS_LIMITING;
+  if (why == ULTRA_ST_WHY_TEST || why == ULTRA_ST_WHY_CALIBRATING || (ou & ULTRA_OU_W_TEST))
+    return RS_CALIBRATING;
+  if (why == ULTRA_ST_WHY_SOFT_START || (ou & ULTRA_OU_W_SOFT_START))
+    return RS_SOFT_START;
+  if (why == ULTRA_ST_WHY_DARK_HOLD || (ou & ULTRA_OU_W_DARK_HOLD))
+    return RS_HELD_DARK;
+  if (why == ULTRA_ST_WHY_PATTERN || (ou & ULTRA_OU_W_PATTERN))
+    return RS_BLINKING;
+  return RS_OK;
+}
+
+/// A light's status on a receiver with several lights (its channels): the receiver's, as far as it dims the light.
+inline ReceiverStatus light_status(const ReceiverData &d, bool answering, uint8_t channels) {
+  return receiver_status(d, answering, channels != 0 ? channels : 0x1F);
+}
+
+/// The hub's own current calibration on the receiver's line includes it (asked for and waiting for the power, its
+/// test, or held dark until the run is over): Calibrating, unless what it says is a problem that stays (no answer, a
+/// trip, a channel fault, too hot, signal loss, supply dips: its Problem doesn't blink off for the run) or its port is
+/// Off. Calibration suggested gives way: the run is the answer to it.
+inline ReceiverStatus with_hub_calibration(ReceiverStatus s, bool calibrating) {
+  return calibrating && s >= RS_CAL_SUGGESTED && s != RS_PORT_OFF ? RS_CALIBRATING : s;
+}
+
+/// "Receivers 1 and 2", "Receiver 1", "Receivers 1-3" (1-based positions before position `pos`, 0-based)
+inline std::string receivers_before(uint16_t pos) {
+  if (pos == 1)
+    return "Receiver 1";
+  if (pos == 2)
+    return "Receivers 1 and 2";
+  return "Receivers 1-" + std::to_string(pos);
+}
+
+/// The plain-language line under the Status: short and factual, from the pages (no clock: Home Assistant shows since
+/// when). It changes only when its meaning does (Home Assistant records every change): no countdowns or running
+/// durations, live numbers rounded. pos: the receiver's position on the port (0-based); cut: the receiver that cuts
+/// the port off (-1: none).
+inline std::string receiver_status_detail(const ReceiverData &d, ReceiverStatus s, uint16_t pos, int cut) {
+  char b[160];
+  const uint8_t why = receiver_why(d);
+  switch (s) {
+    case RS_NO_ANSWER:
+      if (cut >= 0 && cut < pos)
+        return "No answer: receiver " + std::to_string(cut + 1) +
+               " before it doesn't answer, so this one can't be heard. Check that one first.";
+      if (pos == 0)
+        return "No answer. Check its cable and power, and the hub's RS-485 connection.";
+      return "No answer. " + receivers_before(pos) + " before it answer" + (pos == 1 ? "s" : "") +
+             ", so check its cable or power.";
+    case RS_TRIPPED: {
+      // the reason now , else the last trip's cause (POWER)
+      const bool is_short = why == ULTRA_ST_WHY_SHORT ||
+                            (why != ULTRA_ST_WHY_OVERLOAD && d.have_power && d.trip_cause == ULTRA_PW_CAUSE_SHORT);
+      const bool is_overload = !is_short && (why == ULTRA_ST_WHY_OVERLOAD ||
+                                             (d.have_power && d.trip_cause == ULTRA_PW_CAUSE_OVERLOAD));
+      const char *cause = is_short ? "a short circuit" : is_overload ? "an overload" : "an overcurrent";
+      if (d.have_power)
+        snprintf(b, sizeof(b), "Tripped by %s at %.2f A", cause, d.trip_ma / 1000.0);
+      else
+        snprintf(b, sizeof(b), "Tripped by %s", cause);
+      std::string t = b;
+      if (why == ULTRA_ST_WHY_RETRIES_OUT)
+        return t + "; off, its retries are used up. Fix the wiring of its outputs, then switch its lights off and on "
+                   "(or its power).";
+      if (d.have_power && d.retry_s != 0)
+        t += "; it tries again by itself";   // (no countdown: the text changes with its meaning only)
+      else if (!(d.power_state & ULTRA_ST_TRIPPED))
+        t += "; on again";
+      return t + ". Check the wiring of its outputs.";
+    }
+    case RS_CHANNEL_FAULT: {
+      std::string t;
+      const uint8_t ab = abnormal_channels(d, 0x1F);
+      if (ab != 0) {
+        t = channel_list(ab) + ((ab & (ab - 1)) != 0 ? " are" : " is") + " abnormal at the last calibration test";
+        for (int i = 0; i < 5; i++) {   // the first one's finding
+          if (!(ab & (1u << i)))
+            continue;
+          const uint8_t c = d.ch_class[i];
+          t += c & ULTRA_HE_R_NOT_RISING ? " (the current didn't rise with the level)"
+               : c & ULTRA_HE_R_ABOVE    ? " (far above the test before)"
+               : c & ULTRA_HE_R_BELOW    ? " (far below the test before, or no load)"
+                                         : "";
+          break;
+        }
+        t += ": check its LEDs and wiring.";
+      }
+      if (d.he_flags & ULTRA_HE_F_DARK)
+        t += std::string(t.empty() ? "" : " ") + "Current flows with every output off: an output may be stuck on.";
+      return t;
+    }
+    case RS_TOO_HOT:
+      return "Its MCU is over its warning level. Check the cooling around the receiver.";
+    case RS_SIGNAL_LOSS:
+      return "No frames from the hub: the outputs follow its signal_loss setting.";
+    case RS_SUPPLY_DIPS: {   // (a dip below the line's dip_warning in the last 24 h)
+      uint8_t pct;
+      uint16_t mv;
+      if (!lowest_recent_dip(d, &pct, &mv))
+        return "A supply dip in the last 30 s. The supply or its cable may be too weak.";
+      bool cable = false;
+      if (newest_dip_is_lowest(d, pct)) {   // the newest is the lowest: its details
+        const uint32_t recent = d.logged;   // (the log keeps the last 4)
+        cable = dip_is_cable_drop(d, d.dip_pct, d.dip_mv, d.dip_ma);
+        snprintf(b, sizeof(b), "%u supply dip%s in the last 24 h, the last to %.1f V (%u %%) for %u ms at %.1f A.",
+                 static_cast<unsigned>(recent), recent == 1 ? "" : "s", d.dip_mv / 1000.0,
+                 static_cast<unsigned>(d.dip_pct), static_cast<unsigned>(d.dip_ms), d.dip_ma / 1000.0);
+      } else {
+        snprintf(b, sizeof(b), "Supply dips in the last 24 h, the lowest to %.1f V (%u %%).", mv / 1000.0,
+                 static_cast<unsigned>(pct));
+      }
+      return std::string(b) + (cable ? " Cable drop (expected): the cable is too long or too thin."
+                                     : " The supply or its cable may be too weak.");
+    }
+    case RS_OUTPUT_VOLTAGE_LOW:
+      return "Output voltage low: fuse blown, output shorted / overloaded, or the supply module is current-limiting";
+    case RS_CAL_SUGGESTED:
+      return "A current calibration test is suggested: its currents are far off the last test, or a new load is "
+             "connected.";
+    case RS_LIMITING:
+      if (d.have_power && d.limit_ma != 0xFFFF && (d.power_state & ULTRA_ST_LIMITING)) {
+        // (by about 10 / 20 / ... %: the factor moves with every fade)
+        const unsigned pct = static_cast<unsigned>(((65535u - d.factor) * 100u + 32767u) / 65535u);
+        if (pct < 5)
+          snprintf(b, sizeof(b), "The board limit (%.1f A, %s) is reducing the outputs a little.", d.limit_ma / 1000.0,
+                   telemetry_limit_source(d.limit_source));
+        else
+          snprintf(b, sizeof(b), "The board limit (%.1f A, %s) is reducing the outputs by about %u %%.",
+                   d.limit_ma / 1000.0, telemetry_limit_source(d.limit_source), (pct + 5) / 10 * 10);
+        return b;
+      }
+      if (d.power_state & ULTRA_ST_CH_LIMITING)
+        return "A channel limit is reducing a channel.";
+      return "The board limit is reducing the outputs.";
+    case RS_CALIBRATING:
+      if (why == ULTRA_ST_WHY_TEST)
+        return "The test jig's mode is on.";
+      if (why == ULTRA_ST_WHY_CALIBRATING)
+        return "A current calibration test is running.";
+      if (d.have_outputs && (d.why & ULTRA_OU_W_TEST))
+        return "A current calibration (or the test jig) is running.";
+      return "A current calibration on its line: its outputs stay dark until it is done.";   // (the hub's run)
+    case RS_SOFT_START:
+      return "Soft start: the outputs ramp up after a power-up or a trip.";
+    case RS_HELD_DARK:
+      return "Held dark by the hub: a current calibration on its line.";
+    case RS_BLINKING:
+      return "Showing a blink pattern: identify, a firmware update's answer, its version or a fault code.";
+    case RS_STANDBY:
+      return "The port is in standby (4.5 V); the receiver is off and wakes with its lights.";
+    case RS_WAKING:
+      return "Its port just woke: waiting for its first answer.";
+    case RS_PORT_OFF:
+      return "Its port's power mode is Off: no 55 V until another mode is chosen.";
+    default:
+      return "OK.";
+  }
+}
+
+// (The texts below change only with a new event, not with its age: Home Assistant records every change, and shows
+// since when a state holds.)
+
+/// The last trip: this power-up's (POWER: "short circuit at 12.40 A"), else the one the board keeps across power cuts
+/// (DIAG part 1: "overload at 6.5 A (at 1234 lit hours, before its last power-up)"), or "none".
+inline std::string telemetry_last_trip(const ReceiverData &d) {
+  char b[96];
+  if (d.have_power && (d.short_trips != 0 || d.overload_trips != 0)) {
+    snprintf(b, sizeof(b), "%s at %.2f A", d.trip_cause == ULTRA_PW_CAUSE_SHORT ? "short circuit" : "overload",
+             d.trip_ma / 1000.0);
+    return b;
+  }
+  if (d.have_faults && (d.fm_trip & 3) != 0) {
+    const unsigned half_a = d.fm_trip >> 2;
+    snprintf(b, sizeof(b), "%s at %.1f A%s (", (d.fm_trip & 3) == 1 ? "short circuit" : "overload", half_a * 0.5,
+             half_a == 63 ? " or more" : "");
+    std::string t = b;
+    if (d.fm_trip_lit_h != 0xFFFF)
+      t += "at " + std::to_string(d.fm_trip_lit_h) + " lit hours, ";
+    return t + "before its last power-up)";
+  }
+  return d.have_power || d.have_faults ? "none" : "";
+}
+
+/// The receiver page's note on its supply (Supply note): "No supply dips in the last 24 h.", "A supply dip in the last
+/// 24 h, to 46.1 V (84 %): fine down to 80 %.", "Supply dips in the last 24 h, the lowest to 43.1 V (78 %): below 80 %,
+/// the supply or its cable may be too weak." ("": SUPPLY not read). Its numbers change with a deeper dip only. The
+/// newest dip, when it is the lowest and the cable alone explains it (Z x its current): "cable drop (expected)". A
+/// board without the SUPPLY page: only whether STATUS says a dip in the last 30 s.
+inline std::string telemetry_supply_note(const ReceiverData &d, uint8_t warn_pct) {
+  char b[200];
+  if (!d.have_supply) {
+    if (!lean_supply_board(d) || !d.have_status)
+      return "";
+    if (receiver_why(d) != ULTRA_ST_WHY_SUPPLY)
+      return "No supply dip in the last 30 s.";
+    snprintf(b, sizeof(b), "A supply dip in the last 30 s; this board doesn't measure its depth, so it counts only "
+             "when its bus voltage fell below %u %% of its highest.", static_cast<unsigned>(warn_pct));
+    return b;
+  }
+  uint8_t pct;
+  uint16_t mv;
+  if (!lowest_recent_dip(d, &pct, &mv))
+    return "No supply dips in the last 24 h.";
+  const bool one = d.dips == 1;
+  const bool cable = newest_dip_is_lowest(d, pct) && dip_is_cable_drop(d, pct, mv, d.dip_ma);
+  snprintf(b, sizeof(b), "%s in the last 24 h, %s %.1f V (%u %%): ", one ? "A supply dip" : "Supply dips",
+           one ? "to" : "the lowest to", mv / 1000.0, static_cast<unsigned>(pct));
+  std::string s = b;
+  if (pct < warn_pct)
+    snprintf(b, sizeof(b), cable ? "below %u %%, cable drop (expected): the cable is too long or too thin."
+                                 : "below %u %%, the supply or its cable may be too weak.",
+             static_cast<unsigned>(warn_pct));
+  else
+    snprintf(b, sizeof(b), cable ? "cable drop (expected), fine down to %u %%." : "fine down to %u %%.",
+             static_cast<unsigned>(warn_pct));
+  return s + b;
+}
+
+/// The last supply dip: this power-up's (SUPPLY: "to 39.80 V (86 %) for 35 ms at 1.00 A"), else the one the board
+/// keeps across power cuts ("to 86 % for 30 ms at 1.0 A (before its last power-up)"), or "none".
+inline std::string telemetry_last_dip(const ReceiverData &d) {
+  char b[96];
+  if (d.have_supply && d.logged != 0) {
+    snprintf(b, sizeof(b), "to %.2f V (%u %%) for %u ms at %.2f A%s", d.dip_mv / 1000.0,
+             static_cast<unsigned>(d.dip_pct), static_cast<unsigned>(d.dip_ms), d.dip_ma / 1000.0,
+             dip_is_cable_drop(d, d.dip_pct, d.dip_mv, d.dip_ma) ? ", cable drop (expected)" : "");
+    return b;
+  }
+  if (d.have_faults && d.fm_dip_pct != 0) {
+    if (d.fm_dip_10ms == 255)
+      snprintf(b, sizeof(b), "to %u %% for 2.5 s or more at %.1f A (before its last power-up)",
+               static_cast<unsigned>(d.fm_dip_pct), d.fm_dip_a10 / 10.0);
+    else
+      snprintf(b, sizeof(b), "to %u %% for %u ms at %.1f A (before its last power-up)",
+               static_cast<unsigned>(d.fm_dip_pct), static_cast<unsigned>(d.fm_dip_10ms) * 10u, d.fm_dip_a10 / 10.0);
+    return b;
+  }
+  return d.have_supply || d.have_faults ? "none" : "";
+}
+
+/// The receiver's Cable drop line: what Z says about it at full load, and whether that is fine ("At full load (2.1 A,
+/// calibrated) about 51 V at the receiver (7 % drop): fine."). Whole volts and percent, 0.1 A: it changes with its
+/// meaning, not with every reading. warn_pct: the line's dip_warning, the share of the unloaded voltage it must keep
+/// (a drop beyond 100 - warn_pct is a note); a 36 V receiver must keep RX36_MIN_BUS_V in any case. "": nothing to say
+/// (not read yet, or its bus voltage / current isn't measured).
+inline std::string telemetry_cable_drop(const ReceiverData &d, uint8_t warn_pct) {
+  if (!d.have_energy)
+    return "";
+  const CableDrop c = cable_drop(d);
+  if (!c.z_known)
+    return "Not measured yet: the supply impedance needs a change of load.";
+  if (!c.known)
+    return full_load_ma(d) == 0 ? "Full load not known for this board." : "";
+  static const char *const BASIS[3] = {"board limit", "learned", "calibrated"};
+  char b[240];
+  const int line = 100 - warn_pct;
+  const bool low36 = receiver_is_36v(d) && c.full_v < RX36_MIN_BUS_V;
+  // (the volts rounded down: it never promises more than it predicts; a 36 V strip just under 40 V never reads "40 V")
+  int n = snprintf(b, sizeof(b), "At full load (%.1f A, %s) about %d V at the receiver (%.0f %% drop): ", c.full_a,
+                   BASIS[c.basis % 3], static_cast<int>(std::floor(c.full_v)), c.drop_pct);
+  if (n < 0 || static_cast<size_t>(n) >= sizeof(b))
+    return "";
+  if (low36)
+    snprintf(b + n, sizeof(b) - static_cast<size_t>(n), "a 36 V strip needs at least %.0f V there. Shorten the cable (up to 50 m on 48 V, "
+             "100 m on 55 V) or raise the supply voltage.", RX36_MIN_BUS_V);
+  else if (c.drop_pct > line)
+    snprintf(b + n, sizeof(b) - static_cast<size_t>(n), "more than the %d %% the line allows. Shorten the cable or raise the supply voltage.",
+             line);
+  else
+    snprintf(b + n, sizeof(b) - static_cast<size_t>(n), "fine.");
+  return b;
+}
+
+/// The estimated power of the channels in `mask` (bit n = CH n+1): the receiver's measured input power, split by the
+/// channel currents of its model (OUTPUTS). NAN while one of them isn't known.
+inline float light_power_estimate(const ReceiverData &d, uint8_t mask) {
+  const float total = telemetry_value(d, TV_INPUT_POWER);
+  if (!d.have_outputs || std::isnan(total))
+    return NAN;
+  uint32_t all = 0, mine = 0;
+  for (int i = 0; i < 5; i++) {
+    all += d.ch_ma[i];
+    if (mask & (1u << i))
+      mine += d.ch_ma[i];
+  }
+  return all == 0 ? 0.0f : total * static_cast<float>(mine) / static_cast<float>(all);
+}
+
+// ------------------------------------------------------------------------------------------------------- setup info
+/// Channel count comes from validated firmware inventory, independent of product id.
+inline uint8_t setup_channels(const ReceiverData &d) {
+  ultra_descriptor_t descriptor{};
+  return d.have_descriptor && !ultra_descriptor_decode(&descriptor, d.descriptor_bytes.data(), d.descriptor_bytes.size())
+             ? std::min<uint8_t>(5, descriptor.channels) : 0;
+}
+
+/// What one receiver's record of the Setup info says: the single source of both the text and its signature.
+struct SetupFields {
+  bool heard{false};     // false: "<position>:?" (nothing has answered at this position)
+  bool have_uid{false};
+  uint16_t uid16{0};
+  uint8_t hw{0};
+  uint8_t channels{0};
+  uint8_t used{0};       // bit n = CH n+1 draws current in the last calibration test
+  bool used_known{false};
+  bool operator==(const SetupFields &o) const {
+    return heard == o.heard && have_uid == o.have_uid && uid16 == o.uid16 && hw == o.hw && channels == o.channels &&
+           used == o.used && used_known == o.used_known;
+  }
+};
+
+/// The fields of a receiver's record. The used channels are the last calibration test's (normal or abnormal, not "no
+/// load"), so they change only with a test, never with the lights (Home Assistant records every change).
+inline SetupFields telemetry_setup_fields(const ReceiverData &d, bool answering, bool have_uid, uint16_t uid16) {
+  SetupFields f;
+  f.heard = have_uid || answering || d.have_board;
+  if (!f.heard)
+    return f;
+  f.have_uid = have_uid;
+  f.uid16 = have_uid ? uid16 : 0;
+  f.hw = d.have_board ? d.hw_id : d.have_status ? d.hw : 0;
+  f.channels = setup_channels(d);
+  const bool tested = d.have_health && ((d.he_flags & ULTRA_HE_F_TESTED) || d.ch_class[0] != ULTRA_HE_UNTESTED);
+  if (f.channels == 0) {
+    f.used_known = d.have_descriptor;   // (no lights to lay out: "-"; before its IDENTITY: "?")
+  } else if (tested) {
+    f.used_known = true;
+    for (uint8_t i = 0; i < f.channels; i++) {
+      const uint8_t c = d.ch_class[i] & 0x0F;
+      if (c == ULTRA_HE_NORMAL || c == ULTRA_HE_ABNORMAL)
+        f.used |= static_cast<uint8_t>(1u << i);
+    }
+  }
+  return f;
+}
+
+/// One receiver's record: "<position>:<UID16>:<hardware id>:<channels>:<used>" (position 1-based, UID16 four hex
+/// digits, used = the channels that draw current, e.g. "125", "-" none, "?" not known: no calibration test yet, so
+/// which outputs have a load isn't known), or "<position>:?" for a position nothing has answered at.
+inline std::string telemetry_setup_record(uint16_t position, const SetupFields &f) {
+  std::string s = std::to_string(position);
+  if (!f.heard)
+    return s + ":?";
+  char b[8];
+  snprintf(b, sizeof(b), ":%04X:", static_cast<unsigned>(f.uid16));
+  s += f.have_uid ? b : ":????:";
+  s += std::to_string(f.hw) + ":" + std::to_string(f.channels) + ":";
+  if (!f.used_known)
+    return s + "?";
+  if (f.used == 0)
+    return s + "-";
+  for (uint8_t i = 0; i < 5; i++) {
+    if (f.used & (1u << i))
+      s += static_cast<char>('1' + i);
+  }
+  return s;
+}
+inline std::string telemetry_setup_record(uint16_t position, const ReceiverData &d, bool answering, bool have_uid,
+                                          uint16_t uid16) {
+  return telemetry_setup_record(position, telemetry_setup_fields(d, answering, have_uid, uid16));
+}
+
+/// The Setup info text, the receivers in cable order: "S1 1:9C02:2:5:12 2:A41F:2:5:3 3:?". "S1" is the format's
+/// version. Trailing positions nothing has ever answered at are left out (a controller made for more receivers than
+/// are connected). Within Home Assistant's 255 characters: if the records don't fit, the rest is "+N" (N receivers).
+template <typename Poller>
+inline std::string telemetry_setup_info(const Poller &p) {
+  size_t last = 0;   // 1 + the last position that has been heard
+  for (uint16_t i = 0; i < p.receivers(); i++) {
+    if (telemetry_setup_fields(p.data(i), p.answering(i), p.has_uid(i), p.uid16(i)).heard)
+      last = i + 1;
+  }
+  std::string s = "S1";
+  for (size_t i = 0; i < last; i++) {
+    const std::string r = telemetry_setup_record(
+        static_cast<uint16_t>(i + 1), telemetry_setup_fields(p.data(i), p.answering(i), p.has_uid(i), p.uid16(i)));
+    if (s.size() + 1 + r.size() > TEXT_STATE_MAX - 5) {
+      s += " +" + std::to_string(last - i);
+      break;
+    }
+    s += " " + r;
+  }
+  return s;
+}
+
+/// A hash of exactly what telemetry_setup_info() reads (the fields above; no allocation, a few integer operations per
+/// receiver): the port builds the text only when this changes, not on every window.
+template <typename Poller>
+inline uint32_t telemetry_setup_sig(const Poller &p) {
+  uint32_t h = 2166136261u;
+  auto mix = [&h](uint32_t v) { h = (h ^ v) * 16777619u; };
+  for (uint16_t i = 0; i < p.receivers(); i++) {
+    const SetupFields f = telemetry_setup_fields(p.data(i), p.answering(i), p.has_uid(i), p.uid16(i));
+    mix(static_cast<uint32_t>(f.heard) | static_cast<uint32_t>(f.have_uid) << 1 | static_cast<uint32_t>(f.used_known) << 2 |
+        static_cast<uint32_t>(f.used) << 3 | static_cast<uint32_t>(f.hw) << 8 | static_cast<uint32_t>(f.channels) << 16);
+    mix(f.uid16);
+  }
+  return h;
+}
+
+// --------------------------------------------------------------------------------------- the receivers' reply rate
+/// The rate a line's receivers answer at (ULTRA_RW_RATE_*), stepped down on a cable that breaks their answers: one
+/// rate slower (1 M -> 500 k -> 250 k) once BAD of its last 32 counted windows had a broken answer (a SYNC byte whose
+/// answer fails its CRC). A window without any answer, whole or broken, doesn't count (a receiver gone, the port in
+/// standby: not the cable), and missing answers alone don't either. One rate faster again after QUIET_MS of windows
+/// without a broken answer (the time between windows counts up to GAP_MAX_MS: a port in standby meanwhile adds
+/// nothing), never above the configured rate (the UART's baud_rate). A step up that steps down again before it held
+/// QUIET_MS doubles the next quiet period (QUIET_MAX_MS at most); one that holds resets it. Pinned (adaptive_rate:
+/// false): always the configured rate.
+class ReplyRate {
+ public:
+  static constexpr uint8_t BAD = 4;                           // windows with a broken answer, of the last 32 counted
+  static constexpr uint32_t QUIET_MS = 3600000;               // an hour of telemetry without one: a rate faster
+  static constexpr uint32_t QUIET_MAX_MS = 24u * 3600000u;    // (doubled after failed tries, up to a day)
+  static constexpr uint32_t GAP_MAX_MS = 60000;               // the time between two windows counts this much at most
+
+  void configure(uint8_t top, bool adaptive) {
+    this->top_ = this->rate_ = top < ULTRA_RW_RATES ? top : ULTRA_RW_RATE_1M;
+    this->adaptive_ = adaptive;
+  }
+  uint8_t rate() const { return this->rate_; }
+  uint8_t top() const { return this->top_; }
+  bool adaptive() const { return this->adaptive_; }
+  /// the quiet time a step up needs now (QUIET_MS, doubled after each failed try)
+  uint32_t quiet_needed_ms() const { return this->need_ms_; }
+  uint32_t steps_down() const { return this->downs_; }
+  uint32_t steps_up() const { return this->ups_; }
+
+  /// A window's outcome: its answers matched and its broken answers. True: the rate changed (the next POLL asks for it)
+  bool window(uint32_t now_ms, uint32_t answers, uint32_t broken) {
+    const uint32_t gap = now_ms - this->last_ms_;
+    this->last_ms_ = now_ms;
+    if (!this->adaptive_ || (answers == 0 && broken == 0))
+      return false;
+    const uint32_t dt = this->started_ && gap < GAP_MAX_MS ? gap : (this->started_ ? GAP_MAX_MS : 0);
+    this->started_ = true;
+    this->hist_ = (this->hist_ << 1) | (broken != 0 ? 1u : 0u);
+    this->run_ms_ = sat_add_(this->run_ms_, dt);
+    if (broken != 0) {
+      this->quiet_ms_ = 0;
+      if (__builtin_popcount(this->hist_) < BAD || this->rate_ + 1u >= ULTRA_RW_RATES)
+        return false;
+      if (this->tried_)   // (the step up didn't hold)
+        this->need_ms_ = this->need_ms_ >= QUIET_MAX_MS / 2 ? QUIET_MAX_MS : this->need_ms_ * 2;
+      this->tried_ = false;
+      this->rate_++;
+      this->downs_++;
+      this->changed_();
+      return true;
+    }
+    this->quiet_ms_ = sat_add_(this->quiet_ms_, dt);
+    if (this->tried_ && this->run_ms_ >= QUIET_MS) {   // the step up held
+      this->tried_ = false;
+      this->need_ms_ = QUIET_MS;
+    }
+    if (this->rate_ <= this->top_ || this->quiet_ms_ < this->need_ms_)
+      return false;
+    this->rate_--;
+    this->ups_++;
+    this->tried_ = true;
+    this->changed_();
+    return true;
+  }
+
+ protected:
+  static uint32_t sat_add_(uint32_t a, uint32_t b) { return a > UINT32_MAX - b ? UINT32_MAX : a + b; }
+  void changed_() {
+    this->hist_ = 0;
+    this->run_ms_ = this->quiet_ms_ = 0;
+  }
+  uint32_t hist_{0};             // bit 0: the last counted window had a broken answer
+  uint32_t last_ms_{0}, run_ms_{0}, quiet_ms_{0};   // telemetry time at this rate, and since the last broken answer
+  uint32_t need_ms_{QUIET_MS};
+  uint32_t downs_{0}, ups_{0};
+  uint8_t top_{ULTRA_RW_RATE_1M}, rate_{ULTRA_RW_RATE_1M};
+  bool adaptive_{false}, tried_{false}, started_{false};
+};
+
+// --------------------------------------------------------------------------------- the standby cap (old receivers)
+/// The planned power-offs of a Diff-Power port with receivers that lack standby support (each
+/// power-off and wake is a flash write and a power-on scene on them): at most CAP in 24 h. Once CAP are inside the
+/// last 24 h, hold() keeps the port powered until the oldest of them is 24 h old. Entries older than that are
+/// forgotten at every hold() (it runs every loop), so a millis() wrap can't bring one back.
+class PowerOffCap {
+ public:
+  static constexpr uint8_t CAP = 10;
+  static constexpr uint32_t WINDOW_MS = 24u * 3600u * 1000u;
+  /// a planned power-off now
+  void note(uint32_t now_ms) {
+    uint8_t slot = 0;
+    for (uint8_t k = 0; k < CAP; k++) {   // a free slot, else the oldest
+      if (!(this->used_ & (1u << k))) {
+        slot = k;
+        break;
+      }
+      if (now_ms - this->at_[k] > now_ms - this->at_[slot])
+        slot = k;
+    }
+    this->at_[slot] = now_ms;
+    this->used_ |= static_cast<uint16_t>(1u << slot);
+  }
+  /// CAP planned power-offs within the last 24 h: keep the port powered
+  bool hold(uint32_t now_ms) {
+    uint8_t n = 0;
+    for (uint8_t k = 0; k < CAP; k++) {
+      if (!(this->used_ & (1u << k)))
+        continue;
+      if (now_ms - this->at_[k] >= WINDOW_MS)
+        this->used_ &= static_cast<uint16_t>(~(1u << k));
+      else
+        n++;
+    }
+    return n >= CAP;
+  }
+
+ protected:
+  uint32_t at_[CAP]{};
+  uint16_t used_{0};
+};
+
+
+// ------------------------------------------------------------------------------------------------- the port's load
+/// A Diff-Power sender port: its receivers' bus-side input currents against the port's limit (declared current rating),
+/// the power at the sender, and the cable along the chain (from each receiver's bus voltage and the current through
+/// each segment: segment k carries the input currents of receivers k..N). Updated after every response window.
+/// A receiver that doesn't answer makes the port values incomplete (complete() false): the current and power without
+/// its share, no cable loss. The peak : each receiver's highest ~100 ms input current since its ENERGY read
+/// before (about a minute), added up: at most what the port carried (the peaks needn't coincide).
+class PortMonitor {
+ public:
+  struct Config {
+    float limit_a{2.25f};        // the port's current limit
+    float supply_v{NAN};         // the sender's voltage; NAN: learned (receiver 1's highest bus voltage)
+    float warning_pct{80.0f};    // a warning (the Status) from this load on
+    float problem_pct{90.0f};    // a problem after this load lasted problem_ms (100 %: at once)
+    uint32_t problem_ms{30000};
+  };
+  static constexpr float RESISTANCE_MIN_A = 0.3f;   // a segment's resistance only from this current on (10 mV steps)
+  static constexpr float RESISTANCE_ALPHA = 0.2f;   // its smoothing per window
+
+  void configure(const Config &c) { this->cfg_ = c; }
+  const Config &config() const { return this->cfg_; }
+
+  void update(uint32_t now_ms, const TelemetryPoller &p) {
+    const uint16_t n = p.receivers();
+    if (this->drop_.size() != n) {
+      this->drop_.assign(n, NAN);
+      this->res_.assign(n, NAN);
+      this->v_.assign(n, NAN);
+      this->i_.assign(n, NAN);
+    }
+    std::vector<float> &v = this->v_, &i = this->i_;   // (every one written below: no heap per window)
+    float total = 0.0f, rx_power = 0.0f, peak = 0.0f;
+    bool any = false, any_power = false, any_peak = false;
+    this->complete_ = true;
+    this->missing_ = -1;
+    for (uint16_t k = 0; k < n; k++) {
+      const bool a = p.answering(k);
+      const ReceiverData &d = p.data(k);
+      v[k] = a ? telemetry_value(d, TV_SUPPLY_VOLTAGE) : NAN;
+      i[k] = a ? telemetry_value(d, TV_INPUT_CURRENT) : NAN;
+      if (std::isnan(v[k]) || std::isnan(i[k])) {
+        this->complete_ = false;
+        if (this->missing_ < 0)
+          this->missing_ = k;
+      }
+      if (!std::isnan(i[k])) {
+        total += i[k];
+        any = true;
+      }
+      const float pk = a ? telemetry_value(d, TV_CURRENT_PEAK) : NAN;
+      if (!std::isnan(pk))
+        any_peak = true;
+      if (!std::isnan(pk) || !std::isnan(i[k]))
+        peak += std::isnan(pk) ? i[k] : std::isnan(i[k]) || pk > i[k] ? pk : i[k];
+      const float w = a ? telemetry_value(d, TV_INPUT_POWER) : NAN;
+      if (!std::isnan(w)) {
+        rx_power += w;
+        any_power = true;
+      }
+    }
+    // the sender's voltage: configured, else learned (receiver 1 at its highest: the least load on the first cable)
+    if (std::isnan(this->cfg_.supply_v) && n > 0 && !std::isnan(v[0]))
+      this->learned_v_ = std::isnan(this->learned_v_) || v[0] > this->learned_v_ ? v[0] : this->learned_v_;
+    const float vs = this->supply_v();
+    this->current_ = any ? total : NAN;
+    this->load_ = any ? total / this->cfg_.limit_a * 100.0f : NAN;
+    this->peak_ = any_peak ? peak : NAN;
+    this->power_ = any && !std::isnan(vs) ? vs * total : any_power ? rx_power : NAN;
+    // the cable: segment k from receiver k-1 (the sender for k = 0) to receiver k
+    this->loss_ = NAN;
+    float through = total, loss = 0.0f, prev = vs;
+    for (uint16_t k = 0; k < n; k++) {
+      this->drop_[k] = !std::isnan(vs) && !std::isnan(v[k]) ? vs - v[k] : NAN;
+      if (this->complete_ && !std::isnan(prev)) {
+        const float dv = prev - v[k];
+        loss += dv * through;
+        if (through >= RESISTANCE_MIN_A && dv >= 0.0f) {
+          const float r = dv / through;
+          this->res_[k] = std::isnan(this->res_[k]) ? r : this->res_[k] + RESISTANCE_ALPHA * (r - this->res_[k]);
+        }
+      }
+      prev = v[k];
+      if (this->complete_)
+        through -= i[k];
+    }
+    if (this->complete_ && !std::isnan(vs) && n > 0)
+      this->loss_ = loss > 0.0f ? loss : 0.0f;
+    // the load: a warning, a problem at 100 % or after problem_ms at problem_pct
+    const bool high = !std::isnan(this->load_) && this->load_ >= this->cfg_.problem_pct;
+    if (high && !this->high_)
+      this->high_since_ = now_ms;
+    this->high_ = high;
+    this->sustained_ = high && now_ms - this->high_since_ >= this->cfg_.problem_ms;
+  }
+
+  float current_a() const { return this->current_; }
+  float load_pct() const { return this->load_; }
+  /// the receivers' peaks since their ENERGY reads before, added up (A, and against the limit; NAN: none reports one)
+  float peak_a() const { return this->peak_; }
+  float peak_load_pct() const { return std::isnan(this->peak_) ? NAN : this->peak_ / this->cfg_.limit_a * 100.0f; }
+  /// peaks over the limit while the average is below the warning
+  bool peaks() const { return !this->warning() && !std::isnan(this->peak_) && this->peak_load_pct() >= 100.0f; }
+  /// at the sender: its voltage x the port current; without a sender voltage the receivers' power together
+  float power_w() const { return this->power_; }
+  float cable_loss_w() const { return this->loss_; }
+  float cable_loss_pct() const {
+    return std::isnan(this->loss_) || std::isnan(this->power_) || this->power_ <= 0.0f ? NAN
+                                                                                       : this->loss_ / this->power_ * 100.0f;
+  }
+  float supply_v() const { return std::isnan(this->cfg_.supply_v) ? this->learned_v_ : this->cfg_.supply_v; }
+  bool complete() const { return this->complete_; }
+  /// the first receiver without a current or voltage (-1: none)
+  int missing() const { return this->missing_; }
+  bool warning() const { return !std::isnan(this->load_) && this->load_ >= this->cfg_.warning_pct; }
+  bool over() const { return !std::isnan(this->load_) && this->load_ >= 100.0f; }
+  bool problem() const { return this->over() || this->sustained_; }
+  /// how long the load has been at problem_pct or more (ms; 0: it isn't)
+  uint32_t high_ms(uint32_t now_ms) const { return this->high_ ? now_ms - this->high_since_ : 0; }
+  /// the sender's voltage minus receiver k's (V; NAN: not known)
+  float drop_v(uint16_t k) const { return k < this->drop_.size() ? this->drop_[k] : NAN; }
+  /// the cable segment before receiver k, smoothed (ohm; NAN until it carried RESISTANCE_MIN_A)
+  float resistance(uint16_t k) const { return k < this->res_.size() ? this->res_[k] : NAN; }
+
+ protected:
+  Config cfg_{};
+  float learned_v_{NAN};
+  float current_{NAN}, load_{NAN}, power_{NAN}, loss_{NAN}, peak_{NAN};
+  bool complete_{false};
+  int missing_{-1};
+  bool high_{false}, sustained_{false};
+  uint32_t high_since_{0};
+  std::vector<float> drop_, res_;
+  std::vector<float> v_, i_;   // (update(): the window's voltages and currents, kept: no heap per window)
+};
+
+/// A load in 5 % steps (the texts: they change only with a step, not with every reading)
+inline unsigned load_step5(float pct) { return pct <= 0.0f ? 0u : static_cast<unsigned>((pct + 2.5f) / 5.0f) * 5u; }
+
+/// The port's status, for its chip: "95 % load" (from the warning on; in 5 % steps), "No answer", the worst receiver
+/// problem, "Peaks 105 %", "2 limiting", or "OK".
+inline std::string port_status(const PortMonitor &m, const TelemetryPoller &p) {
+  char b[24];
+  if (m.warning()) {
+    snprintf(b, sizeof(b), "%u %% load", load_step5(m.load_pct()));
+    return b;
+  }
+  ReceiverStatus worst = RS_OK;
+  unsigned limiting = 0;
+  for (uint16_t k = 0; k < p.receivers(); k++) {
+    const ReceiverStatus s = receiver_status(p.data(k), p.answering(k), 0, p.dip_warning());
+    worst = s < worst ? s : worst;
+    limiting += s == RS_LIMITING;
+  }
+  if (receiver_status_problem(worst))
+    return receiver_status_name(worst);
+  if (m.peaks()) {
+    snprintf(b, sizeof(b), "Peaks %u %%", load_step5(m.peak_load_pct()));
+    return b;
+  }
+  if (limiting) {
+    snprintf(b, sizeof(b), "%u limiting", limiting);
+    return b;
+  }
+  return "OK";
+}
+
+/// The port's plain line: near / over its limit, peaks over it, or a receiver missing from its values, or "OK.". Its
+/// numbers rounded (0.1 A, 5 %), no running duration: it changes with its meaning only (Home Assistant records every
+/// change, and shows since when).
+inline std::string port_status_detail(const PortMonitor &m) {
+  char b[200];
+  const float limit = m.config().limit_a;
+  if (m.warning()) {
+    std::string t;
+    snprintf(b, sizeof(b), "%.1f A of %.2f A (%u %%)", m.current_a(), limit, load_step5(m.load_pct()));
+    t = b;
+    if (m.problem())
+      t += ". The port may trip: lower the brightness or move a receiver to a quieter port.";
+    else
+      t += ": near the port's limit.";
+    return t;
+  }
+  if (m.peaks()) {
+    snprintf(b, sizeof(b), "Peaks up to %.1f A (%u %%) in the last minute: short peaks are fine; if they last, the "
+             "port may trip.", m.peak_a(), load_step5(m.peak_load_pct()));
+    return b;
+  }
+  if (!m.complete() && m.missing() >= 0) {
+    snprintf(b, sizeof(b), "Receiver %d doesn't report: the port's current and power are without it.",
+             m.missing() + 1);
+    return b;
+  }
+  return "OK.";
+}
+
+/// The port's 36 V rules (Port v1.1; the manual's counting rules, here checked from what the receivers report): at
+/// most RX36_MAX_PER_PORT receivers on 36 V strips (LED supply of RX36_LED_V or more) per port, and each of them must
+/// keep RX36_MIN_BUS_V at the receiver at full load (CableDrop: Z x its full-load current), which sets the cable
+/// (50 m on a 48 V supply, 100 m on 55 V). With the sender's configured supply voltage under RX36_MIN_BUS_V no 36 V
+/// strip can work. text(): "OK." or what is broken; problem(): a rule is broken. Not checked while the port is in
+/// standby or before a receiver's LED supply is read. A rule 2 flag clears only RELEASE_V above its minimum.
+class PortLoadRules {
+ public:
+  static constexpr float RELEASE_V = 0.5f;
+
+  void update(const TelemetryPoller &p, const PortMonitor &m, bool standby) {
+    this->problem_ = false;
+    if (standby) {
+      this->low_ = false;
+      this->text_ = "Not checked (port in standby).";
+      return;
+    }
+    unsigned n36 = 0;
+    bool any = false;
+    int worst = -1;
+    float worst_v = NAN;
+    for (uint16_t k = 0; k < p.receivers(); k++) {
+      if (!p.answering(k))
+        continue;
+      const ReceiverData &d = p.data(k);
+      any = any || (d.have_energy && d.vb_10mv != 0xFFFF);
+      if (!receiver_is_36v(d))
+        continue;
+      n36++;
+      const CableDrop c = cable_drop(d);
+      if (c.known && (worst < 0 || c.full_v < worst_v)) {
+        worst = k;
+        worst_v = c.full_v;
+      }
+    }
+    if (!any) {
+      this->low_ = false;
+      this->text_ = "Not checked yet.";
+      return;
+    }
+    if (worst >= 0 && worst_v < RX36_MIN_BUS_V)
+      this->low_ = true;
+    else if (worst < 0 || worst_v >= RX36_MIN_BUS_V + RELEASE_V)
+      this->low_ = false;
+    const float supply = m.config().supply_v;   // (the configured one: NAN when the port learns it)
+    std::string t;
+    char b[160];
+    auto add = [&t](const std::string &s) { t += (t.empty() ? "" : " ") + s; };
+    if (n36 > RX36_MAX_PER_PORT) {
+      snprintf(b, sizeof(b), "36 V: at most %u receivers per port (%u are at 36 V).",
+               static_cast<unsigned>(RX36_MAX_PER_PORT), n36);
+      add(b);
+    }
+    if (n36 != 0 && !std::isnan(supply) && supply < RX36_MIN_BUS_V) {
+      snprintf(b, sizeof(b), "36 V strips need at least %.0f V at the receiver; the sender's supply is %.0f V.",
+               RX36_MIN_BUS_V, supply);
+      add(b);
+    }
+    if (this->low_ && worst >= 0) {
+      snprintf(b, sizeof(b), "36 V at full load: receiver %d would get %.1f V (needs %.0f V).", worst + 1,
+               std::floor(worst_v * 10.0f) / 10.0f,
+               RX36_MIN_BUS_V);
+      add(b);
+      add(std::isnan(supply)    ? "Keep the 36 V cable to 50 m on a 48 V supply, 100 m on 55 V."
+          : supply >= 54.0f     ? "Keep the 36 V cable to 100 m on this 55 V supply."
+                                : "Keep the 36 V cable to 50 m on this 48 V supply.");
+    }
+    this->problem_ = !t.empty();
+    this->text_ = t.empty() ? "OK." : t;
+  }
+  bool problem() const { return this->problem_; }
+  const std::string &text() const { return this->text_; }
+
+ protected:
+  bool problem_{false}, low_{false};
+  std::string text_{"Not checked yet."};
+};
+
+/// A light's estimated energy (Wh): the mean of two power estimates over the time between them; a gap of more than
+/// MAX_GAP_MS (no answers, the supply off) isn't counted. Starts at 0 (Home Assistant's total_increasing).
+struct EnergyCounter {
+  static constexpr uint32_t MAX_GAP_MS = 60000;
+  double wh{0.0};
+  float last_w{NAN};
+  uint32_t last_ms{0};
+  void add(float w, uint32_t now_ms) {
+    if (!std::isnan(w) && !std::isnan(this->last_w) && now_ms - this->last_ms <= MAX_GAP_MS)
+      this->wh += (this->last_w + w) * 0.5 * (now_ms - this->last_ms) / 3600000.0;
+    this->last_w = w;
+    this->last_ms = now_ms;
+  }
+};
+
+// ------------------------------------------------------------------------------------------- current calibration
+/// How a calibration test ended (ULTRA_CA_END_*): "OK", "Stopped: a trip", ...
+inline const char *calibration_end_text(uint8_t end) {
+  switch (end) {
+    case ULTRA_CA_END_COMPLETE:
+      return "OK";
+    case ULTRA_CA_END_TRIP:
+      return "Stopped: a trip";
+    case ULTRA_CA_END_LIMIT:
+      return "Stopped: the current limit";
+    case ULTRA_CA_END_SUPPLY:
+      return "Stopped: a supply dip";
+    case ULTRA_CA_END_NOLOAD:
+      return "Not taken: no load";
+    case ULTRA_CA_END_FLAT:
+      return "Not taken: no change";
+    default:
+      return "Stopped";
+  }
+}
+/// What its channel currents and connected load come from (CALIBRATION byte 1, bits 0-3)
+inline const char *calibration_model_text(uint8_t model) {
+  return model == 2 ? "Calibrated" : model == 1 ? "Learned" : model == 0 ? "No model" : "Unknown";
+}
+
+/// The hub's record of a position's current calibration, kept on the ESP32 across restarts (a board forgets when its
+/// last test ran at a power cut, and has no clock): the board it is (UID16), when its last complete test ended (unix
+/// s; 0: not known, no clock then), how its last test ended (ULTRA_CA_END_*). 8 bytes: a line's records are one blob.
+struct CalRecord {
+  uint32_t ok_unix{0};
+  uint16_t uid16{0};
+  uint8_t end{ULTRA_CA_END_COMPLETE};
+  uint8_t flags{0};   // CR_BOARD: uid16 is the board's; CR_TESTED: end is a test's
+};
+static constexpr uint8_t CR_BOARD = 1, CR_TESTED = 2;
+
+/// Each receiver's last current calibration (wiki: Ultra-Current), from its CALIBRATION page and the hub's records:
+/// what its Calibration, Current model and Last calibrated show. Pure (host-tested); the hub stores the records.
+class CalibrationLog {
+ public:
+  void init(size_t receivers) {
+    this->rec_.assign(receivers, CalRecord{});
+    this->seen_.assign(receivers, Seen{});
+  }
+  size_t size() const { return this->rec_.size(); }
+  /// the records as stored (a line's blob, size() of them), and back (from flash: before the first observe)
+  const CalRecord *records() const { return this->rec_.data(); }
+  void load(const CalRecord *r, size_t n) {
+    for (size_t i = 0; i < n && i < this->rec_.size(); i++)
+      this->rec_[i] = r[i];
+  }
+  const CalRecord &record(uint16_t i) const { return this->rec_[i]; }
+
+  /// Receiver i's CALIBRATION page was read (its board's UID16; now_unix 0: no clock yet). True: its record changed
+  /// (store it). A complete test is new when it is younger than the one seen before (its age grows with the hub's
+  /// time; the boards' clocks within 3 %), or, first seen in this run of the ESP32, when it ended at another time
+  /// than the record's (its time unknown: once the clock is set).
+  bool observe(uint16_t i, const ReceiverData &d, uint16_t uid16, uint32_t now_ms, uint32_t now_unix) {
+    if (i >= this->rec_.size() || !d.have_calibration)
+      return false;
+    CalRecord &r = this->rec_[i];
+    Seen &s = this->seen_[i];
+    const CalRecord was = r;
+    if (!(r.flags & CR_BOARD) || r.uid16 != uid16) {   // another board at this position: a record of its own
+      r = CalRecord{};
+      r.uid16 = uid16;
+      r.flags = CR_BOARD;
+      s = Seen{};
+    }
+    if (d.cal_end != ULTRA_CA_END_COMPLETE) {   // its last test stopped (it says so until its power-up)
+      r.end = d.cal_end;
+      r.flags |= CR_TESTED;
+    } else if (d.cal_age_s < CA_AGE_NONE) {    // a complete test, cal_age_s ago (this power-up)
+      const uint32_t age = d.cal_age_s;
+      const uint32_t ended = now_unix > age ? now_unix - age : 0;
+      bool fresh;
+      if (s.age_s < CA_AGE_NONE) {
+        const uint32_t el = (now_ms - s.ms) / 1000;
+        fresh = age + 5 + el / 16 < s.age_s + el;
+      } else if (!(r.flags & CR_TESTED) || r.end != ULTRA_CA_END_COMPLETE || r.ok_unix == 0) {
+        fresh = true;   // (the record has no complete test since a stopped one, or not its time)
+      } else if (ended == 0) {
+        return std::memcmp(&was, &r, sizeof(r)) != 0;   // the record's test or a newer one: once the clock is set
+      } else {
+        fresh = (ended > r.ok_unix ? ended - r.ok_unix : r.ok_unix - ended) > 60 + age / 16;
+      }
+      s.age_s = age;
+      s.ms = now_ms;
+      if (fresh) {
+        r.end = ULTRA_CA_END_COMPLETE;
+        r.flags |= CR_TESTED;
+        r.ok_unix = ended;
+      } else if (r.ok_unix == 0) {
+        r.ok_unix = ended;   // (its time, now that the clock is set)
+      }
+    } else {
+      s = Seen{};   // no complete test since its power-up
+    }
+    return std::memcmp(&was, &r, sizeof(r)) != 0;
+  }
+  /// How its last test ended ("OK", "Stopped: a trip", ...; "Not tested"): its own word for a test since its
+  /// power-up, else the record's, else a stored test's (complete: a stopped test stores nothing). "": not read yet.
+  std::string result(uint16_t i, const ReceiverData &d) const {
+    if (!d.have_calibration)
+      return "";
+    if (d.cal_end != ULTRA_CA_END_COMPLETE || d.cal_age_s < CA_AGE_NONE)
+      return calibration_end_text(d.cal_end);
+    if (i < this->rec_.size() && (this->rec_[i].flags & CR_TESTED))
+      return calibration_end_text(this->rec_[i].end);
+    return d.cal_levels != 0 ? "OK" : "Not tested";
+  }
+  /// When its last complete test ended (unix s); 0: not known (none seen, or no clock then)
+  uint32_t last_unix(uint16_t i) const { return i < this->rec_.size() ? this->rec_[i].ok_unix : 0; }
+
+ protected:
+  struct Seen {   // its last complete test as last read in this run of the ESP32
+    uint32_t age_s{CA_AGE_NONE}, ms{0};
+  };
+  std::vector<CalRecord> rec_;
+  std::vector<Seen> seen_;
+};
+
+}  // namespace esphome::ultra_line

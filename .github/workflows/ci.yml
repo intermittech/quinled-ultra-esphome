@@ -1,0 +1,158 @@
+# Host tests, schema tests and ESP32 compiles of the Dig2Analog-Plus-5ch components, on pinned versions.
+# The host tests run against the pinned protocol (PROTOCOL_REF) and receiver firmware (FIRMWARE_REF): both required,
+# never skipped (tests/receiver_dependency.py); tests/check_pins.py fails when one pin moves alone. Local run:
+# python tests/run_all.py (the same host steps).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.13"
+  ESPHOME_VERSION: "2026.9.1"   # brings ESP-IDF 5.5.5 for the esp-idf framework
+  ZIGLANG_VERSION: "0.16.0"     # the host tests' C / C++ compiler
+  PROTOCOL_REF: a4c3f8af944b09b69c719261ab503179429fdf83          # intermittech/quinled-ultra-protocol (ultra_protocol.h and the vendored sender sources must match it)
+  FIRMWARE_REF: 1b38a628fd9345e609f3c49644e700e0af8c590c          # intermittech/quinled-ultra-firmware (the receiver contracts; it must pin the same PROTOCOL_REF)
+  ULTRA_TEST_JOBS: "4"          # parallel compiles inside a host test
+
+jobs:
+  host:
+    name: Host and schema tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: quinled-ultra-esphome
+      - uses: actions/checkout@v7
+        with:
+          repository: intermittech/quinled-ultra-protocol
+          ref: ${{ env.PROTOCOL_REF }}
+          path: quinled-ultra-protocol
+      - uses: actions/checkout@v7
+        with:
+          repository: intermittech/quinled-ultra-firmware
+          ref: ${{ env.FIRMWARE_REF }}
+          path: quinled-ultra-firmware
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install ESPHome and zig
+        run: pip install "esphome==${ESPHOME_VERSION}" "ziglang==${ZIGLANG_VERSION}"
+      - name: Pin consistency (PROTOCOL_REF, FIRMWARE_REF, the firmware's protocol pin, header copies, vendored sender)
+        working-directory: quinled-ultra-esphome
+        run: python tests/check_pins.py
+      - name: Ultra host test (scheduler, frames, the board engine)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_host_test.py
+      - name: Analog host effects (SET cadence, fades, stored levels, reserved-opcode negative control)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_analog_effects_test.py
+      - name: Stream host test (glide of streamed steps)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_stream_host_test.py
+      - name: Change log test (light changes in the log: texts, a line a second per board, warnings, idle line)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_change_log_test.py
+      - name: Lifecycle test (light setup, port update entity, hub loop / transmit / line lease)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_lifecycle_test.py
+      - name: Production wire-3 contract (targets, scopes, descriptors, scenes, rates)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_contract_test.py
+      - name: Telemetry test (the return channel's hub side against a modelled receiver chain)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_telemetry_test.py
+      - name: Telemetry contract test (the hub's polls through the receiver firmware's own answer path)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_telemetry_contract_test.py
+      - name: Ledger test (the lifetime ledger against its frozen reference, stored-copy faults, long runs)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_ledger_test.py
+      - name: Telemetry fuzz test (random, malformed and boundary answers; every text within 255 characters)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_telemetry_fuzz.py
+      - name: Diff-Power test (the port power manager's core)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_diffpower_test.py
+      - name: Diff-Power config test (partitions at any depth, wake targets)
+        working-directory: quinled-ultra-esphome
+        run: python tests/diffpower_config_test.py
+      - name: ABI-3 update codecs, manifest and image checks
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_update_abi3_test.py
+      - name: Port update (topology ledger, tuple-aware manifest, per-node plan, job report, artifact source)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_port_update_test.py
+      - name: Port job glue against the sender library's port job (and the vendored sender sources against the pin)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_port_job_test.py
+      - name: PARLIO test (16 lanes, the shared-UART telemetry scheduling, negative controls, the render's cost)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_parlio_test.py
+      - name: Diff-Power Ultra Receiver Digital-Medium test (PIXEL_FX, the pixel CONFIG, page 0x11, the light's own code, the catalogue copy, the digital port's wire and the receiver's delay line)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ur_digital_m_test.py
+      - name: Chain reset floor (the reset of a normal line whose first board is a Diff-Power-UR-Digital-M)
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_chain_reset_test.py
+      - name: Schema tests
+        working-directory: quinled-ultra-esphome
+        run: python tests/validate_configs.py
+      - name: Power model entities and text format
+        working-directory: quinled-ultra-esphome
+        run: python tests/run_ultra_power_model_test.py
+
+  compile:
+    name: Compile ${{ matrix.config }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - ultra/ultra-example.yaml
+          - ultra/ultra-strip.yaml
+          - ultra/ultra-telemetry.yaml
+          - ultra/ultra-p4-telemetry.yaml
+          - ultra/ultra-diffpower.yaml
+          - ultra/ur-digital-m.yaml
+          - ultra/ultra-chain.yaml
+          - ultra/ultra-p4-parlio.yaml
+          - ultra/ultra-p4-parlio-lights.yaml
+          - ultra/ultra-p4-parlio-ports.yaml
+          - examples-local/quinled-dig2analog-plus-rgbcct.yaml
+          - examples-local/quinled-dig2analog-plus-downlights.yaml
+          - examples-local/quinled-dig2analog-plus-candle-niche.yaml
+          - examples-local/quinled-dig2analog-plus-strip.yaml
+          - examples-local/quinled-dig2analog-plus-strip-partition.yaml
+          - examples-local/quinled-dig2analog-plus-line-update.yaml
+          - examples-local/quinled-diff-power-ultra-sender.yaml
+          - examples-local/quinled-diff-power-ur-digital-m.yaml
+          - examples-local/quinled-diff-power-ultra-chain.yaml
+    env:
+      ESPHOME_ESP_IDF_PREFIX: /home/runner/esphome-idf   # ESPHome's ESP-IDF install, kept between runs
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/cache@v6
+        with:
+          path: /home/runner/esphome-idf
+          key: esp-idf-esphome-${{ env.ESPHOME_VERSION }}
+      - name: Install ESPHome
+        run: pip install "esphome==${ESPHOME_VERSION}"
+      - name: Configurations with the local components
+        run: |
+          python tests/local_examples.py
+          python tests/make_ultra_compile_config.py
+      - name: Compile
+        shell: bash   # with pipefail: the compile's exit status, not tee's
+        run: esphome compile "tests/build/${{ matrix.config }}" 2>&1 | tee compile.log
+      - name: RAM and flash
+        if: always()
+        run: |
+          echo "### ${{ matrix.config }}" >> "$GITHUB_STEP_SUMMARY"
+          grep -E "^(RAM|Flash):" compile.log | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY" || true

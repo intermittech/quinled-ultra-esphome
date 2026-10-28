@@ -1,0 +1,7695 @@
+{
+ "catalogue_version": 4,
+ "note": "ids are never reused; 1-127 official, 128-255 custom. Every effect takes a palette: palette 254 = colour 1 -> 2 -> 3, 255 = Effect default: the effect's default palette, or its own colours when default_palette is \"own\". colors = how many of c1..c3 the effect uses, color_slots = their labels by position (null: that slot is unused); speed / intensity: true when used; palette_slots / palette_note (the ESPHome catalogue): the colour slots it still uses while a palette is chosen, and what the palette colours; the labels say what they do; custom1 / custom2: null or a label. A retired id would stay with retired: true. V407 catalogue: ids 37-114 and palettes 31-42 added 2026-10-22 (design data under \"design\").",
+ "palette_special": {
+  "colors": 254,
+  "default": 255
+ },
+ "effects": [
+  {
+   "id": 1,
+   "name": "Solid",
+   "summary": "One colour; fades smoothly to another (the transition).",
+   "colors": 1,
+   "color_slots": [
+    "Colour",
+    null,
+    null
+   ],
+   "speed": false,
+   "speed_label": null,
+   "intensity": false,
+   "intensity_label": null,
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the palette laid end to end along the strip, standing still.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 255,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Calm"
+  },
+  {
+   "id": 2,
+   "name": "Breathe",
+   "summary": "The colour swells and fades like breathing.",
+   "colors": 2,
+   "color_slots": [
+    "Colour",
+    "Low colour",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Rate",
+   "intensity": true,
+   "intensity_label": "Depth",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the palette laid along the strip breathes in and out as one.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 255,
+    "palette": 255,
+    "c1": [
+     255,
+     140,
+     30
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Calm"
+  },
+  {
+   "id": 3,
+   "name": "Colorloop",
+   "summary": "The whole strip cycles through the hues.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Rate",
+   "intensity": true,
+   "intensity_label": "Saturation",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the whole strip cycles through the palette; Saturation still whitens it.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 255,
+    "palette": 255,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Colour"
+  },
+  {
+   "id": 4,
+   "name": "Rainbow",
+   "summary": "A rainbow moves along the strip.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Size (128: one rainbow per strip, doubling every 32)",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the palette moves along the strip at the rainbow's pace.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 255,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Colour"
+  },
+  {
+   "id": 5,
+   "name": "Palette",
+   "summary": "The chosen palette moves along the strip.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Size (128: one palette per strip, doubling every 32)",
+   "default_palette_id": 10,
+   "palette_slots": [],
+   "palette_note": "With a palette: the palette runs along the strip and scrolls slowly.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 10,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Colour"
+  },
+  {
+   "id": 6,
+   "name": "Colorwaves",
+   "summary": "Slow, ever-changing waves of palette colour.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Wave density",
+   "default_palette_id": 10,
+   "palette_slots": [],
+   "palette_note": "With a palette: the palette sweeps back and forth along the strip in waves of brightness.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 10,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "FastLED ColorWavesWithPalettes (Mark Kriegsman), MIT",
+   "ha_group": "Colour"
+  },
+  {
+   "id": 7,
+   "name": "Pride 2015",
+   "summary": "Animated, ever-changing rainbows (not palette-based).",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Wave density",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the bright waves run through the palette instead of the rainbow.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 255,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "FastLED Pride2015 (Mark Kriegsman), MIT",
+   "ha_group": "Colour"
+  },
+  {
+   "id": 8,
+   "name": "Sinelon",
+   "summary": "A dot sweeps back and forth, trailing a fading tail.",
+   "colors": 1,
+   "color_slots": [
+    null,
+    "Background",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Trail (higher: shorter tail)",
+   "default_palette_id": 0,
+   "palette_slots": [
+    "Background"
+   ],
+   "palette_note": "With a palette: the swinging dot slowly cycles through the palette (about 11 s a round).",
+   "custom1": "Dots (0-127: one, 128-255: two)",
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 0,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "FastLED DemoReel100 sinelon (Mark Kriegsman, MIT), tail computed instead of faded",
+   "ha_group": "Sparkle"
+  },
+  {
+   "id": 9,
+   "name": "Twinklefox",
+   "summary": "Twinkling holiday lights that fade in and out.",
+   "colors": 1,
+   "color_slots": [
+    null,
+    "Background",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Density",
+   "default_palette_id": 3,
+   "palette_slots": [
+    "Background"
+   ],
+   "palette_note": "With a palette: each twinkle takes a palette colour, a new one each time it lights.",
+   "custom1": "Incandescent cooling (0-127: on, 128-255: off)",
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 150,
+    "palette": 3,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "FastLED TwinkleFOX (Mark Kriegsman), MIT",
+   "ha_group": "Sparkle"
+  },
+  {
+   "id": 10,
+   "name": "Colortwinkles",
+   "summary": "Pixels light up in random palette colours and fade away.",
+   "colors": 1,
+   "color_slots": [
+    null,
+    "Background",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Density",
+   "default_palette_id": 10,
+   "palette_slots": [
+    "Background"
+   ],
+   "palette_note": "With a palette: each twinkle takes a random palette colour.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 100,
+    "palette": 10,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Sparkle"
+  },
+  {
+   "id": 11,
+   "name": "Candle",
+   "summary": "The whole strip flickers like a candle.",
+   "colors": 2,
+   "color_slots": [
+    "Flame",
+    "Dim colour",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Flicker rate",
+   "intensity": true,
+   "intensity_label": "Flicker amount",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the palette laid along the strip flickers as one flame.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 255,
+    "c1": [
+     255,
+     140,
+     30
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Fire & candle"
+  },
+  {
+   "id": 12,
+   "name": "Candle Multi",
+   "summary": "Every pixel flickers on its own like a candle.",
+   "colors": 2,
+   "color_slots": [
+    "Flame",
+    "Dim colour",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Flicker rate",
+   "intensity": true,
+   "intensity_label": "Flicker amount",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: every pixel flickers on its own, in its colour of the palette laid along the strip.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 255,
+    "c1": [
+     255,
+     140,
+     30
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Fire & candle"
+  },
+  {
+   "id": 13,
+   "name": "Aurora",
+   "summary": "Drifting curtains of northern-light colour.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Curtain size",
+   "default_palette_id": 17,
+   "palette_slots": [],
+   "palette_note": "With a palette: which of the two drifting curtains leads picks the palette colour.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 17,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Calm"
+  },
+  {
+   "id": 14,
+   "name": "Blends",
+   "summary": "A smooth rippling wash of the palette's colours that drifts along.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Ripple tightness (higher: shorter ripples)",
+   "default_palette_id": 10,
+   "palette_slots": [],
+   "palette_note": "With a palette: the palette ripples back and forth along the strip and drifts through.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 190,
+    "palette": 10,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Calm"
+  },
+  {
+   "id": 15,
+   "name": "Flow",
+   "summary": "Zones that each show the palette, flowing in turn in opposite directions.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Zones (higher: more, shorter zones)",
+   "default_palette_id": 0,
+   "palette_slots": [],
+   "palette_note": "With a palette: each zone shows the whole palette, neighbours flowing in opposite ways.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 0,
+    "c1": [
+     0,
+     0,
+     0
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own, from the described behaviour",
+   "ha_group": "Calm"
+  },
+  {
+   "id": 16,
+   "name": "Fire 2012",
+   "summary": "Flames rising from the start of the strip.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Sparking",
+   "default_palette_id": 14,
+   "palette_slots": [],
+   "palette_note": "With a palette: the heat runs through the palette, coolest to hottest.",
+   "custom1": "Cooling",
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 120,
+    "palette": 14,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 85,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 1,
+   "origin": "FastLED Fire2012 (Mark Kriegsman), MIT",
+   "ha_group": "Fire & candle"
+  },
+  {
+   "id": 17,
+   "name": "Gradient",
+   "summary": "Colour 1 to colour 2 to colour 3 across the strip.",
+   "colors": 3,
+   "color_slots": [
+    "Colour 1",
+    "Colour 2",
+    "Colour 3"
+   ],
+   "speed": true,
+   "speed_label": "Scroll speed (0: still)",
+   "intensity": true,
+   "intensity_label": "Repeats (0: one gradient, no loop)",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the palette runs across the strip instead of colours 1-2-3, repeating and scrolling as set.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 0,
+    "intensity": 0,
+    "palette": 255,
+    "c1": [
+     255,
+     0,
+     0
+    ],
+    "c2": [
+     255,
+     160,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     255
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Colour"
+  },
+  {
+   "id": 18,
+   "name": "Pacifica",
+   "summary": "Gentle blue-green ocean waves.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Whitecaps",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the waves take the palette's colours, dark troughs to bright crests; the whitecaps stay white.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 255,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "FastLED Pacifica (Mark Kriegsman, Mary Corey March), MIT",
+   "ha_group": "Calm"
+  },
+  {
+   "id": 19,
+   "name": "Sunrise",
+   "summary": "A slow wake-up: dark, red, orange, warm white.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Duration (10 s .. 1 h)",
+   "intensity": true,
+   "intensity_label": "Spread along the strip",
+   "default_palette_id": 19,
+   "palette_slots": [],
+   "palette_note": "With a palette: each pixel moves from the palette's start to its end as the sun rises.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 0,
+    "palette": 19,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Seasonal"
+  },
+  {
+   "id": 20,
+   "name": "Sunset",
+   "summary": "The wake-up backwards: warm white to dark, and it stays dark.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Duration (10 s .. 1 h)",
+   "intensity": true,
+   "intensity_label": "Spread along the strip",
+   "default_palette_id": 19,
+   "palette_slots": [],
+   "palette_note": "With a palette: each pixel moves from the palette's end back to its start as it sets.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 0,
+    "palette": 19,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Seasonal"
+  },
+  {
+   "id": 21,
+   "name": "Glitter",
+   "summary": "A palette backdrop with short sparkles.",
+   "colors": 1,
+   "color_slots": [
+    "Sparkle",
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Sparkle density",
+   "default_palette_id": 0,
+   "palette_slots": [
+    "Sparkle"
+   ],
+   "palette_note": "With a palette: the palette drifts slowly along the strip, twice over; the sparkles stay Sparkle.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 40,
+    "palette": 0,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Sparkle"
+  },
+  {
+   "id": 22,
+   "name": "Meteor",
+   "summary": "A meteor with a shimmering tail runs along the strip.",
+   "colors": 2,
+   "color_slots": [
+    "Meteor",
+    "Background",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Tail length",
+   "default_palette": "own",
+   "palette_slots": [
+    "Background"
+   ],
+   "palette_note": "With a palette: the head takes the palette's last colour and the tail runs back through it to the first.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 255,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Sparkle"
+  },
+  {
+   "id": 23,
+   "name": "Fairy",
+   "summary": "Sparse, soft, slow twinkles like fairy lights.",
+   "colors": 1,
+   "color_slots": [
+    null,
+    "Background",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Density",
+   "default_palette_id": 18,
+   "palette_slots": [
+    "Background"
+   ],
+   "palette_note": "With a palette: each slow twinkle takes a random palette colour.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 100,
+    "intensity": 60,
+    "palette": 18,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Sparkle"
+  },
+  {
+   "id": 24,
+   "name": "Plasma",
+   "summary": "Smooth overlapping waves through the palette.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Scale",
+   "default_palette_id": 10,
+   "palette_slots": [],
+   "palette_note": "With a palette: three moving waves add up to pick the palette colour along the strip.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 10,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Colour"
+  },
+  {
+   "id": 25,
+   "name": "Noise",
+   "summary": "Drifting smooth noise through the palette.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Scale",
+   "default_palette_id": 13,
+   "palette_slots": [],
+   "palette_note": "With a palette: slowly drifting noise picks the palette colour along the strip.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 13,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Colour"
+  },
+  {
+   "id": 26,
+   "name": "Running",
+   "summary": "Waves of colour 1 on colour 2 run along the strip.",
+   "colors": 2,
+   "color_slots": [
+    "Colour 1",
+    "Colour 2",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Wavelength",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the waves carry the palette along the strip; the troughs go dark.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 255,
+    "c1": [
+     255,
+     120,
+     0
+    ],
+    "c2": [
+     0,
+     0,
+     30
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Colour"
+  },
+  {
+   "id": 27,
+   "name": "Ripples",
+   "summary": "Raindrops on a pond: soft rings spread out and fade.",
+   "colors": 1,
+   "color_slots": [
+    null,
+    "Background",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Ripple size",
+   "default_palette_id": 24,
+   "palette_slots": [
+    "Background"
+   ],
+   "palette_note": "With a palette: each ring takes a random palette colour.",
+   "custom1": "Rain (how many of the drops fall; 0: none)",
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 24,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 200,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Colour"
+  },
+  {
+   "id": 28,
+   "name": "Wipe",
+   "summary": "One colour wipes over the other along the strip, then back.",
+   "colors": 2,
+   "color_slots": [
+    "Colour 1",
+    "Colour 2",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Hold (0: none, 255: three quarters of the cycle)",
+   "default_palette_id": 23,
+   "palette_slots": [
+    "Colour 1",
+    "Colour 2"
+   ],
+   "palette_note": "With a palette: with Colours 128 and up, each wipe brings a new palette colour.",
+   "custom1": "Colours (0-127: Colour 1 and 2 alternate, 128-255: a new palette colour each wipe)",
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 64,
+    "palette": 23,
+    "c1": [
+     255,
+     0,
+     0
+    ],
+    "c2": [
+     0,
+     150,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Colour"
+  },
+  {
+   "id": 29,
+   "name": "Stripes",
+   "summary": "Hard stripes of colour 1 and colour 2 move along the strip (candy cane).",
+   "colors": 2,
+   "color_slots": [
+    "Colour 1",
+    "Colour 2",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed (0: still)",
+   "intensity": true,
+   "intensity_label": "Stripe size (higher: finer)",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the stripes take the palette's 16 colours in turn, hard-edged as ever.",
+   "custom1": "Share of Colour 1 (128: half)",
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 190,
+    "palette": 255,
+    "c1": [
+     255,
+     0,
+     0
+    ],
+    "c2": [
+     255,
+     255,
+     255
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 128,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Colour"
+  },
+  {
+   "id": 30,
+   "name": "Bulbs",
+   "summary": "A string of coloured bulbs; the colours hop along it.",
+   "colors": 1,
+   "color_slots": [
+    null,
+    "Unlit",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Shift speed (0: still)",
+   "intensity": true,
+   "intensity_label": "Spacing (higher: closer bulbs)",
+   "default_palette_id": 3,
+   "palette_slots": [
+    "Unlit"
+   ],
+   "palette_note": "With a palette: the bulbs step through the palette by Colour step; the colours hop along.",
+   "custom1": "Bulb size (share of the spacing, 128: half)",
+   "custom2": "Colour step (64: a quarter of the palette)",
+   "defaults": {
+    "speed": 40,
+    "intensity": 200,
+    "palette": 3,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 128,
+    "custom2": 64
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Seasonal"
+  },
+  {
+   "id": 31,
+   "name": "Lava Lamp",
+   "summary": "Big soft blobs of palette colour drift and merge.",
+   "colors": 1,
+   "color_slots": [
+    null,
+    "Background",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Blob size",
+   "default_palette_id": 16,
+   "palette_slots": [
+    "Background"
+   ],
+   "palette_note": "With a palette: the three blobs take colours a third apart, turning about once a minute.",
+   "custom1": null,
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 200,
+    "palette": 16,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Calm"
+  },
+  {
+   "id": 32,
+   "name": "Mosaic Drift",
+   "summary": "Fixed adjoining tiles that slowly melt from one colour to the next.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Colour change speed",
+   "intensity": true,
+   "intensity_label": "Tile size (higher: smaller tiles)",
+   "default_palette_id": 1,
+   "palette_slots": [],
+   "palette_note": "With a palette: each tile melts from one random palette colour to another.",
+   "custom1": "Whiten (mixes neutral white in; 0: none)",
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 180,
+    "palette": 1,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 90,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Calm"
+  },
+  {
+   "id": 33,
+   "name": "Silk Weave",
+   "summary": "Two broad ribbons of light slide through each other and turn pearly where they cross.",
+   "colors": 3,
+   "color_slots": [
+    "Ribbon 1",
+    "Ribbon 2",
+    "Ground"
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Ribbon spacing (higher: closer)",
+   "default_palette": "own",
+   "palette_slots": [
+    "Ground"
+   ],
+   "palette_note": "With a palette: each ribbon carries the palette along its length, the two half a palette apart.",
+   "custom1": "White at the crossings",
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 100,
+    "palette": 255,
+    "c1": [
+     255,
+     150,
+     110
+    ],
+    "c2": [
+     110,
+     160,
+     255
+    ],
+    "c3": [
+     20,
+     12,
+     14
+    ],
+    "custom1": 130,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Calm"
+  },
+  {
+   "id": 34,
+   "name": "Canopy Shade",
+   "summary": "A pale wash with soft leaf-like shadows that breathe and lean a little.",
+   "colors": 2,
+   "color_slots": [
+    "Wash",
+    "Shadow",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Sway speed",
+   "intensity": true,
+   "intensity_label": "Shadow depth",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the wash is the palette laid along the strip; the leaf shadows darken it.",
+   "custom1": "Leaf spacing (higher: closer)",
+   "custom2": null,
+   "defaults": {
+    "speed": 100,
+    "intensity": 180,
+    "palette": 255,
+    "c1": [
+     255,
+     236,
+     200
+    ],
+    "c2": [
+     40,
+     70,
+     30
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 150,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Calm"
+  },
+  {
+   "id": 35,
+   "name": "Opal Facets",
+   "summary": "Fixed glass-like facets in palette colours; a pearly reflection rolls across each one.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Reflection speed",
+   "intensity": true,
+   "intensity_label": "Facet width (higher: narrower)",
+   "default_palette_id": 27,
+   "palette_slots": [],
+   "palette_note": "With a palette: each facet takes a random palette colour.",
+   "custom1": "Reflection strength",
+   "custom2": null,
+   "defaults": {
+    "speed": 110,
+    "intensity": 170,
+    "palette": 27,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 190,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Calm"
+  },
+  {
+   "id": 36,
+   "name": "Quiet Landings",
+   "summary": "One to three soft pearls rise and fall in arcs and touch down without a trail.",
+   "colors": 1,
+   "color_slots": [
+    null,
+    "Ground",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Bounce pace",
+   "intensity": true,
+   "intensity_label": "Height (share of the strip)",
+   "default_palette_id": 24,
+   "palette_slots": [
+    "Ground"
+   ],
+   "palette_note": "With a palette: the pearls take the palette's colours at its start, a third and two thirds.",
+   "custom1": "Pearls (0-85: one, 86-170: two, 171-255: three)",
+   "custom2": null,
+   "defaults": {
+    "speed": 128,
+    "intensity": 160,
+    "palette": 24,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 128,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "ha_group": "Calm"
+  },
+  {
+   "id": 37,
+   "name": "Daylight Arc",
+   "summary": "A whole day in slow motion: a soft sun climbs along the strip, the light warms from dawn red to clear daylight, back to dusk and a dim moonlit night.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Day length (1 min .. 24 h)",
+   "intensity": true,
+   "intensity_label": "Sun size",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the day walks the palette, from its first colour at night, dawn and dusk to its last at noon.",
+   "custom1": "Start time of day (0: midnight, 128: noon)",
+   "custom2": "Night level (0: dark, higher: moonlight)",
+   "defaults": {
+    "speed": 200,
+    "intensity": 120,
+    "palette": 255,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 96,
+    "custom2": 40
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 48,
+    "cpu_class": "light (~40 cycles/px: one gaussian from a table, one colour-temperature lerp)",
+    "white_use": "RGBCCT: the sun's colour temperature drives WW/CW (about 2200 K at dawn to 5000 K at noon), RGB only adds dawn and dusk reds and the night blue; RGBW: the white part of the daylight goes to W; RGB: mixed whites. With 24 h and a start time the hub could keep it in step with the real clock."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 38,
+   "name": "Kelvin Drift",
+   "summary": "Slow, gentle waves of white that drift between warm and cool along the strip, like daylight moving through a room.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Drift speed",
+   "intensity": true,
+   "intensity_label": "Warm / cool range",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the slow waves drift through the palette instead of warm and cool white; Centre sets where on the palette they swing.",
+   "custom1": "Centre colour temperature (0: 2000 K, 255: 6500 K)",
+   "custom2": "Brightness ripple",
+   "defaults": {
+    "speed": 50,
+    "intensity": 100,
+    "palette": 255,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 110,
+    "custom2": 40
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 64,
+    "cpu_class": "light (~25 cycles/px: two slow sines give a colour temperature per pixel, one table lookup)",
+    "white_use": "Made for white strips: RGBCCT drives WW / CW directly with RGB off; RGBW uses W plus a light RGB tint for the warm and cool ends; RGB mixes the whites."
+   },
+   "ha_group": "Calm",
+   "flashy": false
+  },
+  {
+   "id": 39,
+   "name": "Cloud Shadows",
+   "summary": "Sunny light with soft cloud shadows drifting across in two layers at different speeds; the cloud edges glow a little brighter.",
+   "colors": 2,
+   "color_slots": [
+    "Sunlight",
+    "Shadow tint",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Wind speed",
+   "intensity": true,
+   "intensity_label": "Cloud cover",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the clouds colour the light, clear sky in the palette's first colours and thick cloud in its last, shadows darker.",
+   "custom1": "Shadow depth",
+   "custom2": "Silver lining (edge glow)",
+   "defaults": {
+    "speed": 70,
+    "intensity": 110,
+    "palette": 255,
+    "c1": [
+     255,
+     236,
+     200
+    ],
+    "c2": [
+     120,
+     140,
+     190
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 110,
+    "custom2": 120
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 64,
+    "cpu_class": "medium (~120 cycles/px: two layers of 2-octave 1-D value noise, parallax offset)",
+    "white_use": "Sunlight is mostly white: W on RGBW with the shadow tint on RGB; on RGBCCT lit parts lean WW and shadows lean CW (shade is cooler)."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 40,
+   "name": "Ember Bed",
+   "summary": "A bed of glowing coals: every pixel pulses its own slow heat with dark cracks between, and now and then a spark lifts off, drifts a few pixels and dies.",
+   "colors": 1,
+   "color_slots": [
+    null,
+    null,
+    "Spark"
+   ],
+   "speed": true,
+   "speed_label": "Heat pulse rate",
+   "intensity": true,
+   "intensity_label": "Glow (how many coals are hot)",
+   "default_palette_id": 28,
+   "palette_slots": [
+    "Spark"
+   ],
+   "palette_note": "With a palette: each coal glows through the palette by its heat, from near its start to its end.",
+   "custom1": "Sparks per minute (0: none)",
+   "custom2": "Crack darkness",
+   "defaults": {
+    "speed": 60,
+    "intensity": 150,
+    "palette": 28,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     255,
+     200,
+     120
+    ],
+    "custom1": 40,
+    "custom2": 160
+   },
+   "state_bytes_per_pixel": 2,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 16,
+    "ram_bytes": 1760,
+    "cpu_class": "light (~40 cycles/px: per-pixel phase oscillator + palette lookup; sparks splatted on top)",
+    "white_use": "W off on RGBW (keeps the deep reds); RGBCCT adds warm white at up to 20 % under the hottest coals for depth, never cool white."
+   },
+   "ha_group": "Fire & candle",
+   "flashy": false
+  },
+  {
+   "id": 41,
+   "name": "Shoreline",
+   "summary": "A beach seen from above: waves wash up the strip with a white foam edge, leave the sand darker and wet, and slide back again.",
+   "colors": 3,
+   "color_slots": [
+    "Water",
+    "Sand",
+    "Foam"
+   ],
+   "speed": true,
+   "speed_label": "Wave period",
+   "intensity": true,
+   "intensity_label": "Wave reach",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the sea runs through the palette's first half from offshore to the waterline, stretching with each wave, the sand through its second half along the beach; the foam is the sea, paled.",
+   "custom1": "Foam amount",
+   "custom2": "Sets (every few waves one reaches further)",
+   "defaults": {
+    "speed": 90,
+    "intensity": 150,
+    "palette": 255,
+    "c1": [
+     0,
+     70,
+     110
+    ],
+    "c2": [
+     190,
+     150,
+     100
+    ],
+    "c3": [
+     255,
+     255,
+     255
+    ],
+    "custom1": 160,
+    "custom2": 100
+   },
+   "state_bytes_per_pixel": 1,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 848,
+    "cpu_class": "light (~50 cycles/px: swash front as a damped run-up and backwash, wetness per pixel dries slowly)",
+    "white_use": "Foam uses W (RGBW) or CW (RGBCCT); dry sand adds a little WW; water stays RGB."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 42,
+   "name": "Tide Line",
+   "summary": "A sea edge creeps up the strip over minutes and slides back with a bright foam fringe at its edge; sand it covered stays dark and wet, then dries pale again.",
+   "colors": 3,
+   "color_slots": [
+    "Water",
+    "Foam",
+    "Dry sand"
+   ],
+   "speed": true,
+   "speed_label": "Tide period (1 min .. 30 min)",
+   "intensity": true,
+   "intensity_label": "Reach (how far up the strip the tide comes)",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the sea runs through the palette's first half from offshore to the tide line, stretching with the tide, the sand through its second half along the strip; the foam is the sea, paled.",
+   "custom1": "Chop (small waves riding the tide edge)",
+   "custom2": "Drying time",
+   "defaults": {
+    "speed": 100,
+    "intensity": 200,
+    "palette": 255,
+    "c1": [
+     0,
+     70,
+     110
+    ],
+    "c2": [
+     230,
+     245,
+     255
+    ],
+    "c3": [
+     210,
+     180,
+     120
+    ],
+    "custom1": 90,
+    "custom2": 120
+   },
+   "state_bytes_per_pixel": 1,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 816,
+    "cpu_class": "light (~30 cycles/px: edge distance + wetness decay + 3-colour blend)",
+    "white_use": "Foam and dry sand carry the white: RGBW renders them on W (sand warm-tinted by RGB); RGBCCT uses cool white for foam and warm white for dry sand; RGB blends."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 43,
+   "name": "Night Sky",
+   "summary": "A deep-blue night with fixed stars of different brightness and colour that twinkle gently, a faint Milky Way band and now and then a slow shooting star.",
+   "colors": 1,
+   "color_slots": [
+    "Sky",
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Twinkle",
+   "intensity": true,
+   "intensity_label": "Star density",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: every star and shooting star has its own palette colour, over a dim sky in the palette's colours along the strip.",
+   "custom1": "Shooting stars (0: none)",
+   "custom2": "Milky Way",
+   "defaults": {
+    "speed": 60,
+    "intensity": 110,
+    "palette": 255,
+    "c1": [
+     0,
+     4,
+     18
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 50,
+    "custom2": 100
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 2,
+    "ram_bytes": 96,
+    "cpu_class": "light (~35 cycles/px: star positions, colour and magnitude from a hash of the index, no state)",
+    "white_use": "White and blue-white stars use W / CW; orange stars use WW on RGBCCT; the sky stays RGB."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 44,
+   "name": "Moon Path",
+   "summary": "Moonlight on a lake: a still bright moon at one point and a long broken, shimmering reflection stretching away from it along the water.",
+   "colors": 2,
+   "color_slots": [
+    "Moon",
+    "Water",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Shimmer speed",
+   "intensity": true,
+   "intensity_label": "Reflection length",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the reflection runs through the palette from the moon to the far end of the strip, the water is the same colours, dim.",
+   "custom1": "Moon position (0: start .. 255: end)",
+   "custom2": "Ripple fineness",
+   "defaults": {
+    "speed": 80,
+    "intensity": 150,
+    "palette": 255,
+    "c1": [
+     255,
+     245,
+     220
+    ],
+    "c2": [
+     0,
+     6,
+     24
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 32,
+    "custom2": 128
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 64,
+    "cpu_class": "medium (~60 cycles/px: two noise samples per pixel for the broken reflection)",
+    "white_use": "Moon and its glints go on W (RGBW) or cool white (RGBCCT); water stays a deep RGB blue."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 45,
+   "name": "Firefly Sync",
+   "summary": "Fireflies drift over a dark meadow and blink; their blinks slowly fall into step until the whole field flashes together, then drift apart again.",
+   "colors": 2,
+   "color_slots": [
+    "Firefly",
+    "Meadow",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Drift speed",
+   "intensity": true,
+   "intensity_label": "Fireflies",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the meadow runs through the palette along the strip; each firefly blinks in the colour where it floats, over the same colours very dim.",
+   "custom1": "Coupling (how fast they fall into step)",
+   "custom2": "Glow length",
+   "defaults": {
+    "speed": 70,
+    "intensity": 120,
+    "palette": 255,
+    "c1": [
+     190,
+     255,
+     40
+    ],
+    "c2": [
+     0,
+     6,
+     2
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 90,
+    "custom2": 120
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own (phase-coupled oscillator model, public science)",
+   "design": {
+    "category": "ambient",
+    "particles": 48,
+    "ram_bytes": 832,
+    "cpu_class": "light (48 particles; each nudges its blink phase toward the flock's mean phase, mean-field so O(N))",
+    "white_use": "None: firefly yellow-green stays saturated RGB on every strip type."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 46,
+   "name": "Rain on Glass",
+   "summary": "Raindrops land on a window, cling, merge with neighbours and run down when they get heavy, over the soft blurred lights of a city behind.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Rain",
+   "intensity": true,
+   "intensity_label": "Drop size",
+   "default_palette_id": 6,
+   "palette_slots": [],
+   "palette_note": "With a palette: the blurred lights behind the glass take palette colours from slow noise.",
+   "custom1": "Background lights",
+   "custom2": "Streak length",
+   "defaults": {
+    "speed": 90,
+    "intensity": 120,
+    "palette": 6,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 140,
+    "custom2": 100
+   },
+   "state_bytes_per_pixel": 1,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 64,
+    "ram_bytes": 1616,
+    "cpu_class": "medium (~100 cycles/px: blurred palette bokeh behind, each drop is a small lens that magnifies and flips the background under it)",
+    "white_use": "Drop highlights use W / CW; the city bokeh stays RGB, warmed with a little WW on RGBCCT."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 47,
+   "name": "Pool Caustics",
+   "summary": "The bright, wandering web of sunlight on the floor of a swimming pool: thin light lines that split, merge and shimmer over blue.",
+   "colors": 2,
+   "color_slots": [
+    "Water",
+    "Light",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Ripple speed",
+   "intensity": true,
+   "intensity_label": "Line sharpness",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the water takes the first half of the palette, the light lines the matching colours from its second half.",
+   "custom1": "Scale",
+   "custom2": "Depth (more: softer lines)",
+   "defaults": {
+    "speed": 80,
+    "intensity": 150,
+    "palette": 255,
+    "c1": [
+     0,
+     60,
+     120
+    ],
+    "c2": [
+     230,
+     255,
+     255
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 120,
+    "custom2": 80
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 64,
+    "cpu_class": "medium (~120 cycles/px: three moving sine waves, light focuses where their slope sum is flat, sharpened by a power curve table)",
+    "white_use": "The light lines go to W (RGBW) or CW (RGBCCT) so they look crisp white; the water stays RGB."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 48,
+   "name": "Bioluminescence",
+   "summary": "A dark night sea where unseen waves stir glowing plankton: blue-cyan light flares where the water moves, then fades slowly.",
+   "colors": 2,
+   "color_slots": [
+    "Glow",
+    "Water",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Wave speed",
+   "intensity": true,
+   "intensity_label": "Plankton",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the glow runs through the palette along the strip, over a night sea of the same colours kept very dark.",
+   "custom1": "Afterglow",
+   "custom2": "Sparkle",
+   "defaults": {
+    "speed": 70,
+    "intensity": 140,
+    "palette": 255,
+    "c1": [
+     0,
+     200,
+     255
+    ],
+    "c2": [
+     0,
+     2,
+     8
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 160,
+    "custom2": 90
+   },
+   "state_bytes_per_pixel": 1,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 848,
+    "cpu_class": "light (~40 cycles/px: an invisible wave field excites a per-pixel glow level that decays)",
+    "white_use": "None: the glow stays saturated cyan; RGBCCT adds a hint of CW to the very brightest flares."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 49,
+   "name": "Waterfall",
+   "summary": "Water pours down the strip: fast streaks with white foam, a churning pool at the bottom and a light mist rising above it.",
+   "colors": 2,
+   "color_slots": [
+    "Water",
+    "Foam",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Flow",
+   "intensity": true,
+   "intensity_label": "Foam",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the water runs through the palette from the top of the fall to the pool; foam, streaks and mist are those colours, paled.",
+   "custom1": "Pool height",
+   "custom2": "Mist",
+   "defaults": {
+    "speed": 150,
+    "intensity": 130,
+    "palette": 255,
+    "c1": [
+     0,
+     90,
+     160
+    ],
+    "c2": [
+     230,
+     250,
+     255
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 60,
+    "custom2": 90
+   },
+   "state_bytes_per_pixel": 1,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 848,
+    "cpu_class": "medium (~80 cycles/px: streak noise scrolled fast, foam field with turbulence in the pool zone)",
+    "white_use": "Foam and mist use W (RGBW) or CW (RGBCCT); water stays RGB. Start of the strip = top."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 50,
+   "name": "Koi Pond",
+   "summary": "A dim pond: a few koi, each a short soft body of orange, white or black-and-gold, glide along, pause, flick and turn, and send a small ripple when they rise.",
+   "colors": 1,
+   "color_slots": [
+    null,
+    "Water",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Swim speed",
+   "intensity": true,
+   "intensity_label": "Fish (1 .. 6)",
+   "default_palette_id": 39,
+   "palette_slots": [
+    "Water"
+   ],
+   "palette_note": "With a palette: each koi takes a random palette colour, its patches a third further on.",
+   "custom1": "Fish length",
+   "custom2": "Ripples (0: none)",
+   "defaults": {
+    "speed": 50,
+    "intensity": 128,
+    "palette": 255,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     10,
+     20
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 100,
+    "custom2": 120
+   },
+   "state_bytes_per_pixel": 1,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 6,
+    "ram_bytes": 912,
+    "cpu_class": "light (~30 cycles/px: 6 fish bodies + a ripple buffer)",
+    "white_use": "White koi and the white patches of the gold ones use W (RGBW) or a neutral mix (RGBCCT).",
+    "default_palette_name": "Koi",
+    "default_palette_id": 39
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 51,
+   "name": "Ink Bloom",
+   "summary": "Drops of coloured ink fall into still water, bloom outward, curl and mix their colours where they meet, then the water slowly clears.",
+   "colors": 3,
+   "color_slots": [
+    "Ink 1",
+    "Ink 2",
+    "Ink 3"
+   ],
+   "speed": true,
+   "speed_label": "Bloom speed",
+   "intensity": true,
+   "intensity_label": "Drops",
+   "default_palette_id": 0,
+   "palette_slots": [],
+   "palette_note": "With a palette: the three inks take the palette's colours at its start, a third and two thirds.",
+   "custom1": "Mixing (diffusion)",
+   "custom2": "Current (drift)",
+   "defaults": {
+    "speed": 80,
+    "intensity": 90,
+    "palette": 254,
+    "c1": [
+     0,
+     40,
+     255
+    ],
+    "c2": [
+     255,
+     0,
+     90
+    ],
+    "c3": [
+     0,
+     200,
+     140
+    ],
+    "custom1": 130,
+    "custom2": 60
+   },
+   "state_bytes_per_pixel": 12,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 9472,
+    "cpu_class": "medium (~150 cycles/px: three 16-bit dye fields, diffusion + slow advection, subtractive colour mix)",
+    "white_use": "Clear water is a faint white on W / WW+CW; inks are pure RGB, so the white fades where ink covers it."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 52,
+   "name": "Incense Smoke",
+   "summary": "Slow, curling wisps of smoke that rise, twist and thin out, in soft palette colours.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Rise speed",
+   "intensity": true,
+   "intensity_label": "Density",
+   "default_palette_id": 27,
+   "palette_slots": [],
+   "palette_note": "With a palette: the smoke's swirling noise picks the palette colour of each wisp.",
+   "custom1": "Curl (turbulence)",
+   "custom2": "Fade height",
+   "defaults": {
+    "speed": 50,
+    "intensity": 120,
+    "palette": 27,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 140,
+    "custom2": 120
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 64,
+    "cpu_class": "medium (~180 cycles/px: domain-warped noise, one noise field bends the lookup position of a second)",
+    "white_use": "Near-white wisps go to W or a neutral WW+CW mix; tinted parts stay RGB."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 53,
+   "name": "Dust Motes",
+   "summary": "A warm beam of light where tiny dust motes float lazily, glinting as they cross the brightest part.",
+   "colors": 2,
+   "color_slots": [
+    "Beam",
+    "Dust glint",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Air movement",
+   "intensity": true,
+   "intensity_label": "Dust",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the beam is a band of palette colours from edge to edge that sways with it and slowly slides across it; the motes glint in the beam's colour.",
+   "custom1": "Beam width",
+   "custom2": "Beam drift",
+   "defaults": {
+    "speed": 40,
+    "intensity": 120,
+    "palette": 255,
+    "c1": [
+     255,
+     190,
+     120
+    ],
+    "c2": [
+     255,
+     240,
+     210
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 120,
+    "custom2": 60
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 96,
+    "ram_bytes": 832,
+    "cpu_class": "light (96 slow Brownian particles, brightness = beam profile at their position)",
+    "white_use": "The beam is warm white: WW on RGBCCT, W on RGBW; glints add short W / CW peaks."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 54,
+   "name": "Sand Ripples",
+   "summary": "Wind-blown sand ripples lit by a low sun: bright faces and shaded faces creep slowly along the strip.",
+   "colors": 3,
+   "color_slots": [
+    "Sand",
+    "Sun side",
+    "Shade side"
+   ],
+   "speed": true,
+   "speed_label": "Creep speed",
+   "intensity": true,
+   "intensity_label": "Ripple size (higher: finer)",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the sand runs through the palette along the strip; the ripples stay as light and shade.",
+   "custom1": "Sun height (lower: more contrast)",
+   "custom2": "Irregularity",
+   "defaults": {
+    "speed": 40,
+    "intensity": 120,
+    "palette": 255,
+    "c1": [
+     200,
+     150,
+     90
+    ],
+    "c2": [
+     255,
+     200,
+     130
+    ],
+    "c3": [
+     90,
+     60,
+     50
+    ],
+    "custom1": 150,
+    "custom2": 80
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 64,
+    "cpu_class": "light (~40 cycles/px: asymmetric sawtooth ripple, wavelength wobbled by slow noise)",
+    "white_use": "Sun-side highlights use WW (RGBCCT) or W; shade stays RGB."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 55,
+   "name": "Wheat Field",
+   "summary": "Wind gusts roll across a golden field: bright sheen bands sweep along as the stalks bend, then sway back.",
+   "colors": 2,
+   "color_slots": [
+    "Field",
+    "Sheen",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Wind",
+   "intensity": true,
+   "intensity_label": "Gustiness",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the field takes the palette's first half along the strip and the gust sheen its second half.",
+   "custom1": "Sway",
+   "custom2": "Gust width",
+   "defaults": {
+    "speed": 70,
+    "intensity": 110,
+    "palette": 255,
+    "c1": [
+     170,
+     120,
+     30
+    ],
+    "c2": [
+     255,
+     230,
+     150
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 120,
+    "custom2": 110
+   },
+   "state_bytes_per_pixel": 4,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 3200,
+    "cpu_class": "light (~40 cycles/px: each pixel a damped spring pushed by travelling gust fronts)",
+    "white_use": "The sheen uses WW (RGBCCT) or W; the field colour stays RGB."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 56,
+   "name": "Petal Fall",
+   "summary": "Petals or leaves drift down the strip, fluttering and catching the light as they turn, and settle softly at the bottom.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Fall speed",
+   "intensity": true,
+   "intensity_label": "Petals",
+   "default_palette_id": 29,
+   "palette_slots": [],
+   "palette_note": "With a palette: each petal takes a random palette colour and keeps it in the pile.",
+   "custom1": "Flutter",
+   "custom2": "Settle (pile up at the end; 0: none)",
+   "defaults": {
+    "speed": 60,
+    "intensity": 100,
+    "palette": 29,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 140,
+    "custom2": 100
+   },
+   "state_bytes_per_pixel": 1,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 40,
+    "ram_bytes": 1328,
+    "cpu_class": "light (40 particles with sideways sway; brightness pulses as each one turns; Autumn palette = falling leaves)",
+    "white_use": "A petal facing the light gets a short W glint; the petals and background stay RGB."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 57,
+   "name": "Starlings",
+   "summary": "A murmuration against a dusk sky: a dense flock swoops along the strip, stretches thin, bunches up, splits and joins again.",
+   "colors": 2,
+   "color_slots": [
+    "Birds",
+    "Sky",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Flight speed",
+   "intensity": true,
+   "intensity_label": "Flock size",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the sky runs through the palette along the strip, brightest at the horizon glow; the birds stay dark silhouettes.",
+   "custom1": "Cohesion",
+   "custom2": "Sky glow",
+   "defaults": {
+    "speed": 90,
+    "intensity": 140,
+    "palette": 255,
+    "c1": [
+     10,
+     6,
+     12
+    ],
+    "c2": [
+     255,
+     140,
+     70
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 150,
+    "custom2": 140
+   },
+   "state_bytes_per_pixel": 2,
+   "origin": "own (flocking rules after Reynolds 1987, public algorithm)",
+   "design": {
+    "category": "ambient",
+    "particles": 160,
+    "ram_bytes": 3552,
+    "cpu_class": "medium (160 birds: 1-D flocking with cohesion, alignment and separation on index-sorted neighbours; a density buffer darkens the sky)",
+    "white_use": "The dusk sky uses WW (RGBCCT) or W; the birds are dark silhouettes that take light away."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 58,
+   "name": "Town at Night",
+   "summary": "Distant windows of a small town at night: warm lights switch on and off now and then, one flickers from a TV, and the town slowly goes to sleep.",
+   "colors": 3,
+   "color_slots": [
+    "Warm window",
+    "Cool window",
+    "TV"
+   ],
+   "speed": true,
+   "speed_label": "Activity",
+   "intensity": true,
+   "intensity_label": "Windows",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: each window glows in the palette colour of its place along the street, the TV flickers through the palette.",
+   "custom1": "Bedtime (0: never, higher: sooner)",
+   "custom2": "Street lights",
+   "defaults": {
+    "speed": 50,
+    "intensity": 130,
+    "palette": 255,
+    "c1": [
+     255,
+     150,
+     60
+    ],
+    "c2": [
+     200,
+     210,
+     255
+    ],
+    "c3": [
+     80,
+     120,
+     255
+    ],
+    "custom1": 0,
+    "custom2": 80
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 128,
+    "ram_bytes": 576,
+    "cpu_class": "light (up to 128 window segments, each with a slow random on/off timer)",
+    "white_use": "Warm windows use WW (RGBCCT) or W plus amber; cool windows CW; the TV flicker is RGB only and stays within one window."
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 59,
+   "name": "Lantern Row",
+   "summary": "Paper lanterns strung along the strip: each glows warm with its own soft flicker, and now and then one swings gently in a breeze.",
+   "colors": 2,
+   "color_slots": [
+    "Lantern",
+    "Night",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Breeze",
+   "intensity": true,
+   "intensity_label": "Spacing (higher: closer)",
+   "default_palette_id": 33,
+   "palette_slots": [
+    "Night"
+   ],
+   "palette_note": "With a palette: each lantern takes its own random palette colour.",
+   "custom1": "Lantern width",
+   "custom2": "Flicker",
+   "defaults": {
+    "speed": 60,
+    "intensity": 110,
+    "palette": 255,
+    "c1": [
+     255,
+     150,
+     60
+    ],
+    "c2": [
+     2,
+     1,
+     6
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 90,
+    "custom2": 70
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 400,
+    "cpu_class": "light (~15 cycles/px: up to 64 lanterns with phase, swing and flicker)",
+    "white_use": "RGBW gives the lantern body ~30 % W so the paper looks lit from inside; RGBCCT uses warm white; the night colour stays RGB.",
+    "default_palette_name": "Hygge",
+    "default_palette_id": 33
+   },
+   "ha_group": "Calm",
+   "flashy": false
+  },
+  {
+   "id": 60,
+   "name": "Lamp Conversation",
+   "summary": "Small steady pools of lamplight pass a gentle brightening to their neighbours, with pauses and occasional replies.",
+   "colors": 3,
+   "color_slots": [
+    "Lamp",
+    "Room",
+    "Reply"
+   ],
+   "speed": true,
+   "speed_label": "Reply delay (0: 12 s; 255: 1 s)",
+   "intensity": true,
+   "intensity_label": "Conversation depth",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: each lamp has the palette colour of its place in the row, a reply glows in the colour of the lamp it answers, the room is them very dim; the colours move on each turn.",
+   "custom1": "Lamp spacing (0: close; 255: wide)",
+   "custom2": "Reply chance (0: none; 255: frequent)",
+   "defaults": {
+    "speed": 42,
+    "intensity": 60,
+    "palette": 255,
+    "c1": [
+     176,
+     103,
+     43
+    ],
+    "c2": [
+     25,
+     15,
+     10
+    ],
+    "c3": [
+     219,
+     155,
+     83
+    ],
+    "custom1": 100,
+    "custom2": 90
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 48,
+    "ram_bytes": 1408,
+    "cpu_class": "light",
+    "white_use": "RGB approximates warm highlights; RGBW transfers only their calibrated neutral component to W; RGBCCT sends that component mostly to warm white, preserving coloured edges."
+   },
+   "ha_group": "Calm",
+   "flashy": false
+  },
+  {
+   "id": 61,
+   "name": "Wind Chimes",
+   "summary": "A set of chimes hung along the strip: a passing breeze sets them ringing one after another, each flaring bright and then humming down slowly.",
+   "colors": 2,
+   "color_slots": [
+    "Chime",
+    "Night",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Breeze (how often)",
+   "intensity": true,
+   "intensity_label": "Ring decay (higher: shorter)",
+   "default_palette_id": 31,
+   "palette_slots": [
+    "Chime",
+    "Night"
+   ],
+   "palette_note": "With a palette: the chimes take palette colours in order along the row.",
+   "custom1": "Chimes (3 .. 12)",
+   "custom2": "Breeze width",
+   "defaults": {
+    "speed": 60,
+    "intensity": 60,
+    "palette": 255,
+    "c1": [
+     200,
+     220,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     4
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 120,
+    "custom2": 100
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 96,
+    "cpu_class": "light (~10 cycles/px: 12 chime envelopes)",
+    "white_use": "The strike flare uses W (RGBW) or cool white (RGBCCT), decaying to the tube colour.",
+    "default_palette_name": "Iridescent",
+    "default_palette_id": 31
+   },
+   "ha_group": "Nature",
+   "flashy": false
+  },
+  {
+   "id": 62,
+   "name": "Plucked String",
+   "summary": "The strip is a guitar string: it is plucked at random spots and the standing waves ring and slowly die away, coloured by how far each point swings.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Pitch",
+   "intensity": true,
+   "intensity_label": "Pluck strength",
+   "default_palette_id": 31,
+   "palette_slots": [],
+   "palette_note": "With a palette: the colour follows how far each point of the string swings, the palette's start at rest.",
+   "custom1": "Ring time (damping)",
+   "custom2": "Plucks per minute",
+   "defaults": {
+    "speed": 100,
+    "intensity": 140,
+    "palette": 255,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 120,
+    "custom2": 60
+   },
+   "state_bytes_per_pixel": 4,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 3200,
+    "cpu_class": "medium (~120 cycles/px: 1-D wave equation, 16-bit displacement + velocity, 4 sub-steps per frame)",
+    "white_use": "The fastest-swinging points get a W / CW highlight; at rest the string is a dim palette line.",
+    "palette_default_hint": "default palette 255 = the new 'Iridescent' palette from this file once it has an id",
+    "default_palette_name": "Iridescent",
+    "default_palette_id": 31
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 63,
+   "name": "Marble Veins",
+   "summary": "Polished stone: broad soft bands of palette colour with thin bright veins that wander, fork and slowly dissolve as the pattern drifts.",
+   "colors": 1,
+   "color_slots": [
+    "Vein",
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Drift",
+   "intensity": true,
+   "intensity_label": "Vein density",
+   "default_palette_id": 29,
+   "palette_slots": [
+    "Vein"
+   ],
+   "palette_note": "With a palette: the stone's noise picks the palette colour; the veins glow in Vein.",
+   "custom1": "Vein sharpness",
+   "custom2": "Vein glow",
+   "defaults": {
+    "speed": 40,
+    "intensity": 100,
+    "palette": 29,
+    "c1": [
+     255,
+     250,
+     240
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 160,
+    "custom2": 120
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 64,
+    "cpu_class": "medium (~90 cycles/px: three noise octaves, veins where the sum crosses zero)",
+    "white_use": "Veins on W (RGBW) or cool white (RGBCCT); the stone body uses auto extraction."
+   },
+   "ha_group": "Calm",
+   "flashy": false
+  },
+  {
+   "id": 64,
+   "name": "Silt Settling",
+   "summary": "Fine coloured grains settle into softly layered banks that occasionally slump into a new arrangement.",
+   "colors": 2,
+   "color_slots": [
+    null,
+    "Water",
+    "Settled glow"
+   ],
+   "speed": true,
+   "speed_label": "Grain drift (0: 30 s; 255: 2 s transit)",
+   "intensity": true,
+   "intensity_label": "Sediment supply",
+   "default_palette_id": 42,
+   "palette_slots": [
+    "Water",
+    "Settled glow"
+   ],
+   "palette_note": "With a palette: the grains take nearby palette colours that drift slowly; the layers keep them.",
+   "custom1": "Resting banks (0: 2; 255: 12)",
+   "custom2": "Slump threshold (0: loose; 255: firm)",
+   "defaults": {
+    "speed": 36,
+    "intensity": 64,
+    "palette": 255,
+    "c1": [
+     0,
+     0,
+     0
+    ],
+    "c2": [
+     4,
+     12,
+     15
+    ],
+    "c3": [
+     134,
+     110,
+     74
+    ],
+    "custom1": 55,
+    "custom2": 160
+   },
+   "state_bytes_per_pixel": 4,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 128,
+    "ram_bytes": 6464,
+    "cpu_class": "medium",
+    "white_use": "RGB approximates warm highlights; RGBW transfers only their calibrated neutral component to W; RGBCCT sends that component mostly to warm white, preserving coloured edges.",
+    "default_palette_name": "Copper Oxide",
+    "default_palette_id": 42
+   },
+   "ha_group": "Calm",
+   "flashy": false
+  },
+  {
+   "id": 65,
+   "name": "Velvet Erosion",
+   "summary": "A matte field slowly develops soft worn patches whose feathered edges reveal a second colour beneath.",
+   "colors": 3,
+   "color_slots": [
+    "Velvet",
+    "Underlayer",
+    "Edge sheen"
+   ],
+   "speed": true,
+   "speed_label": "Wear cycle (0: 20 min; 255: 90 s)",
+   "intensity": true,
+   "intensity_label": "Exposed area",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the velvet runs through the whole palette along the strip and the worn patches reveal the colour opposite it beneath, still matte.",
+   "custom1": "Edge softness (0: crisp; 255: broad)",
+   "custom2": "Repair delay (0: 10 s; 255: 3 min)",
+   "defaults": {
+    "speed": 30,
+    "intensity": 64,
+    "palette": 255,
+    "c1": [
+     63,
+     31,
+     60
+    ],
+    "c2": [
+     40,
+     67,
+     66
+    ],
+    "c3": [
+     116,
+     87,
+     98
+    ],
+    "custom1": 190,
+    "custom2": 140
+   },
+   "state_bytes_per_pixel": 4,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 3392,
+    "cpu_class": "medium",
+    "white_use": "RGB approximates warm highlights; RGBW transfers only their calibrated neutral component to W; RGBCCT sends that component mostly to warm white, preserving coloured edges."
+   },
+   "ha_group": "Calm",
+   "flashy": false
+  },
+  {
+   "id": 66,
+   "name": "Glass Memory",
+   "summary": "Soft touches of light leave long-lived coloured fingerprints that spread, blend and slowly disappear into smoked glass.",
+   "colors": 3,
+   "color_slots": [
+    "Fresh touch",
+    "Glass",
+    "Old trace"
+   ],
+   "speed": true,
+   "speed_label": "Touch interval (0: 90 s; 255: 3 s)",
+   "intensity": true,
+   "intensity_label": "Trace strength",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: old traces and the dark glass run through the whole palette along the strip; fresh touches glow in the colour opposite.",
+   "custom1": "Diffusion (0: narrow; 255: broad)",
+   "custom2": "Memory (0: 15 s; 255: 8 min)",
+   "defaults": {
+    "speed": 40,
+    "intensity": 75,
+    "palette": 255,
+    "c1": [
+     159,
+     182,
+     196
+    ],
+    "c2": [
+     7,
+     11,
+     18
+    ],
+    "c3": [
+     111,
+     66,
+     106
+    ],
+    "custom1": 100,
+    "custom2": 170
+   },
+   "state_bytes_per_pixel": 8,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 0,
+    "ram_bytes": 6528,
+    "cpu_class": "medium",
+    "white_use": "RGB carries the complete look; RGBW transfers the calibrated neutral highlight component to W; RGBCCT divides it between warm and cool whites for neutral highlights without adding brightness."
+   },
+   "ha_group": "Calm",
+   "flashy": false
+  },
+  {
+   "id": 67,
+   "name": "Dew Necklace",
+   "summary": "A line of tiny dewdrops gradually feeds a few larger pearls, then quietly redistributes itself into fine beads.",
+   "colors": 3,
+   "color_slots": [
+    "Dew",
+    "Stem",
+    "Pearl heart"
+   ],
+   "speed": true,
+   "speed_label": "Coarsening period (0: 15 min; 255: 45 s)",
+   "intensity": true,
+   "intensity_label": "Water amount",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the beads run through the palette along the thread, the pearl hearts the brightest, the thread the same colours dim.",
+   "custom1": "Bead spacing (0: close; 255: sparse)",
+   "custom2": "Redistribution softness (0: 5 s; 255: 45 s)",
+   "defaults": {
+    "speed": 38,
+    "intensity": 80,
+    "palette": 255,
+    "c1": [
+     103,
+     147,
+     143
+    ],
+    "c2": [
+     5,
+     18,
+     13
+    ],
+    "c3": [
+     188,
+     199,
+     171
+    ],
+    "custom1": 90,
+    "custom2": 180
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 128,
+    "ram_bytes": 3328,
+    "cpu_class": "medium",
+    "white_use": "RGB carries the complete look; RGBW transfers the calibrated neutral highlight component to W; RGBCCT divides it between warm and cool whites for neutral highlights without adding brightness."
+   },
+   "ha_group": "Calm",
+   "flashy": false
+  },
+  {
+   "id": 68,
+   "name": "Linen Pleats",
+   "summary": "Soft lit folds compress at one end of the strip and relax at the other, carrying a gentle crease through the fabric.",
+   "colors": 3,
+   "color_slots": [
+    "Fabric",
+    "Valley",
+    "Fold edge"
+   ],
+   "speed": true,
+   "speed_label": "Compression pace (0: 3 min; 255: 12 s)",
+   "intensity": true,
+   "intensity_label": "Fold depth",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the palette is printed on the fabric, so its colours fold and unfold with the pleats; valleys dark, fold edges bright.",
+   "custom1": "Pleats (0: 4; 255: 24)",
+   "custom2": "Damping (0: supple; 255: settled)",
+   "defaults": {
+    "speed": 32,
+    "intensity": 60,
+    "palette": 255,
+    "c1": [
+     136,
+     122,
+     99
+    ],
+    "c2": [
+     36,
+     30,
+     25
+    ],
+    "c3": [
+     190,
+     172,
+     138
+    ],
+    "custom1": 70,
+    "custom2": 200
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 48,
+    "ram_bytes": 1408,
+    "cpu_class": "medium",
+    "white_use": "RGB approximates warm highlights; RGBW transfers only their calibrated neutral component to W; RGBCCT sends that component mostly to warm white, preserving coloured edges."
+   },
+   "ha_group": "Calm",
+   "flashy": false
+  },
+  {
+   "id": 69,
+   "name": "Estuary Locks",
+   "summary": "Quiet pools fill to different levels, spill a little light into the next pool and gradually find a shared level.",
+   "colors": 3,
+   "color_slots": [
+    "Water",
+    "Bank",
+    "Spill"
+   ],
+   "speed": true,
+   "speed_label": "Inflow pace (0: 8 min; 255: 30 s)",
+   "intensity": true,
+   "intensity_label": "Fill range",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the row of pools spans the palette and each tide sweeps it along, so pools at a shared level form one gradient; the spill carries the fuller pool's colour.",
+   "custom1": "Pools (0: 3; 255: 12)",
+   "custom2": "Gate resistance (0: free; 255: slow)",
+   "defaults": {
+    "speed": 36,
+    "intensity": 85,
+    "palette": 255,
+    "c1": [
+     51,
+     104,
+     110
+    ],
+    "c2": [
+     20,
+     27,
+     25
+    ],
+    "c3": [
+     125,
+     170,
+     158
+    ],
+    "custom1": 90,
+    "custom2": 180
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 24,
+    "ram_bytes": 832,
+    "cpu_class": "light",
+    "white_use": "RGB carries the complete look; RGBW transfers the calibrated neutral highlight component to W; RGBCCT divides it between warm and cool whites for neutral highlights without adding brightness."
+   },
+   "ha_group": "Calm",
+   "flashy": false
+  },
+  {
+   "id": 70,
+   "name": "Porcelain Kiln",
+   "summary": "A row of pale ceramic pieces warms in a slow travelling order, holds its glow and cools through rose-grey at different rates.",
+   "colors": 3,
+   "color_slots": [
+    "Warm glaze",
+    "Cool glaze",
+    "Hot glaze"
+   ],
+   "speed": true,
+   "speed_label": "Firing cycle (0: 45 min; 255: 3 min)",
+   "intensity": true,
+   "intensity_label": "Thermal contrast",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the heat colours each piece, cold in the palette's first colours and hottest in its last.",
+   "custom1": "Pieces (0: 5; 255: 30)",
+   "custom2": "Heat memory (0: short; 255: long)",
+   "defaults": {
+    "speed": 30,
+    "intensity": 60,
+    "palette": 255,
+    "c1": [
+     179,
+     113,
+     84
+    ],
+    "c2": [
+     61,
+     62,
+     73
+    ],
+    "c3": [
+     225,
+     186,
+     139
+    ],
+    "custom1": 95,
+    "custom2": 200
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "ambient",
+    "particles": 64,
+    "ram_bytes": 1792,
+    "cpu_class": "light",
+    "white_use": "RGB approximates the temperature progression; RGBW uses its fixed-temperature W only to the extent calibration can match the target; RGBCCT crossfades warm and cool white at constant intended luminance, with RGB retaining coloured detail."
+   },
+   "ha_group": "Calm",
+   "flashy": false
+  },
+  {
+   "id": 71,
+   "name": "Morphogen",
+   "summary": "Living spots grow, split in two and wander apart like dividing cells, then settle into stripes or die out and start again.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Growth rate",
+   "intensity": true,
+   "intensity_label": "Feed (more: busier)",
+   "default_palette_id": 32,
+   "palette_slots": [],
+   "palette_note": "With a palette: the pattern's strength runs through the palette, background to bright spots.",
+   "custom1": "Kill rate (pattern type)",
+   "custom2": "Reseed",
+   "defaults": {
+    "speed": 120,
+    "intensity": 110,
+    "palette": 255,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 120,
+    "custom2": 40
+   },
+   "state_bytes_per_pixel": 8,
+   "origin": "own (Gray-Scott reaction-diffusion model, public science)",
+   "design": {
+    "category": "showpiece",
+    "particles": 0,
+    "ram_bytes": 6336,
+    "cpu_class": "heavy (~40 cycles/px per step, 8-16 steps per frame: 320-640 cycles/px; two 16-bit fields, double-buffered)",
+    "white_use": "The densest spots get a W / CW highlight; the background stays dim palette colour.",
+    "palette_default_hint": "default palette 255 = the new 'Abyss' palette from this file once it has an id",
+    "default_palette_name": "Abyss",
+    "default_palette_id": 32
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 72,
+   "name": "Cyclic Automaton",
+   "summary": "Random colour noise organises itself into waves that chase each other along the strip, each colour eating the one before it.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Generations per second",
+   "intensity": true,
+   "intensity_label": "States (colours)",
+   "default_palette_id": 10,
+   "palette_slots": [],
+   "palette_note": "With a palette: each cell state is a palette colour, the states spread evenly round it.",
+   "custom1": "Threshold",
+   "custom2": "Smoothing (cross-fade between generations)",
+   "defaults": {
+    "speed": 100,
+    "intensity": 100,
+    "palette": 10,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 60,
+    "custom2": 160
+   },
+   "state_bytes_per_pixel": 2,
+   "origin": "own (cyclic cellular automaton after Griffeath, public science)",
+   "design": {
+    "category": "showpiece",
+    "particles": 0,
+    "ram_bytes": 1632,
+    "cpu_class": "light (~20 cycles/px: next state if a neighbour within range holds state+1; fade byte per pixel)",
+    "white_use": "None: pure palette colour."
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 73,
+   "name": "Rule Garden",
+   "summary": "A cellular automaton that grows: each new generation is drawn over the last with a soft fade, so the strip fills with branching, triangular and lace-like patterns that keep evolving.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Generations per second (0.5 .. 10)",
+   "intensity": true,
+   "intensity_label": "Seeding (random cells per second that keep it alive)",
+   "default_palette_id": 17,
+   "palette_slots": [],
+   "palette_note": "With a palette: each new cell takes the palette colour of its birth, drifting over time.",
+   "custom1": "Rule (0 .. 255, the Wolfram rule; 30, 90, 110 and 184 look best)",
+   "custom2": "Fade (how long a dead cell keeps its colour)",
+   "defaults": {
+    "speed": 80,
+    "intensity": 20,
+    "palette": 17,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 110,
+    "custom2": 140
+   },
+   "state_bytes_per_pixel": 2,
+   "origin": "own; elementary cellular automata (Wolfram), published maths",
+   "design": {
+    "category": "showpiece",
+    "particles": 0,
+    "ram_bytes": 1600,
+    "cpu_class": "light (~15 cycles/px: 3-cell rule lookup + age)",
+    "white_use": "Auto extraction from the palette colour."
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 74,
+   "name": "Night Traffic",
+   "summary": "A road at night: white headlights one way and red tail lights the other, with traffic jams that form out of nothing and creep backwards.",
+   "colors": 2,
+   "color_slots": [
+    "Headlights",
+    "Tail lights",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Traffic speed",
+   "intensity": true,
+   "intensity_label": "Traffic density",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the cars run through the palette as they go round the road; headlights and tail lights take opposite palette colours.",
+   "custom1": "Dawdling (more: more jams)",
+   "custom2": "Lanes (0-127: one, 128-255: two ways)",
+   "defaults": {
+    "speed": 120,
+    "intensity": 100,
+    "palette": 255,
+    "c1": [
+     255,
+     245,
+     220
+    ],
+    "c2": [
+     255,
+     10,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 70,
+    "custom2": 255
+   },
+   "state_bytes_per_pixel": 1,
+   "origin": "own (Nagel-Schreckenberg traffic model, public science)",
+   "design": {
+    "category": "showpiece",
+    "particles": 120,
+    "ram_bytes": 1808,
+    "cpu_class": "light (120 cars on a cell road: accelerate, keep distance, random dawdle; tail lights brighten while braking)",
+    "white_use": "Headlights use W / CW; tail and brake lights stay pure red."
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 75,
+   "name": "Marble Run",
+   "summary": "Glass marbles roll along an invisible hilly track: they race down slopes, crawl up hills, bump into each other and gather in the valleys before the track tilts.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Gravity",
+   "intensity": true,
+   "intensity_label": "Marbles",
+   "default_palette_id": 10,
+   "palette_slots": [],
+   "palette_note": "With a palette: each marble takes a random palette colour with a swirl of a nearby one.",
+   "custom1": "Hilliness",
+   "custom2": "Friction",
+   "defaults": {
+    "speed": 120,
+    "intensity": 90,
+    "palette": 10,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 140,
+    "custom2": 60
+   },
+   "state_bytes_per_pixel": 2,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 24,
+    "ram_bytes": 2016,
+    "cpu_class": "light (height map from slow noise, 24 marbles with slope force, friction and elastic hits)",
+    "white_use": "Each marble has a small specular highlight on W / CW; bodies are palette colour."
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 76,
+   "name": "Soap Film",
+   "summary": "The skin of a soap bubble: swirling iridescent bands drain downward, thin to gold and black at the top, pop, and form again.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Swirl",
+   "intensity": true,
+   "intensity_label": "Film thickness",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the film's bands are the palette, by film thickness; the thin top drains to dark.",
+   "custom1": "Drainage",
+   "custom2": "Pop (0: never)",
+   "defaults": {
+    "speed": 80,
+    "intensity": 140,
+    "palette": 255,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 100,
+    "custom2": 60
+   },
+   "state_bytes_per_pixel": 2,
+   "origin": "own (thin-film interference physics)",
+   "design": {
+    "category": "showpiece",
+    "particles": 0,
+    "ram_bytes": 2400,
+    "cpu_class": "medium (~100 cycles/px: thickness field drains and swirls; colour from a thin-film interference table built at start)",
+    "white_use": "A faint white sheen across the film on W / CW; the colours themselves are RGB."
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 77,
+   "name": "Pendulum Wave",
+   "summary": "A row of pendulums of slightly different lengths: they swing in and out of step, forming snakes, waves and chaos, then line up again every cycle.",
+   "colors": 2,
+   "color_slots": [
+    "Bob",
+    "Background",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Cycle length",
+   "intensity": true,
+   "intensity_label": "Pendulums",
+   "default_palette_id": 0,
+   "palette_slots": [
+    "Background"
+   ],
+   "palette_note": "With a palette: each pendulum takes a palette colour by its place, shifting as it swings.",
+   "custom1": "Show as (0-127: colour, 128-255: moving dots)",
+   "custom2": "Swing width",
+   "defaults": {
+    "speed": 100,
+    "intensity": 120,
+    "palette": 254,
+    "c1": [
+     255,
+     120,
+     0
+    ],
+    "c2": [
+     0,
+     0,
+     20
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 160
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 0,
+    "ram_bytes": 64,
+    "cpu_class": "light (~30 cycles/px: phase per pendulum = k * (N + i) * t, one sine table lookup)",
+    "white_use": "Bob peaks add W; the background is colour 2."
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 78,
+   "name": "Newton Cradle",
+   "summary": "Steel balls hang in a row at the middle of the strip; one swings out from the end, clacks back in and the far ball flies out, back and forth with a brief bright flash at each clack.",
+   "colors": 2,
+   "color_slots": [
+    "Ball",
+    "Background",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Swing period",
+   "intensity": true,
+   "intensity_label": "Balls lifted (1 .. balls-1)",
+   "default_palette": "own",
+   "palette_slots": [
+    "Background"
+   ],
+   "palette_note": "With a palette: the row of balls is the palette laid out, one slice per ball, moving on by one ball every swing so each ball shows every colour; the highlights and clack stay white.",
+   "custom1": "Balls (3 .. 7)",
+   "custom2": "Clack flash (0: none)",
+   "defaults": {
+    "speed": 120,
+    "intensity": 40,
+    "palette": 255,
+    "c1": [
+     220,
+     230,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 160,
+    "custom2": 160
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 7,
+    "ram_bytes": 88,
+    "cpu_class": "light (~15 cycles/px: 7 balls, analytic swing)",
+    "white_use": "Balls are chrome: RGBW draws them mostly on W with an RGB tint; RGBCCT cool white; the clack flash is a 1-pixel white blip at most twice a second."
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 79,
+   "name": "Interference",
+   "summary": "Two light sources send ripples toward each other; where the ripples meet, bright and dark bands stand still, breathe and slowly slide as the sources drift.",
+   "colors": 2,
+   "color_slots": [
+    "Source A",
+    "Source B",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Wave speed",
+   "intensity": true,
+   "intensity_label": "Wavelength",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the ripples carry the palette outward from both sources and mix where they meet.",
+   "custom1": "Source spacing",
+   "custom2": "Drift (how fast the pattern slides; 0: standing still)",
+   "defaults": {
+    "speed": 80,
+    "intensity": 100,
+    "palette": 255,
+    "c1": [
+     255,
+     60,
+     0
+    ],
+    "c2": [
+     0,
+     80,
+     255
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 160,
+    "custom2": 30
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 0,
+    "ram_bytes": 32,
+    "cpu_class": "light (~25 cycles/px: two sines + sum)",
+    "white_use": "Where both crests add, the pixel whitens: RGBW uses W for the overlap, RGBCCT neutral white."
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 80,
+   "name": "Prism",
+   "summary": "A beam of white light sweeps along the strip and fans out into a rainbow as it travels, then folds back into white.",
+   "colors": 1,
+   "color_slots": [
+    "Beam",
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Dispersion",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the palette replaces the rainbow: a beam fans out from the palette's middle colour to both ends, the background glows in it.",
+   "custom1": "Beams (0-85: one, 86-170: two, 171-255: three)",
+   "custom2": "Background glow",
+   "defaults": {
+    "speed": 90,
+    "intensity": 140,
+    "palette": 255,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 30
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 0,
+    "ram_bytes": 64,
+    "cpu_class": "light (~60 cycles/px: seven spectral bands, each a gaussian offset by its own speed)",
+    "white_use": "The undispersed core is on W / CW, the spread spectrum on RGB, so the white-to-colour split is very visible on RGBW."
+   },
+   "ha_group": "Colour",
+   "flashy": false
+  },
+  {
+   "id": 81,
+   "name": "Sonar Ping",
+   "summary": "A dark sea where a soft sonar ping spreads out; hidden shapes light up for a moment as it passes, and their echoes travel back to the source.",
+   "colors": 2,
+   "color_slots": [
+    "Ping",
+    "Echo",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Ping interval",
+   "intensity": true,
+   "intensity_label": "Targets",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the ping and the targets run through the palette's first half by distance from the source, the echoes and the dark sea its second half.",
+   "custom1": "Range",
+   "custom2": "Afterglow",
+   "defaults": {
+    "speed": 80,
+    "intensity": 100,
+    "palette": 255,
+    "c1": [
+     0,
+     255,
+     140
+    ],
+    "c2": [
+     0,
+     120,
+     255
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 200,
+    "custom2": 120
+   },
+   "state_bytes_per_pixel": 1,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 24,
+    "ram_bytes": 1040,
+    "cpu_class": "light (one ring, up to 16 targets, 8 echoes, per-pixel afterglow)",
+    "white_use": "None: ping and echoes are saturated RGB."
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 82,
+   "name": "Thunderstorm",
+   "summary": "Heavy, dark rolling clouds with rain; lightning flickers inside parts of the cloud with a few short strokes and a slow afterglow.",
+   "colors": 2,
+   "color_slots": [
+    "Cloud",
+    "Lightning",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Storm activity",
+   "intensity": true,
+   "intensity_label": "Rain",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the clouds run dark through the palette along the strip, shifting as they roll; rain and lightning light them up in their own colour.",
+   "custom1": "Flash size (0: small, 255: up to half the strip)",
+   "custom2": "Afterglow",
+   "defaults": {
+    "speed": 70,
+    "intensity": 120,
+    "palette": 255,
+    "c1": [
+     20,
+     22,
+     40
+    ],
+    "c2": [
+     200,
+     210,
+     255
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 60,
+    "custom2": 120
+   },
+   "state_bytes_per_pixel": 1,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 0,
+    "ram_bytes": 848,
+    "cpu_class": "light-medium (~70 cycles/px: cloud noise, rain streaks, flash envelope over a region)",
+    "white_use": "Lightning uses CW / W for a crisp flash; clouds and rain stay RGB. Comfort: defaults keep flashes local (about a quarter of the strip) and at most one burst every ~5 s; larger flash sizes are flashy."
+   },
+   "ha_group": "Nature",
+   "flashy": true
+  },
+  {
+   "id": 83,
+   "name": "Neon Sign",
+   "summary": "Neon tube segments strike up one by one with a buzzing flicker, then glow steady with a soft halo, and now and then one tube stutters.",
+   "colors": 3,
+   "color_slots": [
+    "Tube 1",
+    "Tube 2",
+    "Tube 3"
+   ],
+   "speed": true,
+   "speed_label": "Faults",
+   "intensity": true,
+   "intensity_label": "Tube length",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: each tube is one palette colour, the palette across the sign; a tube moves on to a new palette colour each time it stutters.",
+   "custom1": "Halo",
+   "custom2": "Restart every (0: never)",
+   "defaults": {
+    "speed": 60,
+    "intensity": 120,
+    "palette": 255,
+    "c1": [
+     255,
+     0,
+     80
+    ],
+    "c2": [
+     0,
+     180,
+     255
+    ],
+    "c3": [
+     255,
+     120,
+     0
+    ],
+    "custom1": 120,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 64,
+    "ram_bytes": 320,
+    "cpu_class": "light (up to 64 tube segments with a small strike / steady / stutter state machine)",
+    "white_use": "None: neon stays saturated RGB. Flicker stays inside one tube at a time."
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 84,
+   "name": "Sand Pour",
+   "summary": "An hourglass on its side: grains fall from one end, bounce down the strip and pile up at the other into a heap that grows grain by grain; when it is full the glass flips.",
+   "colors": 2,
+   "color_slots": [
+    "Sand",
+    "Glass",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Pour rate",
+   "intensity": true,
+   "intensity_label": "Grain speed",
+   "default_palette_id": 43,
+   "palette_slots": [
+    "Sand",
+    "Glass"
+   ],
+   "palette_note": "With a palette: the sand's layers run through the palette in order, mixed with Sand.",
+   "custom1": "Flip (0: never, the heap melts away; else flips when full)",
+   "custom2": "Heap softness (how grains settle)",
+   "defaults": {
+    "speed": 110,
+    "intensity": 140,
+    "palette": 255,
+    "c1": [
+     235,
+     205,
+     150
+    ],
+    "c2": [
+     6,
+     6,
+     10
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 200,
+    "custom2": 100
+   },
+   "state_bytes_per_pixel": 1,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 32,
+    "ram_bytes": 1072,
+    "cpu_class": "light (~20 cycles/px: 32 falling grains + heap occupancy)",
+    "white_use": "Auto extraction; pale sand goes largely on W or warm white.",
+    "default_palette_name": "Fig and Brass",
+    "default_palette_id": 43
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 85,
+   "name": "Domino Run",
+   "summary": "Standing dominoes along the strip: a push tips the first, each knocks the next with a short bright flash as it falls and leaves a darker lying row behind; then they stand back up one by one.",
+   "colors": 2,
+   "color_slots": [
+    "Standing",
+    "Fallen",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Run speed",
+   "intensity": true,
+   "intensity_label": "Domino spacing (higher: closer)",
+   "default_palette_id": 10,
+   "palette_slots": [
+    "Fallen"
+   ],
+   "palette_note": "With a palette: each domino takes a palette colour by its place, turning Fallen as it tips.",
+   "custom1": "Tip flash",
+   "custom2": "Reset (0-127: stand up from the end, 128-255: from the start)",
+   "defaults": {
+    "speed": 120,
+    "intensity": 120,
+    "palette": 255,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     40,
+     40,
+     60
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 150,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 1,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 0,
+    "ram_bytes": 816,
+    "cpu_class": "light (~15 cycles/px: fall angle per domino slot)",
+    "white_use": "The tip flash uses W (RGBW) or cool white (RGBCCT); dominoes keep their colour.",
+    "default_palette_name": "Party",
+    "default_palette_id": 10
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 86,
+   "name": "Rope Pulse",
+   "summary": "A rope pinned at both ends: a flick at one end sends a bump travelling to the other, where it bounces back flipped, and bounces again until it dies away.",
+   "colors": 2,
+   "color_slots": [
+    "Rope",
+    "Pulse",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Wave speed",
+   "intensity": true,
+   "intensity_label": "Damping (higher: dies faster)",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the rope is the palette along its length, dim; a bump lights it up as it passes, a flipped bump shows the palette backwards, darker.",
+   "custom1": "Flick rate",
+   "custom2": "Far end (0-127: fixed, the bump comes back flipped; 128-255: free, it comes back the same)",
+   "defaults": {
+    "speed": 100,
+    "intensity": 60,
+    "palette": 255,
+    "c1": [
+     30,
+     30,
+     60
+    ],
+    "c2": [
+     255,
+     180,
+     40
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 70,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 4,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 0,
+    "ram_bytes": 3168,
+    "cpu_class": "medium (~40 cycles/px: explicit 1-D wave equation, two history buffers, 2 sub-steps per frame)",
+    "white_use": "A negative bump shows a darker tint of the pulse colour; W only in a pale pulse colour (auto extraction)."
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 87,
+   "name": "Soliton Courier",
+   "summary": "Compact luminous packets meet head-on, fuse briefly and emerge on the other side with their shapes intact.",
+   "colors": 3,
+   "color_slots": [
+    "Packet A",
+    "Space",
+    "Packet B"
+   ],
+   "speed": true,
+   "speed_label": "Travel speed (0: 20 s; 255: 3 s traverse)",
+   "intensity": true,
+   "intensity_label": "Packet width",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: packets from the start take the palette's first half and packets from the end its second half, changing colour as they travel.",
+   "custom1": "Collision frequency (0: sparse; 255: busy)",
+   "custom2": "Phase shift (0: none; 255: obvious)",
+   "defaults": {
+    "speed": 80,
+    "intensity": 95,
+    "palette": 255,
+    "c1": [
+     48,
+     162,
+     210
+    ],
+    "c2": [
+     2,
+     3,
+     10
+    ],
+    "c3": [
+     220,
+     72,
+     147
+    ],
+    "custom1": 90,
+    "custom2": 140
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 32,
+    "ram_bytes": 1024,
+    "cpu_class": "medium",
+    "white_use": "RGB renders saturated colours; RGBW and RGBCCT leave white channels off for these coloured regions, using only a small neutral component in pale accents if the selected colours or palette contain one."
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 88,
+   "name": "Excitable Wire",
+   "summary": "A spark starts opposing trains of light that collide, extinguish and leave a short dark recovery gap.",
+   "colors": 3,
+   "color_slots": [
+    "Active front",
+    "Resting wire",
+    "Recovering wire"
+   ],
+   "speed": true,
+   "speed_label": "Propagation speed (0: 5; 255: 80 cells/s)",
+   "intensity": true,
+   "intensity_label": "Front width",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: a front starts in the palette's last colour and its fading wake runs back through the rest to the dim resting wire in its first.",
+   "custom1": "Recovery time (0: 0.5 s; 255: 8 s)",
+   "custom2": "Seed interval (0: 20 s; 255: 2 s)",
+   "defaults": {
+    "speed": 65,
+    "intensity": 100,
+    "palette": 255,
+    "c1": [
+     70,
+     203,
+     192
+    ],
+    "c2": [
+     3,
+     8,
+     14
+    ],
+    "c3": [
+     70,
+     29,
+     89
+    ],
+    "custom1": 150,
+    "custom2": 75
+   },
+   "state_bytes_per_pixel": 4,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 0,
+    "ram_bytes": 3392,
+    "cpu_class": "medium",
+    "white_use": "RGB renders saturated colours; RGBW and RGBCCT leave white channels off for these coloured regions, using only a small neutral component in pale accents if the selected colours or palette contain one."
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 89,
+   "name": "Avalanche Loom",
+   "summary": "Tiny deposits build coloured ridges until one gives way and sends a cascading rearrangement through its neighbours.",
+   "colors": 2,
+   "color_slots": [
+    null,
+    "Empty cells",
+    "Falling ridge"
+   ],
+   "speed": true,
+   "speed_label": "Feed rate (0: sparse; 255: busy)",
+   "intensity": true,
+   "intensity_label": "Ridge height",
+   "default_palette_id": 42,
+   "palette_slots": [
+    "Empty cells",
+    "Falling ridge"
+   ],
+   "palette_note": "With a palette: the heap's height runs through the palette (a tenth to four fifths of it).",
+   "custom1": "Topple threshold (0: loose; 255: firm)",
+   "custom2": "Relaxation pace (0: slow; 255: brisk)",
+   "defaults": {
+    "speed": 65,
+    "intensity": 110,
+    "palette": 255,
+    "c1": [
+     0,
+     0,
+     0
+    ],
+    "c2": [
+     3,
+     5,
+     9
+    ],
+    "c3": [
+     224,
+     188,
+     115
+    ],
+    "custom1": 130,
+    "custom2": 90
+   },
+   "state_bytes_per_pixel": 8,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 0,
+    "ram_bytes": 6528,
+    "cpu_class": "heavy",
+    "white_use": "RGB approximates warm highlights; RGBW transfers only their calibrated neutral component to W; RGBCCT sends that component mostly to warm white, preserving coloured edges.",
+    "default_palette_name": "Copper Oxide",
+    "default_palette_id": 42
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 90,
+   "name": "Orbit Slingshot",
+   "summary": "Small satellites arc around moving wells of light, speed through close encounters and escape into a new orbit.",
+   "colors": 2,
+   "color_slots": [
+    null,
+    "Space",
+    "Gravity well"
+   ],
+   "speed": true,
+   "speed_label": "Orbital pace (0: lazy; 255: energetic)",
+   "intensity": true,
+   "intensity_label": "Satellite count",
+   "default_palette_id": 44,
+   "palette_slots": [
+    "Space",
+    "Gravity well"
+   ],
+   "palette_note": "With a palette: each satellite takes a random palette colour.",
+   "custom1": "Attraction (0: loose; 255: tight)",
+   "custom2": "Transfer chance (0: rare; 255: frequent)",
+   "defaults": {
+    "speed": 72,
+    "intensity": 100,
+    "palette": 255,
+    "c1": [
+     0,
+     0,
+     0
+    ],
+    "c2": [
+     2,
+     3,
+     11
+    ],
+    "c3": [
+     185,
+     173,
+     215
+    ],
+    "custom1": 130,
+    "custom2": 80
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 128,
+    "ram_bytes": 3328,
+    "cpu_class": "heavy",
+    "white_use": "RGB carries the complete look; RGBW transfers the calibrated neutral highlight component to W; RGBCCT divides it between warm and cool whites for neutral highlights without adding brightness.",
+    "default_palette_name": "Mulberry Milk",
+    "default_palette_id": 44
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 91,
+   "name": "Chromatic Sort",
+   "summary": "Mixed colour chips shuffle past neighbours until the strip becomes an ordered spectrum, then gently scrambles again.",
+   "colors": 2,
+   "color_slots": [
+    null,
+    "Gaps",
+    "Active pair"
+   ],
+   "speed": true,
+   "speed_label": "Swap duration (0: 2 s; 255: 0.15 s)",
+   "intensity": true,
+   "intensity_label": "Chip count",
+   "default_palette_id": 48,
+   "palette_slots": [
+    "Gaps",
+    "Active pair"
+   ],
+   "palette_note": "With a palette: the chips take palette colours spread evenly and sort back into palette order.",
+   "custom1": "Ordering (0: hue; 255: luminance)",
+   "custom2": "Sorted hold (0: 2 s; 255: 30 s)",
+   "defaults": {
+    "speed": 70,
+    "intensity": 95,
+    "palette": 255,
+    "c1": [
+     0,
+     0,
+     0
+    ],
+    "c2": [
+     2,
+     3,
+     6
+    ],
+    "c3": [
+     124,
+     138,
+     143
+    ],
+    "custom1": 0,
+    "custom2": 150
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 128,
+    "ram_bytes": 3328,
+    "cpu_class": "medium",
+    "white_use": "RGB carries the complete look; RGBW transfers the calibrated neutral highlight component to W; RGBCCT divides it between warm and cool whites for neutral highlights without adding brightness.",
+    "default_palette_name": "Graphite Citrus",
+    "default_palette_id": 48
+   },
+   "ha_group": "Colour",
+   "flashy": false
+  },
+  {
+   "id": 92,
+   "name": "Echo Vault",
+   "summary": "A soft strike sends unequal echoes between invisible walls, leaving bright nodes where returning waves briefly agree.",
+   "colors": 3,
+   "color_slots": [
+    "Strike",
+    "Space",
+    "Echo"
+   ],
+   "speed": true,
+   "speed_label": "Strike interval (0: 20 s; 255: 3 s)",
+   "intensity": true,
+   "intensity_label": "Echo strength",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: strikes take the palette's first half and echoes its second half along the strip, over dark space of the same colours.",
+   "custom1": "Wall positions (0: symmetrical; 255: irregular)",
+   "custom2": "Reflection loss (0: long memory; 255: short)",
+   "defaults": {
+    "speed": 65,
+    "intensity": 105,
+    "palette": 255,
+    "c1": [
+     111,
+     169,
+     213
+    ],
+    "c2": [
+     2,
+     5,
+     13
+    ],
+    "c3": [
+     182,
+     95,
+     159
+    ],
+    "custom1": 160,
+    "custom2": 110
+   },
+   "state_bytes_per_pixel": 8,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 0,
+    "ram_bytes": 6528,
+    "cpu_class": "heavy",
+    "white_use": "RGB renders saturated colours; RGBW and RGBCCT leave white channels off for these coloured regions, using only a small neutral component in pale accents if the selected colours or palette contain one."
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 93,
+   "name": "Folded Time",
+   "summary": "A coloured gesture returns as successively smaller echoes, each replayed backwards inside the previous trace.",
+   "colors": 2,
+   "color_slots": [
+    null,
+    "Space",
+    "Present gesture"
+   ],
+   "speed": true,
+   "speed_label": "Phrase duration (0: 45 s; 255: 5 s)",
+   "intensity": true,
+   "intensity_label": "Echo depth",
+   "default_palette_id": 43,
+   "palette_slots": [
+    "Space",
+    "Present gesture"
+   ],
+   "palette_note": "With a palette: each echo sweeps through the palette as it travels, tinted by Present gesture.",
+   "custom1": "Time reversal mix (0: forward; 255: reversed)",
+   "custom2": "Scale ratio (0: tight; 255: wide)",
+   "defaults": {
+    "speed": 70,
+    "intensity": 105,
+    "palette": 255,
+    "c1": [
+     0,
+     0,
+     0
+    ],
+    "c2": [
+     4,
+     3,
+     11
+    ],
+    "c3": [
+     201,
+     173,
+     214
+    ],
+    "custom1": 210,
+    "custom2": 145
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "showpiece",
+    "particles": 64,
+    "ram_bytes": 1792,
+    "cpu_class": "heavy",
+    "white_use": "RGB carries the complete look; RGBW transfers the calibrated neutral highlight component to W; RGBCCT divides it between warm and cool whites for neutral highlights without adding brightness.",
+    "default_palette_name": "Fig and Brass",
+    "default_palette_id": 43
+   },
+   "ha_group": "Motion",
+   "flashy": false
+  },
+  {
+   "id": 94,
+   "name": "Fireworks",
+   "summary": "Rockets climb from the start of the strip and burst into showers of coloured sparks that spread, fall back under gravity and crackle as they fade.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Launch rate",
+   "intensity": true,
+   "intensity_label": "Burst size",
+   "default_palette_id": 10,
+   "palette_slots": [],
+   "palette_note": "With a palette: each burst's sparks take random palette colours; the rockets stay warm white.",
+   "custom1": "Gravity",
+   "custom2": "Crackle",
+   "defaults": {
+    "speed": 100,
+    "intensity": 150,
+    "palette": 10,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 120,
+    "custom2": 100
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "party",
+    "particles": 400,
+    "ram_bytes": 4864,
+    "cpu_class": "medium (400 sparks, ~80 cycles each with drag and gravity, additive sub-pixel splat; ~45 cycles/px on 784 px)",
+    "white_use": "Burst cores and crackle use W / CW; trails stay palette RGB. Bursts are local, no full-strip flash."
+   },
+   "ha_group": "Party",
+   "flashy": true
+  },
+  {
+   "id": 95,
+   "name": "Collider",
+   "summary": "Two bright pulses race in from both ends, smash together and burst into sparks and a shockwave in the mixed colour.",
+   "colors": 2,
+   "color_slots": [
+    "Left pulse",
+    "Right pulse",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Speed",
+   "intensity": true,
+   "intensity_label": "Sparks",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: each collision takes two palette colours half a palette apart, the sparks fly in the colours between them; the next collision moves on through the palette.",
+   "custom1": "Collision point wander",
+   "custom2": "Shockwave",
+   "defaults": {
+    "speed": 130,
+    "intensity": 140,
+    "palette": 255,
+    "c1": [
+     0,
+     120,
+     255
+    ],
+    "c2": [
+     255,
+     40,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 100,
+    "custom2": 120
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "party",
+    "particles": 128,
+    "ram_bytes": 1600,
+    "cpu_class": "light (2 pulses, up to 128 sparks, one expanding ring)",
+    "white_use": "The collision flash and spark cores use W; pulses stay RGB. The flash is local to the crash."
+   },
+   "ha_group": "Party",
+   "flashy": true
+  },
+  {
+   "id": 96,
+   "name": "Bass Drop",
+   "summary": "Energy gathers from both ends into the middle, squeezing tighter and brighter, then releases in a shock wave that races outward and leaves a shimmering afterglow; repeats on a beat.",
+   "colors": 2,
+   "color_slots": [
+    "Charge",
+    "Shock",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Tempo (60 .. 180 bpm, one drop every 4 beats)",
+   "intensity": true,
+   "intensity_label": "Shock strength",
+   "default_palette_id": 10,
+   "palette_slots": [
+    "Charge",
+    "Shock"
+   ],
+   "palette_note": "With a palette: the charging ring's colour runs through the palette, tinted by Charge.",
+   "custom1": "Build length (beats)",
+   "custom2": "Afterglow",
+   "defaults": {
+    "speed": 128,
+    "intensity": 180,
+    "palette": 10,
+    "c1": [
+     140,
+     0,
+     255
+    ],
+    "c2": [
+     255,
+     255,
+     255
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 64,
+    "custom2": 140
+   },
+   "state_bytes_per_pixel": 1,
+   "origin": "own",
+   "design": {
+    "category": "party",
+    "particles": 0,
+    "ram_bytes": 816,
+    "cpu_class": "light (~20 cycles/px: envelope + afterglow decay)",
+    "white_use": "The shock front uses W (RGBW) or cool white (RGBCCT) at full; the charge colour stays saturated."
+   },
+   "ha_group": "Party",
+   "flashy": false
+  },
+  {
+   "id": 97,
+   "name": "Beat Pump",
+   "summary": "Palette bands scroll to a set beat while the brightness kicks on each beat and swells back, like club lights breathing with the music.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Tempo (60 .. 180 BPM)",
+   "intensity": true,
+   "intensity_label": "Pump depth",
+   "default_palette_id": 34,
+   "palette_slots": [],
+   "palette_note": "With a palette: the palette runs along the strip in bands and drifts; the beat pumps it.",
+   "custom1": "Accent every N beats",
+   "custom2": "Band size",
+   "defaults": {
+    "speed": 128,
+    "intensity": 100,
+    "palette": 255,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 4,
+    "custom2": 120
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "party",
+    "particles": 0,
+    "ram_bytes": 64,
+    "cpu_class": "light (~25 cycles/px: palette scroll plus one envelope per frame)",
+    "white_use": "Palette colour only; on RGBW the accent beat adds a short W lift. Comfort: the kick is a dip-and-swell (default 40 % depth), never black-to-white; up to 3 Hz at 180 BPM.",
+    "palette_default_hint": "default palette 255 = the new 'Synthwave' palette from this file once it has an id",
+    "default_palette_name": "Synthwave",
+    "default_palette_id": 34
+   },
+   "ha_group": "Party",
+   "flashy": true
+  },
+  {
+   "id": 98,
+   "name": "Beat Bars",
+   "summary": "A fake equaliser: a handful of bars along the strip jump to an internal beat with bass, mids and highs, fall back with gravity and keep a peak-hold dot that drops slowly.",
+   "colors": 0,
+   "color_slots": [
+    null,
+    null,
+    null
+   ],
+   "speed": true,
+   "speed_label": "Tempo (bpm)",
+   "intensity": true,
+   "intensity_label": "Bars (2 .. 16)",
+   "default_palette_id": 14,
+   "palette_slots": [],
+   "palette_note": "With a palette: each bar runs through the palette from its foot to its top.",
+   "custom1": "Groove (0: four-on-the-floor, 128: breakbeat, 255: random)",
+   "custom2": "Peak hold",
+   "defaults": {
+    "speed": 128,
+    "intensity": 128,
+    "palette": 14,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 0,
+    "custom2": 150
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "party",
+    "particles": 0,
+    "ram_bytes": 128,
+    "cpu_class": "light (~10 cycles/px: 16 bar envelopes)",
+    "white_use": "Peak dots on W (RGBW) or cool white (RGBCCT); bars saturated."
+   },
+   "ha_group": "Party",
+   "flashy": false
+  },
+  {
+   "id": 99,
+   "name": "Disco Ball",
+   "summary": "Dozens of small bright reflections sweep across a dark room at the same speed, as from a slowly turning mirror ball.",
+   "colors": 2,
+   "color_slots": [
+    "Spots",
+    "Room",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Rotation",
+   "intensity": true,
+   "intensity_label": "Spots",
+   "default_palette_id": 0,
+   "palette_slots": [
+    "Spots",
+    "Room"
+   ],
+   "palette_note": "With a palette: each spot takes a random palette colour, mixed with Spots by Coloured spots.",
+   "custom1": "Spot size",
+   "custom2": "Coloured spots (0: white, higher: more palette colour)",
+   "defaults": {
+    "speed": 80,
+    "intensity": 140,
+    "palette": 254,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     6,
+     0,
+     12
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 90,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "party",
+    "particles": 0,
+    "ram_bytes": 64,
+    "cpu_class": "light (~30 cycles/px: spots from a hashed grid scrolled at one speed, soft edges from a table)",
+    "white_use": "White spots use W / CW; coloured spots and the room stay RGB."
+   },
+   "ha_group": "Party",
+   "flashy": false
+  },
+  {
+   "id": 100,
+   "name": "Plasma Globe",
+   "summary": "Crackling purple filaments branch out from the middle of the strip, wander, and reach toward the ends with bright tips.",
+   "colors": 2,
+   "color_slots": [
+    "Filament",
+    "Core",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Wander speed",
+   "intensity": true,
+   "intensity_label": "Filaments",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the filaments run through the palette from the core (its first colour) out to the tips.",
+   "custom1": "Reach",
+   "custom2": "Crackle",
+   "defaults": {
+    "speed": 110,
+    "intensity": 110,
+    "palette": 255,
+    "c1": [
+     140,
+     40,
+     255
+    ],
+    "c2": [
+     255,
+     120,
+     220
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 160,
+    "custom2": 120
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "party",
+    "particles": 12,
+    "ram_bytes": 352,
+    "cpu_class": "medium (~70 cycles/px: up to 12 filaments as random walks with jitter, glow summed per pixel)",
+    "white_use": "Filament tips and the core are whiter (W / CW); the filament body stays purple RGB."
+   },
+   "ha_group": "Party",
+   "flashy": false
+  },
+  {
+   "id": 101,
+   "name": "Energy Blade",
+   "summary": "A glowing blade ignites from the start of the strip with a humming flicker, clashes now and then in a bright local flare, and retracts.",
+   "colors": 2,
+   "color_slots": [
+    "Blade",
+    "Clash",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Ignite speed",
+   "intensity": true,
+   "intensity_label": "Hum flicker",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the blade runs through the palette from hilt to tip; each clash flares in one palette colour.",
+   "custom1": "Clashes (0: none)",
+   "custom2": "Stay lit (0: ignite / retract cycle, 255: always lit)",
+   "defaults": {
+    "speed": 150,
+    "intensity": 70,
+    "palette": 255,
+    "c1": [
+     0,
+     80,
+     255
+    ],
+    "c2": [
+     255,
+     255,
+     200
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 60,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "party",
+    "particles": 0,
+    "ram_bytes": 64,
+    "cpu_class": "light (~20 cycles/px: blade length, hum noise, clash spot)",
+    "white_use": "The blade core is whiter on W / CW with colour at the edges. Clash flares are local and under 1 Hz."
+   },
+   "ha_group": "Party",
+   "flashy": true
+  },
+  {
+   "id": 102,
+   "name": "Confetti Cannon",
+   "summary": "A cannon at one end fires a burst of coloured confetti that flies down the strip, slows, flutters with little brightness wobbles and settles into a sprinkled layer that slowly fades.",
+   "colors": 1,
+   "color_slots": [
+    null,
+    "Floor",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Shots per minute",
+   "intensity": true,
+   "intensity_label": "Confetti per shot",
+   "default_palette_id": 10,
+   "palette_slots": [
+    "Floor"
+   ],
+   "palette_note": "With a palette: each confetti piece takes a random palette colour, kept as it settles.",
+   "custom1": "Cannon end (0: start, 128: alternate, 255: end)",
+   "custom2": "Settle (how long fallen confetti stays)",
+   "defaults": {
+    "speed": 60,
+    "intensity": 120,
+    "palette": 10,
+    "c1": [
+     255,
+     255,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 128,
+    "custom2": 150
+   },
+   "state_bytes_per_pixel": 2,
+   "origin": "own",
+   "design": {
+    "category": "party",
+    "particles": 128,
+    "ram_bytes": 2624,
+    "cpu_class": "light (~25 cycles/px: 128 particles + settled layer)",
+    "white_use": "W off except for white confetti pieces; RGBCCT channels unused."
+   },
+   "ha_group": "Party",
+   "flashy": false
+  },
+  {
+   "id": 103,
+   "name": "Pinball Relay",
+   "summary": "Coloured balls ricochet between shifting bumpers, handing their colour to each bumper before racing onward.",
+   "colors": 2,
+   "color_slots": [
+    null,
+    "Track",
+    "Bumper"
+   ],
+   "speed": true,
+   "speed_label": "Ball speed (0: 15 s; 255: 1.5 s traverse)",
+   "intensity": true,
+   "intensity_label": "Ball population",
+   "default_palette_id": 48,
+   "palette_slots": [
+    "Track",
+    "Bumper"
+   ],
+   "palette_note": "With a palette: each ball takes a random palette colour that steps on at every bumper.",
+   "custom1": "Bumpers (0: 2; 255: 10)",
+   "custom2": "Rebound energy (0: soft; 255: lively)",
+   "defaults": {
+    "speed": 90,
+    "intensity": 100,
+    "palette": 255,
+    "c1": [
+     0,
+     0,
+     0
+    ],
+    "c2": [
+     2,
+     3,
+     7
+    ],
+    "c3": [
+     207,
+     188,
+     155
+    ],
+    "custom1": 100,
+    "custom2": 140
+   },
+   "state_bytes_per_pixel": 2,
+   "origin": "own",
+   "design": {
+    "category": "party",
+    "particles": 160,
+    "ram_bytes": 5664,
+    "cpu_class": "heavy",
+    "white_use": "RGB carries the complete look; RGBW transfers the calibrated neutral highlight component to W; RGBCCT divides it between warm and cool whites for neutral highlights without adding brightness.",
+    "default_palette_name": "Graphite Citrus",
+    "default_palette_id": 48
+   },
+   "ha_group": "Party",
+   "flashy": true
+  },
+  {
+   "id": 104,
+   "name": "Pocket Rave",
+   "summary": "Separate little clubs of light trade syncopated pulses while a bright accent walks between them.",
+   "colors": 3,
+   "color_slots": [
+    "Downbeat",
+    "Room",
+    "Offbeat"
+   ],
+   "speed": true,
+   "speed_label": "Tempo (0: 60; 255: 150 BPM)",
+   "intensity": true,
+   "intensity_label": "Pulse depth",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: each club has its own palette colour on the downbeat and the colour half a palette away on the offbeat, the room is them very dim; the colours move on one palette colour a bar.",
+   "custom1": "Clubs (0: 3; 255: 12)",
+   "custom2": "Swing (0: straight; 255: strongly swung)",
+   "defaults": {
+    "speed": 100,
+    "intensity": 110,
+    "palette": 255,
+    "c1": [
+     42,
+     147,
+     198
+    ],
+    "c2": [
+     6,
+     3,
+     13
+    ],
+    "c3": [
+     209,
+     58,
+     135
+    ],
+    "custom1": 110,
+    "custom2": 100
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "party",
+    "particles": 32,
+    "ram_bytes": 1024,
+    "cpu_class": "light",
+    "white_use": "RGB renders saturated colours; RGBW and RGBCCT leave white channels off for these coloured regions, using only a small neutral component in pale accents if the selected colours or palette contain one."
+   },
+   "ha_group": "Party",
+   "flashy": false
+  },
+  {
+   "id": 105,
+   "name": "Zipper Exchange",
+   "summary": "Two coloured seams interlock tooth by tooth, exchange their colours and unzip into the next arrangement.",
+   "colors": 3,
+   "color_slots": [
+    "Seam A",
+    "Backing",
+    "Seam B"
+   ],
+   "speed": true,
+   "speed_label": "Zipping cycle (0: 20 s; 255: 2 s)",
+   "intensity": true,
+   "intensity_label": "Tooth size",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the teeth run through the palette along the strip, the two seams in opposite palette colours that swap at each exchange.",
+   "custom1": "Zipper origins (0: 1; 255: 4)",
+   "custom2": "Hold time (0: none; 255: half cycle)",
+   "defaults": {
+    "speed": 95,
+    "intensity": 110,
+    "palette": 255,
+    "c1": [
+     37,
+     161,
+     200
+    ],
+    "c2": [
+     4,
+     3,
+     9
+    ],
+    "c3": [
+     229,
+     81,
+     109
+    ],
+    "custom1": 80,
+    "custom2": 65
+   },
+   "state_bytes_per_pixel": 2,
+   "origin": "own",
+   "design": {
+    "category": "party",
+    "particles": 0,
+    "ram_bytes": 1824,
+    "cpu_class": "medium",
+    "white_use": "RGB renders saturated colours; RGBW and RGBCCT leave white channels off for these coloured regions, using only a small neutral component in pale accents if the selected colours or palette contain one."
+   },
+   "ha_group": "Party",
+   "flashy": false
+  },
+  {
+   "id": 106,
+   "name": "Packet Switch",
+   "summary": "Bright parcels queue at junctions, split into smaller packets and rejoin with satisfying little gaps.",
+   "colors": 2,
+   "color_slots": [
+    null,
+    "Bus",
+    "Junction"
+   ],
+   "speed": true,
+   "speed_label": "Transfer speed (0: 12 s; 255: 1 s traverse)",
+   "intensity": true,
+   "intensity_label": "Packet traffic",
+   "default_palette_id": 48,
+   "palette_slots": [
+    "Bus",
+    "Junction"
+   ],
+   "palette_note": "With a palette: each packet takes a random palette colour; its split pieces keep it.",
+   "custom1": "Junctions (0: 2; 255: 8)",
+   "custom2": "Split ratio (0: whole; 255: many small)",
+   "defaults": {
+    "speed": 88,
+    "intensity": 120,
+    "palette": 255,
+    "c1": [
+     0,
+     0,
+     0
+    ],
+    "c2": [
+     2,
+     5,
+     9
+    ],
+    "c3": [
+     162,
+     191,
+     201
+    ],
+    "custom1": 100,
+    "custom2": 155
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "party",
+    "particles": 192,
+    "ram_bytes": 4864,
+    "cpu_class": "heavy",
+    "white_use": "RGB carries the complete look; RGBW transfers the calibrated neutral highlight component to W; RGBCCT divides it between warm and cool whites for neutral highlights without adding brightness.",
+    "default_palette_name": "Graphite Citrus",
+    "default_palette_id": 48
+   },
+   "ha_group": "Party",
+   "flashy": false
+  },
+  {
+   "id": 107,
+   "name": "Snowfall",
+   "summary": "Snowflakes drift down the strip in light gusts and pile up into a glittering white bank at the bottom, which melts away now and then.",
+   "colors": 2,
+   "color_slots": [
+    "Snow",
+    "Night",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Fall speed",
+   "intensity": true,
+   "intensity_label": "Snowfall",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the flakes run through the palette as they fall and the bank takes its last colours, over a dim night in the same colours.",
+   "custom1": "Wind",
+   "custom2": "Pile height",
+   "defaults": {
+    "speed": 70,
+    "intensity": 120,
+    "palette": 255,
+    "c1": [
+     235,
+     245,
+     255
+    ],
+    "c2": [
+     0,
+     4,
+     20
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 80,
+    "custom2": 100
+   },
+   "state_bytes_per_pixel": 1,
+   "origin": "own",
+   "design": {
+    "category": "seasonal",
+    "particles": 150,
+    "ram_bytes": 2648,
+    "cpu_class": "light (150 flakes with gusts; the snow bank is a fill level with glitter)",
+    "white_use": "Snow uses W (RGBW) or CW (RGBCCT); the night sky stays RGB. Winter / Christmas."
+   },
+   "ha_group": "Seasonal",
+   "flashy": false
+  },
+  {
+   "id": 108,
+   "name": "Icicle Drip",
+   "summary": "Icicles hang at fixed points: each glows pale blue-white, a drop swells at its tip, then falls along the strip and splashes into a short sparkle.",
+   "colors": 2,
+   "color_slots": [
+    "Ice",
+    "Night",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Drip rate",
+   "intensity": true,
+   "intensity_label": "Icicle spacing (higher: closer)",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the ice runs through the palette from the root down, so a falling drop walks the palette to its last colour at the splash.",
+   "custom1": "Icicle length",
+   "custom2": "Glint (sparkle on the ice; 0: none)",
+   "defaults": {
+    "speed": 70,
+    "intensity": 100,
+    "palette": 255,
+    "c1": [
+     200,
+     230,
+     255
+    ],
+    "c2": [
+     0,
+     0,
+     6
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 110,
+    "custom2": 60
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "seasonal",
+    "particles": 16,
+    "ram_bytes": 160,
+    "cpu_class": "light (~15 cycles/px: fixed icicles + 16 drops)",
+    "white_use": "Ice and drops on W with a little blue RGB (RGBW) or cool white (RGBCCT)."
+   },
+   "ha_group": "Seasonal",
+   "flashy": false
+  },
+  {
+   "id": 109,
+   "name": "Tinsel Garland",
+   "summary": "A garland of tinsel with baubles spaced along it: a travelling light makes the tinsel glint in little flashes as it passes, and each bauble shows a round highlight sliding across it.",
+   "colors": 2,
+   "color_slots": [
+    "Tinsel",
+    "Bauble",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Light pass speed",
+   "intensity": true,
+   "intensity_label": "Bauble spacing (higher: closer)",
+   "default_palette_id": 23,
+   "palette_slots": [
+    "Tinsel",
+    "Bauble"
+   ],
+   "palette_note": "With a palette: each bauble gets a light palette tint (about a fifth) over Bauble.",
+   "custom1": "Glint density",
+   "custom2": "Bauble size",
+   "defaults": {
+    "speed": 70,
+    "intensity": 100,
+    "palette": 23,
+    "c1": [
+     200,
+     190,
+     150
+    ],
+    "c2": [
+     255,
+     0,
+     0
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 120,
+    "custom2": 90
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "seasonal",
+    "particles": 0,
+    "ram_bytes": 32,
+    "cpu_class": "light (~30 cycles/px: hashed glints under a travelling light window)",
+    "white_use": "Glints on W (RGBW) or warm white (RGBCCT); tinsel body is an RGB silver/gold tint plus ~20 % W."
+   },
+   "ha_group": "Seasonal",
+   "flashy": false
+  },
+  {
+   "id": 110,
+   "name": "Ribbon Unwrap",
+   "summary": "Little wrapped gifts wait along the strip, then their gold ribbons loosen to reveal jewel-coloured interiors.",
+   "colors": 2,
+   "color_slots": [
+    null,
+    "Wrapping",
+    "Ribbon"
+   ],
+   "speed": true,
+   "speed_label": "Unwrap interval (0: 60 s; 255: 5 s)",
+   "intensity": true,
+   "intensity_label": "Open gift share",
+   "default_palette_id": 43,
+   "palette_slots": [
+    "Wrapping",
+    "Ribbon"
+   ],
+   "palette_note": "With a palette: each gift's jewel inside takes a random palette colour.",
+   "custom1": "Gift size (0: small; 255: large)",
+   "custom2": "Rewrap delay (0: 3 s; 255: 30 s)",
+   "defaults": {
+    "speed": 48,
+    "intensity": 95,
+    "palette": 255,
+    "c1": [
+     0,
+     0,
+     0
+    ],
+    "c2": [
+     47,
+     9,
+     19
+    ],
+    "c3": [
+     204,
+     148,
+     62
+    ],
+    "custom1": 125,
+    "custom2": 175
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "seasonal",
+    "particles": 48,
+    "ram_bytes": 1408,
+    "cpu_class": "light",
+    "white_use": "RGB approximates warm highlights; RGBW transfers only their calibrated neutral component to W; RGBCCT sends that component mostly to warm white, preserving coloured edges.",
+    "default_palette_name": "Fig and Brass",
+    "default_palette_id": 43
+   },
+   "ha_group": "Seasonal",
+   "flashy": false
+  },
+  {
+   "id": 111,
+   "name": "Haunted Hall",
+   "summary": "A dim orange-and-purple corridor lit by uneasy candles; a cold blue draught passes and makes them gutter, a pale ghost drifts through, and once in a while a pair of eyes blink in the dark.",
+   "colors": 3,
+   "color_slots": [
+    "Candle",
+    "Wall",
+    "Ghost"
+   ],
+   "speed": true,
+   "speed_label": "Activity",
+   "intensity": true,
+   "intensity_label": "Candle count",
+   "default_palette_id": 25,
+   "palette_slots": [
+    "Candle",
+    "Wall",
+    "Ghost"
+   ],
+   "palette_note": "With a palette: each candle gets a faint palette tint (about a seventh) over Candle.",
+   "custom1": "Ghost (0: none; otherwise how often)",
+   "custom2": "Eyes (0: none; otherwise how often)",
+   "defaults": {
+    "speed": 80,
+    "intensity": 100,
+    "palette": 25,
+    "c1": [
+     255,
+     120,
+     20
+    ],
+    "c2": [
+     60,
+     0,
+     90
+    ],
+    "c3": [
+     180,
+     200,
+     220
+    ],
+    "custom1": 90,
+    "custom2": 60
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "seasonal",
+    "particles": 6,
+    "ram_bytes": 200,
+    "cpu_class": "light (~20 cycles/px: 32 candles, 2 ghosts, 4 eye pairs)",
+    "white_use": "The ghost is dim W (RGBW) or cool white (RGBCCT); everything else saturated; no bright flashes."
+   },
+   "ha_group": "Seasonal",
+   "flashy": false
+  },
+  {
+   "id": 112,
+   "name": "Champagne",
+   "summary": "Golden fizz: tiny bubbles stream up from the bottom, speed up as they rise and pop in a sparkle at the surface.",
+   "colors": 2,
+   "color_slots": [
+    "Wine",
+    "Bubble",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Fizz",
+   "intensity": true,
+   "intensity_label": "Bubbles",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the glass runs through the palette from the bottom to the surface and the colours slowly rise through it; the bubbles rise in full light and pop in the surface's colour.",
+   "custom1": "Surface height",
+   "custom2": "Pop sparkle",
+   "defaults": {
+    "speed": 110,
+    "intensity": 140,
+    "palette": 255,
+    "c1": [
+     120,
+     70,
+     5
+    ],
+    "c2": [
+     255,
+     240,
+     190
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 220,
+    "custom2": 120
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "seasonal",
+    "particles": 200,
+    "ram_bytes": 1664,
+    "cpu_class": "light (200 bubbles, buoyancy with a little wobble, pops spawn short glints)",
+    "white_use": "Bubbles and pops use W / WW; the wine stays golden RGB. New Year."
+   },
+   "ha_group": "Seasonal",
+   "flashy": false
+  },
+  {
+   "id": 113,
+   "name": "Countdown",
+   "summary": "A bar of light drains along the strip over the last seconds, pulses on each tick, and at zero the whole strip erupts in fireworks and glitter for a minute before settling to a slow golden sparkle.",
+   "colors": 2,
+   "color_slots": [
+    "Bar",
+    "Sparkle",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Countdown length (10 s .. 10 min)",
+   "intensity": true,
+   "intensity_label": "Finale length",
+   "default_palette_id": 40,
+   "palette_slots": [
+    "Bar",
+    "Sparkle"
+   ],
+   "palette_note": "With a palette: the finale's firework sparks take random palette colours.",
+   "custom1": "Tick pulse",
+   "custom2": "Then (0: stay in golden sparkle, 128: loop, 255: go dark)",
+   "defaults": {
+    "speed": 40,
+    "intensity": 120,
+    "palette": 255,
+    "c1": [
+     255,
+     215,
+     80
+    ],
+    "c2": [
+     255,
+     245,
+     200
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 120,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 3,
+   "origin": "own",
+   "design": {
+    "category": "seasonal",
+    "particles": 160,
+    "ram_bytes": 3696,
+    "cpu_class": "medium (shares the Fireworks engine during the finale)",
+    "white_use": "Bar and sparkle on W or warm white; the zero moment is the one full-strip white flash (300 ms), then fireworks.",
+    "default_palette_name": "Champagne Gold",
+    "default_palette_id": 40
+   },
+   "ha_group": "Seasonal",
+   "flashy": true
+  },
+  {
+   "id": 114,
+   "name": "Heartbeat",
+   "summary": "A realistic heartbeat: a soft double pulse (lub-dub) swells from the centre of the strip and relaxes, in a slow rhythm you can set; warm rose by default.",
+   "colors": 2,
+   "color_slots": [
+    "Pulse",
+    "Rest",
+    null
+   ],
+   "speed": true,
+   "speed_label": "Beats per minute (40 .. 120)",
+   "intensity": true,
+   "intensity_label": "Spread (how far from the centre the pulse reaches)",
+   "default_palette": "own",
+   "palette_slots": [],
+   "palette_note": "With a palette: the pulse runs through the palette from where it starts outward, resting dim in the same colours.",
+   "custom1": "Second beat strength",
+   "custom2": "Origin (0: centre, 128: start, 255: both ends)",
+   "defaults": {
+    "speed": 70,
+    "intensity": 200,
+    "palette": 255,
+    "c1": [
+     255,
+     40,
+     80
+    ],
+    "c2": [
+     30,
+     0,
+     10
+    ],
+    "c3": [
+     0,
+     0,
+     0
+    ],
+    "custom1": 160,
+    "custom2": 0
+   },
+   "state_bytes_per_pixel": 0,
+   "origin": "own",
+   "design": {
+    "category": "seasonal",
+    "particles": 0,
+    "ram_bytes": 16,
+    "cpu_class": "light (~10 cycles/px: envelope + distance)",
+    "white_use": "W off (stays rose); RGBCCT: warm white only through a pale rest colour (auto extraction)."
+   },
+   "ha_group": "Seasonal",
+   "flashy": false
+  }
+ ],
+ "palettes": [
+  {
+   "id": 0,
+   "name": "Rainbow",
+   "origin": "FastLED colorpalettes.cpp, MIT (Daniel Garcia and contributors): RainbowColors_p",
+   "cyclic": true
+  },
+  {
+   "id": 1,
+   "name": "Analogous",
+   "origin": "our own look-alike of the palette of this name (WLED / cpt-city have one): same mood and colour progression, stops chosen by eye from its description, no values copied",
+   "cyclic": false
+  },
+  {
+   "id": 2,
+   "name": "April Night",
+   "origin": "palette by Aircoookie (Christian Schwinne) from WLED, added while WLED was MIT-licensed (Copyright (c) 2016 Christian Schwinne; same stops in v0.14.4); colour stops only",
+   "cyclic": true
+  },
+  {
+   "id": 3,
+   "name": "C9 New",
+   "origin": "palette by Aircoookie (Christian Schwinne) from WLED, added while WLED was MIT-licensed (Copyright (c) 2016 Christian Schwinne; same stops in v0.14.4); colour stops only; derived from Mark Kriegsman's C9 colours (https://gist.github.com/kriegsman/756ea6dcae8e30845b5a)",
+   "cyclic": false
+  },
+  {
+   "id": 4,
+   "name": "Hult",
+   "origin": "our own look-alike of the palette of this name (WLED / cpt-city have one): same mood and colour progression, stops chosen by eye from its description, no values copied",
+   "cyclic": false
+  },
+  {
+   "id": 5,
+   "name": "Magred",
+   "origin": "our own look-alike of the palette of this name (WLED / cpt-city have one): same mood and colour progression, stops chosen by eye from its description, no values copied",
+   "cyclic": false
+  },
+  {
+   "id": 6,
+   "name": "Orange & Teal",
+   "origin": "palette by Aircoookie (Christian Schwinne) from WLED, added while WLED was MIT-licensed (Copyright (c) 2016 Christian Schwinne; same stops in v0.14.4); colour stops only",
+   "cyclic": false
+  },
+  {
+   "id": 7,
+   "name": "Rainbow Bands",
+   "origin": "FastLED colorpalettes.cpp, MIT (Daniel Garcia and contributors): RainbowStripeColors_p",
+   "cyclic": true
+  },
+  {
+   "id": 8,
+   "name": "Retro Clown",
+   "origin": "cpt-city, http://seaviewsensing.com/pub/cpt-city/bhw/bhw1/bhw1_01.c3g: gradient \"bhw1_01\" by Blackheartedwolf (2011), Creative Commons Attribution 3.0 (https://creativecommons.org/licenses/by/3.0/); resampled to 16 entries",
+   "cyclic": false
+  },
+  {
+   "id": 9,
+   "name": "Yelmag",
+   "origin": "our own look-alike of the palette of this name (WLED / cpt-city have one): same mood and colour progression, stops chosen by eye from its description, no values copied",
+   "cyclic": false
+  },
+  {
+   "id": 10,
+   "name": "Party",
+   "origin": "FastLED colorpalettes.cpp, MIT (Daniel Garcia and contributors): PartyColors_p",
+   "cyclic": true
+  },
+  {
+   "id": 11,
+   "name": "Ocean",
+   "origin": "FastLED colorpalettes.cpp, MIT (Daniel Garcia and contributors): OceanColors_p",
+   "cyclic": false
+  },
+  {
+   "id": 12,
+   "name": "Forest",
+   "origin": "FastLED colorpalettes.cpp, MIT (Daniel Garcia and contributors): ForestColors_p",
+   "cyclic": false
+  },
+  {
+   "id": 13,
+   "name": "Lava",
+   "origin": "FastLED colorpalettes.cpp, MIT (Daniel Garcia and contributors): LavaColors_p",
+   "cyclic": false
+  },
+  {
+   "id": 14,
+   "name": "Heat",
+   "origin": "FastLED colorpalettes.cpp, MIT (Daniel Garcia and contributors): HeatColors_p (the black-body ramp of HeatColor)",
+   "cyclic": false
+  },
+  {
+   "id": 15,
+   "name": "Cloud",
+   "origin": "FastLED colorpalettes.cpp, MIT (Daniel Garcia and contributors): CloudColors_p",
+   "cyclic": false
+  },
+  {
+   "id": 16,
+   "name": "Sunset",
+   "origin": "own, made for this firmware (GPL-3.0-or-later)",
+   "cyclic": true
+  },
+  {
+   "id": 17,
+   "name": "Aurora",
+   "origin": "own, made for this firmware (GPL-3.0-or-later)",
+   "cyclic": true
+  },
+  {
+   "id": 18,
+   "name": "Fairy",
+   "origin": "own, made for this firmware (GPL-3.0-or-later)",
+   "cyclic": true
+  },
+  {
+   "id": 19,
+   "name": "Sunrise",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (Sunrise / Sunset: a warm sky from dark to day)",
+   "cyclic": false
+  },
+  {
+   "id": 20,
+   "name": "Candlelight",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (candle flame, amber to warm white)",
+   "cyclic": false
+  },
+  {
+   "id": 21,
+   "name": "Warm White",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (warm whites, about 1900 K - 3000 K; on RGBW strips the white LED carries little of them: auto-white takes min(r, g, b), and a warm white has almost no blue)",
+   "cyclic": true
+  },
+  {
+   "id": 22,
+   "name": "Daylight",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (whites from 2700 K to 6500 K, colour temperatures from the common black-body RGB table; the cool end puts ~30 % of its light on the white LED of RGBW strips)",
+   "cyclic": true
+  },
+  {
+   "id": 23,
+   "name": "Christmas",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (red, green, warm white, gold)",
+   "cyclic": true
+  },
+  {
+   "id": 24,
+   "name": "Winter",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (ice blue and white)",
+   "cyclic": true
+  },
+  {
+   "id": 25,
+   "name": "Halloween",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (orange, purple, green)",
+   "cyclic": true
+  },
+  {
+   "id": 26,
+   "name": "Autumn",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (leaves: rust, orange, gold)",
+   "cyclic": true
+  },
+  {
+   "id": 27,
+   "name": "Pastel",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (soft pink, peach, lemon, mint, sky, lilac)",
+   "cyclic": true
+  },
+  {
+   "id": 28,
+   "name": "Embers",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (glowing coals)",
+   "cyclic": false
+  },
+  {
+   "id": 29,
+   "name": "Rose",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (deep rose to blush)",
+   "cyclic": true
+  },
+  {
+   "id": 30,
+   "name": "Moonlight",
+   "origin": "own, made for this firmware (GPL-3.0-or-later) (night blue to silver)",
+   "cyclic": true
+  },
+  {
+   "id": 31,
+   "name": "Iridescent",
+   "origin": "own",
+   "cyclic": true,
+   "stops": [
+    [
+     255,
+     214,
+     120
+    ],
+    [
+     255,
+     160,
+     90
+    ],
+    [
+     235,
+     90,
+     150
+    ],
+    [
+     170,
+     70,
+     220
+    ],
+    [
+     90,
+     90,
+     255
+    ],
+    [
+     40,
+     170,
+     255
+    ],
+    [
+     30,
+     220,
+     200
+    ],
+    [
+     80,
+     240,
+     140
+    ],
+    [
+     190,
+     240,
+     90
+    ],
+    [
+     255,
+     220,
+     110
+    ],
+    [
+     255,
+     140,
+     170
+    ],
+    [
+     200,
+     100,
+     230
+    ],
+    [
+     120,
+     120,
+     255
+    ],
+    [
+     60,
+     200,
+     240
+    ],
+    [
+     100,
+     240,
+     190
+    ],
+    [
+     220,
+     235,
+     130
+    ]
+   ],
+   "mood": "Soap-bubble and oil-sheen colours: gold, magenta, violet, blue, teal, lime, round again."
+  },
+  {
+   "id": 32,
+   "name": "Abyss",
+   "origin": "own",
+   "cyclic": false,
+   "stops": [
+    [
+     0,
+     0,
+     4
+    ],
+    [
+     0,
+     2,
+     12
+    ],
+    [
+     0,
+     6,
+     24
+    ],
+    [
+     0,
+     12,
+     40
+    ],
+    [
+     0,
+     22,
+     60
+    ],
+    [
+     0,
+     34,
+     80
+    ],
+    [
+     0,
+     50,
+     100
+    ],
+    [
+     0,
+     70,
+     120
+    ],
+    [
+     0,
+     95,
+     140
+    ],
+    [
+     0,
+     125,
+     160
+    ],
+    [
+     0,
+     160,
+     180
+    ],
+    [
+     10,
+     200,
+     200
+    ],
+    [
+     40,
+     230,
+     220
+    ],
+    [
+     90,
+     250,
+     235
+    ],
+    [
+     150,
+     255,
+     245
+    ],
+    [
+     210,
+     255,
+     255
+    ]
+   ],
+   "mood": "From the black deep sea up to glowing bioluminescent cyan."
+  },
+  {
+   "id": 33,
+   "name": "Hygge",
+   "origin": "own",
+   "cyclic": false,
+   "stops": [
+    [
+     60,
+     20,
+     4
+    ],
+    [
+     110,
+     40,
+     8
+    ],
+    [
+     170,
+     70,
+     15
+    ],
+    [
+     220,
+     110,
+     30
+    ],
+    [
+     255,
+     150,
+     60
+    ],
+    [
+     255,
+     185,
+     110
+    ],
+    [
+     255,
+     210,
+     160
+    ],
+    [
+     240,
+     200,
+     170
+    ],
+    [
+     200,
+     170,
+     140
+    ],
+    [
+     160,
+     150,
+     120
+    ],
+    [
+     120,
+     140,
+     100
+    ],
+    [
+     110,
+     120,
+     110
+    ],
+    [
+     130,
+     120,
+     140
+    ],
+    [
+     170,
+     130,
+     120
+    ],
+    [
+     200,
+     120,
+     80
+    ],
+    [
+     230,
+     140,
+     70
+    ]
+   ],
+   "mood": "Cosy living-room tones: ember, amber, linen, oatmeal, sage and dusty lilac."
+  },
+  {
+   "id": 34,
+   "name": "Synthwave",
+   "origin": "own",
+   "cyclic": true,
+   "stops": [
+    [
+     255,
+     0,
+     120
+    ],
+    [
+     255,
+     20,
+     160
+    ],
+    [
+     230,
+     0,
+     200
+    ],
+    [
+     180,
+     0,
+     230
+    ],
+    [
+     120,
+     0,
+     255
+    ],
+    [
+     70,
+     20,
+     255
+    ],
+    [
+     30,
+     60,
+     255
+    ],
+    [
+     0,
+     120,
+     255
+    ],
+    [
+     0,
+     190,
+     255
+    ],
+    [
+     0,
+     240,
+     240
+    ],
+    [
+     40,
+     200,
+     255
+    ],
+    [
+     100,
+     100,
+     255
+    ],
+    [
+     160,
+     40,
+     255
+    ],
+    [
+     210,
+     0,
+     220
+    ],
+    [
+     255,
+     0,
+     180
+    ],
+    [
+     255,
+     30,
+     100
+    ]
+   ],
+   "mood": "Retro neon night: hot pink, violet, electric blue and cyan."
+  },
+  {
+   "id": 35,
+   "name": "Golden Hour",
+   "origin": "own",
+   "cyclic": false,
+   "stops": [
+    [
+     120,
+     40,
+     10
+    ],
+    [
+     170,
+     70,
+     15
+    ],
+    [
+     215,
+     105,
+     25
+    ],
+    [
+     245,
+     140,
+     40
+    ],
+    [
+     255,
+     170,
+     60
+    ],
+    [
+     255,
+     195,
+     95
+    ],
+    [
+     255,
+     210,
+     130
+    ],
+    [
+     255,
+     200,
+     150
+    ],
+    [
+     255,
+     180,
+     160
+    ],
+    [
+     245,
+     165,
+     170
+    ],
+    [
+     225,
+     150,
+     180
+    ],
+    [
+     200,
+     140,
+     190
+    ],
+    [
+     170,
+     130,
+     200
+    ],
+    [
+     140,
+     120,
+     200
+    ],
+    [
+     110,
+     105,
+     190
+    ],
+    [
+     80,
+     85,
+     170
+    ]
+   ],
+   "mood": "The last hour of sun: deep amber, gold and peach fading to rose and lavender."
+  },
+  {
+   "id": 36,
+   "name": "Meadow",
+   "origin": "own",
+   "cyclic": true,
+   "stops": [
+    [
+     20,
+     60,
+     10
+    ],
+    [
+     40,
+     100,
+     20
+    ],
+    [
+     70,
+     140,
+     30
+    ],
+    [
+     110,
+     170,
+     40
+    ],
+    [
+     160,
+     200,
+     50
+    ],
+    [
+     220,
+     220,
+     60
+    ],
+    [
+     255,
+     230,
+     80
+    ],
+    [
+     255,
+     245,
+     170
+    ],
+    [
+     240,
+     250,
+     230
+    ],
+    [
+     180,
+     220,
+     255
+    ],
+    [
+     120,
+     190,
+     255
+    ],
+    [
+     150,
+     150,
+     250
+    ],
+    [
+     180,
+     120,
+     220
+    ],
+    [
+     220,
+     140,
+     200
+    ],
+    [
+     150,
+     170,
+     80
+    ],
+    [
+     60,
+     120,
+     30
+    ]
+   ],
+   "mood": "Spring meadow: fresh greens, buttercup, daisy cream, sky blue, heather and clover."
+  },
+  {
+   "id": 37,
+   "name": "Cherry Blossom",
+   "origin": "own",
+   "cyclic": true,
+   "stops": [
+    [
+     255,
+     200,
+     215
+    ],
+    [
+     255,
+     220,
+     230
+    ],
+    [
+     255,
+     245,
+     248
+    ],
+    [
+     255,
+     255,
+     255
+    ],
+    [
+     255,
+     230,
+     235
+    ],
+    [
+     250,
+     180,
+     200
+    ],
+    [
+     240,
+     140,
+     170
+    ],
+    [
+     250,
+     170,
+     195
+    ],
+    [
+     255,
+     215,
+     225
+    ],
+    [
+     230,
+     240,
+     220
+    ],
+    [
+     170,
+     215,
+     150
+    ],
+    [
+     120,
+     190,
+     110
+    ],
+    [
+     160,
+     210,
+     140
+    ],
+    [
+     225,
+     235,
+     215
+    ],
+    [
+     255,
+     225,
+     230
+    ],
+    [
+     255,
+     205,
+     215
+    ]
+   ],
+   "mood": "Spring: pink petals, white and fresh green."
+  },
+  {
+   "id": 38,
+   "name": "Dusk Lavender",
+   "origin": "own",
+   "cyclic": true,
+   "stops": [
+    [
+     20,
+     10,
+     50
+    ],
+    [
+     40,
+     20,
+     80
+    ],
+    [
+     70,
+     40,
+     120
+    ],
+    [
+     110,
+     70,
+     160
+    ],
+    [
+     150,
+     110,
+     200
+    ],
+    [
+     185,
+     150,
+     220
+    ],
+    [
+     205,
+     170,
+     210
+    ],
+    [
+     210,
+     150,
+     170
+    ],
+    [
+     200,
+     120,
+     140
+    ],
+    [
+     220,
+     140,
+     110
+    ],
+    [
+     230,
+     170,
+     110
+    ],
+    [
+     190,
+     130,
+     100
+    ],
+    [
+     120,
+     80,
+     110
+    ],
+    [
+     70,
+     45,
+     100
+    ],
+    [
+     40,
+     25,
+     75
+    ],
+    [
+     25,
+     12,
+     55
+    ]
+   ],
+   "mood": "A lavender field at dusk: indigo, lilac, dusty rose and a thin amber horizon; calm evening ambient."
+  },
+  {
+   "id": 39,
+   "name": "Koi",
+   "origin": "own",
+   "cyclic": false,
+   "stops": [
+    [
+     255,
+     90,
+     0
+    ],
+    [
+     255,
+     120,
+     10
+    ],
+    [
+     255,
+     250,
+     235
+    ],
+    [
+     255,
+     255,
+     255
+    ],
+    [
+     255,
+     160,
+     20
+    ],
+    [
+     255,
+     200,
+     60
+    ],
+    [
+     255,
+     255,
+     250
+    ],
+    [
+     255,
+     80,
+     0
+    ],
+    [
+     20,
+     16,
+     16
+    ],
+    [
+     10,
+     8,
+     8
+    ],
+    [
+     255,
+     255,
+     255
+    ],
+    [
+     255,
+     110,
+     0
+    ],
+    [
+     255,
+     215,
+     80
+    ],
+    [
+     255,
+     255,
+     245
+    ],
+    [
+     25,
+     20,
+     20
+    ],
+    [
+     255,
+     95,
+     0
+    ]
+   ],
+   "mood": "Koi fish: orange, white, gold and ink black, for the pond and bulb-type effects."
+  },
+  {
+   "id": 40,
+   "name": "Champagne Gold",
+   "origin": "own",
+   "cyclic": false,
+   "stops": [
+    [
+     0,
+     0,
+     0
+    ],
+    [
+     20,
+     12,
+     0
+    ],
+    [
+     60,
+     35,
+     0
+    ],
+    [
+     120,
+     70,
+     0
+    ],
+    [
+     200,
+     130,
+     10
+    ],
+    [
+     255,
+     180,
+     30
+    ],
+    [
+     255,
+     210,
+     80
+    ],
+    [
+     255,
+     235,
+     160
+    ],
+    [
+     255,
+     245,
+     215
+    ],
+    [
+     250,
+     250,
+     240
+    ],
+    [
+     220,
+     220,
+     220
+    ],
+    [
+     190,
+     190,
+     200
+    ],
+    [
+     240,
+     240,
+     245
+    ],
+    [
+     255,
+     225,
+     120
+    ],
+    [
+     255,
+     195,
+     40
+    ],
+    [
+     150,
+     95,
+     0
+    ]
+   ],
+   "mood": "New Year: black into amber, gold, champagne white and silver sparkle."
+  },
+  {
+   "id": 41,
+   "name": "Petrol Porcelain",
+   "origin": "own",
+   "cyclic": true,
+   "stops": [
+    [
+     5,
+     18,
+     24
+    ],
+    [
+     7,
+     31,
+     39
+    ],
+    [
+     9,
+     48,
+     57
+    ],
+    [
+     12,
+     68,
+     76
+    ],
+    [
+     20,
+     88,
+     95
+    ],
+    [
+     38,
+     109,
+     112
+    ],
+    [
+     67,
+     132,
+     131
+    ],
+    [
+     104,
+     157,
+     151
+    ],
+    [
+     149,
+     184,
+     173
+    ],
+    [
+     198,
+     211,
+     195
+    ],
+    [
+     237,
+     234,
+     215
+    ],
+    [
+     210,
+     211,
+     197
+    ],
+    [
+     159,
+     179,
+     174
+    ],
+    [
+     99,
+     139,
+     144
+    ],
+    [
+     43,
+     89,
+     104
+    ],
+    [
+     10,
+     42,
+     57
+    ]
+   ],
+   "mood": "Deep petrol blue meets glazed ivory, with restrained sea-glass midtones."
+  },
+  {
+   "id": 42,
+   "name": "Copper Oxide",
+   "origin": "own",
+   "cyclic": false,
+   "stops": [
+    [
+     24,
+     13,
+     9
+    ],
+    [
+     48,
+     23,
+     12
+    ],
+    [
+     80,
+     36,
+     16
+    ],
+    [
+     118,
+     55,
+     23
+    ],
+    [
+     159,
+     79,
+     34
+    ],
+    [
+     191,
+     108,
+     51
+    ],
+    [
+     210,
+     141,
+     79
+    ],
+    [
+     210,
+     168,
+     114
+    ],
+    [
+     176,
+     181,
+     142
+    ],
+    [
+     125,
+     178,
+     156
+    ],
+    [
+     77,
+     159,
+     149
+    ],
+    [
+     43,
+     130,
+     130
+    ],
+    [
+     24,
+     96,
+     108
+    ],
+    [
+     15,
+     65,
+     84
+    ],
+    [
+     11,
+     40,
+     59
+    ],
+    [
+     12,
+     23,
+     35
+    ]
+   ],
+   "mood": "Weathered copper changing through straw to oxidised turquoise and deep slate."
+  },
+  {
+   "id": 43,
+   "name": "Fig and Brass",
+   "origin": "own",
+   "cyclic": true,
+   "stops": [
+    [
+     21,
+     9,
+     24
+    ],
+    [
+     39,
+     15,
+     42
+    ],
+    [
+     62,
+     24,
+     59
+    ],
+    [
+     85,
+     35,
+     72
+    ],
+    [
+     107,
+     50,
+     80
+    ],
+    [
+     127,
+     69,
+     84
+    ],
+    [
+     148,
+     92,
+     86
+    ],
+    [
+     170,
+     117,
+     84
+    ],
+    [
+     192,
+     145,
+     83
+    ],
+    [
+     214,
+     176,
+     102
+    ],
+    [
+     232,
+     205,
+     138
+    ],
+    [
+     219,
+     184,
+     119
+    ],
+    [
+     185,
+     143,
+     93
+    ],
+    [
+     140,
+     97,
+     73
+    ],
+    [
+     89,
+     50,
+     57
+    ],
+    [
+     44,
+     20,
+     38
+    ]
+   ],
+   "mood": "Smoked fig, muted rose and antique brass for an evening lounge."
+  },
+  {
+   "id": 44,
+   "name": "Mulberry Milk",
+   "origin": "own",
+   "cyclic": false,
+   "stops": [
+    [
+     34,
+     13,
+     30
+    ],
+    [
+     58,
+     22,
+     45
+    ],
+    [
+     85,
+     35,
+     61
+    ],
+    [
+     115,
+     53,
+     78
+    ],
+    [
+     146,
+     77,
+     98
+    ],
+    [
+     174,
+     106,
+     121
+    ],
+    [
+     199,
+     139,
+     148
+    ],
+    [
+     220,
+     172,
+     173
+    ],
+    [
+     236,
+     202,
+     197
+    ],
+    [
+     246,
+     225,
+     216
+    ],
+    [
+     251,
+     241,
+     229
+    ],
+    [
+     234,
+     229,
+     222
+    ],
+    [
+     205,
+     209,
+     213
+    ],
+    [
+     167,
+     180,
+     199
+    ],
+    [
+     123,
+     144,
+     176
+    ],
+    [
+     80,
+     108,
+     147
+    ]
+   ],
+   "mood": "Dusty mulberry through milk-white into blue-grey, soft without a rainbow."
+  },
+  {
+   "id": 45,
+   "name": "Clay and Linen",
+   "origin": "own",
+   "cyclic": false,
+   "stops": [
+    [
+     30,
+     18,
+     16
+    ],
+    [
+     49,
+     29,
+     23
+    ],
+    [
+     72,
+     43,
+     31
+    ],
+    [
+     99,
+     60,
+     42
+    ],
+    [
+     128,
+     82,
+     57
+    ],
+    [
+     158,
+     109,
+     79
+    ],
+    [
+     187,
+     141,
+     108
+    ],
+    [
+     211,
+     173,
+     140
+    ],
+    [
+     230,
+     202,
+     175
+    ],
+    [
+     242,
+     222,
+     202
+    ],
+    [
+     249,
+     237,
+     223
+    ],
+    [
+     236,
+     223,
+     207
+    ],
+    [
+     213,
+     194,
+     174
+    ],
+    [
+     179,
+     152,
+     131
+    ],
+    [
+     137,
+     105,
+     87
+    ],
+    [
+     89,
+     60,
+     48
+    ]
+   ],
+   "mood": "Quiet terracotta, oatmeal and unbleached linen for warm architectural light."
+  },
+  {
+   "id": 46,
+   "name": "Neon Noir",
+   "origin": "own",
+   "cyclic": true,
+   "stops": [
+    [
+     0,
+     0,
+     0
+    ],
+    [
+     20,
+     0,
+     30
+    ],
+    [
+     120,
+     0,
+     160
+    ],
+    [
+     255,
+     0,
+     180
+    ],
+    [
+     255,
+     40,
+     220
+    ],
+    [
+     80,
+     0,
+     100
+    ],
+    [
+     0,
+     0,
+     0
+    ],
+    [
+     0,
+     20,
+     30
+    ],
+    [
+     0,
+     160,
+     200
+    ],
+    [
+     0,
+     255,
+     240
+    ],
+    [
+     40,
+     220,
+     255
+    ],
+    [
+     0,
+     80,
+     120
+    ],
+    [
+     0,
+     0,
+     0
+    ],
+    [
+     40,
+     0,
+     80
+    ],
+    [
+     150,
+     0,
+     255
+    ],
+    [
+     30,
+     0,
+     60
+    ]
+   ],
+   "mood": "Black with magenta and cyan neon and a violet flash; for party effects."
+  },
+  {
+   "id": 47,
+   "name": "Tide Pool",
+   "origin": "own",
+   "cyclic": true,
+   "stops": [
+    [
+     0,
+     60,
+     70
+    ],
+    [
+     0,
+     90,
+     100
+    ],
+    [
+     0,
+     130,
+     130
+    ],
+    [
+     40,
+     170,
+     160
+    ],
+    [
+     110,
+     210,
+     190
+    ],
+    [
+     200,
+     230,
+     210
+    ],
+    [
+     235,
+     220,
+     180
+    ],
+    [
+     240,
+     205,
+     150
+    ],
+    [
+     245,
+     180,
+     140
+    ],
+    [
+     250,
+     140,
+     120
+    ],
+    [
+     240,
+     110,
+     110
+    ],
+    [
+     200,
+     100,
+     120
+    ],
+    [
+     120,
+     110,
+     130
+    ],
+    [
+     50,
+     100,
+     120
+    ],
+    [
+     10,
+     80,
+     95
+    ],
+    [
+     0,
+     65,
+     75
+    ]
+   ],
+   "mood": "Rock pool at low tide: teal water, pale sand and a touch of coral."
+  },
+  {
+   "id": 48,
+   "name": "Graphite Citrus",
+   "origin": "own",
+   "cyclic": true,
+   "stops": [
+    [
+     7,
+     11,
+     16
+    ],
+    [
+     12,
+     21,
+     28
+    ],
+    [
+     20,
+     39,
+     47
+    ],
+    [
+     27,
+     65,
+     68
+    ],
+    [
+     34,
+     92,
+     82
+    ],
+    [
+     59,
+     119,
+     83
+    ],
+    [
+     104,
+     151,
+     68
+    ],
+    [
+     169,
+     184,
+     45
+    ],
+    [
+     230,
+     211,
+     22
+    ],
+    [
+     255,
+     232,
+     72
+    ],
+    [
+     246,
+     241,
+     158
+    ],
+    [
+     206,
+     220,
+     189
+    ],
+    [
+     139,
+     181,
+     176
+    ],
+    [
+     75,
+     125,
+     140
+    ],
+    [
+     32,
+     67,
+     86
+    ],
+    [
+     12,
+     27,
+     40
+    ]
+   ],
+   "mood": "Graphite and teal punctuated by acid-yellow highlights for crisp kinetic effects."
+  }
+ ],
+ "ha_group_order": [
+  "Calm",
+  "Nature",
+  "Colour",
+  "Sparkle",
+  "Fire & candle",
+  "Motion",
+  "Party",
+  "Seasonal",
+  "Other"
+ ],
+ "catalogue_version_board": "4+v407-1+pal49",
+ "board_catalogue_version": "4+v407-1+pal49",
+ "firmware_built": {
+  "effects": "feffffffffffffffffffffffffff07000000000000000000",
+  "palettes": "ffffffffffff010000000000000000000000000000000000"
+ }
+}

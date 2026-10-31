@@ -1,0 +1,28 @@
+{
+  "name": "QuinLED Dig2Analog-Plus-5ch (preview)",
+  "channel": "alpha",
+  "version": "0.7.3-alpha.3",
+  "release_url": "",
+  "summary": "Preview image: the 0.7.2 app (pulse-skip rate setting, 100 ns minimum pulse default, per-channel ceilings, flash writes only above 2.81 V) as 0.7.3-alpha.3, installed over the data line; needs bootloader 4",
+  "images": [
+    {
+      "target": "0101010103020200080021000000df00",
+      "rev_min": 4,
+      "rev_max": 4,
+      "min_bootloader": 4,
+      "size": 49908,
+      "sha256": "b5f299de2244e5cc62bc57312e54e80fca0e955eada1a7276227ba1ba4f3725c",
+      "url": "quinled-dig2analog-plus-5ch-0.7.3-alpha.3-rev04-update.bin",
+      "descriptor": "51445536020004040101010103020204000703030000c2b406bbd91c0800210008002100020301003430313934333430313934350000000000000000d4f05324"
+    }
+  ],
+  "layouts": [
+    {
+      "target": "0101010103020204080021000000df00",
+      "metadata_base": 134225920,
+      "metadata_bytes": 256,
+      "bootloader_bytes": 8192,
+      "blackout_ms": 5
+    }
+  ]
+}

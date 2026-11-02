@@ -1,0 +1,132 @@
+# QuinLED Diff-Power sender with a normal Ultra line on port 1: two Diff-Power Ultra Receiver Analog-Medium boards and, as the
+# last board of the line, a Diff-Power Ultra Receiver Digital-Medium (chain mode). The Diff-Power-UR-Digital-M makes its
+# strip's pixels itself (local pixel effects: Aurora, Rainbow, Candle, ...) and takes its commands in its own slot of the
+# line like the analog receivers do: no pixel stream, no markers, no digital: on the data line. Its place is board
+# num_boards, the last: it forwards nothing, so nothing sits behind it (wiki: Diff-Power-UR-Digital-M chain mode).
+# The light has the protocol's effect list, Speed, Intensity and Palette as entities of its device, and a Line status
+# (the mode it runs in, whether it hears the line, a warning when it is not the last board).
+# ESP32 classic, ESP-IDF. Set the pins to your sender's wiring.
+
+substitutions:
+  name: sender-1
+  friendly_name: Sender 1
+  port1_data: GPIO16      # port 1's Ultra data line (the commands of all three receivers)
+  port1_enable: GPIO25    # its ChannelEnable
+  port1_rx: GPIO34        # its RS-485 receiver output (the receivers' answers: the telemetry and page 0x81)
+  port1_de: GPIO4         # its RS-485 driver enable (DE)
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  project:
+    name: quinled.diff-power-ultra-chain
+    version: "0.1.0"
+  areas:
+    - id: garden
+      name: Garden
+    - id: living_room
+      name: Living room
+  devices:
+    - id: port_1
+      name: ${friendly_name} · Port 1
+    - id: living_cove
+      name: Living cove
+      area_id: living_room
+    - id: bookshelf
+      name: Bookshelf
+      area_id: living_room
+    - id: garden_strip
+      name: Garden strip
+      area_id: garden
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+external_components:
+  # @main until the first release; then pin one (@v0.x.y, wiki: Installation)
+  - source: github://intermittech/quinled-ultra-esphome@main
+    components: [ultra_line, diffpower, ur_analog_m, ur_digital_m]
+    # Developing the component itself? Use the local copy instead:
+    # source:
+    #   type: local
+    #   path: ../components
+
+logger:
+api:
+  encryption:
+    key: !secret api_encryption_key
+  reboot_timeout: 0s   # the lights keep running without Home Assistant (the default reboots after 15 min)
+ota:
+  - platform: esphome
+    encryption:                # uploads use the api encryption key
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:                 # the fallback hotspot (captive portal) if the Wi-Fi is gone
+    password: !secret fallback_ap_password
+captive_portal:
+
+uart:
+  - id: rs485_1
+    rx_pin: ${port1_rx}
+    baud_rate: 1000000
+    rx_buffer_size: 1024
+
+diffpower:
+  - id: port1
+    name: Port 1
+    device_id: port_1
+    enable_pin: ${port1_enable}
+
+ultra_line:
+  - id: line1
+    pin: ${port1_data}
+    num_boards: 3          # board 1 and 2: Diff-Power-UR-Analog-M receivers, board 3: the Diff-Power-UR-Digital-M (the last)
+    rmt_symbols: 128
+    port: port1
+    telemetry:
+      uart_id: rs485_1
+      name: Port 1
+      device_id: port_1
+      direction_pin: ${port1_de}
+      receivers:           # in the order of the line: the Diff-Power-UR-Digital-M answers like the others
+        - device_id: living_cove
+        - device_id: bookshelf
+        - device_id: garden_strip
+
+light:
+  # the Diff-Power-UR-Analog-M receivers: lights as always
+  - platform: ur_analog_m
+    ultra_line_id: line1
+    name: None
+    device_id: living_cove
+    board: 1
+    red: 1
+    green: 2
+    blue: 3
+    cold_white: 4
+    warm_white: 5
+  - platform: ur_analog_m
+    ultra_line_id: line1
+    name: None
+    device_id: bookshelf
+    board: 2
+    cold_white: 1
+    warm_white: 2
+  # the Diff-Power-UR-Digital-M, the last board of the line: a 300 pixel WS2812B strip
+  - platform: ur_digital_m
+    ultra_line_id: line1
+    name: None
+    device_id: garden_strip
+    board: 3               # = num_boards: the receiver is the last board and the only one of its kind on the line
+    mode: chain            # CONFIG 140: it runs on a normal Ultra line (auto, the default, lets the line decide)
+    chip: ws2812b
+    num_leds: 300
+    color_order: GRB
+    default_transition_length: 1s
+    # what the receiver does without the controller (a power cut of the controller, the signal lost): the stored effect
+    store_after: 30s
+    standalone:
+      power_on: true
